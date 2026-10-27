@@ -1,0 +1,1200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Salesforce MCP Governance &amp; Okta SSO Control Plane</title>
+  <style>
+    :root {
+      --bg-base: #090d16;
+      --bg-surface: #111827;
+      --bg-elevated: #1e293b;
+      --bg-hover: #283548;
+      --border: #334155;
+      --text-primary: #f8fafc;
+      --text-secondary: #94a3b8;
+      --accent-blue: #38bdf8;
+      --accent-indigo: #6366f1;
+      --accent-emerald: #10b981;
+      --accent-amber: #f59e0b;
+      --accent-rose: #f43f5e;
+      --radius: 10px;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: var(--bg-base);
+      color: var(--text-primary);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    /* Login Screen */
+    .login-wrapper {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: radial-gradient(circle at top right, #1e1b4b 0%, #090d16 65%);
+    }
+
+    .login-card {
+      width: 100%;
+      max-width: 440px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 32px;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
+    }
+
+    .brand-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      background: rgba(56, 189, 248, 0.12);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      color: var(--accent-blue);
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 16px;
+    }
+
+    .login-card h1 {
+      font-size: 22px;
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+
+    .login-card p.subtitle {
+      font-size: 13.5px;
+      color: var(--text-secondary);
+      margin-bottom: 24px;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 10px 16px;
+      border-radius: 8px;
+      font-size: 13.5px;
+      font-weight: 600;
+      cursor: pointer;
+      border: 1px solid transparent;
+      transition: all 0.15s ease;
+      text-decoration: none;
+    }
+
+    .btn-primary {
+      background: var(--accent-indigo);
+      color: #fff;
+    }
+    .btn-primary:hover {
+      background: #4f46e5;
+    }
+
+    .btn-okta {
+      width: 100%;
+      background: #00297a;
+      border-color: #2563eb;
+      color: #fff;
+      padding: 12px;
+      font-size: 14px;
+      margin-bottom: 18px;
+    }
+    .btn-okta:hover {
+      background: #1d4ed8;
+    }
+
+    .btn-secondary {
+      background: var(--bg-elevated);
+      border-color: var(--border);
+      color: var(--text-primary);
+    }
+    .btn-secondary:hover {
+      background: var(--bg-hover);
+    }
+
+    .btn-emerald {
+      background: rgba(16, 185, 129, 0.15);
+      border-color: rgba(16, 185, 129, 0.4);
+      color: #34d399;
+    }
+    .btn-emerald:hover {
+      background: rgba(16, 185, 129, 0.25);
+    }
+
+    .divider {
+      display: flex;
+      align-items: center;
+      text-align: center;
+      color: var(--text-secondary);
+      font-size: 12px;
+      margin: 16px 0;
+    }
+    .divider::before,
+    .divider::after {
+      content: '';
+      flex: 1;
+      border-bottom: 1px solid var(--border);
+    }
+    .divider:not(:empty)::before { margin-right: 10px; }
+    .divider:not(:empty)::after { margin-left: 10px; }
+
+    .form-group {
+      margin-bottom: 16px;
+    }
+    .form-group label {
+      display: block;
+      font-size: 12.5px;
+      font-weight: 600;
+      color: #cbd5e1;
+      margin-bottom: 6px;
+    }
+    .form-control {
+      width: 100%;
+      padding: 10px 12px;
+      background: #0b0f19;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text-primary);
+      font-size: 13.5px;
+    }
+    .form-control:focus {
+      outline: none;
+      border-color: var(--accent-blue);
+    }
+
+    /* App Layout */
+    .app-shell {
+      display: none;
+      min-height: 100vh;
+      flex-direction: column;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 28px;
+      background: var(--bg-surface);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .topbar-left {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .topbar-title {
+      font-size: 17px;
+      font-weight: 700;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: rgba(16, 185, 129, 0.12);
+      color: #34d399;
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+
+    .topbar-right {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      font-size: 13px;
+    }
+
+    .nav-tabs {
+      display: flex;
+      gap: 6px;
+      padding: 12px 28px 0;
+      background: var(--bg-surface);
+      border-bottom: 1px solid var(--border);
+      overflow-x: auto;
+    }
+
+    .nav-tab {
+      padding: 10px 16px;
+      font-size: 13.5px;
+      font-weight: 600;
+      color: var(--text-secondary);
+      border-bottom: 2px solid transparent;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: all 0.15s;
+    }
+    .nav-tab:hover {
+      color: var(--text-primary);
+    }
+    .nav-tab.active {
+      color: var(--accent-blue);
+      border-bottom-color: var(--accent-blue);
+    }
+
+    .main-content {
+      max-width: 1360px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 28px;
+      flex: 1;
+    }
+
+    .tab-pane {
+      display: none;
+    }
+    .tab-pane.active {
+      display: block;
+    }
+
+    .card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 22px;
+      margin-bottom: 22px;
+    }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+
+    .card-title {
+      font-size: 16px;
+      font-weight: 700;
+    }
+
+    .card-subtitle {
+      font-size: 13px;
+      color: var(--text-secondary);
+      margin-top: 2px;
+    }
+
+    /* Profile RBAC Matrix Table */
+    .table-wrapper {
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    th, td {
+      padding: 12px 10px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+
+    th {
+      font-size: 11.5px;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: var(--text-secondary);
+      background: rgba(15, 23, 42, 0.6);
+    }
+
+    tr:hover td {
+      background: rgba(30, 41, 59, 0.35);
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .badge-standard {
+      background: rgba(56, 189, 248, 0.15);
+      color: #38bdf8;
+    }
+    .badge-custom {
+      background: rgba(167, 139, 250, 0.15);
+      color: #c4b5fd;
+    }
+    .badge-permit {
+      background: rgba(16, 185, 129, 0.15);
+      color: #34d399;
+    }
+    .badge-deny {
+      background: rgba(244, 63, 94, 0.18);
+      color: #fb7185;
+    }
+
+    .tool-check {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .tool-check input[type="checkbox"] {
+      width: 17px;
+      height: 17px;
+      accent-color: var(--accent-indigo);
+      cursor: pointer;
+    }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+      gap: 22px;
+    }
+
+    .code-box {
+      background: #070a12;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 12.5px;
+      color: #e2e8f0;
+      overflow-x: auto;
+      white-space: pre-wrap;
+    }
+
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      padding: 12px 18px;
+      border-radius: 8px;
+      background: #1e293b;
+      border: 1px solid var(--accent-emerald);
+      color: #f8fafc;
+      font-size: 13.5px;
+      font-weight: 600;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+      display: none;
+      z-index: 9999;
+    }
+
+    .alert-banner {
+      padding: 12px 16px;
+      border-radius: 8px;
+      margin-bottom: 16px;
+      font-size: 13px;
+      display: none;
+    }
+    .alert-error {
+      background: rgba(244, 63, 94, 0.15);
+      border: 1px solid rgba(244, 63, 94, 0.4);
+      color: #fda4af;
+    }
+  </style>
+</head>
+<body>
+  <!-- LOGIN VIEW -->
+  <div id="loginView" class="login-wrapper">
+    <div class="login-card">
+      <div class="brand-badge">🛡️ Zero-Trust MCP Governance</div>
+      <h1>Salesforce MCP Admin Portal</h1>
+      <p class="subtitle">Authenticate via Okta OIDC SSO or bootstrap credentials to manage Salesforce Profile RBAC policies.</p>
+
+      <div id="loginError" class="alert-banner alert-error"></div>
+
+      <a id="oktaLoginBtn" href="/auth/okta/login" class="btn btn-okta" style="display: none;">
+        🔐 Sign in with Okta SSO (OIDC + PKCE)
+      </a>
+
+      <div id="loginDivider" class="divider" style="display: none;">OR BOOTSTRAP ADMIN LOGIN</div>
+
+      <form id="localLoginForm">
+        <div class="form-group">
+          <label for="loginEmail">Admin Email</label>
+          <input id="loginEmail" type="email" class="form-control" required placeholder="admin@company.com" />
+        </div>
+        <div class="form-group">
+          <label for="loginPassword">Admin Password</label>
+          <input id="loginPassword" type="password" class="form-control" required placeholder="••••••••••••" />
+        </div>
+        <button type="submit" class="btn btn-primary" style="width: 100%; padding: 11px;">
+          Sign In to Control Plane
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <!-- MAIN ADMIN DASHBOARD -->
+  <div id="appShell" class="app-shell">
+    <header class="topbar">
+      <div class="topbar-left">
+        <span style="font-size: 20px;">⚡</span>
+        <div>
+          <div class="topbar-title">Salesforce MCP Server — Enterprise Control Plane</div>
+        </div>
+        <span class="status-pill">● Streamable HTTP (/mcp) Active</span>
+      </div>
+      <div class="topbar-right">
+        <span id="adminIdentityBadge" style="color: var(--text-secondary);"></span>
+        <button id="logoutBtn" class="btn btn-secondary" style="padding: 6px 12px; font-size: 12px;">Sign Out</button>
+      </div>
+    </header>
+
+    <nav class="nav-tabs">
+      <div class="nav-tab active" data-tab="tab-rbac">1. Salesforce Profile RBAC Matrix</div>
+      <div class="nav-tab" data-tab="tab-sync">2. Sync Profiles from Salesforce Org</div>
+      <div class="nav-tab" data-tab="tab-okta">3. Okta SSO Admin Configuration</div>
+      <div class="nav-tab" data-tab="tab-simulator">4. Copilot &amp; Profile Policy Simulator</div>
+      <div class="nav-tab" data-tab="tab-architecture">5. Architecture &amp; Copilot Studio Setup</div>
+      <div class="nav-tab" data-tab="tab-audit">6. Zero-Trust Audit Log</div>
+    </nav>
+
+    <main class="main-content">
+      <!-- TAB 1: PROFILE RBAC MATRIX -->
+      <section id="tab-rbac" class="tab-pane active">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <div class="card-title">Salesforce Profile-Based Action Matrix</div>
+              <div class="card-subtitle">
+                Configure which MCP tools and Salesforce sObjects each Salesforce Profile can execute when calling <code>POST /mcp</code> from Microsoft Copilot Studio.
+              </div>
+            </div>
+            <div style="display: flex; gap: 10px;">
+              <button id="quickSampleSyncBtn" class="btn btn-emerald">🔄 Pull Sample Enterprise Profiles</button>
+              <button id="openAddProfileBtn" class="btn btn-secondary">+ Add Profile Rule</button>
+            </div>
+          </div>
+
+          <!-- Add Profile Inline Drawer -->
+          <div id="addProfileDrawer" style="display: none; background: #0b0f19; border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 18px;">
+            <div style="font-weight: 600; margin-bottom: 10px; font-size: 13.5px;">Add Salesforce Profile Policy</div>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px;">
+              <div>
+                <label style="font-size: 12px; color: var(--text-secondary);">Salesforce Profile Name</label>
+                <input id="newProfileName" class="form-control" placeholder="e.g. Custom: Partner Portal User" />
+              </div>
+              <div>
+                <label style="font-size: 12px; color: var(--text-secondary);">Salesforce Profile ID (Optional)</label>
+                <input id="newProfileId" class="form-control" placeholder="00e000000000099AAA" />
+              </div>
+              <div>
+                <label style="font-size: 12px; color: var(--text-secondary);">Allowed sObjects (* or comma list)</label>
+                <input id="newProfileObjects" class="form-control" value="Account, Contact, Opportunity" />
+              </div>
+              <div style="display: flex; align-items: flex-end; gap: 8px;">
+                <button id="createProfileConfirmBtn" class="btn btn-primary">Create Profile Policy</button>
+                <button id="createProfileCancelBtn" class="btn btn-secondary">Cancel</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>Active</th>
+                  <th>Salesforce Profile</th>
+                  <th style="text-align:center;">SOQL Query<br/><span style="font-size:10px;color:#38bdf8;">Read</span></th>
+                  <th style="text-align:center;">SOSL Search<br/><span style="font-size:10px;color:#38bdf8;">Read</span></th>
+                  <th style="text-align:center;">Describe<br/><span style="font-size:10px;color:#38bdf8;">Metadata</span></th>
+                  <th style="text-align:center;">Get Record<br/><span style="font-size:10px;color:#38bdf8;">Read</span></th>
+                  <th style="text-align:center;">Create Record<br/><span style="font-size:10px;color:#fbbf24;">Write</span></th>
+                  <th style="text-align:center;">Update Record<br/><span style="font-size:10px;color:#fbbf24;">Write</span></th>
+                  <th style="text-align:center;">Delete Record<br/><span style="font-size:10px;color:#f43f5e;">Destructive</span></th>
+                  <th>Allowed sObjects</th>
+                  <th>Max Rows</th>
+                  <th>Save</th>
+                </tr>
+              </thead>
+              <tbody id="profilesTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 2: SYNC PROFILES FROM SALESFORCE ORG -->
+      <section id="tab-sync" class="tab-pane">
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <div class="card-title">Pull All Profiles from Live Salesforce Org</div>
+                <div class="card-subtitle">
+                  Executes <code>SELECT Id, Name, UserType, PermissionsModifyAllData FROM Profile</code> against your Salesforce REST API and populates the RBAC matrix.
+                </div>
+              </div>
+            </div>
+            <form id="liveSyncForm">
+              <div class="form-group">
+                <label>Salesforce Instance URL (MyDomain)</label>
+                <input id="syncInstanceUrl" class="form-control" placeholder="https://yourcompany.my.salesforce.com" />
+              </div>
+              <div class="form-group">
+                <label>Salesforce Access Token (Used one-time to pull Profiles)</label>
+                <input id="syncAccessToken" type="password" class="form-control" placeholder="00D...!... (or use CLI: sf org display)" />
+              </div>
+              <div style="display: flex; gap: 10px;">
+                <button type="submit" class="btn btn-primary">⚡ Sync Profiles from Live Salesforce Org</button>
+                <button type="button" id="sampleSyncBtn2" class="btn btn-emerald">Sync Sample Enterprise Org Profiles</button>
+              </div>
+            </form>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <div class="card-title">Global Salesforce Governance &amp; SSRF Protection</div>
+                <div class="card-subtitle">Configure fallback behavior for unrecognized Salesforce Profiles and domain restrictions.</div>
+              </div>
+            </div>
+            <form id="sfSettingsForm">
+              <div class="form-group">
+                <label>Salesforce Login / OAuth Server URL</label>
+                <input id="sfLoginUrl" class="form-control" placeholder="https://login.salesforce.com" />
+              </div>
+              <div class="form-group">
+                <label>Default Policy for Unconfigured Salesforce Profiles</label>
+                <select id="sfDefaultUnknownPolicy" class="form-control">
+                  <option value="read_only">Read-Only Tools Only (soql_query, sosl_search, describe_object, get_record)</option>
+                  <option value="deny_all">Strict Deny-All (Block all MCP tools until Profile is explicitly enabled)</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>Salesforce REST API Version</label>
+                <input id="sfApiVersion" class="form-control" value="v62.0" />
+              </div>
+              <button type="submit" class="btn btn-primary">Save Salesforce Governance Settings</button>
+            </form>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 3: OKTA SSO ADMIN CONFIGURATION -->
+      <section id="tab-okta" class="tab-pane">
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <div class="card-title">Okta OIDC Single Sign-On (Admin Control Plane)</div>
+                <div class="card-subtitle">
+                  Protect this MCP Administration Portal with Okta OpenID Connect (Authorization Code Flow + PKCE + Remote JWKS Verification).
+                </div>
+              </div>
+            </div>
+            <form id="oktaConfigForm">
+              <div class="form-group" style="display: flex; align-items: center; gap: 10px;">
+                <input id="oktaEnabled" type="checkbox" style="width: 18px; height: 18px;" />
+                <label for="oktaEnabled" style="margin: 0; font-size: 14px;">Enable Okta OIDC SSO for Admin Portal</label>
+              </div>
+              <div class="form-group">
+                <label>Okta Issuer URL</label>
+                <input id="oktaIssuer" class="form-control" placeholder="https://your-org.okta.com/oauth2/default" />
+              </div>
+              <div class="form-group">
+                <label>Okta OIDC Client ID</label>
+                <input id="oktaClientId" class="form-control" placeholder="0oa..." />
+              </div>
+              <div class="form-group">
+                <label>Okta OIDC Client Secret (Encrypted at rest with AES-256-GCM)</label>
+                <input id="oktaClientSecret" type="password" class="form-control" placeholder="Leave as •••••••• to keep existing secret" />
+              </div>
+              <div class="form-group">
+                <label>Okta Redirect Callback URI (Configure in Okta App)</label>
+                <input id="oktaRedirectUri" class="form-control" />
+              </div>
+              <div class="form-group">
+                <label>Required Okta Group Claim (Optional RBAC Filter)</label>
+                <input id="oktaRequiredGroup" class="form-control" placeholder="e.g. MCP-Administrators (leave blank to allow all assigned Okta users)" />
+              </div>
+              <div class="form-group" style="display: flex; align-items: center; gap: 10px;">
+                <input id="oktaAllowLocalFallback" type="checkbox" style="width: 18px; height: 18px;" checked />
+                <label for="oktaAllowLocalFallback" style="margin: 0;">Allow Local Break-Glass Password Login alongside Okta SSO</label>
+              </div>
+              <button type="submit" class="btn btn-primary">Save Okta SSO Configuration</button>
+            </form>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <div class="card-title">How to Set Up Your Okta OIDC Application</div>
+                <div class="card-subtitle">Follow these steps in the Okta Admin Console</div>
+              </div>
+            </div>
+            <ol style="padding-left: 18px; font-size: 13.5px; color: #cbd5e1; display: flex; flex-direction: column; gap: 10px;">
+              <li>In Okta Admin Console, go to <strong>Applications &rarr; Applications &rarr; Create App Integration</strong>.</li>
+              <li>Select <strong>OIDC - OpenID Connect</strong> and <strong>Web Application</strong>.</li>
+              <li>Check <strong>Authorization Code</strong> and enable <strong>Require PKCE as additional verification</strong>.</li>
+              <li>Set <strong>Sign-in redirect URIs</strong> to:
+                <div class="code-box" id="oktaCallbackPreview" style="margin-top: 6px;"></div>
+              </li>
+              <li>If using group-based admin restriction, add a <code>groups</code> claim in <strong>Security &rarr; API &rarr; Authorization Servers &rarr; Claims</strong> matching <code>.*</code>.</li>
+              <li>Paste your Issuer URL, Client ID, and Client Secret on the left and click <strong>Save</strong>.</li>
+            </ol>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 4: COPILOT & PROFILE POLICY SIMULATOR -->
+      <section id="tab-simulator" class="tab-pane">
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <div class="card-title">Interactive Salesforce Profile RBAC &amp; MCP Simulator</div>
+                <div class="card-subtitle">
+                  Simulate how Microsoft Copilot Studio calls <code>POST /mcp</code> as a user with a specific Salesforce Profile, and verify whether the RBAC Engine permits or blocks the action.
+                </div>
+              </div>
+            </div>
+            <form id="simulatorForm">
+              <div class="form-group">
+                <label>Simulate User with Salesforce Profile</label>
+                <select id="simProfileSelect" class="form-control"></select>
+              </div>
+              <div class="form-group">
+                <label>MCP Tool Requested by Microsoft Copilot</label>
+                <select id="simToolSelect" class="form-control">
+                  <option value="soql_query">soql_query (Read SOQL)</option>
+                  <option value="sosl_search">sosl_search (Read SOSL)</option>
+                  <option value="describe_object">describe_object (Schema Metadata)</option>
+                  <option value="get_record">get_record (Read by ID)</option>
+                  <option value="create_record">create_record (Write / Create)</option>
+                  <option value="update_record">update_record (Write / Update)</option>
+                  <option value="delete_record">delete_record (Destructive / Delete)</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>Target Salesforce sObject</label>
+                <input id="simTargetObject" class="form-control" value="Opportunity" />
+              </div>
+              <div style="display: flex; gap: 10px;">
+                <button type="submit" class="btn btn-primary">▶️ Run Policy Check &amp; Execute Live /mcp Call</button>
+              </div>
+            </form>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <div class="card-title">Live Streamable HTTP <code>POST /mcp</code> Response</div>
+                <div class="card-subtitle">Shows both the Policy Evaluation and the real JSON-RPC 2.0 MCP response</div>
+              </div>
+            </div>
+            <div id="simResultOutput" class="code-box" style="min-height: 290px;">Click "Run Policy Check &amp; Execute Live /mcp Call" to test...</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 5: ARCHITECTURE & COPILOT STUDIO SETUP -->
+      <section id="tab-architecture" class="tab-pane">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <div class="card-title">Enterprise Architecture Diagram (Saved in Workspace)</div>
+              <div class="card-subtitle">Saved at <code>/docs/architecture-diagram.jpg</code> and <code>/docs/architecture-diagram.svg</code></div>
+            </div>
+            <div style="display: flex; gap: 10px;">
+              <a href="/docs/architecture-diagram.jpg" download="salesforce-mcp-architecture.jpg" class="btn btn-primary">⬇️ Download Hi-Res JPG</a>
+              <a href="/docs/architecture-diagram.svg" download="salesforce-mcp-architecture.svg" class="btn btn-secondary">⬇️ Download Vector SVG</a>
+            </div>
+          </div>
+          <div style="text-align: center; background: #070a12; padding: 16px; border-radius: 10px; border: 1px solid var(--border);">
+            <img src="/docs/architecture-diagram.jpg" alt="Salesforce MCP Architecture Diagram" style="max-width: 100%; border-radius: 8px; margin-bottom: 16px;" />
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <div class="card-title">Microsoft Copilot Studio Connection Values</div>
+              <div class="card-subtitle">Use these settings in Microsoft Copilot Studio &rarr; Tools &rarr; Add a tool &rarr; Model Context Protocol</div>
+            </div>
+          </div>
+          <div class="code-box" id="copilotConfigBox"></div>
+        </div>
+      </section>
+
+      <!-- TAB 6: AUDIT LOGS -->
+      <section id="tab-audit" class="tab-pane">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <div class="card-title">Zero-Trust Governance &amp; MCP Execution Audit Log</div>
+              <div class="card-subtitle">Every MCP tool invocation, Profile RBAC decision, and Admin configuration change is recorded.</div>
+            </div>
+            <button id="refreshAuditBtn" class="btn btn-secondary">🔄 Refresh Audit Log</button>
+          </div>
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>Timestamp (UTC)</th>
+                  <th>Actor Type</th>
+                  <th>User / Email</th>
+                  <th>Salesforce Profile</th>
+                  <th>Action / Tool</th>
+                  <th>sObject</th>
+                  <th>Decision</th>
+                  <th>Reason</th>
+                </tr>
+              </thead>
+              <tbody id="auditTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script>
+    const TOOL_KEYS = [
+      'soql_query',
+      'sosl_search',
+      'describe_object',
+      'get_record',
+      'create_record',
+      'update_record',
+      'delete_record'
+    ];
+
+    let csrfToken = null;
+    let currentState = null;
+
+    function showToast(msg, isError = false) {
+      const el = document.getElementById('toast');
+      el.textContent = msg;
+      el.style.borderColor = isError ? '#f43f5e' : '#10b981';
+      el.style.display = 'block';
+      setTimeout(() => { el.style.display = 'none'; }, 3500);
+    }
+
+    async function apiFetch(url, options = {}) {
+      const headers = Object.assign({ 'Content-Type': 'application/json' }, options.headers || {});
+      if (csrfToken && options.method && options.method !== 'GET') {
+        headers['X-CSRF-Token'] = csrfToken;
+      }
+      const res = await fetch(url, Object.assign({}, options, { headers }));
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.error || `Request failed (${res.status})`);
+      }
+      return data;
+    }
+
+    // Check URL query for auth_error from Okta OIDC callback
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('auth_error')) {
+      const errBanner = document.getElementById('loginError');
+      errBanner.textContent = params.get('auth_error');
+      errBanner.style.display = 'block';
+      window.history.replaceState({}, '', '/');
+    }
+
+    async function initApp() {
+      const session = await apiFetch('/api/admin/session');
+      csrfToken = session.csrfToken;
+
+      if (!session.authenticated) {
+        document.getElementById('loginView').style.display = 'flex';
+        document.getElementById('appShell').style.display = 'none';
+        document.getElementById('loginEmail').value = session.authOptions.bootstrapEmailHint || '';
+
+        if (session.authOptions.oktaEnabled) {
+          document.getElementById('oktaLoginBtn').style.display = 'inline-flex';
+          document.getElementById('loginDivider').style.display = session.authOptions.allowLocalFallback ? 'flex' : 'none';
+        }
+        document.getElementById('localLoginForm').style.display = session.authOptions.allowLocalFallback ? 'block' : 'none';
+        return;
+      }
+
+      document.getElementById('loginView').style.display = 'none';
+      document.getElementById('appShell').style.display = 'flex';
+      document.getElementById('adminIdentityBadge').textContent =
+        `${session.user.name} (${session.user.email}) • ${session.user.authMethod === 'okta_oidc' ? 'Okta OIDC' : 'Bootstrap Admin'}`;
+
+      await loadOverview();
+    }
+
+    async function loadOverview() {
+      const data = await apiFetch('/api/admin/overview');
+      currentState = data;
+      renderProfilesMatrix(data.profiles);
+      renderSimulatorProfiles(data.profiles);
+      renderSalesforceSettings(data.salesforceSettings);
+      renderOktaConfig(data.oktaConfig);
+      renderCopilotSetup(data.mcpServer, data.salesforceSettings);
+      renderAuditLogs(data.auditLogs);
+    }
+
+    function renderProfilesMatrix(profiles) {
+      const tbody = document.getElementById('profilesTableBody');
+      tbody.innerHTML = '';
+
+      for (const p of profiles) {
+        const tr = document.createElement('tr');
+        tr.dataset.profileId = p.profileId;
+
+        const toolCells = TOOL_KEYS.map((tool) => {
+          const checked = p.allowedTools.includes(tool) ? 'checked' : '';
+          return `
+            <td>
+              <div class="tool-check">
+                <input type="checkbox" data-tool="${tool}" ${checked} />
+              </div>
+            </td>
+          `;
+        }).join('');
+
+        tr.innerHTML = `
+          <td>
+            <input type="checkbox" class="prof-enabled" ${p.enabled ? 'checked' : ''} style="width:16px;height:16px;accent-color:#10b981;" />
+          </td>
+          <td>
+            <div style="font-weight: 600; color: #f8fafc;">${escapeHtml(p.profileName)}</div>
+            <div style="font-size: 11px; color: var(--text-secondary); margin-top: 2px;">
+              ID: <code>${escapeHtml(p.profileId)}</code> •
+              <span class="badge ${p.isCustom ? 'badge-custom' : 'badge-standard'}">${p.isCustom ? 'Custom Profile' : 'Standard Profile'}</span>
+            </div>
+          </td>
+          ${toolCells}
+          <td>
+            <input type="text" class="form-control prof-objects" value="${escapeHtml(p.allowedObjects.join(', '))}" style="min-width: 170px; padding: 6px 8px; font-size: 12px;" />
+          </td>
+          <td>
+            <input type="number" class="form-control prof-limit" value="${p.maxQueryLimit}" style="width: 80px; padding: 6px 8px; font-size: 12px;" />
+          </td>
+          <td>
+            <button class="btn btn-primary save-prof-btn" style="padding: 6px 12px; font-size: 12px;">Save</button>
+          </td>
+        `;
+
+        tr.querySelector('.save-prof-btn').addEventListener('click', async () => {
+          const enabled = tr.querySelector('.prof-enabled').checked;
+          const allowedTools = Array.from(tr.querySelectorAll('input[data-tool]:checked')).map((el) => el.dataset.tool);
+          const allowedObjects = tr.querySelector('.prof-objects').value.split(',').map((s) => s.trim()).filter(Boolean);
+          const maxQueryLimit = parseInt(tr.querySelector('.prof-limit').value, 10) || 200;
+
+          try {
+            await apiFetch(`/api/admin/profiles/${encodeURIComponent(p.profileId)}`, {
+              method: 'PUT',
+              body: JSON.stringify({
+                profileName: p.profileName,
+                userType: p.userType,
+                isCustom: p.isCustom,
+                enabled,
+                allowedTools,
+                allowedObjects,
+                maxQueryLimit,
+              }),
+            });
+            showToast(`Saved policy for "${p.profileName}"`);
+            await loadOverview();
+          } catch (err) {
+            showToast(err.message, true);
+          }
+        });
+
+        tbody.appendChild(tr);
+      }
+    }
+
+    function renderSimulatorProfiles(profiles) {
+      const sel = document.getElementById('simProfileSelect');
+      sel.innerHTML = profiles.map((p) =>
+        `<option value="${escapeHtml(p.profileId)}" data-name="${escapeHtml(p.profileName)}">${escapeHtml(p.profileName)} (${p.allowedTools.length} tools enabled)</option>`
+      ).join('');
+    }
+
+    function renderSalesforceSettings(sf) {
+      document.getElementById('sfLoginUrl').value = sf.loginUrl || 'https://login.salesforce.com';
+      document.getElementById('syncInstanceUrl').value = sf.instanceUrl || '';
+      document.getElementById('sfDefaultUnknownPolicy').value = sf.defaultUnknownProfilePolicy || 'read_only';
+      document.getElementById('sfApiVersion').value = sf.apiVersion || 'v62.0';
+    }
+
+    function renderOktaConfig(okta) {
+      document.getElementById('oktaEnabled').checked = Boolean(okta.enabled);
+      document.getElementById('oktaIssuer').value = okta.issuer || '';
+      document.getElementById('oktaClientId').value = okta.clientId || '';
+      document.getElementById('oktaClientSecret').value = okta.clientSecret || '';
+      document.getElementById('oktaRedirectUri').value = okta.redirectUri || `${window.location.origin}/auth/okta/callback`;
+      document.getElementById('oktaRequiredGroup').value = okta.requiredGroup || '';
+      document.getElementById('oktaAllowLocalFallback').checked = Boolean(okta.allowLocalFallback);
+      document.getElementById('oktaCallbackPreview').textContent = okta.redirectUri || `${window.location.origin}/auth/okta/callback`;
+    }
+
+    function renderCopilotSetup(mcpServer, sfSettings) {
+      const authHost = sfSettings.instanceUrl || sfSettings.loginUrl || 'https://login.salesforce.com';
+      document.getElementById('copilotConfigBox').textContent =
+`1. MCP Streamable HTTP Endpoint URL:
+   ${mcpServer.streamableHttpEndpoint}
+
+2. Copilot Studio Authentication Type:
+   OAuth 2.0 (Generic OAuth 2.0 / Delegated Per-User)
+
+3. Authorization URL (Salesforce):
+   ${authHost}/services/oauth2/authorize
+
+4. Token URL (Salesforce):
+   ${authHost}/services/oauth2/token
+
+5. Refresh URL (Salesforce):
+   ${authHost}/services/oauth2/token
+
+6. Scopes:
+   api refresh_token openid profile email`;
+    }
+
+    function renderAuditLogs(logs) {
+      const tbody = document.getElementById('auditTableBody');
+      tbody.innerHTML = logs.map((l) => `
+        <tr>
+          <td style="white-space:nowrap;color:var(--text-secondary);font-size:12px;">${escapeHtml(l.timestamp)}</td>
+          <td><code>${escapeHtml(l.actorType)}</code></td>
+          <td>${escapeHtml(l.actorEmail)}</td>
+          <td><strong>${escapeHtml(l.profileName)}</strong></td>
+          <td><code>${escapeHtml(l.action)}</code></td>
+          <td><code>${escapeHtml(l.targetObject)}</code></td>
+          <td><span class="badge ${l.decision === 'PERMIT' ? 'badge-permit' : 'badge-deny'}">${escapeHtml(l.decision)}</span></td>
+          <td style="font-size:12px;color:#cbd5e1;">${escapeHtml(l.reason)}</td>
+        </tr>
+      `).join('');
+    }
+
+    // Event Listeners
+    document.getElementById('localLoginForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const email = document.getElementById('loginEmail').value;
+      const password = document.getElementById('loginPassword').value;
+      try {
+        await apiFetch('/api/admin/login', {
+          method: 'POST',
+          body: JSON.stringify({ email, password }),
+        });
+        await initApp();
+      } catch (err) {
+        const errBanner = document.getElementById('loginError');
+        errBanner.textContent = err.message;
+        errBanner.style.display = 'block';
+      }
+    });
+
+    document.getElementById('logoutBtn').addEventListener('click', async () => {
+      await apiFetch('/api/admin/logout', { method: 'POST' });
+      window.location.reload();
+    });
+
+    document.querySelectorAll('.nav-tab').forEach((tab) => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('.nav-tab').forEach((t) => t.classList.remove('active'));
+        document.querySelectorAll('.tab-pane').forEach((p) => p.classList.remove('active'));
+        tab.classList.add('active');
+        document.getElementById(tab.dataset.tab).classList.add('active');
+      });
+    });
+
+    document.getElementById('openAddProfileBtn').addEventListener('click', () => {
+      document.getElementById('addProfileDrawer').style.display = 'block';
+    });
+    document.getElementById('createProfileCancelBtn').addEventListener('click', () => {
+      document.getElementById('addProfileDrawer').style.display = 'none';
+    });
+
+    document.getElementById('createProfileConfirmBtn').addEventListener('click', async () => {
+      const profileName = document.getElementById('newProfileName').value.trim();
+      const profileId = document.getElementById('newProfileId').value.trim();
+      const allowedObjects = document.getElementById('newProfileObjects').value.split(',').map((s) => s.trim()).filter(Boolean);
+      if (!profileName) return showToast('Enter a Salesforce Profile name', true);
+
+      try {
+        await apiFetch('/api/admin/profiles', {
+          method: 'POST',
+          body: JSON.stringify({ profileName, profileId, allowedObjects }),
+        });
+        document.getElementById('addProfileDrawer').style.display = 'none';
+        showToast(`Created policy for "${profileName}"`);
+        await loadOverview();
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    });
+
+    async function triggerSampleSync() {
+      try {
+        const res = await apiFetch('/api/admin/salesforce/sync-profiles', {
+          method: 'POST',
+          body: JSON.stringify({ mode: 'sample_org' }),
+        });
+        showToast(`Synced Salesforce Profiles (+${res.summary.added} new, ${res.summary.updated} updated)`);
+        await loadOverview();
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    }
+
+    document.getElementById('quickSampleSyncBtn').addEventListener('click', triggerSampleSync);
+    document.getElementById('sampleSyncBtn2').addEventListener('click', triggerSampleSync);
+
+    document.getElementById('liveSyncForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const instanceUrl = document.getElementById('syncInstanceUrl').value.trim();
+      const accessToken = document.getElementById('syncAccessToken').value.trim();
+      try {
+        const res = await apiFetch('/api/admin/salesforce/sync-profiles', {
+          method: 'POST',
+          body: JSON.stringify({ instanceUrl, accessToken }),
+        });
+        showToast(`Live Org Sync Complete! (${res.summary.total} profiles in matrix)`);
+        await loadOverview();
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    });
+
+    document.getElementById('sfSettingsForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      try {
+        await apiFetch('/api/admin/salesforce/settings', {
+          method: 'PUT',
+          body: JSON.stringify({
+            loginUrl: document.getElementById('sfLoginUrl').value,
+            defaultUnknownProfilePolicy: document.getElementById('sfDefaultUnknownPolicy').value,
+            apiVersion: document.getElementById('sfApiVersion').value,
+          }),
+        });
+        showToast('Saved Salesforce Governance Settings');
+        await loadOverview();
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    });
+
+    document.getElementById('oktaConfigForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      try {
+        await apiFetch('/api/admin/okta', {
+          method: 'PUT',
+          body: JSON.stringify({
+            enabled: document.getElementById('oktaEnabled').checked,
+            issuer: document.getElementById('oktaIssuer').value,
+            clientId: document.getElementById('oktaClientId').value,
+            clientSecret: document.getElementById('oktaClientSecret').value,
+            redirectUri: document.getElementById('oktaRedirectUri').value,
+            requiredGroup: document.getElementById('oktaRequiredGroup').value,
+            allowLocalFallback: document.getElementById('oktaAllowLocalFallback').checked,
+          }),
+        });
+        showToast('Saved Okta OIDC SSO Configuration (Secret encrypted with AES-256-GCM)');
+        await loadOverview();
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    });
+
+    document.getElementById('simulatorForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const select = document.getElementById('simProfileSelect');
+      const profileId = select.value;
+      const profileName = select.options[select.selectedIndex]?.dataset?.name || 'Standard User';
+      const toolName = document.getElementById('simToolSelect').value;
+      const targetObject = document.getElementById('simTargetObject').value.trim() || 'Opportunity';
+
+      try {
+        // 1. Get simulator token & policy evaluation
+        const simMeta = await apiFetch('/api/admin/simulator/test', {
+          method: 'POST',
+          body: JSON.stringify({ profileId, profileName, toolName, targetObject }),
+        });
+
+        // 2. Call the real Streamable HTTP `/mcp` endpoint with that user's Bearer token
+        const toolArgs = buildSampleToolArguments(toolName, targetObject);
+        const mcpRes = await fetch('/mcp', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json, text/event-stream',
+            'Authorization': `Bearer ${simMeta.simulatorBearerToken}`,
+          },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'tools/call',
+            params: {
+              name: toolName,
+              arguments: toolArgs,
+            },
+          }),
+        });
+
+        const mcpJson = await mcpRes.json();
+        document.getElementById('simResultOutput').textContent = JSON.stringify(
+          {
+            simulatedSalesforceUser: simMeta.resolvedUser,
+            toolsVisibleToUserInCopilot: simMeta.visibleToolsInCopilot,
+            policyEngineDecision: {
+              permitted: simMeta.evaluation.permitted,
+              reason: simMeta.evaluation.reason,
+            },
+            streamableHttpMcpResponse: mcpJson,
+          },
+          null,
+          2
+        );
+        await loadOverview();
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    });
+
+    document.getElementById('refreshAuditBtn').addEventListener('click', loadOverview);
+
+    function buildSampleToolArguments(toolName, targetObject) {
+      switch (toolName) {
+        case 'soql_query':
+          return { query: `SELECT Id, Name FROM ${targetObject} LIMIT 5` };
+        case 'sosl_search':
+          return { search: `FIND {Acme} IN ALL FIELDS RETURNING ${targetObject}(Id, Name)` };
+        case 'describe_object':
+          return { objectName: targetObject };
+        case 'get_record':
+          return { objectName: targetObject, recordId: '00600000001A1B2AAK' };
+        case 'create_record':
+          return { objectName: targetObject, fields: { Name: 'New Copilot Deal', StageName: 'Prospecting' } };
+        case 'update_record':
+          return { objectName: targetObject, recordId: '00600000001A1B2AAK', fields: { StageName: 'Closed Won' } };
+        case 'delete_record':
+          return { objectName: targetObject, recordId: '00600000001A1B2AAK' };
+        default:
+          return {};
+      }
+    }
+
+    function escapeHtml(str) {
+      return String(str || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    initApp();
+  </script>
+</body>
+</html>
