@@ -15,7 +15,7 @@ The stack is two processes:
 
 | Process | Port | What it serves |
 | :--- | :--- | :--- |
-| **Next.js Admin Portal** (`src/app/`, `src/components/`) | `3000` | The admin UI. It proxies `/mcp`, `/api/admin/*`, `/auth/okta/*`, `/.well-known/*` and `/docs/*` to the backend (`next.config.ts`), so `http://localhost:3000` is the one public origin. |
+| **Next.js Admin Portal** (`src/app/`, `src/components/`) | `3000` | The admin UI. It proxies `/mcp`, `/api/admin/*`, `/auth/okta/*`, `/.well-known/*`, `/healthz` and `/docs/*` to the backend (`next.config.ts`), so `http://localhost:3000` is the one public origin. |
 | **Express MCP backend** (`src/index.ts`) | `3001` | `POST /mcp` (Streamable HTTP MCP), `/.well-known/oauth-protected-resource`, `/api/admin/*`, `/auth/okta/*`, `/healthz`, `/docs/*`. It serves no UI; browsers that open it are redirected to the portal. |
 
 ---
@@ -49,7 +49,7 @@ Everything has a development default. The ones that matter:
 | :--- | :--- | :--- |
 | `PORT` | `3001` | Backend port when you run it directly (`node dist/index.js`, `tsx src/index.ts`). `npm run dev` uses `MCP_BACKEND_PORT` (default `3001`) and `PORTAL_PORT` (default `3000`) instead. |
 | `BASE_URL` | `http://localhost:3000` | Public origin (the portal). Used in OAuth metadata and Okta redirects. |
-| `MCP_BACKEND_URL` | `http://localhost:3001` | Where the portal proxies to. Read by `next dev`, and baked in at `next build` for `next start`. |
+| `MCP_BACKEND_URL` | `http://localhost:3001` | Where the portal proxies to. Read by `next dev`, and baked in at `next build` for `next start`. `npm run dev` and `npm start` also read it, `MCP_BACKEND_PORT` and `PORTAL_PORT` from `.env`; real environment variables take precedence. |
 | `APP_SECRET_KEY` | development key | 64 hex chars (`openssl rand -hex 32`). **Required in production**: the backend refuses to start if it is missing, malformed, or a publicly known sample. In development and test a deterministic insecure key is used, with a warning. |
 | `ADMIN_BOOTSTRAP_USERNAME` / `ADMIN_BOOTSTRAP_PASSWORD` | `admin` / `admin123` | Break-glass portal login, seeded only into an empty database. Production refuses to start while any portal account uses a publicly known password, and rotates the bootstrap account to a strong `ADMIN_BOOTSTRAP_PASSWORD`. |
 | `DB_PATH` | `./data/mcp-governance.sqlite` | SQLite database file. |
@@ -116,6 +116,7 @@ salesforce-mcp/
     ├── index.ts                       # Express app: security headers, CORS, rate limits, routes
     ├── config.ts                      # Environment config, APP_SECRET_KEY guard, bootstrap admin
     ├── db/store.ts                    # SQLite (node:sqlite, WAL) store: profiles, objects, groups, settings, audit logs
+    ├── db/importers.ts                # Profile CSV and SFDX / Metadata API XML parsers
     ├── mcp/server.ts                  # Request-scoped MCP server: tool visibility + governed tool handlers
     ├── mcp/soqlGuard.ts               # Validates soql_query WHERE filters against the field allowlist
     ├── mcp/streamableHttp.ts          # Stateless Streamable HTTP (/mcp) handler and 401 challenge

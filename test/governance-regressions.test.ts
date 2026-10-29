@@ -286,13 +286,14 @@ describe('Okta callback errors', () => {
   const callback = (query: string) =>
     fetch(`${server.baseUrl}/auth/okta/callback?${query}`, { redirect: 'manual' });
 
-  test('an IdP error redirects with a fixed code only; the attacker-controlled text goes to the audit log', async () => {
+  test('an IdP error without a login state redirects with a fixed code only and keeps the attacker-controlled text out of the audit log', async () => {
     const lure = 'Sign in at https://evil.example/okta instead';
     const res = await callback(`error=access_denied&error_description=${encodeURIComponent(lure)}`);
     assert.equal(res.status, 302);
-    assert.equal(res.headers.get('location'), '/?auth_error=okta_error');
+    assert.equal(res.headers.get('location'), '/?auth_error=invalid_callback');
     const log = store.getPortalAdminLogs(5).find((l) => l.action === 'OKTA_LOGIN_FAILED');
-    assert.match(log?.details || '', /evil\.example/);
+    assert.ok(log, 'the failed callback is still logged');
+    assert.doesNotMatch(log.details, /evil\.example/);
   });
 
   test('a callback without the login state cookie redirects with invalid_callback', async () => {

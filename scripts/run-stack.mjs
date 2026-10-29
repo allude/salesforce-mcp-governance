@@ -8,9 +8,21 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
+import { parseEnv } from 'node:util';
 
 const mode = process.argv[2] === 'start' ? 'start' : 'dev';
 const root = process.cwd();
+
+// The services load .env themselves, but the values set below for them would take precedence,
+// so the stack settings in .env are read here too (real environment variables still win).
+try {
+  const fileEnv = parseEnv(fs.readFileSync(path.join(root, '.env'), 'utf8'));
+  for (const key of ['MCP_BACKEND_PORT', 'PORTAL_PORT', 'MCP_BACKEND_URL']) {
+    if (process.env[key] === undefined && fileEnv[key]) process.env[key] = fileEnv[key];
+  }
+} catch {
+  // no .env
+}
 let backendPort = process.env.MCP_BACKEND_PORT || '3001';
 const portalPort = process.env.PORTAL_PORT || '3000';
 const isWindows = process.platform === 'win32';

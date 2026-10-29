@@ -30,7 +30,7 @@ Use this skill when reviewing code changes, debugging authentication issues, or 
 - Okta OIDC Client Secrets in `okta_config` must be encrypted at rest using `encryptSecret(...)` (AES-256-GCM) and never returned in plaintext by `GET /api/admin/overview` (only `hasClientSecret: boolean`).
 
 ### 3. SSRF & SOQL Injection Prevention (`src/salesforce/client.ts` & `src/mcp/server.ts`)
-- Every Salesforce instance URL must be validated by `validateSalesforceInstanceUrl(rawUrl)` before `fetch` is called. It enforces `SALESFORCE_ALLOWED_DOMAINS` (suffix entries start with `.`), HTTPS in production, and no embedded credentials.
+- Every Salesforce instance URL must be validated by `validateSalesforceInstanceUrl(rawUrl)` before `fetch` is called. It enforces `SALESFORCE_ALLOWED_DOMAINS` (suffix entries start with `.`), HTTPS (in every environment), plain DNS hostnames, and no embedded credentials.
 - Every SOQL query must validate requested field names against the caller's `evaluation.allowedFields` allowlist, validate any caller-supplied `whereClause` with `assertSafeSoqlWhereClause` (allowed fields only, no subqueries), and escape string literals it builds with `escapeSoqlString`.
 
 ### 4. PII & Customer Data Stripping in Copilot Logs (`src/db/store.ts`)

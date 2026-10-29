@@ -1,12 +1,12 @@
 import { Request, Response } from 'express';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { resolveSalesforceUserFromToken } from '../salesforce/client.js';
+import { resolveSalesforceUserFromToken, salesforceAuthorizationBase } from '../salesforce/client.js';
 import { createUserScopedMcpServer } from './server.js';
 import { config } from '../config.js';
 import { store } from '../db/store.js';
 
 /** Keeps reflected error text header-safe: printable ASCII only, no quotes or backslashes. */
-function toHeaderSafe(text: string): string {
+export function toHeaderSafe(text: string): string {
   return text.replace(/[^\x20-\x7e]|["\\]/g, "'").slice(0, 300);
 }
 
@@ -16,8 +16,7 @@ export async function handleMcpStreamableHttpRequest(
 ): Promise<void> {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.toLowerCase().startsWith('bearer ')) {
-    const sfSettings = store.getSalesforceSettings();
-    const authUrl = sfSettings.instanceUrl || 'https://login.salesforce.com';
+    const authUrl = salesforceAuthorizationBase();
     res.setHeader(
       'WWW-Authenticate',
       `Bearer realm="salesforce-mcp", resource_metadata="${config.baseUrl}/.well-known/oauth-protected-resource", authorization_uri="${authUrl}/services/oauth2/authorize"`

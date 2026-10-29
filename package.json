@@ -11,7 +11,7 @@
     "build:mcp": "tsc -p tsconfig.server.json",
     "start": "node scripts/run-stack.mjs start",
     "start:web": "next start --port 3000",
-    "start:mcp": "PORT=3001 node dist/index.js",
+    "start:mcp": "NODE_ENV=${NODE_ENV:-production} PORT=3001 node dist/index.js",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "npm run test:unit && npm run test:self",
     "test:unit": "NODE_ENV=test tsx --test --test-concurrency=1 'test/**/*.test.ts'",

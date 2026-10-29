@@ -7,8 +7,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { config } from './config.js';
-import { store } from './db/store.js';
 import { handleMcpStreamableHttpRequest } from './mcp/streamableHttp.js';
+import { salesforceAuthorizationBase } from './salesforce/client.js';
 import {
   handleOktaLoginRedirect,
   handleOktaCallback,
@@ -124,11 +124,9 @@ const mcpLimiter = rateLimit({
 
 // 3. RFC 9728 OAuth 2.0 Protected Resource Metadata (For MCP OAuth Discovery & Copilot Studio)
 app.get('/.well-known/oauth-protected-resource', (_req, res) => {
-  const sfSettings = store.getSalesforceSettings();
-  const authBase = sfSettings.instanceUrl || config.salesforce.loginUrl;
   res.json({
     resource: `${config.baseUrl}/mcp`,
-    authorization_servers: [authBase],
+    authorization_servers: [salesforceAuthorizationBase()],
     bearer_methods_supported: ['header'],
     scopes_supported: ['api', 'refresh_token', 'openid', 'profile', 'email'],
     resource_documentation: `${config.baseUrl}/docs/architecture.md`,

@@ -28,8 +28,8 @@ const newObjectName = (base: string) => `${base}_${RUN}_${nextNumber()}__c`;
 const newGroupName = (base: string) => `${base} ${RUN}-${nextNumber()}`;
 const newUsername = (base: string) => `${base}.${RUN}.${nextNumber()}`;
 
-// Rate-limit counters live in the shared app and are keyed by client IP. The backend trusts its
-// loopback proxy (TRUST_PROXY defaults to `loopback`), so every test sends its own X-Forwarded-For
+// Rate-limit counters live in the shared app and are keyed by client IP. The test env sets
+// TRUST_PROXY=loopback (the app defaults to false), so every test sends its own X-Forwarded-For
 // address: no test here can be throttled by, or throttle, another test or test file.
 const IP_PREFIX = `10.${crypto.randomInt(1, 255)}.${crypto.randomInt(1, 255)}`;
 let ipSuffix = 0;
@@ -1559,6 +1559,21 @@ describe('Admin REST API', () => {
       for (let i = 0; i < 80; i++) statuses.push((await call(admin, 'GET', '/api/admin/overview')).status);
 
       assert.deepEqual(statuses, new Array(80).fill(200));
+    });
+
+    it('the Admin API limit (300 per minute) is per session: one exhausted session does not throttle another from the same client', async () => {
+      const ip = newClientIp();
+      const busy = await signIn(ip);
+      const other = await signIn(ip);
+      assert.notEqual(busy.cookie, other.cookie);
+
+      const statuses: number[] = [];
+      for (let i = 0; i < 300; i++) statuses.push((await call(busy, 'GET', '/api/admin/session')).status);
+      assert.deepEqual(statuses, new Array(300).fill(200));
+
+      assert.equal((await call(busy, 'GET', '/api/admin/session')).status, 429, 'the 301st request in the window');
+      assert.equal((await call(other, 'GET', '/api/admin/session')).status, 200, 'same client IP, different session');
+      assert.equal((await call({ ip }, 'GET', '/api/admin/session')).status, 200, 'same client IP, no session');
     });
 
     it('failed logins are limited to 60 per client: successful logins do not count, the 61st failure gets 429', async () => {

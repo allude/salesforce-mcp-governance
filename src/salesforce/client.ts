@@ -41,7 +41,8 @@ export function validateSalesforceInstanceUrl(rawUrl: string): string {
     throw new Error('Invalid Salesforce instance URL');
   }
 
-  if (parsed.protocol !== 'https:' && (config.isProd || parsed.protocol !== 'http:')) {
+  // The bearer token goes to this host, so plain HTTP is refused in every environment.
+  if (parsed.protocol !== 'https:') {
     throw new Error('Salesforce instance URL must use HTTPS');
   }
   if (parsed.username || parsed.password) {
@@ -49,6 +50,11 @@ export function validateSalesforceInstanceUrl(rawUrl: string): string {
   }
 
   const host = parsed.hostname.toLowerCase();
+  // URL parsing keeps characters such as `"` and `%` in hosts; the origin is later written into
+  // headers, so only plain DNS labels are accepted.
+  if (!/^[a-z0-9-]+(\.[a-z0-9-]+)*$/.test(host)) {
+    throw new Error('Salesforce instance host is not a valid DNS name');
+  }
   const allowed = config.salesforce.allowedDomains.some((domain) =>
     domain.startsWith('.')
       ? host.endsWith(domain) || host === domain.slice(1)
@@ -59,6 +65,23 @@ export function validateSalesforceInstanceUrl(rawUrl: string): string {
   }
 
   return parsed.origin;
+}
+
+/**
+ * The authorization server advertised to MCP clients (401 challenge and RFC 9728 metadata):
+ * the saved instance URL, else `SALESFORCE_LOGIN_URL`, each used only if it passes
+ * `validateSalesforceInstanceUrl` (a database saved before that check may hold any string).
+ */
+export function salesforceAuthorizationBase(): string {
+  for (const candidate of [store.getSalesforceSettings().instanceUrl, config.salesforce.loginUrl]) {
+    if (!candidate) continue;
+    try {
+      return validateSalesforceInstanceUrl(candidate);
+    } catch {
+      // fall through to the next candidate
+    }
+  }
+  return 'https://login.salesforce.com';
 }
 
 /** Salesforce IDs are 15-char case-sensitive or 18-char with a checksum suffix; compare on the first 15. */

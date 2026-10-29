@@ -100,7 +100,7 @@ sequenceDiagram
 
 | Process | Port | Responsibility |
 | :--- | :--- | :--- |
-| **Next.js Admin Portal** (`src/app/`, `src/components/`) | `3000` | Serves the admin UI and is the single public origin (`BASE_URL`). `next.config.ts` rewrites `/mcp`, `/api/admin/*`, `/auth/okta/*`, `/.well-known/*` and `/docs/*` to the backend at `MCP_BACKEND_URL`. |
+| **Next.js Admin Portal** (`src/app/`, `src/components/`) | `3000` | Serves the admin UI and is the single public origin (`BASE_URL`). `next.config.ts` rewrites `/mcp`, `/api/admin/*`, `/auth/okta/*`, `/.well-known/*`, `/healthz` and `/docs/*` to the backend at `MCP_BACKEND_URL`. |
 | **Express MCP backend** (`src/index.ts`) | `3001` | Implements every endpoint above against the SQLite store (`node:sqlite`, WAL). It serves no HTML; `GET /` redirects browsers to the portal. |
 
 `npm run dev` starts both (`scripts/run-stack.mjs`); `npm run build` compiles the backend to `dist/` and builds the portal; `npm start` runs both production builds.

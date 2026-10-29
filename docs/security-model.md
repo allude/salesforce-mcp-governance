@@ -35,7 +35,7 @@ Implemented in [`src/rbac/policyEngine.ts`](../src/rbac/policyEngine.ts) and [`s
 ## 3. Server-Side Request Forgery (SSRF) Protection
 
 * **Threat:** a crafted `X-Salesforce-Instance-Url` header, a mis-set instance URL, or a userinfo response pointing at internal hosts (`http://169.254.169.254`) or an attacker's server could make the backend send requests, and the user's Bearer token, somewhere else.
-* **Mitigation:** `validateSalesforceInstanceUrl()` in [`src/salesforce/client.ts`](../src/salesforce/client.ts) runs on every URL before `fetch`: the instance-URL hint, the configured instance URL, and the `custom_domain` / `rest` URLs returned by userinfo. It requires the host to match `SALESFORCE_ALLOWED_DOMAINS` (entries starting with `.` match that domain and its subdomains, so `login.salesforce.com.evil.com` is rejected), requires `https:` in production (`http:` only outside production), and rejects URLs with embedded credentials.
+* **Mitigation:** `validateSalesforceInstanceUrl()` in [`src/salesforce/client.ts`](../src/salesforce/client.ts) runs on every URL before `fetch`: the instance-URL hint, the configured instance URL, and the `custom_domain` / `rest` URLs returned by userinfo. It requires the host to match `SALESFORCE_ALLOWED_DOMAINS` (entries starting with `.` match that domain and its subdomains, so `login.salesforce.com.evil.com` is rejected), requires `https:` in every environment, accepts only plain DNS hostnames (letters, digits, `-` and `.`), and rejects URLs with embedded credentials. The authorization server advertised in the `401` challenge and the OAuth metadata goes through the same check, falling back to `SALESFORCE_LOGIN_URL` and then `https://login.salesforce.com`.
 
 ---
 
@@ -58,7 +58,7 @@ Implemented in [`src/security/adminAuth.ts`](../src/security/adminAuth.ts):
 1. **PKCE (`S256`) + state + nonce:** `/auth/okta/login` generates a random 32-byte `code_verifier`, its SHA-256 `code_challenge`, and random `state` and `nonce`, stored in a signed, `HttpOnly`, 10-minute cookie.
 2. **Callback verification:** `/auth/okta/callback` checks `state` in constant time, exchanges the code with the `code_verifier`, then verifies the `id_token` with Okta's JWKS (`jose.createRemoteJWKSet()`): signature, `iss`, `aud` (client ID) and `exp`. The `nonce` claim is required and compared in constant time.
 3. **Required Okta group:** if an admin group is configured (default `MCP-Admins`), the `groups` claim must contain it, or the login is denied and logged as `OKTA_LOGIN_DENIED`.
-4. **Errors:** every other callback failure is logged as `OKTA_LOGIN_FAILED` with its details, and the browser is redirected with a fixed error code only (`/?auth_error=state_mismatch` etc.). The portal maps codes to fixed messages, so a crafted link cannot put attacker-chosen text on the login screen.
+4. **Errors:** every other callback failure is logged as `OKTA_LOGIN_FAILED` with its details (an error returned by Okta is logged with its text, up to 300 printable characters, only when the callback's `state` matches this browser's login cookie; otherwise it is logged as `invalid_callback` without the text), and the browser is redirected with a fixed error code only (`/?auth_error=state_mismatch` etc.). The portal maps codes to fixed messages, so a crafted link cannot put attacker-chosen text on the login screen.
 
 ---
 

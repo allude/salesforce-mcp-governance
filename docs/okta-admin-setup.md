@@ -60,7 +60,7 @@ You can also pre-fill these settings from `OKTA_ISSUER`, `OKTA_CLIENT_ID`, `OKTA
 
 ## 3. Registering Salesforce Profiles
 
-Every Copilot user is matched to a Profile registered here by the `ProfileId` of their Salesforce user (15- and 18-character IDs match each other). Users whose Profile is not registered get no tools at all.
+Every Copilot user is matched to a Profile registered here by the `ProfileId` of their Salesforce user (15- and 18-character IDs match each other). If no registered ID matches, the user's Profile name is matched instead, so keep Profile names unique. Users whose Profile matches neither get no tools at all.
 
 1. Export your Profiles, for example with the Salesforce CLI:
    ```bash

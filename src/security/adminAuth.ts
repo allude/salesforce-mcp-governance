@@ -215,29 +215,43 @@ export async function handleOktaCallback(req: Request, res: Response): Promise<v
   // req.ip honours X-Forwarded-For only from trusted proxies (see `trust proxy` in index.ts)
   const clientIp = req.ip || '127.0.0.1';
 
-  if (error) {
-    redirectWithAuthError(res, 'okta_error', clientIp, String(error_description || error));
-    return;
-  }
-
   const flowCookie = req.cookies?.[OIDC_FLOW_COOKIE_NAME];
   res.clearCookie(OIDC_FLOW_COOKIE_NAME, { path: '/' });
+
+  let flowClaims: { codeVerifier: string; state: string; nonce: string } | null = null;
+  if (flowCookie) {
+    try {
+      const { payload } = await jose.jwtVerify(flowCookie, SECRET_KEY);
+      flowClaims = payload as any;
+    } catch {
+      flowClaims = null;
+    }
+  }
+  const stateMatches = !!flowClaims && typeof state === 'string' && timingSafeStringEqual(state, String(flowClaims.state));
+
+  if (error) {
+    // Anyone can send a browser here with ?error=..., so Okta's text is logged only for a
+    // callback that matches a login this browser started.
+    if (stateMatches) {
+      const text = String(error_description || error).replace(/[^\x20-\x7e]/g, ' ').slice(0, 300);
+      redirectWithAuthError(res, 'okta_error', clientIp, `Okta returned an error: ${text}`);
+    } else {
+      redirectWithAuthError(res, 'invalid_callback', clientIp, 'Okta error callback without a matching login state (error text not logged).');
+    }
+    return;
+  }
 
   if (!flowCookie || typeof code !== 'string' || typeof state !== 'string') {
     redirectWithAuthError(res, 'invalid_callback', clientIp, 'Missing login state cookie, code or state.');
     return;
   }
 
-  let flowClaims: { codeVerifier: string; state: string; nonce: string };
-  try {
-    const { payload } = await jose.jwtVerify(flowCookie, SECRET_KEY);
-    flowClaims = payload as any;
-  } catch {
+  if (!flowClaims) {
     redirectWithAuthError(res, 'expired_state', clientIp, 'The login state cookie expired or is invalid.');
     return;
   }
 
-  if (!timingSafeStringEqual(state, flowClaims.state)) {
+  if (!stateMatches) {
     redirectWithAuthError(res, 'state_mismatch', clientIp, 'The OIDC state parameter did not match.');
     return;
   }

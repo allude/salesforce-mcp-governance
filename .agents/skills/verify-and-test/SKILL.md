@@ -17,7 +17,7 @@ Use this skill before committing code changes or when restarting the local devel
   - `/api/admin/*` (Control Plane REST API backed by SQLite `data/mcp-governance.sqlite`)
   - `/auth/okta/*` (Okta OIDC + PKCE login & callback)
   - `/docs/*` (read-only docs referenced by the OAuth metadata). It serves no UI: `GET /` redirects to the portal.
-- **Port `3000` (Frontend)**: Next.js App Router (`src/app/page.tsx`) which proxies `/api/admin/*`, `/auth/okta/*`, `/mcp`, `/.well-known/*` and `/docs/*` to `MCP_BACKEND_URL` (default `http://localhost:3001`) via `next.config.ts`.
+- **Port `3000` (Frontend)**: Next.js App Router (`src/app/page.tsx`) which proxies `/api/admin/*`, `/auth/okta/*`, `/mcp`, `/.well-known/*`, `/healthz` and `/docs/*` to `MCP_BACKEND_URL` (default `http://localhost:3001`) via `next.config.ts`.
 
 ---
 
@@ -41,7 +41,7 @@ It runs, in order:
 Run a single suite while iterating (single process, hard timeout so nothing hangs):
 
 ```bash
-NODE_ENV=test perl -e 'alarm shift; exec @ARGV' 180 node --import tsx --test --test-isolation=none test/policy-engine.test.ts
+NODE_ENV=test perl -e 'alarm shift; exec @ARGV' 180 node --import tsx --test test/policy-engine.test.ts
 ```
 
 Test rules: import `./helpers/env.js` first in every test file (it isolates the DB and secrets), mock Salesforce only through `installSalesforceMock()` from `test/helpers/salesforceMock.ts`, and never point a test at the real `data/` database.

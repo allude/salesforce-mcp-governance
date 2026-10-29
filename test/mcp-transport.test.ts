@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import net from 'node:net';
 import { store } from '../src/db/store.js';
 import { createSimulatorToken, validateSalesforceInstanceUrl } from '../src/salesforce/client.js';
+import { toHeaderSafe } from '../src/mcp/streamableHttp.js';
 import { AVAILABLE_MCP_ACTIONS } from '../src/types/governance.js';
 import {
   installSalesforceMock,
@@ -23,7 +24,7 @@ import { mcpRequest, startTestServer, type TestServer } from './helpers/server.j
 const RESOURCE_METADATA_URL = 'http://localhost:3000/.well-known/oauth-protected-resource';
 const SIM_PREFIX = 'sf_sim_';
 
-// The app trusts its loopback proxy (TRUST_PROXY defaults to `loopback`), so a forwarded client
+// The test env sets TRUST_PROXY=loopback (the app defaults to false), so a forwarded client
 // address gives this file its own rate-limit buckets no matter how many /mcp or Admin API calls
 // other test files in the same process already made from 127.0.0.1.
 const CLIENT_IP = `198.51.100.${1 + crypto.randomInt(254)}`;
@@ -435,6 +436,26 @@ test('a hand-forged simulator token without a valid signature is rejected with 4
   assert.deepEqual(h.sf.calls, []);
 });
 
+test('simulator tokens are signed with a sub-key derived from APP_SECRET_KEY (HKDF), never with the raw key', async (t) => {
+  const h = await startHarness(t);
+  const seeded = seedProfile(t, ['list_enabled_objects']);
+  const token = createSimulatorToken({ profileId: seeded.profileId, profileName: seeded.profileName });
+  const [encoded, signature] = token.slice(SIM_PREFIX.length).split('.');
+
+  const rawKey = Buffer.from(process.env.APP_SECRET_KEY as string, 'hex');
+  const derivedKey = Buffer.from(crypto.hkdfSync('sha256', rawKey, Buffer.alloc(0), 'sf-mcp simulator token v1', 32));
+  assert.equal(signature, crypto.createHmac('sha256', derivedKey).update(encoded).digest('base64url'));
+
+  // A signature made directly with APP_SECRET_KEY (or its hex text) is not accepted.
+  const withRawKey = crypto.createHmac('sha256', rawKey).update(encoded).digest('base64url');
+  const withHexText = crypto.createHmac('sha256', process.env.APP_SECRET_KEY as string).update(encoded).digest('base64url');
+  for (const forged of [withRawKey, withHexText]) {
+    const res = await rpc(h, `${SIM_PREFIX}${encoded}.${forged}`, 'tools/list');
+    assert.equal(res.status, 401, JSON.stringify(res.body));
+  }
+  assert.equal((await rpc(h, token, 'tools/list')).status, 200);
+});
+
 test('a simulator token whose signed payload was modified, or re-paired with another signature, is rejected', async (t) => {
   const h = await startHarness(t);
   const basic = seedProfile(t, ['list_enabled_objects']);
@@ -631,7 +652,7 @@ test('validateSalesforceInstanceUrl accepts production, sandbox and Lightning ho
   }
 });
 
-test('validateSalesforceInstanceUrl rejects foreign hosts, suffix tricks, credentials, non-HTTP schemes and garbage', () => {
+test('validateSalesforceInstanceUrl rejects foreign hosts, suffix tricks, credentials, plain HTTP, non-DNS hosts and garbage', () => {
   const rejected = [
     // foreign and internal hosts
     'https://evil.example.com',
@@ -648,6 +669,14 @@ test('validateSalesforceInstanceUrl rejects foreign hosts, suffix tricks, creden
     'https://evil.com#.salesforce.com',
     'https://evil.com?.my.salesforce.com',
     'https://login.s\u0430lesforce.com', // Cyrillic 'а' homograph
+    // plain HTTP, even on an allowlisted host and outside production (these tests run with NODE_ENV=test)
+    'http://acme.my.salesforce.com',
+    'http://login.salesforce.com',
+    // hosts URL parsing accepts but DNS does not: quotes would break the WWW-Authenticate header
+    'https://evil%22,error=%22x.my.salesforce.com',
+    'https://evil",x.my.salesforce.com',
+    'https://a_b.my.salesforce.com',
+    'https://a%20b.my.salesforce.com',
     // embedded credentials
     'https://user:pass@acme.my.salesforce.com',
     'https://acme.my.salesforce.com@evil.com',
@@ -666,6 +695,68 @@ test('validateSalesforceInstanceUrl rejects foreign hosts, suffix tricks, creden
   for (const input of rejected) {
     assert.throws(() => validateSalesforceInstanceUrl(input), Error, JSON.stringify(input));
   }
+});
+
+test('SSRF guard: a non-Salesforce or plain-HTTP instance URL returned by userinfo is refused; the token goes nowhere else', async (t) => {
+  const h = await startHarness(t);
+  const hostileInstances = [
+    'https://evil.example.com',
+    'http://acme.my.salesforce.com',
+    'https://evil%22,error=%22x.my.salesforce.com',
+  ];
+
+  for (const instanceUrl of hostileInstances) {
+    await t.test(instanceUrl, async () => {
+      const token = addSalesforceUser(h.sf, { instanceUrl });
+      const res = await rpc(h, token, 'tools/list');
+      assert.equal(res.status, 401, JSON.stringify(res.body));
+      assert.ok(challengeOf(res).includes('error="invalid_token"'), challengeOf(res));
+      assert.match(challengeOf(res), WELL_FORMED_BEARER_CHALLENGE);
+      // Only the userinfo call to the configured login host carried the token; no profile query followed.
+      assert.deepEqual(
+        callsBearing(h.sf, token).map((call) => `${call.url.origin}${call.url.pathname}`),
+        ['https://login.salesforce.com/services/oauth2/userinfo']
+      );
+    });
+  }
+  assert.deepEqual(h.sf.nonSalesforceCalls, []);
+});
+
+test('a stored instance URL that fails validation is never advertised: the 401 challenge and metadata fall back to SALESFORCE_LOGIN_URL', async (t) => {
+  const h = await startHarness(t);
+  preserveSalesforceSettings(t);
+  // Written straight to the store, as a database saved before the URL checks existed could hold it.
+  const stored = [
+    'https://evil%22,error=%22x.my.salesforce.com',
+    'http://acme.my.salesforce.com',
+    'https://evil.example.com',
+  ];
+
+  for (const instanceUrl of stored) {
+    await t.test(instanceUrl, async () => {
+      store.updateSalesforceSettings({ instanceUrl });
+
+      const res = await rpc(h, null, 'tools/list');
+      assert.equal(res.status, 401);
+      const challenge = challengeOf(res);
+      assert.match(challenge, WELL_FORMED_BEARER_CHALLENGE);
+      assert.ok(challenge.includes('authorization_uri="https://login.salesforce.com/services/oauth2/authorize"'), challenge);
+
+      const metadata = await fetch(`${h.server.baseUrl}/.well-known/oauth-protected-resource`);
+      assert.deepEqual(((await metadata.json()) as any).authorization_servers, ['https://login.salesforce.com']);
+    });
+  }
+});
+
+test('toHeaderSafe keeps reflected text inside one quoted-string: quotes, backslashes, control and non-ASCII characters become \', length is capped at 300', () => {
+  assert.equal(toHeaderSafe('a"b\\c'), "a'b'c");
+  assert.equal(toHeaderSafe('line1\r\nline2\ttab\u0000nul\u007fdel'), "line1''line2'tab'nul'del");
+  assert.equal(toHeaderSafe('café ✓'), "caf' '");
+  assert.equal(toHeaderSafe('trailing backslash\\'), "trailing backslash'");
+  assert.equal(toHeaderSafe('x'.repeat(1000)).length, 300);
+  const hostile = toHeaderSafe('", error="forged\\\r\nSet-Cookie: x=1');
+  assert.match(`Bearer error_description="${hostile}"`, WELL_FORMED_BEARER_CHALLENGE);
+  assert.match(hostile, PRINTABLE_ASCII);
 });
 
 // ---------------------------------------------------------------------------------------------
