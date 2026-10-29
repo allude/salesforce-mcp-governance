@@ -33,6 +33,27 @@ import {
   PortalAuthSettingsView,
 } from '@/components/views/DashboardAndLogsViews';
 
+// Fixed messages for the codes /auth/okta/callback redirects with; any other value is ignored
+// so a crafted link cannot put its own text on the login screen.
+const OKTA_AUTH_ERRORS: Record<string, string> = {
+  okta_error: 'Okta returned an error. Details are in Logs > Portal Admin Activity.',
+  invalid_callback: 'The Okta sign-in response was incomplete. Please try again.',
+  expired_state: 'The Okta sign-in took too long or was started in another browser. Please try again.',
+  state_mismatch: 'The Okta sign-in response did not match this browser session. Please try again.',
+  group_denied: 'Your Okta account is not in the group required for this portal.',
+  sso_failed: 'Okta sign-in failed. Details are in Logs > Portal Admin Activity.',
+};
+
+/** Parses a JSON body without throwing on HTML/text error pages (e.g. a proxy 500). */
+async function readJsonBody(res: Response): Promise<any> {
+  const text = await res.text();
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch {
+    return { error: `${res.status} ${res.statusText || 'Request failed'}` };
+  }
+}
+
 export default function McpGovernancePortal() {
   const [authenticated, setAuthenticated] = useState<boolean>(false);
   const [checkingSession, setCheckingSession] = useState<boolean>(true);
@@ -45,8 +66,8 @@ export default function McpGovernancePortal() {
   const [oktaEnabled, setOktaEnabled] = useState<boolean>(false);
 
   // Login Form State
-  const [loginUsername, setLoginUsername] = useState('admin');
-  const [loginPassword, setLoginPassword] = useState('admin123');
+  const [loginUsername, setLoginUsername] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
   const [loginError, setLoginError] = useState<string | null>(null);
   const [loggingIn, setLoggingIn] = useState(false);
 
@@ -66,15 +87,42 @@ export default function McpGovernancePortal() {
     }, 3500);
   }, []);
 
+  // Refreshes what the login screen offers (Okta may have been enabled while signed in).
+  const refreshLoginOptions = useCallback(async () => {
+    try {
+      const res = await fetch('/api/admin/session', { credentials: 'include' });
+      const data = await readJsonBody(res);
+      setOktaEnabled(Boolean(data.oktaSso?.enabled));
+    } catch {
+      // keep the previous value
+    }
+  }, []);
+
+  const handleSessionExpired = useCallback(() => {
+    setAuthenticated(false);
+    setCurrentUser(null);
+    setOverview(null);
+    setCsrfToken('');
+    setLoginPassword('');
+    setLoginError('Your session has ended. Please sign in again.');
+    void refreshLoginOptions();
+  }, [refreshLoginOptions]);
+
   const fetchOverview = useCallback(async () => {
     const res = await fetch('/api/admin/overview', {
       credentials: 'include',
     });
-    if (res.ok) {
-      const data: PortalOverviewPayload = await res.json();
-      setOverview(data);
+    if (res.status === 401) {
+      handleSessionExpired();
+      return;
     }
-  }, []);
+    const data = await readJsonBody(res);
+    if (res.ok) {
+      setOverview(data as PortalOverviewPayload);
+    } else {
+      showToast(data.error || `Could not load portal data (${res.status})`, true);
+    }
+  }, [handleSessionExpired, showToast]);
 
   const checkSession = useCallback(async () => {
     setCheckingSession(true);
@@ -82,7 +130,12 @@ export default function McpGovernancePortal() {
       const res = await fetch('/api/admin/session', {
         credentials: 'include',
       });
-      const data = await res.json();
+      const data = await readJsonBody(res);
+      if (!res.ok) {
+        setLoginError(
+          `The MCP backend is not reachable (${res.status}). Start it with \`npm run dev\` (backend on :3001).`
+        );
+      }
       setOktaEnabled(Boolean(data.oktaSso?.enabled));
 
       if (data.authenticated) {
@@ -102,30 +155,69 @@ export default function McpGovernancePortal() {
   }, [fetchOverview]);
 
   useEffect(() => {
+    // Okta callback failures come back as /?auth_error=<message>
+    const params = new URLSearchParams(window.location.search);
+    const authError = params.get('auth_error');
+    if (authError) {
+      setLoginError(OKTA_AUTH_ERRORS[authError] || 'Okta sign-in failed. Please try again.');
+      params.delete('auth_error');
+      const query = params.toString();
+      window.history.replaceState(null, '', `${window.location.pathname}${query ? `?${query}` : ''}`);
+    }
     checkSession();
   }, [checkSession]);
 
   const apiFetch = useCallback(
     async <T = any>(url: string, options?: RequestInit): Promise<T> => {
-      const headers = new Headers(options?.headers || {});
-      if (!headers.has('Content-Type') && options?.body) {
-        headers.set('Content-Type', 'application/json');
+      const send = (token: string) => {
+        const headers = new Headers(options?.headers || {});
+        if (!headers.has('Content-Type') && options?.body) {
+          headers.set('Content-Type', 'application/json');
+        }
+        if (token) {
+          headers.set('X-CSRF-Token', token);
+        }
+        return fetch(url, {
+          ...options,
+          credentials: 'include',
+          headers,
+        });
+      };
+
+      let res = await send(csrfToken);
+      let data = await readJsonBody(res);
+
+      // Signed in again in another tab: pick up the session's current CSRF token and retry once,
+      // but only if it is still the same account. Never replay a change as someone else.
+      if (res.status === 403 && /CSRF/i.test(String(data.error))) {
+        const sessionRes = await fetch('/api/admin/session', { credentials: 'include' });
+        const session = await readJsonBody(sessionRes);
+        if (session.authenticated && session.csrfToken) {
+          const sameAccount =
+            session.user?.username === currentUser?.username &&
+            session.user?.authMethod === currentUser?.authMethod;
+          setCsrfToken(session.csrfToken);
+          if (!sameAccount) {
+            setCurrentUser(session.user);
+            await fetchOverview();
+            throw new Error(
+              `This browser is now signed in as "${session.user?.username}" (another tab). The change was not applied; review it and try again.`
+            );
+          }
+          res = await send(session.csrfToken);
+          data = await readJsonBody(res);
+        }
       }
-      if (csrfToken) {
-        headers.set('X-CSRF-Token', csrfToken);
+
+      if (res.status === 401) {
+        handleSessionExpired();
       }
-      const res = await fetch(url, {
-        ...options,
-        credentials: 'include',
-        headers,
-      });
-      const data = await res.json();
       if (!res.ok) {
         throw new Error(data.error || `Request failed (${res.status})`);
       }
       return data as T;
     },
-    [csrfToken]
+    [csrfToken, currentUser, fetchOverview, handleSessionExpired]
   );
 
   const handleLoginSubmit = async (e: React.FormEvent) => {
@@ -142,7 +234,7 @@ export default function McpGovernancePortal() {
           password: loginPassword,
         }),
       });
-      const data = await res.json();
+      const data = await readJsonBody(res);
       if (!res.ok) {
         setLoginError(data.error || 'Login failed');
         return;
@@ -150,6 +242,8 @@ export default function McpGovernancePortal() {
       setCsrfToken(data.csrfToken);
       setCurrentUser(data.user);
       setAuthenticated(true);
+      setLoginPassword('');
+      setLoginError(null);
       await fetchOverview();
     } catch (err: any) {
       setLoginError(err.message || 'Network error');
@@ -159,13 +253,26 @@ export default function McpGovernancePortal() {
   };
 
   const handleLogout = async () => {
-    await fetch('/api/admin/logout', {
-      method: 'POST',
-      credentials: 'include',
-    });
+    try {
+      const res = await fetch('/api/admin/logout', {
+        method: 'POST',
+        credentials: 'include',
+        headers: csrfToken ? { 'X-CSRF-Token': csrfToken } : undefined,
+      });
+      if (!res.ok) {
+        throw new Error(`Sign out failed (${res.status})`);
+      }
+    } catch (err: any) {
+      // Keep the user signed in so they know the session is still active.
+      showToast(err?.message || 'Sign out failed', true);
+      return;
+    }
     setAuthenticated(false);
     setCurrentUser(null);
     setOverview(null);
+    setCsrfToken('');
+    setLoginPassword('');
+    void refreshLoginOptions();
   };
 
   const handleManualRefresh = async () => {
@@ -258,25 +365,33 @@ export default function McpGovernancePortal() {
             <div className="h-px flex-1 bg-slate-200" />
           </div>
 
-          <a
-            href="/auth/okta/login"
-            className="flex w-full items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white py-2.5 text-xs font-bold text-slate-800 transition hover:bg-slate-50"
-          >
-            <KeyRound className="h-4 w-4 text-indigo-600" />
-            <span>
-              Sign In with Okta SSO{' '}
-              {!oktaEnabled && (
-                <span className="font-normal text-slate-400">
-                  (Configure after login)
-                </span>
-              )}
-            </span>
-          </a>
+          {oktaEnabled ? (
+            <a
+              href="/auth/okta/login"
+              className="flex w-full items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white py-2.5 text-xs font-bold text-slate-800 transition hover:bg-slate-50"
+            >
+              <KeyRound className="h-4 w-4 text-indigo-600" />
+              <span>Sign In with Okta SSO</span>
+            </a>
+          ) : (
+            <div
+              aria-disabled="true"
+              className="flex w-full cursor-not-allowed items-center justify-center gap-2 rounded-xl border border-slate-200 bg-slate-50 py-2.5 text-xs font-bold text-slate-400"
+            >
+              <KeyRound className="h-4 w-4" />
+              <span>
+                Sign In with Okta SSO{' '}
+                <span className="font-normal">(Configure after login)</span>
+              </span>
+            </div>
+          )}
 
-          <p className="mt-4 text-center font-mono text-[11px] text-slate-400">
-            Default local login: <strong className="text-slate-600">admin</strong> /{' '}
-            <strong className="text-slate-600">admin123</strong>
-          </p>
+          {process.env.NODE_ENV !== 'production' && (
+            <p className="mt-4 text-center font-mono text-[11px] text-slate-400">
+              Development default login: <strong className="text-slate-600">admin</strong> /{' '}
+              <strong className="text-slate-600">admin123</strong> (unless ADMIN_BOOTSTRAP_* is set)
+            </p>
+          )}
         </div>
       </div>
     );

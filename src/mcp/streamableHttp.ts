@@ -5,6 +5,11 @@ import { createUserScopedMcpServer } from './server.js';
 import { config } from '../config.js';
 import { store } from '../db/store.js';
 
+/** Keeps reflected error text header-safe: printable ASCII only, no quotes or backslashes. */
+function toHeaderSafe(text: string): string {
+  return text.replace(/[^\x20-\x7e]|["\\]/g, "'").slice(0, 300);
+}
+
 export async function handleMcpStreamableHttpRequest(
   req: Request,
   res: Response
@@ -55,9 +60,9 @@ export async function handleMcpStreamableHttpRequest(
 
     res.setHeader(
       'WWW-Authenticate',
-      `Bearer error="invalid_token", error_description="${(
-        err?.message || 'Invalid Salesforce token'
-      ).replace(/"/g, "'")}"`
+      `Bearer error="invalid_token", error_description="${toHeaderSafe(
+        String(err?.message || 'Invalid Salesforce token')
+      )}", resource_metadata="${config.baseUrl}/.well-known/oauth-protected-resource"`
     );
     res.status(401).json({
       jsonrpc: '2.0',

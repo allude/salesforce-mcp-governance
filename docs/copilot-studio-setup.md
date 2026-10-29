@@ -30,8 +30,8 @@ This guide walks through connecting **Microsoft Copilot Studio** to your **Sales
 
 Microsoft Copilot Studio runs in the cloud and requires a public **HTTPS** endpoint for your MCP Server (`https://<your-mcp-domain>/mcp`).
 
-* **Production Deployment:** Deploy this repository to **Azure Container Apps**, **Azure App Service**, **AWS ECS/App Runner**, **Google Cloud Run**, or **Render** with `BASE_URL=https://mcp.yourcompany.com` and `NODE_ENV=production`.
-* **Local Testing with Tunnel:** During development on `http://localhost:3000`, expose port `3000` over HTTPS using Cloudflare Tunnel or ngrok:
+* **Production Deployment:** Deploy this repository to **Azure Container Apps**, **Azure App Service**, **AWS ECS/App Runner**, **Google Cloud Run**, or **Render**. Run `npm run build`, then `npm start` (backend on `:3001`, portal on `:3000`), and expose only the portal port. Set `NODE_ENV=production`, `BASE_URL=https://mcp.yourcompany.com`, a real `APP_SECRET_KEY` (`openssl rand -hex 32`) and `ADMIN_BOOTSTRAP_PASSWORD`. Set `MCP_BACKEND_URL` at build time if the backend is not on `http://localhost:3001`.
+* **Local Testing with Tunnel:** During development (`npm run dev`), expose the portal port `3000` over HTTPS with Cloudflare Tunnel or ngrok. The portal proxies `/mcp` and `/.well-known/*` to the backend. Then set `BASE_URL=https://<tunnel-host>` (in `.env`) and restart, so the 401 challenge and the RFC 9728 metadata advertise the tunnel URL instead of `http://localhost:3000`:
   ```bash
   npx cloudflared tunnel --url http://localhost:3000
   # or
@@ -46,7 +46,7 @@ Microsoft Copilot Studio runs in the cloud and requires a public **HTTPS** endpo
 2. Navigate to **Tools** &rarr; **Add a tool** &rarr; **New tool** &rarr; **Model Context Protocol (MCP)**.
 3. Enter the MCP Server details:
    * **Server Name:** `Salesforce CRM (Zero-Trust MCP)`
-   * **Description:** `Query, search, describe, create, and update Salesforce CRM records on behalf of the signed-in user.`
+   * **Description:** `List, describe, query (SOQL), get, create, update and delete the Salesforce records the signed-in user's Profile allows.`
    * **Server URL (Streamable HTTP Endpoint):**
      ```text
      https://<your-mcp-server-domain>/mcp
@@ -78,9 +78,11 @@ Microsoft Copilot Studio runs in the cloud and requires a public **HTTPS** endpo
 
 ## Step 4: Test the End-User Flow in Copilot Studio / Microsoft Teams
 
+Before testing, register the test user's Salesforce Profile in the Admin Portal and map it to an Access Group that grants some tools (see the [Admin Portal guide](./okta-admin-setup.md)). Users whose Profile is not registered see no tools.
+
 1. Open the **Test your agent** pane in Copilot Studio and ask:
    > *"Show my open Opportunities in Salesforce"*
 2. Copilot Studio will display a **Sign in to Salesforce** card.
 3. Click **Sign in**, log in as a Salesforce user (e.g. a user with the `Standard User` or `Custom: Sales Representative` Profile), and approve access.
 4. Copilot Studio sends `POST /mcp` with `Authorization: Bearer <USER_SF_TOKEN>` to your MCP server.
-5. Open your MCP Admin Web Portal (`https://<your-mcp-server-domain>/`) &rarr; **6. Zero-Trust Audit Log** to see the verified user, their resolved Salesforce Profile, and the `PERMIT` / `DENY` decisions in real time.
+5. Open the Admin Portal (`https://<your-mcp-server-domain>/`) &rarr; **Logs > Copilot MCP Traffic (PII Stripped)** to see the verified user, their resolved Salesforce Profile, and each `ALLOWED` / `DENIED` / `ERROR` decision.

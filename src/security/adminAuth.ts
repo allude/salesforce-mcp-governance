@@ -65,7 +65,7 @@ export async function verifyAdminSessionFromRequest(
       audience: 'salesforce-mcp-admin-portal',
     });
 
-    return {
+    const claims: AdminSessionClaims = {
       sub: String(payload.sub || ''),
       email: String(payload.email || ''),
       name: String(payload.name || ''),
@@ -73,6 +73,11 @@ export async function verifyAdminSessionFromRequest(
       groups: Array.isArray(payload.groups) ? (payload.groups as string[]) : [],
       csrfToken: String(payload.csrfToken || ''),
     };
+    // Password sessions end as soon as the portal user is deleted.
+    if (claims.authMethod === 'local_bootstrap' && !store.portalUserExists(claims.email)) {
+      return null;
+    }
+    return claims;
   } catch {
     return null;
   }
@@ -173,15 +178,45 @@ export async function handleOktaLoginRedirect(req: Request, res: Response): Prom
 }
 
 /**
+ * The portal shows a fixed message per code (src/app/page.tsx), so a crafted link cannot put
+ * arbitrary text on the login screen. Details go to the Portal Admin log instead.
+ */
+type OktaAuthErrorCode =
+  | 'okta_error'
+  | 'invalid_callback'
+  | 'expired_state'
+  | 'state_mismatch'
+  | 'group_denied'
+  | 'sso_failed';
+
+function redirectWithAuthError(
+  res: Response,
+  code: OktaAuthErrorCode,
+  clientIp: string,
+  details: string
+): void {
+  store.recordPortalAdminLog({
+    adminUsername: 'okta_user',
+    authMethod: 'okta_sso',
+    action: 'OKTA_LOGIN_FAILED',
+    target: 'Portal Auth',
+    details: `Okta sign-in failed (${code}): ${details}`.slice(0, 1000),
+    ipAddress: clientIp,
+  });
+  res.redirect(`/?auth_error=${code}`);
+}
+
+/**
  * Handles the Okta OIDC callback (`/auth/okta/callback`), verifies `state`, `nonce`,
  * cryptographic JWKS signature on the Okta `id_token`, and optional group membership.
  */
 export async function handleOktaCallback(req: Request, res: Response): Promise<void> {
   const { code, state, error, error_description } = req.query;
-  const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip || '127.0.0.1';
+  // req.ip honours X-Forwarded-For only from trusted proxies (see `trust proxy` in index.ts)
+  const clientIp = req.ip || '127.0.0.1';
 
   if (error) {
-    res.redirect(`/?auth_error=${encodeURIComponent(String(error_description || error))}`);
+    redirectWithAuthError(res, 'okta_error', clientIp, String(error_description || error));
     return;
   }
 
@@ -189,7 +224,7 @@ export async function handleOktaCallback(req: Request, res: Response): Promise<v
   res.clearCookie(OIDC_FLOW_COOKIE_NAME, { path: '/' });
 
   if (!flowCookie || typeof code !== 'string' || typeof state !== 'string') {
-    res.redirect('/?auth_error=Invalid+Okta+OIDC+callback+state');
+    redirectWithAuthError(res, 'invalid_callback', clientIp, 'Missing login state cookie, code or state.');
     return;
   }
 
@@ -198,12 +233,12 @@ export async function handleOktaCallback(req: Request, res: Response): Promise<v
     const { payload } = await jose.jwtVerify(flowCookie, SECRET_KEY);
     flowClaims = payload as any;
   } catch {
-    res.redirect('/?auth_error=Expired+Okta+login+state');
+    redirectWithAuthError(res, 'expired_state', clientIp, 'The login state cookie expired or is invalid.');
     return;
   }
 
   if (!timingSafeStringEqual(state, flowClaims.state)) {
-    res.redirect('/?auth_error=OIDC+state+mismatch');
+    redirectWithAuthError(res, 'state_mismatch', clientIp, 'The OIDC state parameter did not match.');
     return;
   }
 
@@ -262,7 +297,8 @@ export async function handleOktaCallback(req: Request, res: Response): Promise<v
       audience: okta.clientId,
     });
 
-    if (payload.nonce && !timingSafeStringEqual(String(payload.nonce), flowClaims.nonce)) {
+    // A nonce was sent with the authorization request, so the ID token must echo it back.
+    if (typeof payload.nonce !== 'string' || !timingSafeStringEqual(payload.nonce, String(flowClaims.nonce))) {
       throw new Error('OIDC nonce mismatch');
     }
 
@@ -276,7 +312,7 @@ export async function handleOktaCallback(req: Request, res: Response): Promise<v
         details: `Denied Okta login: missing required group '${okta.adminGroup}'`,
         ipAddress: clientIp,
       });
-      res.redirect(`/?auth_error=${encodeURIComponent(`Access denied: Requires Okta group '${okta.adminGroup}'`)}`);
+      res.redirect('/?auth_error=group_denied');
       return;
     }
 
@@ -302,6 +338,6 @@ export async function handleOktaCallback(req: Request, res: Response): Promise<v
 
     res.redirect('/');
   } catch (err: any) {
-    res.redirect(`/?auth_error=${encodeURIComponent(err?.message || 'Okta authentication failed')}`);
+    redirectWithAuthError(res, 'sso_failed', clientIp, err?.message || 'Okta authentication failed');
   }
 }

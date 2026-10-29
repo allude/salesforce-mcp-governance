@@ -560,6 +560,10 @@ export function ProfileGroupMatrixView({
   onShowToast: (msg: string, isError?: boolean) => void;
   onNavigate: (view: NavViewId) => void;
 }) {
+  // Profiles with a save in flight; their row is locked so a second click cannot send a
+  // replacement list computed from stale props (which could silently undo a revocation).
+  const [savingProfileIds, setSavingProfileIds] = useState<Set<string>>(new Set());
+
   const getGroupIdsForProfile = (profileId: string): string[] => {
     return mappings.find((m) => m.profileId === profileId)?.groupIds || [];
   };
@@ -568,12 +572,14 @@ export function ProfileGroupMatrixView({
     profileId: string,
     groupId: string
   ) => {
+    if (savingProfileIds.has(profileId)) return;
     const current = getGroupIdsForProfile(profileId);
     const exists = current.includes(groupId);
     const nextGroupIds = exists
       ? current.filter((id) => id !== groupId)
       : [...current, groupId];
 
+    setSavingProfileIds((prev) => new Set(prev).add(profileId));
     try {
       await apiFetch(
         `/api/admin/profile-groups/${encodeURIComponent(profileId)}`,
@@ -582,10 +588,22 @@ export function ProfileGroupMatrixView({
           body: JSON.stringify({ groupIds: nextGroupIds }),
         }
       );
-      await onRefresh();
       onShowToast('Updated Profile-to-Group assignment');
     } catch (err: any) {
       onShowToast(err.message, true);
+    } finally {
+      try {
+        // Always reload so the row shows what the server actually stored
+        await onRefresh();
+      } catch (err: any) {
+        onShowToast(err?.message || 'Could not reload the matrix', true);
+      } finally {
+        setSavingProfileIds((prev) => {
+          const next = new Set(prev);
+          next.delete(profileId);
+          return next;
+        });
+      }
     }
   };
 
@@ -713,10 +731,11 @@ export function ProfileGroupMatrixView({
                             <input
                               type="checkbox"
                               checked={checked}
+                              disabled={savingProfileIds.has(p.id)}
                               onChange={() =>
                                 handleToggleProfileGroup(p.id, g.id)
                               }
-                              className="h-4 w-4 cursor-pointer rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                              className="h-4 w-4 cursor-pointer rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 disabled:cursor-wait disabled:opacity-50"
                             />
                           </td>
                         );

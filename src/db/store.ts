@@ -2,8 +2,9 @@ import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { config } from '../config.js';
+import { config, KNOWN_DEFAULT_PASSWORDS } from '../config.js';
 import { encryptSecret, decryptSecret } from '../security/crypto.js';
+import { parseSfdxFilesToObjects, SALESFORCE_API_NAME_PATTERN } from './importers.js';
 import {
   SalesforceProfile,
   SalesforceObject,
@@ -24,6 +25,21 @@ if (!fs.existsSync(dbDir)) {
 }
 
 const db = new DatabaseSync(config.dbPath);
+
+/** Runs `fn` atomically: either every statement in it commits or none does. */
+function runInTransaction<T>(fn: () => T): T {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const result = fn();
+    db.exec('COMMIT');
+    return result;
+  } catch (err) {
+    db.exec('ROLLBACK');
+    throw err;
+  }
+}
+
+let warnedUndecryptableOktaSecret = false;
 
 db.exec(`
   PRAGMA journal_mode = WAL;
@@ -136,6 +152,40 @@ function hashPassword(password: string, salt: string): string {
   return crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
 }
 
+/**
+ * Production must not run with a portal account whose password is publicly known (e.g. a database
+ * first created by `npm run dev`). The bootstrap account is rotated to ADMIN_BOOTSTRAP_PASSWORD when
+ * that is set to something else; any other such account stops the server with instructions.
+ */
+function enforceNoKnownDefaultPasswords() {
+  const rows = db
+    .prepare('SELECT username, password_hash, password_salt FROM portal_users')
+    .all() as Array<{ username: string; password_hash: string; password_salt: string }>;
+  for (const row of rows) {
+    const stored = Buffer.from(row.password_hash, 'hex');
+    const usesKnownPassword = KNOWN_DEFAULT_PASSWORDS.some((known) => {
+      const candidate = Buffer.from(hashPassword(known, row.password_salt), 'hex');
+      return candidate.length === stored.length && crypto.timingSafeEqual(candidate, stored);
+    });
+    if (!usesKnownPassword) continue;
+
+    const bootstrap = config.bootstrapAdmin;
+    if (row.username.toLowerCase() === bootstrap.username.toLowerCase() && !bootstrap.usesDefaultPassword) {
+      const salt = crypto.randomBytes(16).toString('hex');
+      db.prepare('UPDATE portal_users SET password_hash = ?, password_salt = ? WHERE username = ?').run(
+        hashPassword(bootstrap.password, salt),
+        salt,
+        row.username
+      );
+      console.warn(`[store] Rotated portal user '${row.username}' off a publicly known default password (ADMIN_BOOTSTRAP_PASSWORD).`);
+      continue;
+    }
+    throw new Error(
+      `FATAL: Portal user '${row.username}' uses a publicly known default password. Set ADMIN_BOOTSTRAP_USERNAME=${row.username} and a strong ADMIN_BOOTSTRAP_PASSWORD to rotate it at startup.`
+    );
+  }
+}
+
 function initializeSystemSingletons() {
   const now = new Date().toISOString();
 
@@ -144,25 +194,47 @@ function initializeSystemSingletons() {
     db.prepare('SELECT COUNT(*) as cnt FROM portal_users').get() as { cnt: number }
   ).cnt;
   if (userCount === 0) {
+    const { username, password, usesDefaultPassword } = config.bootstrapAdmin;
+    if (config.isProd && usesDefaultPassword) {
+      throw new Error(
+        'FATAL: Refusing to seed the bootstrap portal admin with the default password in production. Set ADMIN_BOOTSTRAP_PASSWORD.'
+      );
+    }
     const salt = crypto.randomBytes(16).toString('hex');
-    const defaultUsername = process.env.ADMIN_USERNAME || 'admin';
-    const defaultPassword = process.env.ADMIN_BOOTSTRAP_PASSWORD || 'admin123';
-    const hash = hashPassword(defaultPassword, salt);
+    const hash = hashPassword(password, salt);
     db.prepare(`
       INSERT INTO portal_users (username, display_name, password_hash, password_salt, role, created_at)
       VALUES (?, 'Portal Administrator', ?, ?, 'Super Admin', ?)
-    `).run(defaultUsername, hash, salt, now);
+    `).run(username, hash, salt, now);
+  } else if (config.isProd) {
+    enforceNoKnownDefaultPasswords();
   }
 
   const oktaCount = (
     db.prepare('SELECT COUNT(*) as cnt FROM okta_config').get() as { cnt: number }
   ).cnt;
   if (oktaCount === 0) {
+    // Pre-fill from OKTA_* env vars; SSO stays disabled until an admin enables it in the portal.
+    const issuer = config.okta.issuer.trim();
+    let oktaDomain = '';
+    try {
+      oktaDomain = issuer ? new URL(issuer).host : '';
+    } catch {
+      oktaDomain = '';
+    }
     db.prepare(`
       INSERT INTO okta_config (
         id, enabled, okta_domain, issuer, client_id, client_secret_enc, redirect_uri, admin_group, updated_at
-      ) VALUES (1, 0, '', '', '', '', ?, 'MCP-Admins', ?)
-    `).run(`${config.baseUrl}/auth/okta/callback`, now);
+      ) VALUES (1, 0, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      oktaDomain,
+      issuer,
+      config.okta.clientId.trim(),
+      config.okta.clientSecret ? encryptSecret(config.okta.clientSecret) : '',
+      config.okta.redirectUri,
+      config.okta.requiredGroup,
+      now
+    );
   }
 
   const sfCount = (
@@ -172,8 +244,8 @@ function initializeSystemSingletons() {
     db.prepare(`
       INSERT INTO sf_connection_settings (
         id, expected_org_id, instance_url, api_version, enforce_org_id_lock, sfdx_objects_folder_path, updated_at
-      ) VALUES (1, '', 'https://login.salesforce.com', 'v62.0', 0, '', ?)
-    `).run(now);
+      ) VALUES (1, '', ?, ?, 0, '', ?)
+    `).run(config.salesforce.loginUrl, config.salesforce.apiVersion, now);
   }
 }
 
@@ -208,16 +280,20 @@ export function stripSensitivePayloadData(input: unknown): unknown {
       'id',
       'Id',
     ]);
+    // Structural values (object/field API names, record ids, tool names) are kept; anything that
+    // does not look like one (e.g. a record's values sent where field names belong) is redacted.
+    const isStructuralToken = (item: unknown) =>
+      typeof item === 'number' || (typeof item === 'string' && /^(\*|[A-Za-z0-9_.:-]{1,120})$/.test(item));
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(input as Record<string, unknown>)) {
       if (k === 'records' && Array.isArray(v)) {
         out.records = `[REDACTED ${v.length} RECORDS]`;
       } else if (k === 'soql' && typeof v === 'string') {
         // Redact quoted string literals in SOQL WHERE clauses (`'...'` -> `'[REDACTED]'`)
-        out.soql = v.replace(/'[^']*'/g, "'[REDACTED]'");
-      } else if (safeKeys.has(k) && (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean')) {
+        out.soql = v.replace(/'(?:[^'\\]|\\.)*'?/g, "'[REDACTED]'");
+      } else if (safeKeys.has(k) && (typeof v === 'number' || typeof v === 'boolean' || isStructuralToken(v))) {
         out[k] = v;
-      } else if (Array.isArray(v) && safeKeys.has(k)) {
+      } else if (Array.isArray(v) && safeKeys.has(k) && v.every(isStructuralToken)) {
         out[k] = v;
       } else if (typeof v === 'object' && v !== null) {
         out[k] = stripSensitivePayloadData(v);
@@ -230,155 +306,7 @@ export function stripSensitivePayloadData(input: unknown): unknown {
   return `<REDACTED:${typeof input}>`;
 }
 
-/**
- * Helper to extract an XML tag value (`<tag>value</tag>`) without external XML dependencies.
- */
-function extractXmlTag(xml: string, tag: string): string | null {
-  const match = xml.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, 'i'));
-  return match ? match[1].trim() : null;
-}
-
-/**
- * Parses SFDX or Metadata API XML files into Objects & Fields.
- */
-export function parseSfdxFilesToObjects(
-  files: Array<{ relativePath: string; content: string }>
-): Array<{
-  objectName: string;
-  label: string;
-  isCustom: boolean;
-  sourcePath: string;
-  fields: Array<{
-    fieldName: string;
-    label: string;
-    fieldType: string;
-    isCustom: boolean;
-    required: boolean;
-  }>;
-}> {
-  const objectMap = new Map<
-    string,
-    {
-      objectName: string;
-      label: string;
-      isCustom: boolean;
-      sourcePath: string;
-      fields: Map<
-        string,
-        {
-          fieldName: string;
-          label: string;
-          fieldType: string;
-          isCustom: boolean;
-          required: boolean;
-        }
-      >;
-    }
-  >();
-
-  const ensureObject = (objectName: string, sourcePath: string) => {
-    const cleanName = objectName.trim();
-    if (!objectMap.has(cleanName)) {
-      const isCustom = cleanName.endsWith('__c') || cleanName.endsWith('__mdt') || cleanName.endsWith('__e');
-      const fields = new Map();
-      // Always include standard Id and Name fields if not present
-      fields.set('Id', {
-        fieldName: 'Id',
-        label: 'Record ID',
-        fieldType: 'Id',
-        isCustom: false,
-        required: true,
-      });
-      fields.set('Name', {
-        fieldName: 'Name',
-        label: 'Name',
-        fieldType: 'Text',
-        isCustom: false,
-        required: false,
-      });
-      objectMap.set(cleanName, {
-        objectName: cleanName,
-        label: cleanName.replace(/__c$/, '').replace(/_/g, ' '),
-        isCustom,
-        sourcePath,
-        fields,
-      });
-    }
-    return objectMap.get(cleanName)!;
-  };
-
-  for (const file of files) {
-    const normPath = file.relativePath.replace(/\\/g, '/');
-    const parts = normPath.split('/');
-    const fileName = parts[parts.length - 1] || '';
-
-    // Case 1: SFDX Object definition: `.../objects/<ObjectName>/<ObjectName>.object-meta.xml` or `<ObjectName>.object`
-    if (fileName.endsWith('.object-meta.xml') || fileName.endsWith('.object')) {
-      const objectName = fileName
-        .replace(/\.object-meta\.xml$/i, '')
-        .replace(/\.object$/i, '');
-      if (!objectName) continue;
-      const obj = ensureObject(objectName, normPath);
-      const xmlLabel = extractXmlTag(file.content, 'label') || extractXmlTag(file.content, 'fullName');
-      if (xmlLabel) {
-        obj.label = xmlLabel;
-      }
-
-      // Also check if classic `.object` XML has inline `<fields>...</fields>` blocks
-      const fieldBlocks = file.content.match(/<fields>[\s\S]*?<\/fields>/gi) || [];
-      for (const block of fieldBlocks) {
-        const fn = extractXmlTag(block, 'fullName');
-        if (!fn) continue;
-        const flabel = extractXmlTag(block, 'label') || fn;
-        const ftype = extractXmlTag(block, 'type') || 'Text';
-        const freq = extractXmlTag(block, 'required') === 'true';
-        obj.fields.set(fn, {
-          fieldName: fn,
-          label: flabel,
-          fieldType: ftype,
-          isCustom: fn.endsWith('__c'),
-          required: freq,
-        });
-      }
-    }
-
-    // Case 2: SFDX Field definition: `.../objects/<ObjectName>/fields/<FieldName>.field-meta.xml`
-    if (fileName.endsWith('.field-meta.xml') || fileName.endsWith('.field')) {
-      const fieldsIdx = parts.findIndex((p) => p.toLowerCase() === 'fields');
-      const objectName =
-        fieldsIdx > 0
-          ? parts[fieldsIdx - 1]
-          : parts.length >= 2
-          ? parts[parts.length - 2]
-          : 'UnknownObject';
-      const fieldFromFilename = fileName
-        .replace(/\.field-meta\.xml$/i, '')
-        .replace(/\.field$/i, '');
-      const fn = extractXmlTag(file.content, 'fullName') || fieldFromFilename;
-      if (!fn || !objectName) continue;
-
-      const obj = ensureObject(objectName, parts.slice(0, Math.max(1, fieldsIdx)).join('/'));
-      const flabel = extractXmlTag(file.content, 'label') || fn;
-      const ftype = extractXmlTag(file.content, 'type') || 'Text';
-      const freq = extractXmlTag(file.content, 'required') === 'true';
-      obj.fields.set(fn, {
-        fieldName: fn,
-        label: flabel,
-        fieldType: ftype,
-        isCustom: fn.endsWith('__c'),
-        required: freq,
-      });
-    }
-  }
-
-  return Array.from(objectMap.values()).map((o) => ({
-    objectName: o.objectName,
-    label: o.label,
-    isCustom: o.isCustom,
-    sourcePath: o.sourcePath,
-    fields: Array.from(o.fields.values()),
-  }));
-}
+export { parseSfdxFilesToObjects } from './importers.js';
 
 export const store = {
   // ============================================================================
@@ -388,7 +316,11 @@ export const store = {
     const row = db
       .prepare('SELECT * FROM portal_users WHERE lower(username) = lower(?)')
       .get(username.trim()) as any;
-    if (!row) return null;
+    if (!row) {
+      // Spend the same PBKDF2 time for unknown usernames so response timing does not reveal them.
+      hashPassword(password, 'unknown-user-timing-equalizer');
+      return null;
+    }
 
     const computed = hashPassword(password, row.password_salt);
     const a = Buffer.from(computed, 'hex');
@@ -408,6 +340,12 @@ export const store = {
     };
   },
 
+  portalUserExists(username: string): boolean {
+    return Boolean(
+      db.prepare('SELECT 1 AS found FROM portal_users WHERE lower(username) = lower(?)').get(username.trim())
+    );
+  },
+
   getPortalUsers(): PortalUserSummary[] {
     const rows = db.prepare('SELECT * FROM portal_users ORDER BY username ASC').all() as any[];
     return rows.map((r) => ({
@@ -421,7 +359,7 @@ export const store = {
 
   upsertPortalUser(input: {
     username: string;
-    displayName: string;
+    displayName?: string;
     password: string;
     role?: string;
   }): PortalUserSummary {
@@ -429,6 +367,13 @@ export const store = {
     const salt = crypto.randomBytes(16).toString('hex');
     const hash = hashPassword(input.password, salt);
     const uname = input.username.trim();
+    // Sign-in matches usernames case-insensitively, so 'Admin' and 'admin' are the same account.
+    const existing = db
+      .prepare('SELECT username, display_name, role FROM portal_users WHERE lower(username) = lower(?)')
+      .get(uname) as { username: string; display_name: string; role: string } | undefined;
+    const targetUsername = existing?.username ?? uname;
+    const displayName = input.displayName?.trim() || existing?.display_name || uname;
+    const role = input.role?.trim() || existing?.role || 'Admin';
     db.prepare(`
       INSERT INTO portal_users (username, display_name, password_hash, password_salt, role, created_at)
       VALUES (?, ?, ?, ?, ?, ?)
@@ -437,16 +382,24 @@ export const store = {
         password_hash = excluded.password_hash,
         password_salt = excluded.password_salt,
         role = excluded.role
-    `).run(uname, input.displayName.trim() || uname, hash, salt, input.role || 'Admin', now);
-    return this.getPortalUsers().find((u) => u.username.toLowerCase() === uname.toLowerCase())!;
+    `).run(targetUsername, displayName, hash, salt, role, now);
+    return this.getPortalUsers().find((u) => u.username === targetUsername)!;
   },
 
   deletePortalUser(username: string): boolean {
-    const all = this.getPortalUsers();
-    if (all.length <= 1) {
+    const requested = username.trim();
+    // Resolve one exact row (preferring an exact-case match), so case variants left by older
+    // versions are never deleted together and the last-administrator guard always holds.
+    const target = db
+      .prepare(
+        'SELECT username FROM portal_users WHERE lower(username) = lower(?) ORDER BY (username = ?) DESC LIMIT 1'
+      )
+      .get(requested, requested) as { username: string } | undefined;
+    if (!target) return false;
+    if (this.getPortalUsers().length <= 1) {
       throw new Error('Cannot delete the last remaining portal administrator account.');
     }
-    const res = db.prepare('DELETE FROM portal_users WHERE username = ?').run(username);
+    const res = db.prepare('DELETE FROM portal_users WHERE username = ?').run(target.username);
     return res.changes > 0;
   },
 
@@ -562,6 +515,15 @@ export const store = {
   }): SalesforceObject {
     const now = new Date().toISOString();
     const objName = input.objectName.trim();
+    if (!SALESFORCE_API_NAME_PATTERN.test(objName)) {
+      throw new Error(`'${objName}' is not a valid Salesforce object API name.`);
+    }
+    const invalidField = (input.fields || []).find(
+      (f) => f?.fieldName && !SALESFORCE_API_NAME_PATTERN.test(String(f.fieldName).trim())
+    );
+    if (invalidField) {
+      throw new Error(`'${invalidField.fieldName}' is not a valid Salesforce field API name.`);
+    }
     const existing = db
       .prepare('SELECT * FROM sf_objects WHERE object_name = ?')
       .get(objName) as any;
@@ -595,19 +557,24 @@ export const store = {
       { fieldName: 'Name', label: 'Name', fieldType: 'Text', isCustom: false, required: false },
     ];
 
-    const upsertFieldStmt = db.prepare(`
+    // An explicit `enabled` is applied; when it is omitted (e.g. an SFDX re-import) an existing
+    // field keeps the admin's manual toggle.
+    const fieldUpsertSql = (applyEnabled: boolean) => `
       INSERT INTO sf_object_fields (object_name, field_name, label, field_type, is_custom, required, enabled)
       VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(object_name, field_name) DO UPDATE SET
         label = excluded.label,
         field_type = excluded.field_type,
         is_custom = excluded.is_custom,
-        required = excluded.required
-    `);
+        required = excluded.required${applyEnabled ? ',\n        enabled = excluded.enabled' : ''}
+    `;
+    const upsertFieldKeepEnabled = db.prepare(fieldUpsertSql(false));
+    const upsertFieldSetEnabled = db.prepare(fieldUpsertSql(true));
 
     for (const f of fieldsToUpsert) {
       if (!f.fieldName) continue;
-      upsertFieldStmt.run(
+      const stmt = f.enabled !== undefined ? upsertFieldSetEnabled : upsertFieldKeepEnabled;
+      stmt.run(
         objName,
         f.fieldName.trim(),
         (f.label || f.fieldName).trim(),
@@ -707,16 +674,47 @@ export const store = {
     return this.getObjects().find((o) => o.objectName === objectName) || null;
   },
 
+  /** Returns null when the object has no such field. */
   toggleObjectField(objectName: string, fieldName: string, enabled: boolean): SalesforceObject | null {
-    db.prepare(
+    const res = db.prepare(
       'UPDATE sf_object_fields SET enabled = ? WHERE object_name = ? AND field_name = ?'
     ).run(enabled ? 1 : 0, objectName, fieldName);
+    if (res.changes === 0) return null;
     return this.getObjects().find((o) => o.objectName === objectName) || null;
   },
 
+  /**
+   * Deletes an Object and its fields, and revokes it from every Access Group, so re-importing the
+   * object later (e.g. an SFDX re-sync) does not silently restore access an admin removed.
+   */
   deleteObject(objectName: string): boolean {
-    const res = db.prepare('DELETE FROM sf_objects WHERE object_name = ?').run(objectName);
-    return res.changes > 0;
+    return runInTransaction(() => {
+      const res = db.prepare('DELETE FROM sf_objects WHERE object_name = ?').run(objectName);
+      if (res.changes === 0) return false;
+      // Grants match objects case-insensitively; while a case variant (e.g. 'Account' after deleting a
+      // stray 'account') still exists, the grants still refer to it and must stay.
+      const variantRemains = db
+        .prepare('SELECT 1 FROM sf_objects WHERE lower(object_name) = lower(?) LIMIT 1')
+        .get(objectName);
+      if (variantRemains) return true;
+
+      const now = new Date().toISOString();
+      const rows = db.prepare('SELECT id, object_permissions_json FROM access_groups').all() as Array<{
+        id: string;
+        object_permissions_json: string;
+      }>;
+      const updateGroup = db.prepare(
+        'UPDATE access_groups SET object_permissions_json = ?, updated_at = ? WHERE id = ?'
+      );
+      for (const row of rows) {
+        const perms = JSON.parse(row.object_permissions_json || '[]') as GroupObjectPermission[];
+        const kept = perms.filter((p) => String(p.objectName).toLowerCase() !== objectName.toLowerCase());
+        if (kept.length !== perms.length) {
+          updateGroup.run(JSON.stringify(kept), now, row.id);
+        }
+      }
+      return true;
+    });
   },
 
   // ============================================================================
@@ -742,23 +740,30 @@ export const store = {
     objectPermissions: GroupObjectPermission[];
   }): AccessGroup {
     const now = new Date().toISOString();
+    const requestedId = input.id?.trim();
+    // New groups get a random id, and a create is a plain INSERT, so it can never collide with
+    // (and silently overwrite) another group. Passing an id updates that group.
     const id =
-      input.id?.trim() ||
+      requestedId ||
       `grp_${input.name
         .trim()
         .toLowerCase()
-        .replace(/[^a-z0-9]+/g, '_')}_${Math.random().toString(36).slice(2, 5)}`;
+        .replace(/[^a-z0-9]+/g, '_')}_${crypto.randomBytes(6).toString('hex')}`;
 
-    db.prepare(`
+    const insertSql = `
       INSERT INTO access_groups (id, name, description, allowed_actions_json, object_permissions_json, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?)`;
+    db.prepare(
+      requestedId
+        ? `${insertSql}
       ON CONFLICT(id) DO UPDATE SET
         name = excluded.name,
         description = excluded.description,
         allowed_actions_json = excluded.allowed_actions_json,
         object_permissions_json = excluded.object_permissions_json,
-        updated_at = excluded.updated_at
-    `).run(
+        updated_at = excluded.updated_at`
+        : insertSql
+    ).run(
       id,
       input.name.trim(),
       (input.description || '').trim(),
@@ -793,15 +798,25 @@ export const store = {
     }));
   },
 
+  /** Replaces a Profile's groups atomically; unknown group ids are rejected before anything changes. */
   setProfileGroups(profileId: string, groupIds: string[]): ProfileGroupMapping {
-    db.prepare('DELETE FROM profile_group_memberships WHERE profile_id = ?').run(profileId);
-    const ins = db.prepare(
-      'INSERT OR IGNORE INTO profile_group_memberships (profile_id, group_id) VALUES (?, ?)'
-    );
-    for (const gid of groupIds) {
-      ins.run(profileId, gid);
+    const uniqueIds = Array.from(new Set(groupIds));
+    const knownIds = new Set(this.getGroups().map((g) => g.id));
+    const unknownIds = uniqueIds.filter((gid) => !knownIds.has(gid));
+    if (unknownIds.length > 0) {
+      throw new Error(`Unknown Access Group id(s): ${unknownIds.join(', ')}`);
     }
-    return { profileId, groupIds };
+
+    runInTransaction(() => {
+      db.prepare('DELETE FROM profile_group_memberships WHERE profile_id = ?').run(profileId);
+      const ins = db.prepare(
+        'INSERT OR IGNORE INTO profile_group_memberships (profile_id, group_id) VALUES (?, ?)'
+      );
+      for (const gid of uniqueIds) {
+        ins.run(profileId, gid);
+      }
+    });
+    return { profileId, groupIds: uniqueIds };
   },
 
   // ============================================================================
@@ -827,6 +842,19 @@ export const store = {
     }));
   },
 
+  getCopilotMcpLogStats(): { total: number; allowed: number; denied: number; errors: number } {
+    const row = db
+      .prepare(
+        `SELECT COUNT(*) AS total,
+                COALESCE(SUM(CASE WHEN status = 'ALLOWED' THEN 1 ELSE 0 END), 0) AS allowed,
+                COALESCE(SUM(CASE WHEN status = 'DENIED' THEN 1 ELSE 0 END), 0) AS denied,
+                COALESCE(SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END), 0) AS errors
+         FROM mcp_copilot_logs`
+      )
+      .get() as { total: number; allowed: number; denied: number; errors: number };
+    return { total: row.total, allowed: row.allowed, denied: row.denied, errors: row.errors };
+  },
+
   recordCopilotMcpLog(input: {
     sfUsername: string;
     profileId: string;
@@ -839,7 +867,7 @@ export const store = {
     rawRequestPayload: unknown;
     rawResponseSummary: unknown;
   }): CopilotMcpLogRecord {
-    const id = `mcp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const id = `mcp_${Date.now().toString(36)}_${crypto.randomBytes(8).toString('hex')}`;
     const timestamp = new Date().toISOString();
     const sanitizedReq = JSON.stringify(
       stripSensitivePayloadData(input.rawRequestPayload),
@@ -913,7 +941,7 @@ export const store = {
     details: string;
     ipAddress?: string;
   }): PortalAdminLogRecord {
-    const id = `adm_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const id = `adm_${Date.now().toString(36)}_${crypto.randomBytes(8).toString('hex')}`;
     const timestamp = new Date().toISOString();
     const ip = input.ipAddress || '127.0.0.1';
 
@@ -953,7 +981,15 @@ export const store = {
     try {
       secret = row.client_secret_enc ? decryptSecret(row.client_secret_enc) : '';
     } catch {
+      // Usually APP_SECRET_KEY changed. Keep the ciphertext (updateOktaConfig never overwrites it
+      // unless a new secret is entered) and tell the operator once.
       secret = '';
+      if (!warnedUndecryptableOktaSecret) {
+        warnedUndecryptableOktaSecret = true;
+        console.warn(
+          '[store] The stored Okta client secret cannot be decrypted with the current APP_SECRET_KEY. Re-enter it in Settings > Portal Login & Okta SSO.'
+        );
+      }
     }
     return {
       enabled: Boolean(row.enabled),
@@ -978,17 +1014,28 @@ export const store = {
     adminGroup?: string;
   }): OktaSsoSettings {
     const current = this.getOktaConfig();
-    const nextSecret =
+    const storedSecretEnc = (
+      db.prepare('SELECT client_secret_enc FROM okta_config WHERE id = 1').get() as { client_secret_enc: string }
+    ).client_secret_enc;
+    // A blank secret means "keep the stored one"; the stored ciphertext is kept as-is, even if it
+    // cannot be decrypted right now, so a key change never silently destroys it.
+    const nextSecretEnc =
       input.clientSecret !== undefined && input.clientSecret !== ''
-        ? input.clientSecret
-        : current.clientSecret;
+        ? encryptSecret(input.clientSecret)
+        : storedSecretEnc;
     const nextDomain = (input.oktaDomain ?? current.oktaDomain).trim();
-    const nextIssuer =
-      input.issuer !== undefined
-        ? input.issuer.trim()
-        : nextDomain
-        ? `https://${nextDomain.replace(/^https?:\/\//, '')}/oauth2/default`
-        : '';
+    const derivedIssuer = nextDomain
+      ? `https://${nextDomain.replace(/^https?:\/\//, '').replace(/\/+$/, '')}/oauth2/default`
+      : '';
+    const domainChanged = nextDomain !== current.oktaDomain;
+    // An explicit issuer wins; an empty one means "derive from the domain". Otherwise keep a custom
+    // issuer (e.g. the Okta org authorization server) across saves that do not change the domain.
+    const requestedIssuer = input.issuer?.trim();
+    const nextIssuer = requestedIssuer
+      ? requestedIssuer
+      : input.issuer !== undefined || domainChanged || !current.issuer
+      ? derivedIssuer
+      : current.issuer;
     const now = new Date().toISOString();
 
     db.prepare(`
@@ -1001,7 +1048,7 @@ export const store = {
       nextDomain,
       nextIssuer,
       (input.clientId ?? current.clientId).trim(),
-      nextSecret ? encryptSecret(nextSecret) : '',
+      nextSecretEnc,
       (input.redirectUri ?? current.redirectUri).trim(),
       (input.adminGroup ?? current.adminGroup).trim(),
       now

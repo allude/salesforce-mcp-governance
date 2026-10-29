@@ -1,5 +1,17 @@
-import { app } from './index.js';
-import { store } from './db/store.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+// Always run against a throwaway database so the self-test can never read or wipe real
+// governance data or audit logs (it must be set before the store module opens SQLite).
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sf-mcp-selftest-'));
+process.env.DB_PATH = path.join(tmpDir, 'self-test.sqlite');
+// (Next.js types mark NODE_ENV read-only, hence the cast)
+(process.env as Record<string, string | undefined>).NODE_ENV ||= 'test';
+
+const { app } = await import('./index.js');
+const { store } = await import('./db/store.js');
+const { config } = await import('./config.js');
 
 async function runSelfTests() {
   const server = app.listen(0);
@@ -22,7 +34,10 @@ async function runSelfTests() {
     const loginRes = await fetch(`${baseUrl}/api/admin/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'admin', password: 'admin123' }),
+      body: JSON.stringify({
+        username: config.bootstrapAdmin.username,
+        password: config.bootstrapAdmin.password,
+      }),
     });
     if (loginRes.status !== 200) {
       throw new Error(`Login failed (${loginRes.status}): ${await loginRes.text()}`);
@@ -76,16 +91,10 @@ async function runSelfTests() {
     }
     console.log('✅ 4. Sensitive data stripping verified on Copilot MCP logs');
 
-    // Clean up test log so database remains 100% empty of demo/test data
-    const { DatabaseSync } = await import('node:sqlite');
-    const { config } = await import('./config.js');
-    const cleanDb = new DatabaseSync(config.dbPath);
-    cleanDb.exec('DELETE FROM mcp_copilot_logs; DELETE FROM portal_admin_logs;');
-    cleanDb.close();
-
     console.log('\n🎉 ALL CLEAN PORTAL & MCP SERVER TESTS PASSED!');
   } finally {
     server.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 }
 

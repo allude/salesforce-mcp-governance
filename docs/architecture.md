@@ -22,9 +22,9 @@ A common misconception when building an authenticated MCP server for Microsoft C
    Accept: application/json, text/event-stream
    ```
 5. **Dual-Layer Enforcement (MCP Profile RBAC + Salesforce Native Security):**
-   * **Layer 1 (MCP Server Policy Engine):** The MCP server verifies the token against Salesforce, resolves the user's `ProfileId` and `Profile.Name`, and checks the **Admin RBAC Matrix**:
-     * When Copilot calls `tools/list`, the MCP server dynamically filters the returned tool list so the user's Copilot session only sees tools allowed for their Salesforce Profile.
-     * When Copilot calls `tools/call`, the MCP server verifies that both the **Tool** (e.g., `update_record`, `delete_record`) and the **Target sObject** (e.g., `Opportunity`) are permitted for that user's Salesforce Profile.
+   * **Layer 1 (MCP Server Policy Engine):** The MCP server verifies the token against Salesforce, resolves the user's `ProfileId` and `Profile.Name`, and evaluates the **Profile → Access Group** matrix configured in the Admin Portal:
+     * When Copilot calls `tools/list`, the MCP server filters the returned tool list so the user's Copilot session only sees the tools granted by the groups mapped to their Salesforce Profile.
+     * When Copilot calls `tools/call`, the MCP server verifies the **Tool** (e.g., `update_record`), the **Target sObject** and its CRUD permission (e.g., `canUpdate` on `Opportunity`), and every **Field** requested, written or used in a filter, before anything is sent to Salesforce. Every call is written to the PII-stripped Copilot MCP log.
    * **Layer 2 (Salesforce REST API):** The MCP server executes the REST API call (`/services/data/v62.0/...`) using the user's own Bearer token. Salesforce natively enforces Org-Wide Defaults (OWD), Role Hierarchy, Sharing Rules, Object CRUD, and Field-Level Security (FLS).
 
 ---
@@ -41,19 +41,22 @@ sequenceDiagram
     participant RBAC as Profile RBAC Policy Engine (SQLite)
     participant SFAPI as Salesforce REST API
     actor Admin as MCP Administrator
+    participant Portal as Next.js Admin Portal (:3000)
     participant Okta as Okta SSO (OIDC + PKCE)
 
     rect rgb(30, 41, 59)
     Note over Admin,SFAPI: Plane 1: Admin Control Plane (Okta SSO + Profile RBAC Configuration)
-    Admin->>MCP: Access Admin Web Portal (/)
+    Admin->>Portal: Open Admin Portal (/)
+    Portal->>MCP: /auth/okta/login (proxied to the backend on :3001)
     MCP->>Okta: Redirect to Okta OIDC (/authorize + PKCE S256)
     Okta-->>Admin: Authenticate Admin & MFA
     Okta-->>MCP: Authorization Code -> Verify ID Token via Okta JWKS
-    Admin->>MCP: Click "Sync Salesforce Profiles"
-    MCP->>SFAPI: Query Profiles (SELECT Id, Name, UserType FROM Profile)
-    SFAPI-->>MCP: Returns Org Profiles (System Admin, Sales Rep, Support, etc.)
-    MCP->>RBAC: Upsert Profiles & Default Tool Matrix
-    Admin->>RBAC: Configure Allowed MCP Tools & sObjects per Salesforce Profile
+    Admin->>Portal: Import Profiles (CSV) and Objects & Fields (SFDX folder)
+    Portal->>MCP: /api/admin/* (session cookie + X-CSRF-Token)
+    MCP->>RBAC: Upsert Profiles, Objects and Fields
+    Admin->>Portal: Build Access Groups (tools, object CRUD, allowed fields) and map Profiles to Groups
+    Portal->>MCP: /api/admin/groups, /api/admin/profile-groups/:profileId
+    MCP->>RBAC: Store Profile -> Group matrix
     end
 
     rect rgb(15, 23, 42)
@@ -69,14 +72,14 @@ sequenceDiagram
     SFAPI-->>MCP: User Verified (Profile: "Custom: Sales Representative")
     MCP->>RBAC: Evaluate if "Custom: Sales Representative" can run "update_record" on "Opportunity"
     alt Tool & Object Allowed for Profile
-        RBAC-->>MCP: PERMIT (Allowed + Max Row Limit)
+        RBAC-->>MCP: PERMIT (tool + canUpdate on Opportunity + allowed fields)
         MCP->>SFAPI: PATCH /services/data/v62.0/sobjects/Opportunity/{id}<br/>Header: Authorization: Bearer <USER_SF_TOKEN>
         SFAPI-->>MCP: 204 No Content (Updated as User)
         MCP-->>Copilot: MCP Tool Result (Success)
         Copilot-->>User: "Opportunity updated to Closed Won!"
     else Tool or Object Denied for Profile
         RBAC-->>MCP: DENY (Action blocked for Profile)
-        MCP-->>Copilot: MCP Tool Error (PROFILE_POLICY_DENIED)
+        MCP-->>Copilot: MCP Tool Error (ACCESS_DENIED), logged as DENIED
         Copilot-->>User: "Your Salesforce profile does not permit this action via Copilot."
     end
     end
@@ -89,4 +92,15 @@ sequenceDiagram
 | Plane | Purpose | Authentication Mechanism | Key Endpoints |
 | :--- | :--- | :--- | :--- |
 | **Runtime MCP Plane** | Handles JSON-RPC 2.0 tool discovery and execution from Microsoft Copilot Studio | Per-User Salesforce OAuth 2.0 Bearer Token (`Authorization: Bearer <token>`) | `POST /mcp`<br/>`GET /.well-known/oauth-protected-resource` |
-| **Admin Control Plane** | Web UI for syncing Salesforce Profiles, configuring per-profile tool/object permissions, configuring Okta SSO, and viewing audit logs | Okta OIDC Authorization Code Flow with PKCE (`S256`) + Remote JWKS Verification (plus optional break-glass bootstrap login) | `GET /`<br/>`GET /auth/okta/login`<br/>`GET /auth/okta/callback`<br/>`/api/admin/*` |
+| **Admin Control Plane** | Next.js portal for importing Salesforce Profiles and Objects, building Access Groups and the Profile → Group matrix, configuring Okta SSO, testing policies in the simulator, and viewing audit logs | Okta OIDC Authorization Code Flow with PKCE (`S256`) + Remote JWKS Verification, plus a break-glass username/password login | `GET /` (portal)<br/>`GET /auth/okta/login`<br/>`GET /auth/okta/callback`<br/>`/api/admin/*` |
+
+---
+
+## 4. Process Layout
+
+| Process | Port | Responsibility |
+| :--- | :--- | :--- |
+| **Next.js Admin Portal** (`src/app/`, `src/components/`) | `3000` | Serves the admin UI and is the single public origin (`BASE_URL`). `next.config.ts` rewrites `/mcp`, `/api/admin/*`, `/auth/okta/*`, `/.well-known/*` and `/docs/*` to the backend at `MCP_BACKEND_URL`. |
+| **Express MCP backend** (`src/index.ts`) | `3001` | Implements every endpoint above against the SQLite store (`node:sqlite`, WAL). It serves no HTML; `GET /` redirects browsers to the portal. |
+
+`npm run dev` starts both (`scripts/run-stack.mjs`); `npm run build` compiles the backend to `dist/` and builds the portal; `npm start` runs both production builds.
