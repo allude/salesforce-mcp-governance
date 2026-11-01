@@ -553,7 +553,7 @@ adminRouter.post('/objects', (req: Request, res: Response) => {
   let saved;
   try {
     saved = store.upsertObjectWithFields({
-      objectName: String(objectName),
+      objectName: store.resolveObjectName(String(objectName)),
       label: label ? String(label) : undefined,
       fields: Array.isArray(fields) ? fields : undefined,
     });

@@ -158,14 +158,19 @@ describe('a sync whose names differ from the local row only by case', () => {
     assert.deepEqual(rows.map((o) => [o.objectName, o.enabled]), [[objectName, false]]);
   });
 
-  test('an explicit enable in different casing is still applied', () => {
+  test('adding the object by hand in different casing also updates the existing row', async () => {
     const objectName = newObjectName();
     store.upsertObjectWithFields({ objectName, fields: [{ fieldName: 'Id' }] });
     store.toggleObject(objectName, false);
 
-    store.upsertObjectWithFields({ objectName: objectName.toLowerCase(), enabled: true, fields: [{ fieldName: 'Id' }] });
+    const res = await adminFetch(server.baseUrl, session, '/api/admin/objects', {
+      method: 'POST',
+      body: { objectName: objectName.toLowerCase(), fields: [{ fieldName: 'Id' }] },
+    });
 
-    assert.equal(objectNamed(objectName).enabled, true);
+    assert.equal(res.status, 200);
+    const rows = store.getObjects().filter((o) => o.objectName.toLowerCase() === objectName.toLowerCase());
+    assert.deepEqual(rows.map((o) => [o.objectName, o.enabled]), [[objectName, false]]);
   });
 });
 

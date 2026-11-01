@@ -661,6 +661,20 @@ export const store = {
     });
   },
 
+  /**
+   * The stored spelling of an object name. Salesforce API names are case-insensitive, so a name
+   * differing only by case is the same object: incoming names go through this first, because a new
+   * row would start enabled and undo an admin's disable.
+   */
+  resolveObjectName(objectName: string): string {
+    const name = objectName.trim();
+    const row = (db.prepare('SELECT object_name FROM sf_objects WHERE object_name = ?').get(name) ||
+      db
+        .prepare('SELECT object_name FROM sf_objects WHERE lower(object_name) = lower(?) ORDER BY object_name LIMIT 1')
+        .get(name)) as { object_name: string } | undefined;
+    return row?.object_name ?? name;
+  },
+
   upsertObjectWithFields(input: {
     objectName: string;
     label?: string;
@@ -679,9 +693,9 @@ export const store = {
     }>;
   }): SalesforceObject {
     const now = new Date().toISOString();
-    const requestedName = input.objectName.trim();
-    if (!SALESFORCE_API_NAME_PATTERN.test(requestedName)) {
-      throw new Error(`'${requestedName}' is not a valid Salesforce object API name.`);
+    const objName = input.objectName.trim();
+    if (!SALESFORCE_API_NAME_PATTERN.test(objName)) {
+      throw new Error(`'${objName}' is not a valid Salesforce object API name.`);
     }
     const invalidField = (input.fields || []).find(
       (f) => f?.fieldName && !SALESFORCE_API_NAME_PATTERN.test(String(f.fieldName).trim())
@@ -689,15 +703,9 @@ export const store = {
     if (invalidField) {
       throw new Error(`'${invalidField.fieldName}' is not a valid Salesforce field API name.`);
     }
-    // Salesforce API names are case-insensitive. A name differing only by case is the same object,
-    // so it updates that row; a new row would start enabled and undo an admin's disable.
-    const existing = (db
+    const existing = db
       .prepare('SELECT * FROM sf_objects WHERE object_name = ?')
-      .get(requestedName) ||
-      db
-        .prepare('SELECT * FROM sf_objects WHERE lower(object_name) = lower(?) ORDER BY object_name LIMIT 1')
-        .get(requestedName)) as any;
-    const objName: string = existing?.object_name ?? requestedName;
+      .get(objName) as any;
 
     const isCustom =
       input.isCustom !== undefined
@@ -787,7 +795,7 @@ export const store = {
     let fieldsImported = 0;
     for (const obj of parsedObjects) {
       this.upsertObjectWithFields({
-        objectName: obj.objectName,
+        objectName: this.resolveObjectName(obj.objectName),
         label: obj.label,
         isCustom: obj.isCustom,
         sourcePath: obj.sourcePath,
@@ -1121,7 +1129,7 @@ export const store = {
 
       // Upsert the object and all present org fields (setting missing_in_org = 0)
       this.upsertObjectWithFields({
-        objectName: pulled.objectName,
+        objectName: this.resolveObjectName(pulled.objectName),
         label: pulled.label,
         isCustom: pulled.isCustom,
         sourcePath: 'salesforce-org-jwt',
