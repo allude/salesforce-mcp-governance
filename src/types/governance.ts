@@ -55,6 +55,14 @@ export const AVAILABLE_MCP_ACTIONS = [
 ] as const;
 
 export type McpActionId = (typeof AVAILABLE_MCP_ACTIONS)[number]['id'];
+
+/** The values in `ids` that name no MCP tool, as text. A group granting one of them would grant nothing. */
+export function unknownMcpActionIds(ids: readonly unknown[]): string[] {
+  return ids
+    .filter((id) => !AVAILABLE_MCP_ACTIONS.some((action) => action.id === id))
+    .map((id) => String(id));
+}
+
 export type McpActionType = string;
 export type RemovalResolutionAction = 'KEEP_FLAGGED' | 'DELETE';
 

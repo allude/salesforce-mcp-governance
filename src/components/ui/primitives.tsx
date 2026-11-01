@@ -1,61 +1,54 @@
 import React from 'react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
-import type { McpActionType } from '@/types/governance';
+import { AVAILABLE_MCP_ACTIONS } from '@/types/governance';
+import type { McpActionId, McpActionType } from '@/types/governance';
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
+
+// Keyed by McpActionId so the compiler rejects a tool the server does not have, or a missing one.
+const MCP_TOOL_DETAILS: Record<
+  McpActionId,
+  { risk: 'read' | 'write' | 'destructive'; description: string }
+> = {
+  list_enabled_objects: {
+    risk: 'read',
+    description: 'Lists Salesforce SObjects permitted for this caller via Profile Groups.',
+  },
+  describe_object: {
+    risk: 'read',
+    description: 'Returns allowed fields and metadata for an enabled Salesforce SObject.',
+  },
+  soql_query: {
+    risk: 'read',
+    description: 'Executes a read-only SOQL SELECT restricted to permitted objects & fields.',
+  },
+  get_record: {
+    risk: 'read',
+    description: 'Fetches a single Salesforce record by ID filtered to allowed fields.',
+  },
+  create_record: {
+    risk: 'write',
+    description: 'Creates a new record on an object where group grants Create (C) access.',
+  },
+  update_record: {
+    risk: 'write',
+    description: 'Updates permitted fields on an existing record where group grants Update (U).',
+  },
+  delete_record: {
+    risk: 'destructive',
+    description: 'Deletes a record by ID (requires explicit Delete (D) permission).',
+  },
+};
 
 export const MCP_TOOL_CATALOG: Array<{
   id: McpActionType;
   label: string;
   risk: 'read' | 'write' | 'destructive';
   description: string;
-}> = [
-  {
-    id: 'list_enabled_objects',
-    label: 'list_enabled_objects',
-    risk: 'read',
-    description: 'Lists Salesforce SObjects permitted for this caller via Profile Groups.',
-  },
-  {
-    id: 'describe_object',
-    label: 'describe_object',
-    risk: 'read',
-    description: 'Returns allowed fields and metadata for an enabled Salesforce SObject.',
-  },
-  {
-    id: 'soql_query',
-    label: 'soql_query',
-    risk: 'read',
-    description: 'Executes a read-only SOQL SELECT restricted to permitted objects & fields.',
-  },
-  {
-    id: 'get_record',
-    label: 'get_record',
-    risk: 'read',
-    description: 'Fetches a single Salesforce record by ID filtered to allowed fields.',
-  },
-  {
-    id: 'create_record',
-    label: 'create_record',
-    risk: 'write',
-    description: 'Creates a new record on an object where group grants Create (C) access.',
-  },
-  {
-    id: 'update_record',
-    label: 'update_record',
-    risk: 'write',
-    description: 'Updates permitted fields on an existing record where group grants Update (U).',
-  },
-  {
-    id: 'delete_record',
-    label: 'delete_record',
-    risk: 'destructive',
-    description: 'Deletes a record by ID (requires explicit Delete (D) permission).',
-  },
-];
+}> = AVAILABLE_MCP_ACTIONS.map(({ id }) => ({ id, label: id, ...MCP_TOOL_DETAILS[id] }));
 
 export function isSensitiveField(fieldName: string, label?: string): boolean {
   const target = `${fieldName} ${label || ''}`;

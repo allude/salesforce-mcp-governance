@@ -16,8 +16,10 @@ import {
   resolveEffectiveProfilePermissions,
 } from '../rbac/policyEngine.js';
 import { store } from '../db/store.js';
+import type { McpActionId } from '../types/governance.js';
 
-const TOOL_INPUT_SCHEMAS: Record<string, object> = {
+// Keyed by McpActionId: a tool added to the catalog without a schema here does not compile.
+export const TOOL_INPUT_SCHEMAS: Record<McpActionId, object> = {
   list_enabled_objects: {
     type: 'object',
     properties: {},

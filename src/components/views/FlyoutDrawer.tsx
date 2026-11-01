@@ -3,6 +3,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { portalAuditResult } from './portalAudit';
 import { DEFAULT_SIMULATED_USERNAME, trafficBurstCalls } from './simulatedTraffic';
+import { splitMcpActions } from './accessGroupDraft';
 import type {
   SalesforceProfile,
   SalesforceObject,
@@ -155,6 +156,7 @@ export function FlyoutDrawer({
     allowedActions: McpActionType[];
     objectPermissions: GroupObjectPermission[];
   } | null>(null);
+  const [droppedActions, setDroppedActions] = useState<McpActionType[]>([]);
   const [expandedObj, setExpandedObj] = useState<string | null>(null);
 
   // Simulator drawer state
@@ -180,11 +182,13 @@ export function FlyoutDrawer({
     } else if (flyout.type === 'group' && flyout.data) {
       const liveGrp =
         groups.find((g) => g.id === flyout.data.id) || flyout.data;
+      const { known, unknown } = splitMcpActions(liveGrp.allowedActions || []);
+      setDroppedActions(unknown);
       setGrpDraft({
         id: liveGrp.id,
         name: liveGrp.name || '',
         description: liveGrp.description || '',
-        allowedActions: [...(liveGrp.allowedActions || [])],
+        allowedActions: known,
         objectPermissions: (liveGrp.objectPermissions || []).map(
           (op: GroupObjectPermission) => ({
             ...op,
@@ -1437,6 +1441,14 @@ export function FlyoutDrawer({
                     </button>
                   </div>
                 </div>
+                {droppedActions.length > 0 && (
+                  <div className="hint" style={{ marginBottom: 8 }}>
+                    This group named{' '}
+                    <span className="mono">{droppedActions.join(', ')}</span>,
+                    which are not MCP tools and never granted anything. Saving
+                    removes them, so turn on the tools it should have below.
+                  </div>
+                )}
                 <div className="chk-list">
                   {MCP_TOOL_CATALOG.map((act) => {
                     const on = grpDraft.allowedActions.includes(act.id);

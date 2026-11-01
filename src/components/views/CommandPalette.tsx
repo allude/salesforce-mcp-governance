@@ -7,6 +7,7 @@ import type {
   AccessGroup,
 } from '@/types/governance';
 import type { FlyoutState } from './FlyoutDrawer';
+import { newAccessGroupDraft } from './accessGroupDraft';
 
 interface CommandPaletteProps {
   open: boolean;
@@ -130,17 +131,7 @@ export function CommandPalette({
         action: () =>
           onOpenFlyout({
             type: 'group',
-            data: {
-              name: 'New Access Group',
-              description: 'Custom access policy',
-              allowedActions: [
-                'list_enabled_objects',
-                'describe_object_schema',
-                'query_records',
-                'get_record',
-              ],
-              objectPermissions: [],
-            },
+            data: newAccessGroupDraft(),
           }),
       },
       {

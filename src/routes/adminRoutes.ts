@@ -24,6 +24,7 @@ import {
 } from '../salesforce/jwtConnection.js';
 import { config } from '../config.js';
 import { parseObjectSyncPayload, parseProfileSyncPayload } from './orgSyncPayload.js';
+import { AVAILABLE_MCP_ACTIONS, unknownMcpActionIds } from '../types/governance.js';
 import type { SalesforceConnectionSettings } from '../types/governance.js';
 import {
   evaluateMcpToolCall,
@@ -1059,6 +1060,17 @@ adminRouter.post('/groups', (req: Request, res: Response) => {
     req.body || {};
   if (!name) {
     res.status(400).json({ error: 'Group name is required.' });
+    return;
+  }
+
+  // An unknown ID grants nothing at /mcp, so storing one would only look like a working grant.
+  const unknownActions = Array.isArray(allowedActions) ? unknownMcpActionIds(allowedActions) : [];
+  if (unknownActions.length > 0) {
+    res.status(400).json({
+      error: `Unknown MCP action IDs: ${unknownActions.join(', ')}. Valid IDs: ${AVAILABLE_MCP_ACTIONS.map(
+        (a) => a.id
+      ).join(', ')}.`,
+    });
     return;
   }
 

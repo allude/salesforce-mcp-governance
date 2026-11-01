@@ -9,6 +9,7 @@ import type {
 } from '@/types/governance';
 import { formatDateShort } from '@/components/ui/primitives';
 import type { FlyoutState } from './FlyoutDrawer';
+import { newAccessGroupDraft } from './accessGroupDraft';
 
 // ============================================================================
 // 1. ACCESS GROUPS VIEW
@@ -50,17 +51,7 @@ export function AccessGroupsView({
   const handleNewGroup = () => {
     onOpenFlyout({
       type: 'group',
-      data: {
-        name: 'New Access Group',
-        description: 'Describe what this group allows…',
-        allowedActions: [
-          'list_enabled_objects',
-          'describe_object_schema',
-          'query_records',
-          'get_record',
-        ],
-        objectPermissions: [],
-      },
+      data: newAccessGroupDraft(),
     });
   };
 
@@ -385,17 +376,7 @@ export function ProfileGroupMatrixView({
             onClick={() =>
               onOpenFlyout({
                 type: 'group',
-                data: {
-                  name: 'New Access Group',
-                  description: 'Describe what this group allows…',
-                  allowedActions: [
-                    'list_enabled_objects',
-                    'describe_object_schema',
-                    'query_records',
-                    'get_record',
-                  ],
-                  objectPermissions: [],
-                },
+                data: newAccessGroupDraft(),
               })
             }
           >
