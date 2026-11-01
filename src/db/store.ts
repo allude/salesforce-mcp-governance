@@ -15,8 +15,15 @@ import {
   PortalAdminLogRecord,
   OktaSsoSettings,
   SalesforceConnectionSettings,
+  ProfileSyncDiffPreview,
+  ObjectSyncDiffPreview,
   PortalUserSummary,
 } from '../types/governance.js';
+import {
+  PulledOrgObjectMetadata,
+  inspectCertificatePem,
+  validatePrivateKeyPem,
+} from '../salesforce/jwtConnection.js';
 
 const dbDir = path.dirname(config.dbPath);
 if (!fs.existsSync(dbDir)) {
@@ -42,6 +49,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS sf_profiles (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
+    missing_in_org INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
   );
 
@@ -51,6 +59,7 @@ db.exec(`
     is_custom INTEGER NOT NULL DEFAULT 0,
     enabled INTEGER NOT NULL DEFAULT 1,
     source_path TEXT NOT NULL DEFAULT '',
+    missing_in_org INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
   );
 
@@ -62,6 +71,7 @@ db.exec(`
     is_custom INTEGER NOT NULL DEFAULT 0,
     required INTEGER NOT NULL DEFAULT 0,
     enabled INTEGER NOT NULL DEFAULT 1,
+    missing_in_org INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (object_name, field_name),
     FOREIGN KEY (object_name) REFERENCES sf_objects(object_name) ON DELETE CASCADE
   );
@@ -123,6 +133,19 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS sf_connection_settings (
     id INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled INTEGER NOT NULL DEFAULT 0,
+    auth_mode TEXT NOT NULL DEFAULT 'jwt_bearer',
+    login_url TEXT NOT NULL DEFAULT 'https://login.salesforce.com',
+    client_id TEXT NOT NULL DEFAULT '',
+    username TEXT NOT NULL DEFAULT '',
+    private_key_enc TEXT NOT NULL DEFAULT '',
+    certificate_pem TEXT NOT NULL DEFAULT '',
+    cert_fingerprint TEXT NOT NULL DEFAULT '',
+    connection_status TEXT NOT NULL DEFAULT 'disconnected',
+    last_connected_at TEXT,
+    last_error TEXT NOT NULL DEFAULT '',
+    connected_org_id TEXT NOT NULL DEFAULT '',
+    connected_user TEXT NOT NULL DEFAULT '',
     expected_org_id TEXT NOT NULL DEFAULT '',
     instance_url TEXT NOT NULL DEFAULT 'https://login.salesforce.com',
     api_version TEXT NOT NULL DEFAULT 'v62.0',
@@ -131,6 +154,35 @@ db.exec(`
     updated_at TEXT NOT NULL
   );
 `);
+
+function ensureColumnExists(tableName: string, columnName: string, columnDef: string) {
+  const cols = db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === columnName)) {
+    db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnDef}`);
+  }
+}
+
+function runSchemaMigrations() {
+  ensureColumnExists('sf_profiles', 'missing_in_org', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumnExists('sf_objects', 'missing_in_org', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumnExists('sf_object_fields', 'missing_in_org', 'INTEGER NOT NULL DEFAULT 0');
+
+  ensureColumnExists('sf_connection_settings', 'enabled', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumnExists('sf_connection_settings', 'auth_mode', "TEXT NOT NULL DEFAULT 'jwt_bearer'");
+  ensureColumnExists('sf_connection_settings', 'login_url', "TEXT NOT NULL DEFAULT 'https://login.salesforce.com'");
+  ensureColumnExists('sf_connection_settings', 'client_id', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('sf_connection_settings', 'username', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('sf_connection_settings', 'private_key_enc', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('sf_connection_settings', 'certificate_pem', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('sf_connection_settings', 'cert_fingerprint', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('sf_connection_settings', 'connection_status', "TEXT NOT NULL DEFAULT 'disconnected'");
+  ensureColumnExists('sf_connection_settings', 'last_connected_at', 'TEXT');
+  ensureColumnExists('sf_connection_settings', 'last_error', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('sf_connection_settings', 'connected_org_id', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('sf_connection_settings', 'connected_user', "TEXT NOT NULL DEFAULT ''");
+}
+
+runSchemaMigrations();
 
 function hashPassword(password: string, salt: string): string {
   return crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
@@ -451,13 +503,14 @@ export const store = {
   },
 
   // ============================================================================
-  // 2. SALESFORCE -> PROFILES (List + CSV Import)
+  // 2. SALESFORCE -> PROFILES (List + CSV Import + Org Pull & Reconciliation)
   // ============================================================================
   getProfiles(): SalesforceProfile[] {
     const rows = db.prepare('SELECT * FROM sf_profiles ORDER BY name ASC').all() as any[];
     return rows.map((r) => ({
       id: r.id,
       name: r.name,
+      missingInOrg: Boolean(r.missing_in_org),
       updatedAt: r.updated_at,
     }));
   },
@@ -465,23 +518,33 @@ export const store = {
   getProfileById(id: string): SalesforceProfile | null {
     const r = db.prepare('SELECT * FROM sf_profiles WHERE id = ?').get(id.trim()) as any;
     if (!r) return null;
-    return { id: r.id, name: r.name, updatedAt: r.updated_at };
+    return {
+      id: r.id,
+      name: r.name,
+      missingInOrg: Boolean(r.missing_in_org),
+      updatedAt: r.updated_at,
+    };
   },
 
-  upsertProfile(id: string, name: string): { profile: SalesforceProfile; action: 'inserted' | 'updated' } {
+  upsertProfile(
+    id: string,
+    name: string,
+    missingInOrg = false
+  ): { profile: SalesforceProfile; action: 'inserted' | 'updated' } {
     const cleanId = id.trim();
     const cleanName = name.trim();
     const existing = this.getProfileById(cleanId);
     const now = new Date().toISOString();
     db.prepare(`
-      INSERT INTO sf_profiles (id, name, updated_at)
-      VALUES (?, ?, ?)
+      INSERT INTO sf_profiles (id, name, missing_in_org, updated_at)
+      VALUES (?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         name = excluded.name,
+        missing_in_org = excluded.missing_in_org,
         updated_at = excluded.updated_at
-    `).run(cleanId, cleanName, now);
+    `).run(cleanId, cleanName, missingInOrg ? 1 : 0, now);
     return {
-      profile: { id: cleanId, name: cleanName, updatedAt: now },
+      profile: { id: cleanId, name: cleanName, missingInOrg, updatedAt: now },
       action: existing ? 'updated' : 'inserted',
     };
   },
@@ -493,7 +556,7 @@ export const store = {
     let updated = 0;
     for (const r of rows) {
       if (!r.id || !r.name) continue;
-      const res = this.upsertProfile(r.id, r.name);
+      const res = this.upsertProfile(r.id, r.name, false);
       if (res.action === 'inserted') inserted++;
       else updated++;
     }
@@ -505,8 +568,106 @@ export const store = {
     return res.changes > 0;
   },
 
+  previewProfilesSyncFromOrg(
+    orgProfiles: Array<{ id: string; name: string; userType?: string }>,
+    orgInfo: { orgId: string; instanceUrl: string }
+  ): ProfileSyncDiffPreview {
+    const existingProfiles = this.getProfiles();
+    const existingMap = new Map(existingProfiles.map((p) => [p.id, p]));
+    const orgMap = new Map(orgProfiles.map((p) => [p.id.trim(), p]));
+
+    const mappings = this.getProfileGroupMappings();
+    const groups = this.getGroups();
+
+    const added: ProfileSyncDiffPreview['added'] = [];
+    const updated: ProfileSyncDiffPreview['updated'] = [];
+    const removedFromOrg: ProfileSyncDiffPreview['removedFromOrg'] = [];
+
+    for (const op of orgProfiles) {
+      const cleanId = op.id.trim();
+      const cleanName = op.name.trim();
+      const prev = existingMap.get(cleanId);
+      if (!prev) {
+        added.push({
+          id: cleanId,
+          name: cleanName,
+          userType: op.userType || 'Standard',
+        });
+      } else {
+        updated.push({
+          id: cleanId,
+          name: cleanName,
+          previousName: prev.name,
+          unchanged: prev.name === cleanName && !prev.missingInOrg,
+        });
+      }
+    }
+
+    for (const local of existingProfiles) {
+      if (!orgMap.has(local.id)) {
+        const m = mappings.find((item) => item.profileId === local.id);
+        const mappedGroupNames = (m?.groupIds || []).map(
+          (gid) => groups.find((g) => g.id === gid)?.name || gid
+        );
+        removedFromOrg.push({
+          id: local.id,
+          name: local.name,
+          mappedGroupNames,
+        });
+      }
+    }
+
+    return {
+      orgId: orgInfo.orgId,
+      instanceUrl: orgInfo.instanceUrl,
+      added,
+      updated,
+      removedFromOrg,
+    };
+  },
+
+  applyProfilesSyncFromOrg(input: {
+    upserts: Array<{ id: string; name: string }>;
+    removeProfileIds: string[];
+    keptMissingProfileIds?: string[];
+  }): { inserted: number; updated: number; removed: number; keptMissing: number; total: number } {
+    let inserted = 0;
+    let updated = 0;
+    let removed = 0;
+    let keptMissing = 0;
+
+    for (const p of input.upserts) {
+      if (!p.id || !p.name) continue;
+      const res = this.upsertProfile(p.id, p.name, false);
+      if (res.action === 'inserted') inserted++;
+      else updated++;
+    }
+
+    for (const remId of input.removeProfileIds || []) {
+      if (this.deleteProfile(remId)) {
+        removed++;
+      }
+    }
+
+    for (const keptId of input.keptMissingProfileIds || []) {
+      const existing = this.getProfileById(keptId);
+      if (existing) {
+        db.prepare('UPDATE sf_profiles SET missing_in_org = 1 WHERE id = ?').run(keptId.trim());
+        keptMissing++;
+      }
+    }
+
+    return {
+      inserted,
+      updated,
+      removed,
+      keptMissing,
+      total: this.getProfiles().length,
+    };
+  },
+
   // ============================================================================
-  // 3. SALESFORCE -> OBJECTS (Toggle On/Off + SFDX Folder Import)
+  // 3. SALESFORCE -> OBJECTS (Toggle On/Off + SFDX Folder Import + Org Pull & Reconciliation)
   // ============================================================================
   getObjects(): SalesforceObject[] {
     const objRows = db.prepare('SELECT * FROM sf_objects ORDER BY object_name ASC').all() as any[];
@@ -525,6 +686,7 @@ export const store = {
         isCustom: Boolean(f.is_custom),
         required: Boolean(f.required),
         enabled: Boolean(f.enabled),
+        missingInOrg: Boolean(f.missing_in_org),
       });
       fieldsByObj.set(f.object_name, list);
     }
@@ -540,6 +702,7 @@ export const store = {
         fieldCount: fields.length,
         enabledFieldCount: fields.filter((f) => f.enabled).length,
         fields,
+        missingInOrg: Boolean(o.missing_in_org),
         updatedAt: o.updated_at,
       };
     });
@@ -551,6 +714,7 @@ export const store = {
     isCustom?: boolean;
     enabled?: boolean;
     sourcePath?: string;
+    missingInOrg?: boolean;
     fields?: Array<{
       fieldName: string;
       label?: string;
@@ -558,6 +722,7 @@ export const store = {
       isCustom?: boolean;
       required?: boolean;
       enabled?: boolean;
+      missingInOrg?: boolean;
     }>;
   }): SalesforceObject {
     const now = new Date().toISOString();
@@ -578,17 +743,19 @@ export const store = {
         ? Boolean(existing.enabled)
         : true;
     const sourcePath = input.sourcePath ?? existing?.source_path ?? 'manual';
+    const missingInOrg = input.missingInOrg ? 1 : 0;
 
     db.prepare(`
-      INSERT INTO sf_objects (object_name, label, is_custom, enabled, source_path, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO sf_objects (object_name, label, is_custom, enabled, source_path, missing_in_org, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(object_name) DO UPDATE SET
         label = excluded.label,
         is_custom = excluded.is_custom,
         enabled = excluded.enabled,
         source_path = excluded.source_path,
+        missing_in_org = excluded.missing_in_org,
         updated_at = excluded.updated_at
-    `).run(objName, label, isCustom ? 1 : 0, enabled ? 1 : 0, sourcePath, now);
+    `).run(objName, label, isCustom ? 1 : 0, enabled ? 1 : 0, sourcePath, missingInOrg, now);
 
     const fieldsToUpsert = input.fields || [
       { fieldName: 'Id', label: 'Record ID', fieldType: 'Id', isCustom: false, required: true },
@@ -596,13 +763,14 @@ export const store = {
     ];
 
     const upsertFieldStmt = db.prepare(`
-      INSERT INTO sf_object_fields (object_name, field_name, label, field_type, is_custom, required, enabled)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO sf_object_fields (object_name, field_name, label, field_type, is_custom, required, enabled, missing_in_org)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(object_name, field_name) DO UPDATE SET
         label = excluded.label,
         field_type = excluded.field_type,
         is_custom = excluded.is_custom,
-        required = excluded.required
+        required = excluded.required,
+        missing_in_org = excluded.missing_in_org
     `);
 
     for (const f of fieldsToUpsert) {
@@ -614,7 +782,8 @@ export const store = {
         f.fieldType || 'Text',
         (f.isCustom ?? f.fieldName.endsWith('__c')) ? 1 : 0,
         f.required ? 1 : 0,
-        f.enabled !== undefined ? (f.enabled ? 1 : 0) : 1
+        f.enabled !== undefined ? (f.enabled ? 1 : 0) : 1,
+        f.missingInOrg ? 1 : 0
       );
     }
 
@@ -714,9 +883,225 @@ export const store = {
     return this.getObjects().find((o) => o.objectName === objectName) || null;
   },
 
+  deleteObjectField(objectName: string, fieldName: string): SalesforceObject | null {
+    db.prepare(
+      'DELETE FROM sf_object_fields WHERE object_name = ? AND field_name = ?'
+    ).run(objectName.trim(), fieldName.trim());
+    return this.getObjects().find((o) => o.objectName === objectName.trim()) || null;
+  },
+
   deleteObject(objectName: string): boolean {
     const res = db.prepare('DELETE FROM sf_objects WHERE object_name = ?').run(objectName);
     return res.changes > 0;
+  },
+
+  /**
+   * Computes a non-destructive preview of Object & Field additions, updates, and removals
+   * compared against the live Salesforce Org metadata.
+   */
+  previewObjectsSyncFromOrg(
+    pulledMetadata: PulledOrgObjectMetadata[],
+    orgInfo: { orgId: string; instanceUrl: string }
+  ): ObjectSyncDiffPreview {
+    const existingObjects = this.getObjects();
+    const existingObjMap = new Map(
+      existingObjects.map((o) => [o.objectName.toLowerCase(), o])
+    );
+    const groups = this.getGroups();
+
+    const upsertedObjects: ObjectSyncDiffPreview['upsertedObjects'] = [];
+    const removedObjectsFromOrg: ObjectSyncDiffPreview['removedObjectsFromOrg'] = [];
+
+    for (const pulled of pulledMetadata) {
+      const localObj = existingObjMap.get(pulled.objectName.toLowerCase());
+
+      if (!pulled.existsInOrg) {
+        if (localObj) {
+          const referencedInGroups = groups
+            .filter((g) =>
+              g.objectPermissions.some(
+                (op) => op.objectName.toLowerCase() === localObj.objectName.toLowerCase()
+              )
+            )
+            .map((g) => g.name);
+
+          removedObjectsFromOrg.push({
+            objectName: localObj.objectName,
+            label: localObj.label,
+            fieldCount: localObj.fields.length,
+            referencedInGroups,
+          });
+        }
+        continue;
+      }
+
+      const orgFieldMap = new Map(
+        pulled.fields.map((f) => [f.fieldName.toLowerCase(), f])
+      );
+      const localFieldMap = new Map(
+        (localObj?.fields || []).map((f) => [f.fieldName.toLowerCase(), f])
+      );
+
+      const addedFields: ObjectSyncDiffPreview['upsertedObjects'][number]['addedFields'] = [];
+      let updatedFieldsCount = 0;
+
+      for (const f of pulled.fields) {
+        if (!localFieldMap.has(f.fieldName.toLowerCase())) {
+          addedFields.push(f);
+        } else {
+          updatedFieldsCount++;
+        }
+      }
+
+      const removedFieldsFromOrg: ObjectSyncDiffPreview['upsertedObjects'][number]['removedFieldsFromOrg'] = [];
+      if (localObj) {
+        for (const lf of localObj.fields) {
+          if (!orgFieldMap.has(lf.fieldName.toLowerCase())) {
+            const referencedInGroups = groups
+              .filter((g) =>
+                g.objectPermissions.some(
+                  (op) =>
+                    op.objectName.toLowerCase() === localObj.objectName.toLowerCase() &&
+                    op.allowedFields.some(
+                      (af) => af.toLowerCase() === lf.fieldName.toLowerCase()
+                    )
+                )
+              )
+              .map((g) => g.name);
+
+            removedFieldsFromOrg.push({
+              objectName: localObj.objectName,
+              fieldName: lf.fieldName,
+              label: lf.label,
+              fieldType: lf.fieldType,
+              enabled: lf.enabled,
+              referencedInGroups,
+            });
+          }
+        }
+      }
+
+      upsertedObjects.push({
+        objectName: pulled.objectName,
+        label: pulled.label,
+        isCustom: pulled.isCustom,
+        isNewObject: !localObj,
+        totalOrgFields: pulled.fields.length,
+        addedFields,
+        updatedFieldsCount,
+        removedFieldsFromOrg,
+      });
+    }
+
+    return {
+      orgId: orgInfo.orgId,
+      instanceUrl: orgInfo.instanceUrl,
+      upsertedObjects,
+      removedObjectsFromOrg,
+    };
+  },
+
+  /**
+   * Applies the Object & Field sync from Salesforce Org, deleting ONLY the objects/fields
+   * the user explicitly chose to remove, and marking kept removed items with `missing_in_org = 1`.
+   */
+  applyObjectsSyncFromOrg(input: {
+    pulledMetadata: PulledOrgObjectMetadata[];
+    removeObjectNames: string[];
+    removeFields: Array<{ objectName: string; fieldName: string }>;
+  }): {
+    objectsUpserted: number;
+    fieldsUpserted: number;
+    objectsRemoved: number;
+    fieldsRemoved: number;
+    objectsKeptMissing: number;
+    fieldsKeptMissing: number;
+  } {
+    const removeObjSet = new Set(
+      (input.removeObjectNames || []).map((n) => n.toLowerCase())
+    );
+    const removeFieldSet = new Set(
+      (input.removeFields || []).map(
+        (f) => `${f.objectName.toLowerCase()}.${f.fieldName.toLowerCase()}`
+      )
+    );
+
+    let objectsUpserted = 0;
+    let fieldsUpserted = 0;
+    let objectsRemoved = 0;
+    let fieldsRemoved = 0;
+    let objectsKeptMissing = 0;
+    let fieldsKeptMissing = 0;
+
+    const existingObjects = this.getObjects();
+    const existingObjMap = new Map(
+      existingObjects.map((o) => [o.objectName.toLowerCase(), o])
+    );
+
+    for (const pulled of input.pulledMetadata) {
+      const localObj = existingObjMap.get(pulled.objectName.toLowerCase());
+
+      if (!pulled.existsInOrg) {
+        if (localObj) {
+          if (removeObjSet.has(localObj.objectName.toLowerCase())) {
+            if (this.deleteObject(localObj.objectName)) {
+              objectsRemoved++;
+            }
+          } else {
+            db.prepare(
+              'UPDATE sf_objects SET missing_in_org = 1, updated_at = ? WHERE object_name = ?'
+            ).run(new Date().toISOString(), localObj.objectName);
+            objectsKeptMissing++;
+          }
+        }
+        continue;
+      }
+
+      // Upsert the object and all present org fields (setting missing_in_org = 0)
+      this.upsertObjectWithFields({
+        objectName: pulled.objectName,
+        label: pulled.label,
+        isCustom: pulled.isCustom,
+        sourcePath: 'salesforce-org-jwt',
+        missingInOrg: false,
+        fields: pulled.fields.map((f) => ({
+          ...f,
+          missingInOrg: false,
+        })),
+      });
+      objectsUpserted++;
+      fieldsUpserted += pulled.fields.length;
+
+      // Handle local fields on this object that were NOT in the Salesforce Org
+      if (localObj) {
+        const orgFieldSet = new Set(
+          pulled.fields.map((f) => f.fieldName.toLowerCase())
+        );
+        for (const lf of localObj.fields) {
+          if (!orgFieldSet.has(lf.fieldName.toLowerCase())) {
+            const key = `${localObj.objectName.toLowerCase()}.${lf.fieldName.toLowerCase()}`;
+            if (removeFieldSet.has(key)) {
+              this.deleteObjectField(localObj.objectName, lf.fieldName);
+              fieldsRemoved++;
+            } else {
+              db.prepare(
+                'UPDATE sf_object_fields SET missing_in_org = 1 WHERE object_name = ? AND field_name = ?'
+              ).run(localObj.objectName, lf.fieldName);
+              fieldsKeptMissing++;
+            }
+          }
+        }
+      }
+    }
+
+    return {
+      objectsUpserted,
+      fieldsUpserted,
+      objectsRemoved,
+      fieldsRemoved,
+      objectsKeptMissing,
+      fieldsKeptMissing,
+    };
   },
 
   // ============================================================================
@@ -1020,31 +1405,117 @@ export const store = {
     };
   },
 
-  getSalesforceSettings(): SalesforceConnectionSettings {
+  getSalesforceSettings(): SalesforceConnectionSettings & { privateKeyPem?: string } {
     const row = db.prepare('SELECT * FROM sf_connection_settings WHERE id = 1').get() as any;
+    let privateKeyPem = '';
+    try {
+      privateKeyPem = row.private_key_enc ? decryptSecret(row.private_key_enc) : '';
+    } catch {
+      privateKeyPem = '';
+    }
     return {
-      expectedOrgId: row.expected_org_id,
-      instanceUrl: row.instance_url,
-      apiVersion: row.api_version,
+      enabled: Boolean(row.enabled),
+      authMode: row.auth_mode === 'simulated' ? 'simulated' : 'jwt_bearer',
+      loginUrl: row.login_url || 'https://login.salesforce.com',
+      clientId: row.client_id || '',
+      username: row.username || '',
+      hasPrivateKey: Boolean(privateKeyPem),
+      certificatePem: row.certificate_pem || '',
+      certFingerprint: row.cert_fingerprint || '',
+      connectionStatus:
+        row.connection_status === 'connected' || row.connection_status === 'error'
+          ? row.connection_status
+          : 'disconnected',
+      lastConnectedAt: row.last_connected_at || null,
+      lastError: row.last_error || '',
+      connectedOrgId: row.connected_org_id || '',
+      connectedUser: row.connected_user || '',
+      expectedOrgId: row.expected_org_id || '',
+      instanceUrl: row.instance_url || 'https://login.salesforce.com',
+      apiVersion: row.api_version || 'v62.0',
       enforceOrgIdLock: Boolean(row.enforce_org_id_lock),
-      sfdxObjectsFolderPath: row.sfdx_objects_folder_path,
+      sfdxObjectsFolderPath: row.sfdx_objects_folder_path || '',
       updatedAt: row.updated_at,
     };
   },
 
+  getSalesforceSettingsWithSecrets(): SalesforceConnectionSettings & { privateKeyPem: string } {
+    const row = db.prepare('SELECT * FROM sf_connection_settings WHERE id = 1').get() as any;
+    let privateKeyPem = '';
+    try {
+      privateKeyPem = row.private_key_enc ? decryptSecret(row.private_key_enc) : '';
+    } catch {
+      privateKeyPem = '';
+    }
+    const base = this.getSalesforceSettings();
+    return {
+      ...base,
+      privateKeyPem,
+    };
+  },
+
   updateSalesforceSettings(
-    input: Partial<SalesforceConnectionSettings>
+    input: Partial<SalesforceConnectionSettings> & { privateKeyPem?: string }
   ): SalesforceConnectionSettings {
-    const current = this.getSalesforceSettings();
+    const current = this.getSalesforceSettingsWithSecrets();
     const now = new Date().toISOString();
+
+    let nextPrivateKey = current.privateKeyPem;
+    if (input.privateKeyPem !== undefined && input.privateKeyPem.trim() !== '') {
+      nextPrivateKey = validatePrivateKeyPem(input.privateKeyPem);
+    }
+
+    const nextCertPem =
+      input.certificatePem !== undefined
+        ? input.certificatePem.trim()
+        : current.certificatePem;
+    const certInfo = inspectCertificatePem(nextCertPem);
+    const nextFingerprint =
+      input.certFingerprint !== undefined
+        ? input.certFingerprint
+        : certInfo?.fingerprintSha256 || current.certFingerprint;
+
+    const nextLoginUrl = (input.loginUrl ?? current.loginUrl).trim() || 'https://login.salesforce.com';
+    const nextInstanceUrl = (input.instanceUrl ?? current.instanceUrl).trim() || nextLoginUrl;
+
     db.prepare(`
       UPDATE sf_connection_settings
-      SET expected_org_id = ?, instance_url = ?, api_version = ?,
-          enforce_org_id_lock = ?, sfdx_objects_folder_path = ?, updated_at = ?
+      SET enabled = ?,
+          auth_mode = ?,
+          login_url = ?,
+          client_id = ?,
+          username = ?,
+          private_key_enc = ?,
+          certificate_pem = ?,
+          cert_fingerprint = ?,
+          connection_status = ?,
+          last_connected_at = ?,
+          last_error = ?,
+          connected_org_id = ?,
+          connected_user = ?,
+          expected_org_id = ?,
+          instance_url = ?,
+          api_version = ?,
+          enforce_org_id_lock = ?,
+          sfdx_objects_folder_path = ?,
+          updated_at = ?
       WHERE id = 1
     `).run(
+      (input.enabled ?? current.enabled) ? 1 : 0,
+      input.authMode ?? current.authMode,
+      nextLoginUrl,
+      (input.clientId ?? current.clientId).trim(),
+      (input.username ?? current.username).trim(),
+      nextPrivateKey ? encryptSecret(nextPrivateKey) : '',
+      nextCertPem,
+      nextFingerprint,
+      input.connectionStatus ?? current.connectionStatus,
+      input.lastConnectedAt !== undefined ? input.lastConnectedAt : current.lastConnectedAt,
+      input.lastError !== undefined ? input.lastError : current.lastError,
+      (input.connectedOrgId ?? current.connectedOrgId).trim(),
+      (input.connectedUser ?? current.connectedUser).trim(),
       (input.expectedOrgId ?? current.expectedOrgId).trim(),
-      (input.instanceUrl ?? current.instanceUrl).trim(),
+      nextInstanceUrl,
       (input.apiVersion ?? current.apiVersion).trim(),
       (input.enforceOrgIdLock ?? current.enforceOrgIdLock) ? 1 : 0,
       (input.sfdxObjectsFolderPath ?? current.sfdxObjectsFolderPath).trim(),

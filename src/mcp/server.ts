@@ -194,9 +194,12 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
           objects,
         };
       } else if (toolName === 'describe_object') {
-        const objPerm = effective.objectPermissions.get(targetObject);
+        const objPerm = Array.from(effective.objectPermissions.values()).find(
+          (o) => o.objectName.toLowerCase() === targetObject.toLowerCase()
+        );
+        const missingSet = objPerm?.missingInOrgFields || new Set<string>();
         responsePayload = {
-          objectName: targetObject,
+          objectName: objPerm?.objectName || targetObject,
           permissions: {
             canRead: objPerm?.canRead || false,
             canCreate: objPerm?.canCreate || false,
@@ -204,15 +207,27 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
             canDelete: objPerm?.canDelete || false,
           },
           allowedFields: evaluation.allowedFields,
+          activeOrgFields: evaluation.allowedFields.filter(
+            (f) => !missingSet.has(f)
+          ),
         };
       } else if (toolName === 'soql_query') {
-        const requestedFields: string[] = Array.isArray(args.fields)
+        const objPerm = Array.from(effective.objectPermissions.values()).find(
+          (o) => o.objectName.toLowerCase() === targetObject.toLowerCase()
+        );
+        const missingInOrgSet = new Set(
+          Array.from(objPerm?.missingInOrgFields || []).map((f) =>
+            f.toLowerCase()
+          )
+        );
+
+        const rawRequestedFields: string[] = Array.isArray(args.fields)
           ? args.fields.map(String)
           : evaluation.allowedFields;
         const permittedSet = new Set(
           evaluation.allowedFields.map((f) => f.toLowerCase())
         );
-        const disallowed = requestedFields.filter(
+        const disallowed = rawRequestedFields.filter(
           (f) => !permittedSet.has(f.toLowerCase())
         );
         if (disallowed.length > 0) {
@@ -220,21 +235,60 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
             `Fields [${disallowed.join(', ')}] on ${targetObject} are not permitted for Profile '${effective.profileName}'.`
           );
         }
-        const selectFields =
-          requestedFields.length > 0 ? requestedFields.join(', ') : 'Id';
-        const limit = Math.min(Number(args.limit || 50), 200);
-        const soql = `SELECT ${selectFields} FROM ${targetObject}${
-          args.whereClause ? ` WHERE ${args.whereClause}` : ''
-        } LIMIT ${limit}`;
 
-        const sfRes = await salesforceRestRequest(
-          user,
-          'GET',
-          `/query?q=${encodeURIComponent(soql)}`
-        );
+        // Automatically ignore fields known to be missing in the Salesforce Org so left-over fields never break queries
+        const ignoredMissingFields: string[] = [];
+        let activeFields = rawRequestedFields.filter((f) => {
+          if (missingInOrgSet.has(f.toLowerCase())) {
+            ignoredMissingFields.push(f);
+            return false;
+          }
+          return true;
+        });
+        if (activeFields.length === 0) {
+          activeFields = ['Id'];
+        }
+
+        const limit = Math.min(Number(args.limit || 50), 200);
+        const buildSoql = (fieldsList: string[]) =>
+          `SELECT ${fieldsList.length > 0 ? fieldsList.join(', ') : 'Id'} FROM ${targetObject}${
+            args.whereClause ? ` WHERE ${args.whereClause}` : ''
+          } LIMIT ${limit}`;
+
+        let sfRes: any;
+        try {
+          sfRes = await salesforceRestRequest(
+            user,
+            'GET',
+            `/query?q=${encodeURIComponent(buildSoql(activeFields))}`
+          );
+        } catch (queryErr: any) {
+          // Resilient fallback: If a field was deleted in Salesforce Org (`No such column 'FieldName'`), strip it and retry
+          const errMsg = String(queryErr?.message || '');
+          const match = errMsg.match(/No such column '([^']+)'/i);
+          if (match && match[1]) {
+            const invalidField = match[1];
+            ignoredMissingFields.push(invalidField);
+            activeFields = activeFields.filter(
+              (f) => f.toLowerCase() !== invalidField.toLowerCase()
+            );
+            if (activeFields.length === 0) activeFields = ['Id'];
+            sfRes = await salesforceRestRequest(
+              user,
+              'GET',
+              `/query?q=${encodeURIComponent(buildSoql(activeFields))}`
+            );
+          } else {
+            throw queryErr;
+          }
+        }
+
         responsePayload = {
           objectName: targetObject,
-          fieldsQueried: requestedFields,
+          fieldsQueried: activeFields,
+          ...(ignoredMissingFields.length > 0
+            ? { ignoredMissingFields }
+            : {}),
           totalSize: (sfRes as any)?.totalSize ?? 0,
           records: (sfRes as any)?.records ?? [],
         };
@@ -244,6 +298,16 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
         toolName === 'update_record' ||
         toolName === 'delete_record'
       ) {
+        const objPerm = Array.from(effective.objectPermissions.values()).find(
+          (o) => o.objectName.toLowerCase() === targetObject.toLowerCase()
+        );
+        const missingInOrgSet = new Set(
+          Array.from(objPerm?.missingInOrgFields || []).map((f) =>
+            f.toLowerCase()
+          )
+        );
+        const ignoredMissingFields: string[] = [];
+
         // Validate field-level permissions for create/update
         if (
           (toolName === 'create_record' || toolName === 'update_record') &&
@@ -262,14 +326,27 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
               `Fields [${disallowed.join(', ')}] on ${targetObject} are not permitted for Profile '${effective.profileName}'.`
             );
           }
+          for (const fn of inputFieldNames) {
+            if (missingInOrgSet.has(fn.toLowerCase())) {
+              ignoredMissingFields.push(fn);
+            }
+          }
         }
+
+        const effectiveFieldNames = (
+          args.fields ? Object.keys(args.fields) : evaluation.allowedFields
+        ).filter((f) => !missingInOrgSet.has(f.toLowerCase()));
 
         responsePayload = {
           status: 'SUCCESS',
           tool: toolName,
           objectName: targetObject,
           recordId: args.recordId || '001000000000001AAA',
-          fieldNames: args.fields ? Object.keys(args.fields) : evaluation.allowedFields,
+          fieldNames:
+            effectiveFieldNames.length > 0 ? effectiveFieldNames : ['Id'],
+          ...(ignoredMissingFields.length > 0
+            ? { ignoredMissingFields }
+            : {}),
         };
       }
 

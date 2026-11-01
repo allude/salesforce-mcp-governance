@@ -11,7 +11,11 @@ export const config = {
   baseUrl: process.env.BASE_URL || 'http://localhost:3000',
   nodeEnv: process.env.NODE_ENV || 'development',
   isProd: process.env.NODE_ENV === 'production',
-  dbPath: process.env.DB_PATH || path.join(process.cwd(), 'data', 'mcp-governance.sqlite'),
+  dbPath:
+    process.env.DB_PATH ||
+    (process.env.NODE_ENV === 'test'
+      ? path.join(process.cwd(), 'data', 'mcp-governance.test.sqlite')
+      : path.join(process.cwd(), 'data', 'mcp-governance.sqlite')),
 
   // 32-byte key (64 hex chars) for AES-256-GCM encryption & JWT signing
   appSecretKey: process.env.APP_SECRET_KEY && process.env.APP_SECRET_KEY.length === 64

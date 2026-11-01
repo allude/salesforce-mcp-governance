@@ -1,552 +1,1018 @@
 'use client';
 
-import React, { useState } from 'react';
-import {
-  Activity,
-  ShieldCheck,
-  ShieldAlert,
-  Users,
-  Database,
-  Layers,
-  Play,
-  Search,
-  X,
-  KeyRound,
-  Lock,
-  Plus,
-  Trash2,
-  Save,
-  Terminal,
-  UserCheck,
-  ArrowRight,
-} from 'lucide-react';
-import {
-  PortalOverviewPayload,
-  CopilotMcpLogRecord,
-  PortalAdminLogRecord,
-  AVAILABLE_MCP_ACTIONS,
-  NavViewId,
+import React, { useState, useMemo } from 'react';
+import type {
+  CopilotMcpLogEntry,
+  PortalAdminLogEntry,
+  SalesforceProfile,
+  SalesforceObjectConfig,
+  AccessGroup,
+  ProfileGroupMapping,
+  OktaConfig,
+  PortalUser,
+  SalesforceConnectionSettings,
 } from '@/types/governance';
-import { Card, Badge, Switch } from '@/components/ui/primitives';
+import { MCP_TOOL_CATALOG, formatShortTime } from '@/components/ui/primitives';
+import type { FlyoutState } from './FlyoutDrawer';
 
 // ============================================================================
-// 1. LANDING DASHBOARD (Traffic on the MCP Server + Quick Test + Both Log Previews)
+// 1. DASHBOARD VIEW
 // ============================================================================
+interface TrafficDashboardProps {
+  copilotLogs: CopilotMcpLogEntry[];
+  portalLogs: PortalAdminLogEntry[];
+  profiles: SalesforceProfile[];
+  objects: SalesforceObjectConfig[];
+  groups: AccessGroup[];
+  mappings?: ProfileGroupMapping[];
+  sfSettings?: SalesforceConnectionSettings | null;
+  selectedFlyoutId?: string;
+  onNavigateTab: (tab: string) => void;
+  onOpenFlyout: (flyout: FlyoutState) => void;
+  onSeedEnterpriseMatrix?: () => void;
+}
+
 export function TrafficDashboardView({
-  overview,
-  apiFetch,
-  onRefresh,
-  onShowToast,
-  onNavigate,
-}: {
-  overview: PortalOverviewPayload;
-  apiFetch: <T = any>(url: string, options?: RequestInit) => Promise<T>;
-  onRefresh: () => Promise<void>;
-  onShowToast: (msg: string, isError?: boolean) => void;
-  onNavigate: (view: NavViewId) => void;
-}) {
-  const [testProfileId, setTestProfileId] = useState(
-    overview.profiles[0]?.id || ''
-  );
-  const [testTool, setTestTool] = useState<string>('soql_query');
-  const [testObject, setTestObject] = useState(
-    overview.objects[0]?.objectName || 'Account'
-  );
-  const [testing, setTesting] = useState(false);
-  const [lastTestResult, setLastTestResult] = useState<any>(null);
+  copilotLogs,
+  profiles,
+  objects,
+  groups,
+  mappings = [],
+  sfSettings,
+  onNavigateTab,
+  onOpenFlyout,
+  onSeedEnterpriseMatrix,
+}: TrafficDashboardProps) {
+  const [range, setRange] = useState<'1h' | '24h' | '7d'>('24h');
 
-  const handleRunTestCall = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setTesting(true);
-    try {
-      const res = await apiFetch('/api/admin/test-mcp-access', {
-        method: 'POST',
-        body: JSON.stringify({
-          profileId: testProfileId || overview.profiles[0]?.id || '00e000000000000',
-          toolName: testTool,
-          targetObject: testObject,
-          samplePayload: {
-            objectName: testObject,
-            fields: ['Id', 'Name'],
-            whereClause: "Name = 'Sensitive Customer Name'",
-            customerSecretValue: 'SSN-999-00-1234',
-          },
-        }),
-      });
-      setLastTestResult(res);
-      await onRefresh();
-      onShowToast(
-        res.evaluation?.permitted
-          ? 'MCP Call Permitted (Logged with PII stripped)'
-          : 'MCP Call Denied by Profile Group Matrix'
-      );
-    } catch (err: any) {
-      onShowToast(err.message, true);
-    } finally {
-      setTesting(false);
-    }
+  const getProfileGroupIds = (profileId: string): string[] => {
+    const found = mappings.find((m) => m.profileId === profileId);
+    return found ? found.groupIds : [];
   };
 
+  // KPI metrics
+  const totalCalls = copilotLogs.length;
+  const allowedCalls = copilotLogs.filter((l) => l.status === 'ALLOWED').length;
+  const deniedCalls = copilotLogs.filter((l) => l.status === 'DENIED').length;
+  const errorCalls =
+    totalCalls - allowedCalls - deniedCalls > 0
+      ? totalCalls - allowedCalls - deniedCalls
+      : 0;
+  const successRate = totalCalls
+    ? ((allowedCalls / totalCalls) * 100).toFixed(1)
+    : '100.0';
+
+  const sortedLatencies = useMemo(
+    () =>
+      copilotLogs
+        .map((l) => l.latencyMs || 0)
+        .sort((a, b) => a - b),
+    [copilotLogs]
+  );
+  const p95Latency = sortedLatencies.length
+    ? sortedLatencies[Math.floor(sortedLatencies.length * 0.95)]
+    : 0;
+  const avgLatency = sortedLatencies.length
+    ? Math.round(
+        sortedLatencies.reduce((acc, v) => acc + v, 0) / sortedLatencies.length
+      )
+    : 0;
+
+  const uniqueUsers = useMemo(
+    () => new Set(copilotLogs.map((l) => l.sfUsername)).size,
+    [copilotLogs]
+  );
+  const uniqueProfilesInLogs = useMemo(
+    () => new Set(copilotLogs.map((l) => l.profileId)).size,
+    [copilotLogs]
+  );
+
+  // Stacked bar chart buckets (24 bars)
+  const buckets = useMemo(() => {
+    const count = range === '1h' ? 12 : range === '24h' ? 24 : 14;
+    const result = Array.from({ length: count }, (_, idx) => {
+      const lbl =
+        range === '1h'
+          ? `-${(count - 1 - idx) * 5}m`
+          : range === '24h'
+            ? `${String(idx).padStart(2, '0')}:00`
+            : `D-${count - 1 - idx}`;
+      return { lbl, ok: 0, warn: 0, err: 0 };
+    });
+
+    if (copilotLogs.length === 0) return result;
+
+    // Distribute real logs across buckets (by timestamp hash/hour so chart is informative & deterministic)
+    copilotLogs.forEach((log, i) => {
+      const d = new Date(log.timestamp);
+      const bucketIdx = !Number.isNaN(d.getTime())
+        ? range === '24h'
+          ? d.getHours() % count
+          : (d.getMinutes() + i) % count
+        : i % count;
+      const b = result[bucketIdx];
+      if (!b) return;
+      if (log.status === 'ALLOWED') b.ok += 1;
+      else if (log.status === 'DENIED') b.warn += 1;
+      else b.err += 1;
+    });
+
+    return result;
+  }, [copilotLogs, range]);
+
+  const maxBucket = Math.max(
+    1,
+    ...buckets.map((b) => b.ok + b.warn + b.err)
+  );
+
+  // Top tools
+  const topTools = useMemo(() => {
+    const counts: Record<string, number> = {};
+    copilotLogs.forEach((l) => {
+      counts[l.toolName] = (counts[l.toolName] || 0) + 1;
+    });
+    return Object.entries(counts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 6);
+  }, [copilotLogs]);
+  const maxToolCount = Math.max(1, ...topTools.map((t) => t[1]));
+
+  // Top users
+  const topUsers = useMemo(() => {
+    const map: Record<
+      string,
+      { user: string; profile: string; n: number; denied: number }
+    > = {};
+    copilotLogs.forEach((l) => {
+      if (!map[l.sfUsername]) {
+        map[l.sfUsername] = {
+          user: l.sfUsername,
+          profile: l.profileName,
+          n: 0,
+          denied: 0,
+        };
+      }
+      map[l.sfUsername].n += 1;
+      if (l.status === 'DENIED') map[l.sfUsername].denied += 1;
+    });
+    return Object.values(map)
+      .sort((a, b) => b.n - a.n)
+      .slice(0, 5);
+  }, [copilotLogs]);
+  const maxUserCount = Math.max(1, ...topUsers.map((u) => u.n));
+
+  // Governance health / Needs attention
+  const unassignedProfiles = profiles.filter(
+    (p) => getProfileGroupIds(p.id).length === 0
+  );
+  const disabledObjects = objects.filter((o) => !o.enabled);
+  const missingInOrgCount =
+    profiles.filter((p) => p.missingInOrg).length +
+    objects.filter(
+      (o) => o.missingInOrg || o.fields.some((f) => f.missingInOrg)
+    ).length;
+  const destructiveGroups = groups.filter((g) =>
+    g.allowedActions?.includes('delete_record')
+  );
+  const recentDenials = copilotLogs
+    .filter((l) => l.status === 'DENIED')
+    .slice(0, 5);
+
+  const totalFields = objects.reduce((acc, o) => acc + o.fields.length, 0);
+  const enabledFields = objects.reduce(
+    (acc, o) => acc + o.fields.filter((f) => f.enabled).length,
+    0
+  );
+
   return (
-    <div className="space-y-6">
-      {/* Dense KPI Strip */}
-      <div className="grid grid-cols-2 gap-3.5 sm:grid-cols-3 lg:grid-cols-6">
-        <Card className="p-4">
-          <div className="text-[11px] font-bold tracking-wider text-slate-400 uppercase">
-            MCP Requests
-          </div>
-          <div className="mt-1 font-mono text-2xl font-bold text-slate-900">
-            {overview.stats.totalMcpRequests}
-          </div>
-          <div className="mt-1 text-[11px] text-slate-500">
-            Copilot runtime traffic
-          </div>
-        </Card>
-
-        <Card className="p-4">
-          <div className="text-[11px] font-bold tracking-wider text-emerald-600 uppercase">
-            Allowed Calls
-          </div>
-          <div className="mt-1 font-mono text-2xl font-bold text-emerald-600">
-            {overview.stats.allowedMcpRequests}
-          </div>
-          <div className="mt-1 text-[11px] text-slate-500">
-            Passed Group Matrix
-          </div>
-        </Card>
-
-        <Card className="p-4">
-          <div className="text-[11px] font-bold tracking-wider text-rose-600 uppercase">
-            Denied Calls
-          </div>
-          <div className="mt-1 font-mono text-2xl font-bold text-rose-600">
-            {overview.stats.deniedMcpRequests}
-          </div>
-          <div className="mt-1 text-[11px] text-slate-500">
-            Blocked by policy
-          </div>
-        </Card>
-
-        <Card
-          className="cursor-pointer p-4 transition hover:border-indigo-300"
-          onClick={() => onNavigate('sf-profiles')}
-        >
-          <div className="text-[11px] font-bold tracking-wider text-slate-400 uppercase">
-            SF Profiles
-          </div>
-          <div className="mt-1 font-mono text-2xl font-bold text-slate-900">
-            {overview.stats.totalProfiles}
-          </div>
-          <div className="mt-1 text-[11px] text-indigo-600">
-            Manage Profiles →
-          </div>
-        </Card>
-
-        <Card
-          className="cursor-pointer p-4 transition hover:border-indigo-300"
-          onClick={() => onNavigate('sf-objects')}
-        >
-          <div className="text-[11px] font-bold tracking-wider text-slate-400 uppercase">
-            SF Objects
-          </div>
-          <div className="mt-1 font-mono text-2xl font-bold text-slate-900">
-            {overview.stats.enabledObjects}{' '}
-            <span className="text-sm font-normal text-slate-400">
-              / {overview.stats.totalObjects}
-            </span>
-          </div>
-          <div className="mt-1 text-[11px] text-indigo-600">
-            Enabled Objects →
-          </div>
-        </Card>
-
-        <Card
-          className="cursor-pointer p-4 transition hover:border-indigo-300"
-          onClick={() => onNavigate('matrix-groups')}
-        >
-          <div className="text-[11px] font-bold tracking-wider text-slate-400 uppercase">
-            Access Groups
-          </div>
-          <div className="mt-1 font-mono text-2xl font-bold text-slate-900">
-            {overview.stats.totalGroups}
-          </div>
-          <div className="mt-1 text-[11px] text-indigo-600">
-            Configure Groups →
-          </div>
-        </Card>
+    <div>
+      <div className="ph">
+        <div className="ph-l">
+          <h1>Dashboard</h1>
+          <p>MCP server traffic, policy health, and recent activity.</p>
+        </div>
+        <div className="ph-act">
+          {groups.length <= 1 && onSeedEnterpriseMatrix && (
+            <button
+              type="button"
+              className="btn"
+              onClick={onSeedEnterpriseMatrix}
+              title="Populate 5 standard Enterprise Access Groups & Profile mappings"
+            >
+              Load enterprise matrix
+            </button>
+          )}
+          <button
+            type="button"
+            className="btn"
+            onClick={() => onOpenFlyout({ type: 'simulator' })}
+          >
+            Simulate MCP call
+          </button>
+          <button
+            type="button"
+            className="btn"
+            onClick={() => onNavigateTab('traffic')}
+          >
+            View traffic log
+          </button>
+          <button
+            type="button"
+            className="btn pri"
+            onClick={() => onNavigateTab('matrix')}
+          >
+            Configure access matrix
+          </button>
+        </div>
       </div>
 
-      {/* Live Policy Simulator Bar (Test MCP Server Traffic) */}
-      <Card className="p-4">
-        <div className="mb-3 flex items-center justify-between">
-          <div>
-            <h3 className="text-xs font-bold tracking-wider text-slate-800 uppercase">
-              Test Copilot → MCP Server Request (Simulates Traffic & Logs with PII Stripped)
-            </h3>
-            <p className="text-[11px] text-slate-500">
-              Select a Salesforce Profile, MCP Action, and Object to verify effective permissions from your Profile Group Matrix.
-            </p>
+      {/* KPI Strip */}
+      <div className="kpis">
+        <div className="kpi">
+          <div className="k-lbl">
+            <span>MCP requests</span>
+            <span className="mono">{range.toUpperCase()}</span>
           </div>
-          <span className="font-mono text-[11px] text-slate-400">
-            POST /mcp
-          </span>
+          <div className="k-val">{totalCalls}</div>
+          <div className="k-sub">
+            <span>
+              Allowed: <b style={{ color: 'var(--tx)' }}>{allowedCalls}</b> ·
+              Denied: <b style={{ color: 'var(--warn)' }}>{deniedCalls}</b>
+            </span>
+          </div>
         </div>
 
-        <form
-          onSubmit={handleRunTestCall}
-          className="grid grid-cols-1 gap-2.5 sm:grid-cols-4"
-        >
-          <input
-            type="text"
-            value={testProfileId}
-            onChange={(e) => setTestProfileId(e.target.value)}
-            placeholder={
-              overview.profiles[0]?.id || 'Enter Profile ID (e.g. 00e...)'
-            }
-            list="dashboard-profile-list"
-            className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
-          />
-          <datalist id="dashboard-profile-list">
-            {overview.profiles.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.name}
-              </option>
-            ))}
-          </datalist>
+        <div className="kpi">
+          <div className="k-lbl">
+            <span>Success rate</span>
+            <span className="dot ok" />
+          </div>
+          <div className="k-val">{successRate}%</div>
+          <div className="k-sub">
+            <span>
+              {errorCalls} transport errors · target ≥ 98.0%
+            </span>
+          </div>
+        </div>
 
-          <select
-            value={testTool}
-            onChange={(e) => setTestTool(e.target.value)}
-            className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
+        <div className="kpi">
+          <div className="k-lbl">
+            <span>Policy denials</span>
+            <span className="dot warn" />
+          </div>
+          <div className="k-val">{deniedCalls}</div>
+          <div className="k-sub">
+            <span>
+              {totalCalls
+                ? ((deniedCalls / totalCalls) * 100).toFixed(1)
+                : '0.0'}
+              % of traffic · RBAC enforced
+            </span>
+          </div>
+        </div>
+
+        <div className="kpi">
+          <div className="k-lbl">
+            <span>p95 latency</span>
+            <span className="mono">ms</span>
+          </div>
+          <div className="k-val">{p95Latency}</div>
+          <div className="k-sub">
+            <span>avg {avgLatency} ms · Salesforce REST</span>
+          </div>
+        </div>
+
+        <div className="kpi">
+          <div className="k-lbl">
+            <span>Active users</span>
+            <span className="mono">Copilot</span>
+          </div>
+          <div className="k-val">{uniqueUsers}</div>
+          <div className="k-sub">
+            <span>
+              across {uniqueProfilesInLogs} active profiles ({profiles.length}{' '}
+              total)
+            </span>
+          </div>
+        </div>
+      </div>
+
+      {/* Traffic Chart + Governance Needs Attention */}
+      <div className="g2">
+        <div className="card">
+          <div className="card-h">
+            <div>
+              <div className="card-t">MCP server traffic</div>
+              <div className="card-s">
+                Requests per bucket by policy outcome
+              </div>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <div className="leg">
+                <span>
+                  <i style={{ background: 'rgba(0,163,255,0.8)' }} /> Allowed
+                </span>
+                <span>
+                  <i style={{ background: 'rgba(251,191,36,0.9)' }} /> Denied
+                </span>
+                <span>
+                  <i style={{ background: 'rgba(248,113,113,0.9)' }} /> Error
+                </span>
+              </div>
+              <div className="seg">
+                {(['1h', '24h', '7d'] as const).map((k) => (
+                  <button
+                    key={k}
+                    type="button"
+                    className={range === k ? 'on' : ''}
+                    onClick={() => setRange(k)}
+                  >
+                    {k.toUpperCase()}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+          <div className="card-b">
+            <div className="bars">
+              {buckets.map((b, i) => {
+                const tot = b.ok + b.warn + b.err;
+                const h = tot > 0 ? Math.max(8, (tot / maxBucket) * 108) : 3;
+                const okH = tot ? (b.ok / tot) * h : 0;
+                const warnH = tot ? (b.warn / tot) * h : 0;
+                const errH = tot ? (b.err / tot) * h : 0;
+                return (
+                  <div
+                    className="b-col"
+                    key={i}
+                    title={`${b.lbl} — ${b.ok} allowed, ${b.warn} denied, ${b.err} error`}
+                  >
+                    <div className="b-stk" style={{ height: `${h}px` }}>
+                      <div
+                        className="b-seg ok"
+                        style={{ height: `${okH}px` }}
+                      />
+                      <div
+                        className="b-seg warn"
+                        style={{ height: `${warnH}px` }}
+                      />
+                      <div
+                        className="b-seg err"
+                        style={{ height: `${errH}px` }}
+                      />
+                    </div>
+                    <div className="b-lbl">
+                      {i % 3 === 0 ? b.lbl.replace(':00', 'h') : ''}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="card-h">
+            <div>
+              <div className="card-t">Needs attention</div>
+              <div className="card-s">Governance checks on current config</div>
+            </div>
+            <span className="tag mono">
+              {unassignedProfiles.length +
+                disabledObjects.length +
+                destructiveGroups.length +
+                missingInOrgCount}{' '}
+              items
+            </span>
+          </div>
+          <div
+            className="card-b"
+            style={{ display: 'flex', flexDirection: 'column', gap: 8 }}
           >
-            {AVAILABLE_MCP_ACTIONS.map((a) => (
-              <option key={a.id} value={a.id}>
-                {a.id} ({a.category})
-              </option>
-            ))}
-          </select>
+            {unassignedProfiles.length > 0 && (
+              <div
+                className="chk-row"
+                style={{
+                  border: '1px solid var(--bd)',
+                  borderRadius: 6,
+                  cursor: 'pointer',
+                }}
+                onClick={() => onNavigateTab('matrix')}
+              >
+                <div>
+                  <div
+                    style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+                  >
+                    <span className="dot warn" />
+                    <b>
+                      {unassignedProfiles.length} profile
+                      {unassignedProfiles.length > 1 ? 's' : ''} have no group
+                      assigned
+                    </b>
+                  </div>
+                  <div
+                    style={{
+                      fontSize: 11.5,
+                      color: 'var(--t3)',
+                      marginTop: 2,
+                    }}
+                  >
+                    {unassignedProfiles
+                      .slice(0, 3)
+                      .map((p) => p.name)
+                      .join(', ')}
+                    {unassignedProfiles.length > 3
+                      ? ` +${unassignedProfiles.length - 3} more`
+                      : ''}{' '}
+                    — all MCP calls denied
+                  </div>
+                </div>
+                <span className="tag">Assign &rarr;</span>
+              </div>
+            )}
 
-          <input
-            type="text"
-            value={testObject}
-            onChange={(e) => setTestObject(e.target.value)}
-            placeholder="Target Object (e.g. Account)"
-            list="dashboard-object-list"
-            className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
-          />
-          <datalist id="dashboard-object-list">
-            {overview.objects.map((o) => (
-              <option key={o.objectName} value={o.objectName}>
-                {o.label}
-              </option>
-            ))}
-          </datalist>
+            {disabledObjects.length > 0 && (
+              <div
+                className="chk-row"
+                style={{
+                  border: '1px solid var(--bd)',
+                  borderRadius: 6,
+                  cursor: 'pointer',
+                }}
+                onClick={() => onNavigateTab('objects')}
+              >
+                <div>
+                  <div
+                    style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+                  >
+                    <span className="dot off" />
+                    <b>
+                      {disabledObjects.length} object
+                      {disabledObjects.length > 1 ? 's' : ''} switched off
+                    </b>
+                  </div>
+                  <div
+                    style={{
+                      fontSize: 11.5,
+                      color: 'var(--t3)',
+                      marginTop: 2,
+                    }}
+                  >
+                    {disabledObjects
+                      .slice(0, 4)
+                      .map((o) => o.objectName)
+                      .join(', ')}
+                    {disabledObjects.length > 4
+                      ? ` +${disabledObjects.length - 4} more`
+                      : ''}{' '}
+                    — review fields before enabling
+                  </div>
+                </div>
+                <span className="tag">Review &rarr;</span>
+              </div>
+            )}
 
-          <button
-            type="submit"
-            disabled={testing}
-            className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-1.5 text-xs font-semibold text-white hover:bg-indigo-700 disabled:opacity-50"
-          >
-            <Play className="h-3.5 w-3.5" />
-            {testing ? 'Testing...' : 'Send Test MCP Call'}
-          </button>
-        </form>
+            {missingInOrgCount > 0 && (
+              <div
+                className="chk-row"
+                style={{
+                  border: '1px solid var(--bd)',
+                  borderRadius: 6,
+                  cursor: 'pointer',
+                }}
+                onClick={() => onNavigateTab('objects')}
+              >
+                <div>
+                  <div
+                    style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+                  >
+                    <span className="dot warn" />
+                    <b>
+                      {missingInOrgCount} metadata item
+                      {missingInOrgCount > 1 ? 's' : ''} flagged Missing in Org
+                    </b>
+                  </div>
+                  <div
+                    style={{
+                      fontSize: 11.5,
+                      color: 'var(--t3)',
+                      marginTop: 2,
+                    }}
+                  >
+                    Drift detected between local governance store and Salesforce
+                    org
+                  </div>
+                </div>
+                <span className="tag warn">Reconcile &rarr;</span>
+              </div>
+            )}
 
-        {lastTestResult && (
-          <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs">
-            <div className="flex items-center justify-between">
-              <span className="font-semibold text-slate-800">
-                Result:{' '}
-                {lastTestResult.evaluation?.permitted ? (
-                  <span className="text-emerald-600">ALLOWED</span>
-                ) : (
-                  <span className="text-rose-600">DENIED</span>
-                )}
-              </span>
-              <span className="font-mono text-[11px] text-slate-500">
-                {lastTestResult.evaluation?.reason}
+            {destructiveGroups.length > 0 && (
+              <div
+                className="chk-row"
+                style={{
+                  border: '1px solid var(--bd)',
+                  borderRadius: 6,
+                  cursor: 'pointer',
+                }}
+                onClick={() => onNavigateTab('groups')}
+              >
+                <div>
+                  <div
+                    style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+                  >
+                    <span className="dot err" />
+                    <b>
+                      {destructiveGroups.length} group
+                      {destructiveGroups.length > 1 ? 's' : ''} allow{' '}
+                      <span className="mono">delete_record</span>
+                    </b>
+                  </div>
+                  <div
+                    style={{
+                      fontSize: 11.5,
+                      color: 'var(--t3)',
+                      marginTop: 2,
+                    }}
+                  >
+                    {destructiveGroups.map((g) => g.name).join(', ')}
+                  </div>
+                </div>
+                <span className="tag">Inspect &rarr;</span>
+              </div>
+            )}
+
+            <div
+              className="chk-row"
+              style={{
+                border: '1px solid var(--bd)',
+                borderRadius: 6,
+                cursor: 'pointer',
+              }}
+              onClick={() => onNavigateTab('sf-connection')}
+            >
+              <div>
+                <div
+                  style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+                >
+                  <span
+                    className={`dot ${
+                      sfSettings?.connectionStatus === 'connected'
+                        ? 'ok'
+                        : 'warn'
+                    }`}
+                  />
+                  <b>
+                    Salesforce Org JWT:{' '}
+                    {sfSettings?.connectionStatus === 'connected'
+                      ? `Connected (${sfSettings.connectedOrgId})`
+                      : 'Disconnected'}
+                  </b>
+                </div>
+                <div
+                  style={{
+                    fontSize: 11.5,
+                    color: 'var(--t3)',
+                    marginTop: 2,
+                  }}
+                >
+                  {sfSettings?.connectionStatus === 'connected'
+                    ? `User: ${sfSettings.connectedUser} · ${sfSettings.instanceUrl}`
+                    : 'Configure OAuth 2.0 JWT Bearer to pull live Profiles & Objects'}
+                </div>
+              </div>
+              <span className="tag">Org JWT &rarr;</span>
+            </div>
+
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                padding: '6px 4px 0',
+                fontSize: 11.5,
+                color: 'var(--t3)',
+              }}
+            >
+              <span>Config summary</span>
+              <span className="mono">
+                {objects.filter((o) => o.enabled).length}/{objects.length}{' '}
+                objects · {enabledFields}/{totalFields} fields · {groups.length}{' '}
+                groups
               </span>
             </div>
           </div>
-        )}
-      </Card>
+        </div>
+      </div>
 
-      {/* Two Separate Live Log Feeds Side-by-Side */}
-      <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
-        {/* Feed 1: Users hitting MCP Server from Copilot (PII Stripped) */}
-        <Card className="overflow-hidden">
-          <div className="flex items-center justify-between border-b border-slate-200/80 bg-slate-50/70 px-4 py-3">
-            <div>
-              <h3 className="text-xs font-bold text-slate-900">
-                1. Copilot → MCP Server Traffic Logs (PII Stripped)
-              </h3>
-              <p className="text-[11px] text-slate-500">
-                Users hitting `/mcp` from Microsoft Copilot & tools invoked
-              </p>
-            </div>
+      {/* Bottom 3 Cards */}
+      <div className="g3">
+        <div className="card">
+          <div className="card-h">
+            <div className="card-t">Most used tools</div>
+            <span className="card-s">by call count</span>
+          </div>
+          <div
+            className="card-b"
+            style={{ display: 'flex', flexDirection: 'column', gap: 8 }}
+          >
+            {topTools.length === 0 ? (
+              <div className="empty">No MCP tool calls recorded yet.</div>
+            ) : (
+              topTools.map(([tool, n]) => (
+                <div key={tool}>
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      fontSize: 12,
+                      marginBottom: 3,
+                    }}
+                  >
+                    <span className="mono">{tool}</span>
+                    <span className="mono" style={{ color: 'var(--t2)' }}>
+                      {n}
+                    </span>
+                  </div>
+                  <div
+                    style={{
+                      height: 5,
+                      background: 'var(--bg)',
+                      borderRadius: 3,
+                      overflow: 'hidden',
+                    }}
+                  >
+                    <div
+                      style={{
+                        width: `${(n / maxToolCount) * 100}%`,
+                        height: '100%',
+                        background:
+                          tool === 'delete_record'
+                            ? 'var(--err)'
+                            : 'var(--acc)',
+                      }}
+                    />
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="card-h">
+            <div className="card-t">Most active users</div>
+            <span className="card-s">Copilot callers</span>
+          </div>
+          <div
+            className="card-b"
+            style={{ display: 'flex', flexDirection: 'column', gap: 8 }}
+          >
+            {topUsers.length === 0 ? (
+              <div className="empty">No active callers yet.</div>
+            ) : (
+              topUsers.map((u) => (
+                <div key={u.user}>
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      fontSize: 12,
+                      marginBottom: 3,
+                    }}
+                  >
+                    <span>
+                      {u.user}{' '}
+                      <span style={{ color: 'var(--t3)', fontSize: 11 }}>
+                        · {u.profile}
+                      </span>
+                    </span>
+                    <span className="mono" style={{ color: 'var(--t2)' }}>
+                      {u.n}
+                    </span>
+                  </div>
+                  <div
+                    style={{
+                      height: 5,
+                      background: 'var(--bg)',
+                      borderRadius: 3,
+                      overflow: 'hidden',
+                    }}
+                  >
+                    <div
+                      style={{
+                        width: `${(u.n / maxUserCount) * 100}%`,
+                        height: '100%',
+                        background: 'var(--acc)',
+                      }}
+                    />
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="card-h">
+            <div className="card-t">Recent denials</div>
             <button
-              onClick={() => onNavigate('logs-copilot')}
-              className="inline-flex items-center gap-1 text-xs font-semibold text-indigo-600 hover:underline"
+              type="button"
+              className="btn gh sm"
+              onClick={() => onNavigateTab('traffic')}
             >
-              <span>View All ({overview.copilotLogs.length})</span>
-              <ArrowRight className="h-3 w-3" />
+              View in log &rarr;
             </button>
           </div>
-
-          <div className="overflow-x-auto">
-            <table className="w-full border-collapse text-left text-xs">
-              <thead>
-                <tr className="border-b border-slate-100 bg-slate-50/40 text-[10px] font-bold tracking-wider text-slate-400 uppercase">
-                  <th className="py-2 pr-2 pl-4">Time</th>
-                  <th className="px-2 py-2">Copilot User / Profile</th>
-                  <th className="px-2 py-2">Tool & Object</th>
-                  <th className="py-2 pr-4 pl-2 text-right">Status</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {overview.copilotLogs.length === 0 ? (
-                  <tr>
-                    <td
-                      colSpan={4}
-                      className="py-8 text-center text-xs text-slate-400"
-                    >
-                      No Copilot MCP traffic recorded yet.
-                    </td>
-                  </tr>
-                ) : (
-                  overview.copilotLogs.slice(0, 8).map((l) => (
-                    <tr key={l.id} className="hover:bg-slate-50">
-                      <td className="py-2 pr-2 pl-4 font-mono text-[11px] text-slate-500">
-                        {new Date(l.timestamp).toLocaleTimeString()}
-                      </td>
-                      <td className="px-2 py-2">
-                        <div className="font-medium text-slate-900">
-                          {l.sfUsername}
-                        </div>
-                        <div className="font-mono text-[10px] text-slate-400">
-                          {l.profileName} ({l.profileId})
-                        </div>
-                      </td>
-                      <td className="px-2 py-2 font-mono text-[11px] text-slate-800">
-                        {l.toolName}{' '}
-                        {l.targetObject && l.targetObject !== '*'
-                          ? `(${l.targetObject})`
-                          : ''}
-                      </td>
-                      <td className="py-2 pr-4 pl-2 text-right">
-                        <Badge
-                          variant={
-                            l.status === 'ALLOWED' ? 'emerald' : 'rose'
-                          }
-                        >
-                          {l.status}
-                        </Badge>
-                      </td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
+          <div className="card-b" style={{ padding: 0 }}>
+            {recentDenials.length === 0 ? (
+              <div className="empty">No policy denials in window.</div>
+            ) : (
+              recentDenials.map((r) => (
+                <div
+                  key={r.id}
+                  className="chk-row"
+                  style={{ cursor: 'pointer', padding: '8px 14px' }}
+                  onClick={() => onOpenFlyout({ type: 'traffic', data: r })}
+                >
+                  <div>
+                    <div className="mono" style={{ fontSize: 11.5 }}>
+                      {r.toolName}({r.targetObject})
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--t3)' }}>
+                      {r.sfUsername} · {r.profileName}
+                    </div>
+                  </div>
+                  <span className="mono" style={{ color: 'var(--t3)' }}>
+                    {formatShortTime(r.timestamp)}
+                  </span>
+                </div>
+              ))
+            )}
           </div>
-        </Card>
-
-        {/* Feed 2: Portal Admin Users & Configuration Actions */}
-        <Card className="overflow-hidden">
-          <div className="flex items-center justify-between border-b border-slate-200/80 bg-slate-50/70 px-4 py-3">
-            <div>
-              <h3 className="text-xs font-bold text-slate-900">
-                2. Web Portal Admin Sign-Ins & Configuration Logs
-              </h3>
-              <p className="text-[11px] text-slate-500">
-                Portal users signing in & configuration changes made
-              </p>
-            </div>
-            <button
-              onClick={() => onNavigate('logs-portal')}
-              className="inline-flex items-center gap-1 text-xs font-semibold text-indigo-600 hover:underline"
-            >
-              <span>View All ({overview.portalLogs.length})</span>
-              <ArrowRight className="h-3 w-3" />
-            </button>
-          </div>
-
-          <div className="overflow-x-auto">
-            <table className="w-full border-collapse text-left text-xs">
-              <thead>
-                <tr className="border-b border-slate-100 bg-slate-50/40 text-[10px] font-bold tracking-wider text-slate-400 uppercase">
-                  <th className="py-2 pr-2 pl-4">Time</th>
-                  <th className="px-2 py-2">Portal User</th>
-                  <th className="px-2 py-2">Action</th>
-                  <th className="py-2 pr-4 pl-2">Details</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {overview.portalLogs.length === 0 ? (
-                  <tr>
-                    <td
-                      colSpan={4}
-                      className="py-8 text-center text-xs text-slate-400"
-                    >
-                      No portal actions recorded yet.
-                    </td>
-                  </tr>
-                ) : (
-                  overview.portalLogs.slice(0, 8).map((p) => (
-                    <tr key={p.id} className="hover:bg-slate-50">
-                      <td className="py-2 pr-2 pl-4 font-mono text-[11px] text-slate-500">
-                        {new Date(p.timestamp).toLocaleTimeString()}
-                      </td>
-                      <td className="px-2 py-2">
-                        <span className="font-semibold text-slate-900">
-                          {p.adminUsername}
-                        </span>
-                        <span className="ml-1.5 rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-500">
-                          {p.authMethod}
-                        </span>
-                      </td>
-                      <td className="px-2 py-2">
-                        <Badge variant="indigo">{p.action}</Badge>
-                      </td>
-                      <td className="max-w-xs truncate py-2 pr-4 pl-2 text-[11px] text-slate-600">
-                        {p.details}
-                      </td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
-          </div>
-        </Card>
+        </div>
       </div>
     </div>
   );
 }
 
 // ============================================================================
-// 2. COPILOT MCP SERVER LOGS VIEW (With Sensitive Data Stripped Out)
+// 2. COPILOT MCP TRAFFIC LOG VIEW
 // ============================================================================
+interface CopilotMcpLogsViewProps {
+  logs: CopilotMcpLogEntry[];
+  objects: SalesforceObjectConfig[];
+  selectedFlyoutId?: string;
+  initialSearch?: string;
+  onClearLogs: () => Promise<void>;
+  onOpenFlyout: (flyout: FlyoutState) => void;
+}
+
 export function CopilotMcpLogsView({
   logs,
-}: {
-  logs: CopilotMcpLogRecord[];
-}) {
-  const [search, setSearch] = useState('');
-  const [selectedLog, setSelectedLog] = useState<CopilotMcpLogRecord | null>(
-    null
-  );
+  objects,
+  selectedFlyoutId,
+  initialSearch = '',
+  onClearLogs,
+  onOpenFlyout,
+}: CopilotMcpLogsViewProps) {
+  const [q, setQ] = useState(initialSearch);
+  const [statusFilter, setStatusFilter] = useState<
+    'all' | 'ALLOWED' | 'DENIED' | 'ERROR'
+  >('all');
+  const [toolFilter, setToolFilter] = useState('all');
+  const [objFilter, setObjFilter] = useState('all');
 
-  const filtered = logs.filter(
-    (l) =>
-      !search.trim() ||
-      l.sfUsername.toLowerCase().includes(search.toLowerCase()) ||
-      l.profileName.toLowerCase().includes(search.toLowerCase()) ||
-      l.profileId.toLowerCase().includes(search.toLowerCase()) ||
-      l.toolName.toLowerCase().includes(search.toLowerCase()) ||
-      l.targetObject.toLowerCase().includes(search.toLowerCase())
-  );
+  React.useEffect(() => {
+    if (initialSearch) setQ(initialSearch);
+  }, [initialSearch]);
+
+  const rows = useMemo(() => {
+    return logs.filter(
+      (r) =>
+        (statusFilter === 'all' || r.status === statusFilter) &&
+        (toolFilter === 'all' || r.toolName === toolFilter) &&
+        (objFilter === 'all' || r.targetObject === objFilter) &&
+        (!q ||
+          r.sfUsername.toLowerCase().includes(q.toLowerCase()) ||
+          r.profileName.toLowerCase().includes(q.toLowerCase()) ||
+          r.toolName.toLowerCase().includes(q.toLowerCase()) ||
+          r.targetObject.toLowerCase().includes(q.toLowerCase()) ||
+          r.profileId.toLowerCase().includes(q.toLowerCase()))
+    );
+  }, [logs, statusFilter, toolFilter, objFilter, q]);
+
+  const exportCsv = () => {
+    const header =
+      'Id,Timestamp,User,ProfileId,ProfileName,Tool,TargetObject,Status,LatencyMs\n';
+    const body = rows
+      .map(
+        (r) =>
+          `"${r.id}","${r.timestamp}","${r.sfUsername}","${r.profileId}","${r.profileName}","${r.toolName}","${r.targetObject}","${r.status}",${r.latencyMs}`
+      )
+      .join('\n');
+    const blob = new Blob([header + body], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `mcp-traffic-log-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
 
   return (
-    <div className="space-y-5">
-      <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
-        <div>
-          <h2 className="text-base font-bold text-slate-900">
-            Copilot → MCP Server Execution Logs (Sensitive Data Stripped)
-          </h2>
-          <p className="text-xs text-slate-500">
-            Logs every user hitting the MCP server from Microsoft Copilot, the tool used, matched Access Groups, and structure-only payload with literal data values stripped out (`&lt;REDACTED&gt;`).
+    <div>
+      <div className="ph">
+        <div className="ph-l">
+          <h1>MCP traffic log</h1>
+          <p>
+            Every tool call from Microsoft Copilot Studio to the Salesforce MCP
+            server. Sensitive field values are redacted before storage.
           </p>
         </div>
-
-        <div className="relative">
-          <Search className="pointer-events-none absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-          <input
-            type="text"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Filter user, profile, tool, object..."
-            className="w-64 rounded-lg border border-slate-200 bg-white py-1.5 pr-3 pl-8 text-xs text-slate-800 focus:border-indigo-500 focus:outline-none"
-          />
+        <div className="ph-act">
+          <button
+            type="button"
+            className="btn pri"
+            onClick={() => onOpenFlyout({ type: 'simulator' })}
+          >
+            Simulate MCP call
+          </button>
+          <button type="button" className="btn" onClick={exportCsv}>
+            Export CSV
+          </button>
+          {logs.length > 0 && (
+            <button type="button" className="btn dng" onClick={onClearLogs}>
+              Clear log
+            </button>
+          )}
         </div>
       </div>
 
-      <Card className="overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full border-collapse text-left text-xs">
+      <div className="card">
+        <div className="tbar">
+          <div className="tbar-l">
+            <div className="srch">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.75"
+              >
+                <circle cx="11" cy="11" r="7" />
+                <path d="M20 20l-3.5-3.5" />
+              </svg>
+              <input
+                placeholder="Search user, profile, tool, object…"
+                value={q}
+                onChange={(e) => setQ(e.target.value)}
+              />
+            </div>
+            <div className="seg">
+              {(
+                [
+                  ['all', 'All'],
+                  ['ALLOWED', 'Allowed'],
+                  ['DENIED', 'Denied'],
+                ] as const
+              ).map(([k, lbl]) => (
+                <button
+                  key={k}
+                  type="button"
+                  className={statusFilter === k ? 'on' : ''}
+                  onClick={() => setStatusFilter(k)}
+                >
+                  {lbl}
+                </button>
+              ))}
+            </div>
+            <select
+              className="inp"
+              style={{ width: 'auto', padding: '4px 8px', fontSize: 12 }}
+              value={toolFilter}
+              onChange={(e) => setToolFilter(e.target.value)}
+            >
+              <option value="all">All tools</option>
+              {MCP_TOOL_CATALOG.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.label}
+                </option>
+              ))}
+            </select>
+            <select
+              className="inp"
+              style={{ width: 'auto', padding: '4px 8px', fontSize: 12 }}
+              value={objFilter}
+              onChange={(e) => setObjFilter(e.target.value)}
+            >
+              <option value="all">All objects</option>
+              {objects.map((o) => (
+                <option key={o.objectName} value={o.objectName}>
+                  {o.objectName}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="tbar-r">
+            <span className="tag ok">
+              <span className="dot ok" /> PII redaction active
+            </span>
+            <span className="mono" style={{ color: 'var(--t3)' }}>
+              {rows.length} of {logs.length} events
+            </span>
+          </div>
+        </div>
+
+        <div className="tbl-wrap">
+          <table className="tbl">
             <thead>
-              <tr className="border-b border-slate-200/80 bg-slate-50/70 text-[11px] font-bold tracking-wider text-slate-400 uppercase">
-                <th className="py-2.5 pr-3 pl-4">Timestamp</th>
-                <th className="px-3 py-2.5">Salesforce User</th>
-                <th className="px-3 py-2.5">Profile</th>
-                <th className="px-3 py-2.5">Matched Groups</th>
-                <th className="px-3 py-2.5">Tool & Object</th>
-                <th className="px-3 py-2.5">Status</th>
-                <th className="py-2.5 pr-4 pl-3 text-right">Payload</th>
+              <tr>
+                <th>Time</th>
+                <th>User</th>
+                <th>Salesforce profile</th>
+                <th>Matched groups</th>
+                <th>MCP tool</th>
+                <th>Object</th>
+                <th>Latency</th>
+                <th>Result</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-100">
-              {filtered.length === 0 ? (
+            <tbody>
+              {rows.length === 0 ? (
                 <tr>
-                  <td
-                    colSpan={7}
-                    className="py-10 text-center text-xs text-slate-400"
-                  >
-                    No Copilot MCP requests logged yet.
+                  <td colSpan={8} className="empty">
+                    No matching traffic events. Click &ldquo;Simulate MCP
+                    call&rdquo; to test live policy evaluation.
                   </td>
                 </tr>
               ) : (
-                filtered.map((l) => (
+                rows.map((r) => (
                   <tr
-                    key={l.id}
-                    onClick={() => setSelectedLog(l)}
-                    className="cursor-pointer hover:bg-slate-50/90"
+                    key={r.id}
+                    className={`row ${
+                      selectedFlyoutId === r.id ? 'sel' : ''
+                    }`}
+                    onClick={() =>
+                      onOpenFlyout({ type: 'traffic', data: r })
+                    }
                   >
-                    <td className="py-2.5 pr-3 pl-4 font-mono text-[11px] text-slate-500">
-                      {new Date(l.timestamp).toLocaleString()}
+                    <td className="mono" style={{ color: 'var(--t2)' }}>
+                      {formatShortTime(r.timestamp)}
                     </td>
-                    <td className="px-3 py-2.5 font-medium text-slate-900">
-                      {l.sfUsername}
-                    </td>
-                    <td className="px-3 py-2.5">
-                      <div className="font-medium text-slate-800">
-                        {l.profileName}
+                    <td>{r.sfUsername}</td>
+                    <td>
+                      <div>{r.profileName}</div>
+                      <div
+                        className="mono"
+                        style={{ color: 'var(--t3)', fontSize: 10.5 }}
+                      >
+                        {r.profileId}
                       </div>
-                      <div className="font-mono text-[10px] text-slate-400">
-                        {l.profileId}
-                      </div>
                     </td>
-                    <td className="px-3 py-2.5">
-                      {l.matchedGroups.length === 0 ? (
-                        <span className="text-[11px] text-slate-400">None</span>
+                    <td>
+                      {!r.matchedGroups || r.matchedGroups.length === 0 ? (
+                        <span className="tag warn">None</span>
                       ) : (
-                        <div className="flex flex-wrap gap-1">
-                          {l.matchedGroups.map((g) => (
-                            <Badge key={g} variant="indigo">
-                              {g}
-                            </Badge>
+                        <div
+                          style={{
+                            display: 'flex',
+                            gap: 4,
+                            flexWrap: 'wrap',
+                          }}
+                        >
+                          {r.matchedGroups.map((gn) => (
+                            <span key={gn} className="tag">
+                              {gn}
+                            </span>
                           ))}
                         </div>
                       )}
                     </td>
-                    <td className="px-3 py-2.5 font-mono text-xs font-semibold text-slate-800">
-                      {l.toolName}{' '}
-                      {l.targetObject && l.targetObject !== '*'
-                        ? `→ ${l.targetObject}`
-                        : ''}
+                    <td className="mono">{r.toolName}</td>
+                    <td className="mono">{r.targetObject}</td>
+                    <td className="mono" style={{ color: 'var(--t2)' }}>
+                      {r.latencyMs} ms
                     </td>
-                    <td className="px-3 py-2.5">
-                      <Badge
-                        variant={l.status === 'ALLOWED' ? 'emerald' : 'rose'}
+                    <td>
+                      <span
+                        className={`tag ${
+                          r.status === 'ALLOWED'
+                            ? 'ok'
+                            : r.status === 'DENIED'
+                              ? 'warn'
+                              : 'err'
+                        }`}
                       >
-                        {l.status}
-                      </Badge>
-                    </td>
-                    <td className="py-2.5 pr-4 pl-3 text-right">
-                      <button
-                        type="button"
-                        className="rounded-md border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-indigo-600 hover:bg-indigo-50"
-                      >
-                        View Stripped Payload
-                      </button>
+                        <span
+                          className={`dot ${
+                            r.status === 'ALLOWED'
+                              ? 'ok'
+                              : r.status === 'DENIED'
+                                ? 'warn'
+                                : 'err'
+                          }`}
+                        />
+                        {r.status}
+                      </span>
                     </td>
                   </tr>
                 ))
@@ -554,193 +1020,191 @@ export function CopilotMcpLogsView({
             </tbody>
           </table>
         </div>
-      </Card>
-
-      {/* Slide-over Sanitized Payload Drawer */}
-      {selectedLog && (
-        <div
-          className="fixed inset-0 z-50 flex justify-end bg-slate-900/30 backdrop-blur-[1px]"
-          onClick={() => setSelectedLog(null)}
-        >
-          <div
-            className="flex h-full w-full max-w-xl flex-col border-l border-slate-200 bg-white shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between border-b border-slate-200 px-6 py-4">
-              <div>
-                <div className="flex items-center gap-2">
-                  <span className="font-mono text-sm font-bold text-indigo-600">
-                    {selectedLog.toolName}
-                  </span>
-                  <Badge
-                    variant={
-                      selectedLog.status === 'ALLOWED' ? 'emerald' : 'rose'
-                    }
-                  >
-                    {selectedLog.status}
-                  </Badge>
-                </div>
-                <p className="mt-0.5 font-mono text-[11px] text-slate-400">
-                  {selectedLog.id} •{' '}
-                  {new Date(selectedLog.timestamp).toLocaleString()}
-                </p>
-              </div>
-              <button
-                onClick={() => setSelectedLog(null)}
-                className="rounded-lg border border-slate-200 p-1.5 text-slate-500 hover:bg-slate-100"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-
-            <div className="flex-1 space-y-5 overflow-y-auto p-6 text-xs">
-              <div className="grid grid-cols-2 gap-3 rounded-xl border border-slate-200 bg-slate-50 p-3.5">
-                <div>
-                  <span className="text-[10px] font-bold text-slate-400 uppercase">
-                    Copilot Caller
-                  </span>
-                  <p className="mt-0.5 font-semibold text-slate-900">
-                    {selectedLog.sfUsername}
-                  </p>
-                </div>
-                <div>
-                  <span className="text-[10px] font-bold text-slate-400 uppercase">
-                    Salesforce Profile
-                  </span>
-                  <p className="mt-0.5 font-semibold text-slate-900">
-                    {selectedLog.profileName}
-                  </p>
-                  <p className="font-mono text-[11px] text-indigo-600">
-                    {selectedLog.profileId}
-                  </p>
-                </div>
-              </div>
-
-              <div>
-                <h4 className="mb-1.5 text-xs font-bold text-slate-700 uppercase">
-                  Sanitized Request Payload (Literal Values Stripped)
-                </h4>
-                <pre className="overflow-x-auto rounded-xl bg-slate-900 p-4 font-mono text-xs text-slate-100">
-                  {selectedLog.sanitizedRequestPayload}
-                </pre>
-              </div>
-
-              <div>
-                <h4 className="mb-1.5 text-xs font-bold text-slate-700 uppercase">
-                  Sanitized Response Summary (Records Stripped)
-                </h4>
-                <pre className="overflow-x-auto rounded-xl bg-slate-900 p-4 font-mono text-xs text-emerald-300">
-                  {selectedLog.sanitizedResponseSummary}
-                </pre>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
+      </div>
     </div>
   );
 }
 
 // ============================================================================
-// 3. PORTAL ADMIN AUDIT LOGS VIEW (Users signing into portal & actions taken)
+// 3. PORTAL AUDIT LOG VIEW
 // ============================================================================
+interface PortalAdminLogsViewProps {
+  logs: PortalAdminLogEntry[];
+  selectedFlyoutId?: string;
+  onOpenFlyout: (flyout: FlyoutState) => void;
+}
+
 export function PortalAdminLogsView({
   logs,
-}: {
-  logs: PortalAdminLogRecord[];
-}) {
-  const [search, setSearch] = useState('');
+  selectedFlyoutId,
+  onOpenFlyout,
+}: PortalAdminLogsViewProps) {
+  const [q, setQ] = useState('');
+  const [method, setMethod] = useState<'all' | 'okta_sso' | 'password'>(
+    'all'
+  );
+  const [actionFilter, setActionFilter] = useState('all');
 
-  const filtered = logs.filter(
-    (l) =>
-      !search.trim() ||
-      l.adminUsername.toLowerCase().includes(search.toLowerCase()) ||
-      l.action.toLowerCase().includes(search.toLowerCase()) ||
-      l.target.toLowerCase().includes(search.toLowerCase()) ||
-      l.details.toLowerCase().includes(search.toLowerCase())
+  const uniqueActions = useMemo(
+    () => Array.from(new Set(logs.map((l) => l.action))),
+    [logs]
   );
 
+  const rows = useMemo(() => {
+    return logs.filter(
+      (r) =>
+        (method === 'all' || r.authMethod === method) &&
+        (actionFilter === 'all' || r.action === actionFilter) &&
+        (!q ||
+          r.adminUsername.toLowerCase().includes(q.toLowerCase()) ||
+          r.action.toLowerCase().includes(q.toLowerCase()) ||
+          r.target.toLowerCase().includes(q.toLowerCase()) ||
+          r.details.toLowerCase().includes(q.toLowerCase()))
+    );
+  }, [logs, method, actionFilter, q]);
+
+  const exportCsv = () => {
+    const header =
+      'Id,Timestamp,AdminUsername,AuthMethod,Action,Target,Details,IpAddress\n';
+    const body = rows
+      .map(
+        (r) =>
+          `"${r.id}","${r.timestamp}","${r.adminUsername}","${r.authMethod}","${r.action}","${r.target}","${r.details.replace(/"/g, '""')}","${r.ipAddress}"`
+      )
+      .join('\n');
+    const blob = new Blob([header + body], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `portal-audit-log-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   return (
-    <div className="space-y-5">
-      <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
-        <div>
-          <h2 className="text-base font-bold text-slate-900">
-            Web Portal Admin Sign-Ins & Configuration Audit Logs
-          </h2>
-          <p className="text-xs text-slate-500">
-            Tracks everyone who signs into this administration portal (via Username/Password or Okta SSO) and every configuration change they make.
+    <div>
+      <div className="ph">
+        <div className="ph-l">
+          <h1>Portal audit log</h1>
+          <p>
+            Administrative sign-ins and configuration changes in this control
+            plane.
           </p>
         </div>
-
-        <div className="relative">
-          <Search className="pointer-events-none absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-          <input
-            type="text"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Filter portal user, action, target..."
-            className="w-64 rounded-lg border border-slate-200 bg-white py-1.5 pr-3 pl-8 text-xs text-slate-800 focus:border-indigo-500 focus:outline-none"
-          />
+        <div className="ph-act">
+          <button type="button" className="btn" onClick={exportCsv}>
+            Export CSV
+          </button>
         </div>
       </div>
 
-      <Card className="overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full border-collapse text-left text-xs">
+      <div className="card">
+        <div className="tbar">
+          <div className="tbar-l">
+            <div className="srch">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.75"
+              >
+                <circle cx="11" cy="11" r="7" />
+                <path d="M20 20l-3.5-3.5" />
+              </svg>
+              <input
+                placeholder="Search admin, action, target, details…"
+                value={q}
+                onChange={(e) => setQ(e.target.value)}
+              />
+            </div>
+            <div className="seg">
+              {(
+                [
+                  ['all', 'All'],
+                  ['okta_sso', 'Okta SSO'],
+                  ['password', 'Password'],
+                ] as const
+              ).map(([k, lbl]) => (
+                <button
+                  key={k}
+                  type="button"
+                  className={method === k ? 'on' : ''}
+                  onClick={() => setMethod(k)}
+                >
+                  {lbl}
+                </button>
+              ))}
+            </div>
+            <select
+              className="inp"
+              style={{ width: 'auto', padding: '4px 8px', fontSize: 12 }}
+              value={actionFilter}
+              onChange={(e) => setActionFilter(e.target.value)}
+            >
+              <option value="all">All actions</option>
+              {uniqueActions.map((a) => (
+                <option key={a} value={a}>
+                  {a}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="tbar-r">
+            <span className="mono" style={{ color: 'var(--t3)' }}>
+              {rows.length} events
+            </span>
+          </div>
+        </div>
+
+        <div className="tbl-wrap">
+          <table className="tbl">
             <thead>
-              <tr className="border-b border-slate-200/80 bg-slate-50/70 text-[11px] font-bold tracking-wider text-slate-400 uppercase">
-                <th className="py-2.5 pr-3 pl-4">Timestamp</th>
-                <th className="px-3 py-2.5">Portal User</th>
-                <th className="px-3 py-2.5">Auth Method</th>
-                <th className="px-3 py-2.5">Action</th>
-                <th className="px-3 py-2.5">Target</th>
-                <th className="px-3 py-2.5">Details</th>
-                <th className="py-2.5 pr-4 pl-3 text-right">IP</th>
+              <tr>
+                <th>Timestamp</th>
+                <th>Administrator</th>
+                <th>Sign-in method</th>
+                <th>Action</th>
+                <th>Target</th>
+                <th>Details</th>
+                <th>Source IP</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-100">
-              {filtered.length === 0 ? (
+            <tbody>
+              {rows.length === 0 ? (
                 <tr>
-                  <td
-                    colSpan={7}
-                    className="py-10 text-center text-xs text-slate-400"
-                  >
-                    No portal admin logs recorded yet.
+                  <td colSpan={7} className="empty">
+                    No matching portal audit events.
                   </td>
                 </tr>
               ) : (
-                filtered.map((l) => (
-                  <tr key={l.id} className="hover:bg-slate-50/80">
-                    <td className="py-2.5 pr-3 pl-4 font-mono text-[11px] whitespace-nowrap text-slate-500">
-                      {new Date(l.timestamp).toLocaleString()}
+                rows.map((r) => (
+                  <tr
+                    key={r.id}
+                    className={`row ${
+                      selectedFlyoutId === r.id ? 'sel' : ''
+                    }`}
+                    onClick={() => onOpenFlyout({ type: 'audit', data: r })}
+                  >
+                    <td className="mono" style={{ color: 'var(--t2)' }}>
+                      {r.timestamp.slice(0, 19).replace('T', ' ')}
                     </td>
-                    <td className="px-3 py-2.5 font-semibold text-slate-900">
-                      {l.adminUsername}
-                    </td>
-                    <td className="px-3 py-2.5">
-                      <Badge
-                        variant={
-                          l.authMethod === 'okta_sso' ? 'indigo' : 'slate'
-                        }
+                    <td>{r.adminUsername}</td>
+                    <td>
+                      <span
+                        className={`tag ${
+                          r.authMethod === 'okta_sso' ? 'acc' : ''
+                        }`}
                       >
-                        {l.authMethod === 'okta_sso'
-                          ? 'Okta SSO'
-                          : 'Username / Password'}
-                      </Badge>
-                    </td>
-                    <td className="px-3 py-2.5">
-                      <span className="rounded bg-indigo-50 px-2 py-0.5 font-mono text-[11px] font-bold text-indigo-700">
-                        {l.action}
+                        {r.authMethod === 'okta_sso' ? 'Okta SSO' : 'Password'}
                       </span>
                     </td>
-                    <td className="px-3 py-2.5 font-mono text-[11px] text-slate-800">
-                      {l.target}
+                    <td>
+                      <span className="tag mono">{r.action}</span>
                     </td>
-                    <td className="max-w-md px-3 py-2.5 text-slate-600">
-                      {l.details}
-                    </td>
-                    <td className="py-2.5 pr-4 pl-3 text-right font-mono text-[11px] text-slate-400">
-                      {l.ipAddress}
+                    <td className="mono">{r.target}</td>
+                    <td style={{ color: 'var(--t2)' }}>{r.details}</td>
+                    <td className="mono" style={{ color: 'var(--t3)' }}>
+                      {r.ipAddress}
                     </td>
                   </tr>
                 ))
@@ -748,7 +1212,7 @@ export function PortalAdminLogsView({
             </tbody>
           </table>
         </div>
-      </Card>
+      </div>
     </div>
   );
 }
@@ -756,249 +1220,238 @@ export function PortalAdminLogsView({
 // ============================================================================
 // 4. PORTAL AUTH & OKTA SSO SETTINGS VIEW
 // ============================================================================
-export function PortalAuthSettingsView({
-  overview,
-  apiFetch,
-  onRefresh,
-  onShowToast,
-}: {
-  overview: PortalOverviewPayload;
-  apiFetch: <T = any>(url: string, options?: RequestInit) => Promise<T>;
-  onRefresh: () => Promise<void>;
-  onShowToast: (msg: string, isError?: boolean) => void;
-}) {
-  // Okta SSO State
-  const [oktaEnabled, setOktaEnabled] = useState(overview.oktaSettings.enabled);
-  const [oktaDomain, setOktaDomain] = useState(
-    overview.oktaSettings.oktaDomain
-  );
-  const [clientId, setClientId] = useState(overview.oktaSettings.clientId);
-  const [clientSecret, setClientSecret] = useState('');
-  const [adminGroup, setAdminGroup] = useState(
-    overview.oktaSettings.adminGroup
-  );
+interface PortalAuthSettingsViewProps {
+  oktaSettings: OktaConfig;
+  portalUsers: PortalUser[];
+  onSaveOkta: (settings: Partial<OktaConfig>) => Promise<void>;
+  onCreatePortalUser: (user: {
+    username: string;
+    displayName: string;
+    password: string;
+    role: string;
+  }) => Promise<void>;
+  onDeletePortalUser: (username: string) => Promise<void>;
+}
 
-  // New Portal User State
+export function PortalAuthSettingsView({
+  oktaSettings,
+  portalUsers,
+  onSaveOkta,
+  onCreatePortalUser,
+  onDeletePortalUser,
+}: PortalAuthSettingsViewProps) {
+  const [oktaDraft, setOktaDraft] = useState<OktaConfig>(oktaSettings);
   const [newUsername, setNewUsername] = useState('');
   const [newDisplayName, setNewDisplayName] = useState('');
   const [newPassword, setNewPassword] = useState('');
+  const [newRole, setNewRole] = useState('Security Admin');
+  const [busy, setBusy] = useState(false);
 
-  const handleSaveOkta = async (e: React.FormEvent) => {
-    e.preventDefault();
-    try {
-      await apiFetch('/api/admin/okta', {
-        method: 'PUT',
-        body: JSON.stringify({
-          enabled: oktaEnabled,
-          oktaDomain,
-          clientId,
-          clientSecret: clientSecret.trim() || undefined,
-          adminGroup,
-        }),
-      });
-      setClientSecret('');
-      await onRefresh();
-      onShowToast('Saved Okta SSO configuration');
-    } catch (err: any) {
-      onShowToast(err.message, true);
-    }
-  };
-
-  const handleAddPortalUser = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newUsername.trim() || !newPassword.trim()) return;
-    try {
-      await apiFetch('/api/admin/portal-users', {
-        method: 'POST',
-        body: JSON.stringify({
-          username: newUsername.trim(),
-          displayName: newDisplayName.trim() || newUsername.trim(),
-          password: newPassword,
-        }),
-      });
-      setNewUsername('');
-      setNewDisplayName('');
-      setNewPassword('');
-      await onRefresh();
-      onShowToast(`Saved portal user "${newUsername.trim()}"`);
-    } catch (err: any) {
-      onShowToast(err.message, true);
-    }
-  };
-
-  const handleDeletePortalUser = async (username: string) => {
-    try {
-      await apiFetch(
-        `/api/admin/portal-users/${encodeURIComponent(username)}`,
-        {
-          method: 'DELETE',
-        }
-      );
-      await onRefresh();
-      onShowToast(`Deleted portal user "${username}"`);
-    } catch (err: any) {
-      onShowToast(err.message, true);
-    }
-  };
+  React.useEffect(() => {
+    setOktaDraft(oktaSettings);
+  }, [oktaSettings]);
 
   return (
-    <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-      {/* Left: Local Portal Users (Username & Password) */}
-      <Card className="p-5">
-        <h3 className="text-sm font-bold text-slate-900">
-          Portal Username & Password Accounts
-        </h3>
-        <p className="mt-0.5 text-xs text-slate-500">
-          Manage local administrator accounts that can sign into this portal with a username and password.
-        </p>
+    <div>
+      <div className="ph">
+        <div className="ph-l">
+          <h1>Portal Auth &amp; Okta SSO</h1>
+          <p>
+            Configure Okta OIDC Single Sign-On and local emergency administrator
+            accounts for this control plane.
+          </p>
+        </div>
+      </div>
 
-        <form onSubmit={handleAddPortalUser} className="mt-4 space-y-3">
-          <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
-            <input
-              type="text"
-              required
-              value={newUsername}
-              onChange={(e) => setNewUsername(e.target.value)}
-              placeholder="Username (e.g. alex)"
-              className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
-            />
-            <input
-              type="text"
-              value={newDisplayName}
-              onChange={(e) => setNewDisplayName(e.target.value)}
-              placeholder="Display Name"
-              className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
-            />
-            <input
-              type="password"
-              required
-              value={newPassword}
-              onChange={(e) => setNewPassword(e.target.value)}
-              placeholder="New Password"
-              className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
-            />
-          </div>
-          <button
-            type="submit"
-            className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-slate-800"
-          >
-            <Plus className="h-3.5 w-3.5" />
-            Add / Update Password User
-          </button>
-        </form>
-
-        <div className="mt-5 divide-y divide-slate-100 border-t border-slate-100">
-          {overview.portalUsers.map((u) => (
-            <div
-              key={u.username}
-              className="flex items-center justify-between py-2.5 text-xs"
-            >
-              <div>
-                <span className="font-mono font-bold text-slate-900">
-                  {u.username}
-                </span>
-                <span className="ml-2 text-slate-500">({u.displayName})</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <Badge variant="slate">{u.role}</Badge>
-                {overview.portalUsers.length > 1 && (
-                  <button
-                    type="button"
-                    onClick={() => handleDeletePortalUser(u.username)}
-                    className="rounded p-1 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
-                  >
-                    <Trash2 className="h-3.5 w-3.5" />
-                  </button>
-                )}
+      <div className="g2">
+        {/* Okta SSO Card */}
+        <div className="card">
+          <div className="card-h">
+            <div>
+              <div className="card-t">Okta OIDC Single Sign-On</div>
+              <div className="card-s">
+                Enterprise identity provider configuration
               </div>
             </div>
-          ))}
-        </div>
-      </Card>
-
-      {/* Right: Okta OIDC SSO Configuration */}
-      <Card className="p-5">
-        <div className="flex items-center justify-between">
-          <div>
-            <h3 className="text-sm font-bold text-slate-900">
-              Okta OIDC Single Sign-On (SSO)
-            </h3>
-            <p className="mt-0.5 text-xs text-slate-500">
-              Allow portal administrators to sign in using Okta OIDC + PKCE.
-            </p>
-          </div>
-          <Switch checked={oktaEnabled} onCheckedChange={setOktaEnabled} />
-        </div>
-
-        <form onSubmit={handleSaveOkta} className="mt-4 space-y-3">
-          <div>
-            <label className="block text-xs font-semibold text-slate-700">
-              Okta Domain
-            </label>
-            <input
-              type="text"
-              value={oktaDomain}
-              onChange={(e) => setOktaDomain(e.target.value)}
-              placeholder="your-org.okta.com"
-              className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
-            />
-          </div>
-
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <div>
-              <label className="block text-xs font-semibold text-slate-700">
-                OIDC Client ID
-              </label>
-              <input
-                type="text"
-                value={clientId}
-                onChange={(e) => setClientId(e.target.value)}
-                placeholder="0oa..."
-                className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span
+                className={`tag ${oktaDraft.enabled ? 'ok' : ''}`}
+              >
+                {oktaDraft.enabled ? 'Enabled' : 'Disabled'}
+              </span>
+              <button
+                type="button"
+                className={`sw ${oktaDraft.enabled ? 'on' : ''}`}
+                onClick={() =>
+                  setOktaDraft({ ...oktaDraft, enabled: !oktaDraft.enabled })
+                }
               />
             </div>
+          </div>
+          <div className="card-b">
+            <div className="fld">
+              <label>Okta Organization Domain</label>
+              <input
+                className="inp mono"
+                value={oktaDraft.oktaDomain}
+                onChange={(e) =>
+                  setOktaDraft({ ...oktaDraft, oktaDomain: e.target.value })
+                }
+                placeholder="https://acme-enterprise.okta.com"
+              />
+            </div>
+            <div className="fld">
+              <label>OIDC Client ID</label>
+              <input
+                className="inp mono"
+                value={oktaDraft.clientId}
+                onChange={(e) =>
+                  setOktaDraft({ ...oktaDraft, clientId: e.target.value })
+                }
+                placeholder="0oa8x92kLpQ7EnterpriseMcp"
+              />
+            </div>
+            <div className="fld">
+              <label>Authorization Server Issuer URI</label>
+              <input
+                className="inp mono"
+                value={oktaDraft.issuer}
+                onChange={(e) =>
+                  setOktaDraft({ ...oktaDraft, issuer: e.target.value })
+                }
+                placeholder="https://acme-enterprise.okta.com/oauth2/default"
+              />
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+              <button
+                type="button"
+                className="btn pri"
+                disabled={busy}
+                onClick={async () => {
+                  setBusy(true);
+                  try {
+                    await onSaveOkta(oktaDraft);
+                  } finally {
+                    setBusy(false);
+                  }
+                }}
+              >
+                Save Okta configuration
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Local Administrators Card */}
+        <div className="card">
+          <div className="card-h">
             <div>
-              <label className="block text-xs font-semibold text-slate-700">
-                OIDC Client Secret
-              </label>
+              <div className="card-t">Portal Administrators</div>
+              <div className="card-s">
+                Local password accounts (scrypt hashed)
+              </div>
+            </div>
+            <span className="tag mono">{portalUsers.length} users</span>
+          </div>
+          <div className="card-b">
+            <div className="chk-list" style={{ marginBottom: 14 }}>
+              {portalUsers.map((u) => (
+                <div className="chk-row" key={u.username}>
+                  <div>
+                    <div style={{ fontWeight: 500 }}>
+                      {u.displayName}{' '}
+                      <span className="tag" style={{ marginLeft: 4 }}>
+                        {u.role}
+                      </span>
+                    </div>
+                    <div className="mono" style={{ color: 'var(--t3)' }}>
+                      {u.username}
+                    </div>
+                  </div>
+                  {u.username !== 'admin' ? (
+                    <button
+                      type="button"
+                      className="btn dng sm"
+                      onClick={() => onDeletePortalUser(u.username)}
+                    >
+                      Remove
+                    </button>
+                  ) : (
+                    <span className="tag ok">Primary root</span>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            <div className="sec-h">
+              <span className="sec-t">Add administrator</span>
+            </div>
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: '1fr 1fr',
+                gap: 8,
+                marginBottom: 8,
+              }}
+            >
+              <input
+                className="inp"
+                placeholder="Username (e.g. secops)"
+                value={newUsername}
+                onChange={(e) => setNewUsername(e.target.value)}
+              />
+              <input
+                className="inp"
+                placeholder="Display name"
+                value={newDisplayName}
+                onChange={(e) => setNewDisplayName(e.target.value)}
+              />
               <input
                 type="password"
-                value={clientSecret}
-                onChange={(e) => setClientSecret(e.target.value)}
-                placeholder={
-                  overview.oktaSettings.hasClientSecret
-                    ? '•••••••• (Saved)'
-                    : 'Enter Client Secret'
-                }
-                className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
+                className="inp"
+                placeholder="Password"
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
               />
+              <select
+                className="inp"
+                value={newRole}
+                onChange={(e) => setNewRole(e.target.value)}
+              >
+                <option value="Super Admin">Super Admin</option>
+                <option value="Security Admin">Security Admin</option>
+                <option value="RevOps Admin">RevOps Admin</option>
+                <option value="Read-Only Auditor">Read-Only Auditor</option>
+              </select>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+              <button
+                type="button"
+                className="btn pri"
+                disabled={busy || !newUsername.trim() || !newPassword.trim()}
+                onClick={async () => {
+                  setBusy(true);
+                  try {
+                    await onCreatePortalUser({
+                      username: newUsername.trim(),
+                      displayName: newDisplayName.trim() || newUsername.trim(),
+                      password: newPassword,
+                      role: newRole,
+                    });
+                    setNewUsername('');
+                    setNewDisplayName('');
+                    setNewPassword('');
+                  } finally {
+                    setBusy(false);
+                  }
+                }}
+              >
+                Create administrator
+              </button>
             </div>
           </div>
-
-          <div>
-            <label className="block text-xs font-semibold text-slate-700">
-              Required Okta Group Claim
-            </label>
-            <input
-              type="text"
-              value={adminGroup}
-              onChange={(e) => setAdminGroup(e.target.value)}
-              placeholder="MCP-Admins"
-              className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
-            />
-          </div>
-
-          <div className="pt-2">
-            <button
-              type="submit"
-              className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-1.5 text-xs font-semibold text-white hover:bg-indigo-700"
-            >
-              <Save className="h-3.5 w-3.5" />
-              Save Okta Configuration
-            </button>
-          </div>
-        </form>
-      </Card>
+        </div>
+      </div>
     </div>
   );
 }

@@ -6,7 +6,8 @@ export type NavViewId =
   | 'matrix-profile-groups'
   | 'logs-copilot'
   | 'logs-portal'
-  | 'settings-auth';
+  | 'settings-auth'
+  | 'settings-salesforce';
 
 export const AVAILABLE_MCP_ACTIONS = [
   {
@@ -54,10 +55,31 @@ export const AVAILABLE_MCP_ACTIONS = [
 ] as const;
 
 export type McpActionId = (typeof AVAILABLE_MCP_ACTIONS)[number]['id'];
+export type McpActionType = string;
+export type RemovalResolutionAction = 'KEEP_FLAGGED' | 'DELETE';
+
+export interface AdminSession {
+  username: string;
+  name: string;
+  displayName?: string;
+  role?: string;
+  authMethod: string;
+  groups?: string[];
+}
+
+export interface OrgObjectCatalogEntry {
+  objectName: string;
+  label: string;
+  isCustom: boolean;
+  custom?: boolean;
+  queryable?: boolean;
+  alreadyInStore?: boolean;
+}
 
 export interface SalesforceProfile {
   id: string; // 15 or 18-char Salesforce Profile ID (00e...)
   name: string;
+  missingInOrg?: boolean;
   updatedAt: string;
 }
 
@@ -69,6 +91,7 @@ export interface SalesforceObjectField {
   isCustom: boolean;
   required: boolean;
   enabled: boolean;
+  missingInOrg?: boolean;
 }
 
 export interface SalesforceObject {
@@ -80,6 +103,7 @@ export interface SalesforceObject {
   fieldCount: number;
   enabledFieldCount: number;
   fields: SalesforceObjectField[];
+  missingInOrg?: boolean;
   updatedAt: string;
 }
 
@@ -144,12 +168,76 @@ export interface OktaSsoSettings {
 }
 
 export interface SalesforceConnectionSettings {
+  enabled: boolean;
+  authMode: 'jwt_bearer' | 'simulated';
+  loginUrl: string;
+  clientId: string;
+  username: string;
+  hasPrivateKey: boolean;
+  certificatePem: string;
+  certFingerprint: string;
+  connectionStatus: 'connected' | 'disconnected' | 'error';
+  lastConnectedAt: string | null;
+  lastError: string;
+  connectedOrgId: string;
+  connectedUser: string;
   expectedOrgId: string;
   instanceUrl: string;
   apiVersion: string;
   enforceOrgIdLock: boolean;
   sfdxObjectsFolderPath: string;
   updatedAt: string;
+}
+
+export interface ProfileSyncDiffPreview {
+  orgId: string;
+  instanceUrl: string;
+  added: Array<{ id: string; name: string; userType: string }>;
+  updated: Array<{
+    id: string;
+    name: string;
+    previousName: string;
+    unchanged: boolean;
+  }>;
+  removedFromOrg: Array<{
+    id: string;
+    name: string;
+    mappedGroupNames: string[];
+  }>;
+}
+
+export interface ObjectSyncDiffPreview {
+  orgId: string;
+  instanceUrl: string;
+  upsertedObjects: Array<{
+    objectName: string;
+    label: string;
+    isCustom: boolean;
+    isNewObject: boolean;
+    totalOrgFields: number;
+    addedFields: Array<{
+      fieldName: string;
+      label: string;
+      fieldType: string;
+      isCustom: boolean;
+      required: boolean;
+    }>;
+    updatedFieldsCount: number;
+    removedFieldsFromOrg: Array<{
+      objectName: string;
+      fieldName: string;
+      label: string;
+      fieldType: string;
+      enabled: boolean;
+      referencedInGroups: string[];
+    }>;
+  }>;
+  removedObjectsFromOrg: Array<{
+    objectName: string;
+    label: string;
+    fieldCount: number;
+    referencedInGroups: string[];
+  }>;
 }
 
 export interface PortalUserSummary {
@@ -180,3 +268,12 @@ export interface PortalOverviewPayload {
   sfSettings: SalesforceConnectionSettings;
   portalUsers: PortalUserSummary[];
 }
+
+export type SalesforceObjectConfig = SalesforceObject;
+export type CopilotMcpLogEntry = CopilotMcpLogRecord;
+export type PortalAdminLogEntry = PortalAdminLogRecord;
+export type OktaConfig = OktaSsoSettings;
+export type PortalUser = PortalUserSummary;
+export type OrgProfilesPullPreview = ProfileSyncDiffPreview;
+export type OrgObjectsSyncPreview = ObjectSyncDiffPreview;
+

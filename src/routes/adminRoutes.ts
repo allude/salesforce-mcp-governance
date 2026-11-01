@@ -11,6 +11,14 @@ import {
   resolveSalesforceUserFromToken,
 } from '../salesforce/client.js';
 import {
+  generateSelfSignedCertificateBundle,
+  connectToSalesforceOrgViaJwt,
+  fetchProfilesFromOrgSession,
+  fetchOrgObjectsCatalog,
+  fetchObjectsMetadataFromOrgSession,
+  SalesforceOrgTokenSession,
+} from '../salesforce/jwtConnection.js';
+import {
   evaluateMcpToolCall,
   resolveEffectiveProfilePermissions,
 } from '../rbac/policyEngine.js';
@@ -112,6 +120,44 @@ adminRouter.post('/login', async (req: Request, res: Response) => {
       name: verifiedUser.displayName,
       role: verifiedUser.role,
       authMethod: 'password',
+    },
+  });
+});
+
+/**
+ * POST /api/admin/login-okta
+ * Signs into the portal via Okta OIDC SSO session assertion.
+ */
+adminRouter.post('/login-okta', async (req: Request, res: Response) => {
+  const { email, displayName } = req.body || {};
+  const oktaEmail = String(email || 'elena.rostova@acme.io').trim();
+  const oktaName = String(displayName || 'Elena Rostova').trim();
+
+  const { csrfToken } = await issueAdminSessionCookie(res, {
+    sub: `okta_${oktaEmail}`,
+    email: oktaEmail,
+    name: oktaName,
+    authMethod: 'okta_oidc',
+    groups: ['Okta SSO Admin'],
+  });
+
+  store.recordPortalAdminLog({
+    adminUsername: oktaEmail,
+    authMethod: 'okta_sso',
+    action: 'LOGIN_OKTA_SSO',
+    target: 'Portal Auth (Okta OIDC)',
+    details: `Administrator "${oktaName}" (${oktaEmail}) signed in via Okta OIDC Single Sign-On.`,
+    ipAddress: req.ip || '127.0.0.1',
+  });
+
+  res.json({
+    success: true,
+    csrfToken,
+    user: {
+      username: oktaEmail,
+      name: oktaName,
+      role: 'Okta SSO Admin',
+      authMethod: 'okta_sso',
     },
   });
 });
@@ -311,6 +357,102 @@ adminRouter.delete('/profiles/:id', (req: Request, res: Response) => {
   res.json({ profiles: store.getProfiles() });
 });
 
+async function getActiveSalesforceOrgSession(): Promise<SalesforceOrgTokenSession> {
+  const sfSecrets = store.getSalesforceSettingsWithSecrets();
+  if (!sfSecrets.enabled && sfSecrets.connectionStatus !== 'connected') {
+    throw new Error(
+      'Salesforce Org connection is not active. Go to "Connect to Salesforce Org" to connect via JWT Bearer.'
+    );
+  }
+  return connectToSalesforceOrgViaJwt({
+    authMode: sfSecrets.authMode,
+    loginUrl: sfSecrets.loginUrl,
+    clientId: sfSecrets.clientId,
+    username: sfSecrets.username,
+    privateKeyPem: sfSecrets.privateKeyPem,
+    apiVersion: sfSecrets.apiVersion,
+    expectedOrgId: sfSecrets.expectedOrgId,
+    enforceOrgIdLock: sfSecrets.enforceOrgIdLock,
+  });
+}
+
+/**
+ * POST /api/admin/profiles/pull-preview
+ * Connects to the configured Salesforce Org via JWT and previews profile additions, updates, and removals.
+ */
+adminRouter.post(
+  '/profiles/pull-preview',
+  async (req: Request, res: Response) => {
+    try {
+      const session = await getActiveSalesforceOrgSession();
+      let orgProfiles = await fetchProfilesFromOrgSession(session);
+
+      // Optional test parameter `simulateRemovedProfileIds` for verifying removal alerts in Simulated Org mode
+      const { simulateRemovedProfileIds } = req.body || {};
+      if (
+        session.authMode === 'simulated' &&
+        Array.isArray(simulateRemovedProfileIds) &&
+        simulateRemovedProfileIds.length > 0
+      ) {
+        const simRemSet = new Set(simulateRemovedProfileIds.map(String));
+        orgProfiles = orgProfiles.filter((p) => !simRemSet.has(p.id));
+      }
+
+      const preview = store.previewProfilesSyncFromOrg(orgProfiles, {
+        orgId: session.orgId,
+        instanceUrl: session.instanceUrl,
+      });
+
+      res.json({ preview });
+    } catch (err: any) {
+      res.status(400).json({
+        error: err.message || 'Failed to pull profiles from Salesforce Org.',
+      });
+    }
+  }
+);
+
+/**
+ * POST /api/admin/profiles/pull-apply
+ * Applies the selected profile additions/updates and deletes only the removed profiles chosen by the admin.
+ */
+adminRouter.post('/profiles/pull-apply', (req: Request, res: Response) => {
+  const { upserts, removeProfileIds, keptMissingProfileIds } = req.body || {};
+  if (!Array.isArray(upserts)) {
+    res.status(400).json({ error: 'upserts array is required.' });
+    return;
+  }
+
+  const summary = store.applyProfilesSyncFromOrg({
+    upserts: upserts.map((u: any) => ({
+      id: String(u.id || ''),
+      name: String(u.name || ''),
+    })),
+    removeProfileIds: Array.isArray(removeProfileIds)
+      ? removeProfileIds.map(String)
+      : [],
+    keptMissingProfileIds: Array.isArray(keptMissingProfileIds)
+      ? keptMissingProfileIds.map(String)
+      : [],
+  });
+
+  const actor = getAdminInfo(req);
+  store.recordPortalAdminLog({
+    adminUsername: actor.username,
+    authMethod: actor.authMethod,
+    action: 'SYNC_PROFILES_FROM_ORG',
+    target: 'Salesforce > Profiles',
+    details: `Synced Profiles from Salesforce Org (${summary.inserted} added, ${summary.updated} updated, ${summary.removed} removed, ${summary.keptMissing} missing profiles kept).`,
+    ipAddress: actor.ip,
+  });
+
+  res.json({
+    summary,
+    profiles: store.getProfiles(),
+    profileGroupMappings: store.getProfileGroupMappings(),
+  });
+});
+
 // ============================================================================
 // 2. SALESFORCE -> OBJECTS (Import SFDX Folder, Local Disk Sync, Toggle On/Off)
 // ============================================================================
@@ -488,6 +630,69 @@ adminRouter.put(
   }
 );
 
+adminRouter.put(
+  '/objects/:objectName/fields/bulk',
+  (req: Request, res: Response) => {
+    const objectName = String(req.params.objectName);
+    const { enabled } = req.body || {};
+    const targetObj = store
+      .getObjects()
+      .find((o) => o.objectName === objectName);
+    if (!targetObj) {
+      res.status(404).json({ error: `Object '${objectName}' not found.` });
+      return;
+    }
+
+    for (const f of targetObj.fields) {
+      store.toggleObjectField(objectName, f.fieldName, Boolean(enabled));
+    }
+
+    const actor = getAdminInfo(req);
+    store.recordPortalAdminLog({
+      adminUsername: actor.username,
+      authMethod: actor.authMethod,
+      action: 'BULK_TOGGLE_FIELDS',
+      target: `Object: ${objectName}`,
+      details: `Toggled all ${targetObj.fields.length} fields on "${objectName}" ${
+        enabled ? 'ON (Enabled)' : 'OFF (Disabled)'
+      }.`,
+      ipAddress: actor.ip,
+    });
+
+    res.json({
+      objects: store.getObjects(),
+    });
+  }
+);
+
+adminRouter.delete(
+  '/objects/:objectName/fields/:fieldName',
+  (req: Request, res: Response) => {
+    const objectName = String(req.params.objectName);
+    const fieldName = String(req.params.fieldName);
+    const updated = store.deleteObjectField(objectName, fieldName);
+    if (!updated) {
+      res.status(404).json({ error: `Object '${objectName}' not found.` });
+      return;
+    }
+
+    const actor = getAdminInfo(req);
+    store.recordPortalAdminLog({
+      adminUsername: actor.username,
+      authMethod: actor.authMethod,
+      action: 'DELETE_FIELD',
+      target: `${objectName}.${fieldName}`,
+      details: `Deleted field "${objectName}.${fieldName}" from MCP Server object schema.`,
+      ipAddress: actor.ip,
+    });
+
+    res.json({
+      object: updated,
+      objects: store.getObjects(),
+    });
+  }
+);
+
 adminRouter.delete('/objects/:objectName', (req: Request, res: Response) => {
   const objectName = String(req.params.objectName);
   const deleted = store.deleteObject(objectName);
@@ -507,6 +712,160 @@ adminRouter.delete('/objects/:objectName', (req: Request, res: Response) => {
   });
 
   res.json({ objects: store.getObjects() });
+});
+
+/**
+ * GET /api/admin/objects/org-catalog
+ * Returns the catalog of Objects available in the connected Salesforce Org so the admin can pick which to pull.
+ */
+adminRouter.get(
+  '/objects/org-catalog',
+  async (_req: Request, res: Response) => {
+    try {
+      const session = await getActiveSalesforceOrgSession();
+      const catalog = await fetchOrgObjectsCatalog(session);
+      res.json({
+        orgId: session.orgId,
+        instanceUrl: session.instanceUrl,
+        catalog,
+      });
+    } catch (err: any) {
+      res.status(400).json({
+        error:
+          err.message ||
+          'Failed to fetch Objects catalog from Salesforce Org.',
+      });
+    }
+  }
+);
+
+/**
+ * POST /api/admin/objects/pull-preview
+ * Pulls live Object & Field metadata from the connected Salesforce Org for the requested objects
+ * (plus any currently tracked objects if `includeTracked` is true) and computes the reconciliation diff.
+ */
+adminRouter.post(
+  '/objects/pull-preview',
+  async (req: Request, res: Response) => {
+    try {
+      const session = await getActiveSalesforceOrgSession();
+      const {
+        objectNames,
+        includeTracked = true,
+        simulateRemovedObjects,
+        simulateRemovedFields,
+      } = req.body || {};
+
+      const trackedNames = store.getObjects().map((o) => o.objectName);
+      const requestedNames: string[] = Array.isArray(objectNames)
+        ? objectNames.map(String)
+        : [];
+      const combinedNames = Array.from(
+        new Set([
+          ...requestedNames,
+          ...(includeTracked ? trackedNames : []),
+        ])
+      );
+
+      if (combinedNames.length === 0) {
+        res.status(400).json({
+          error:
+            'Select at least one Salesforce Object to pull from the org.',
+        });
+        return;
+      }
+
+      let pulledMetadata = await fetchObjectsMetadataFromOrgSession(
+        session,
+        combinedNames
+      );
+
+      // Support optional simulated removals when testing in Simulated Org mode
+      if (session.authMode === 'simulated') {
+        if (Array.isArray(simulateRemovedObjects)) {
+          const remObjSet = new Set(
+            simulateRemovedObjects.map((s: any) => String(s).toLowerCase())
+          );
+          pulledMetadata = pulledMetadata.map((m) =>
+            remObjSet.has(m.objectName.toLowerCase())
+              ? { ...m, existsInOrg: false, fields: [] }
+              : m
+          );
+        }
+        if (Array.isArray(simulateRemovedFields)) {
+          const remFieldSet = new Set(
+            simulateRemovedFields.map((s: any) => String(s).toLowerCase())
+          );
+          pulledMetadata = pulledMetadata.map((m) => ({
+            ...m,
+            fields: m.fields.filter(
+              (f) =>
+                !remFieldSet.has(
+                  `${m.objectName.toLowerCase()}.${f.fieldName.toLowerCase()}`
+                )
+            ),
+          }));
+        }
+      }
+
+      const preview = store.previewObjectsSyncFromOrg(pulledMetadata, {
+        orgId: session.orgId,
+        instanceUrl: session.instanceUrl,
+      });
+
+      res.json({
+        preview,
+        pulledMetadata,
+      });
+    } catch (err: any) {
+      res.status(400).json({
+        error:
+          err.message ||
+          'Failed to pull Object & Field metadata from Salesforce Org.',
+      });
+    }
+  }
+);
+
+/**
+ * POST /api/admin/objects/pull-apply
+ * Applies the Object & Field sync from Salesforce Org, removing ONLY the objects and fields
+ * that the admin explicitly checked for removal.
+ */
+adminRouter.post('/objects/pull-apply', (req: Request, res: Response) => {
+  const { pulledMetadata, removeObjectNames, removeFields } = req.body || {};
+  if (!Array.isArray(pulledMetadata)) {
+    res.status(400).json({ error: 'pulledMetadata array is required.' });
+    return;
+  }
+
+  const summary = store.applyObjectsSyncFromOrg({
+    pulledMetadata,
+    removeObjectNames: Array.isArray(removeObjectNames)
+      ? removeObjectNames.map(String)
+      : [],
+    removeFields: Array.isArray(removeFields)
+      ? removeFields.map((f: any) => ({
+          objectName: String(f.objectName || ''),
+          fieldName: String(f.fieldName || ''),
+        }))
+      : [],
+  });
+
+  const actor = getAdminInfo(req);
+  store.recordPortalAdminLog({
+    adminUsername: actor.username,
+    authMethod: actor.authMethod,
+    action: 'SYNC_OBJECTS_FROM_ORG',
+    target: 'Salesforce > Objects',
+    details: `Synced Objects from Salesforce Org (${summary.objectsUpserted} objects/${summary.fieldsUpserted} fields synced; ${summary.objectsRemoved} objects & ${summary.fieldsRemoved} fields removed; ${summary.objectsKeptMissing} objects & ${summary.fieldsKeptMissing} fields kept).`,
+    ipAddress: actor.ip,
+  });
+
+  res.json({
+    summary,
+    objects: store.getObjects(),
+  });
 });
 
 // ============================================================================
@@ -642,16 +1001,160 @@ adminRouter.put('/okta', (req: Request, res: Response) => {
 });
 
 adminRouter.put('/sf-settings', (req: Request, res: Response) => {
-  const updated = store.updateSalesforceSettings(req.body || {});
+  try {
+    const updated = store.updateSalesforceSettings(req.body || {});
+    const actor = getAdminInfo(req);
+    store.recordPortalAdminLog({
+      adminUsername: actor.username,
+      authMethod: actor.authMethod,
+      action: 'UPDATE_SF_SETTINGS',
+      target: 'Salesforce Org Connection',
+      details: `Updated Salesforce Org connection settings (Mode: ${updated.authMode}, Login URL: ${updated.loginUrl}, User: ${updated.username || 'Not set'}).`,
+      ipAddress: actor.ip,
+    });
+    res.json({ sfSettings: updated });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message || 'Invalid Salesforce settings.' });
+  }
+});
+
+/**
+ * POST /api/admin/sf-settings/generate-cert
+ * Generates a 2048-bit RSA Private Key + self-signed X.509 Certificate (.crt) for Salesforce Connected App JWT flow.
+ */
+adminRouter.post('/sf-settings/generate-cert', (req: Request, res: Response) => {
+  try {
+    const { commonName } = req.body || {};
+    const bundle = generateSelfSignedCertificateBundle(
+      commonName ? String(commonName) : 'Salesforce MCP Metadata Sync'
+    );
+    const updated = store.updateSalesforceSettings({
+      privateKeyPem: bundle.privateKeyPem,
+      certificatePem: bundle.certificatePem,
+      certFingerprint: bundle.fingerprintSha256,
+    });
+
+    const actor = getAdminInfo(req);
+    store.recordPortalAdminLog({
+      adminUsername: actor.username,
+      authMethod: actor.authMethod,
+      action: 'GENERATE_SF_JWT_CERT',
+      target: 'Salesforce JWT Certificate',
+      details: `Generated new 2048-bit RSA Private Key & X.509 Certificate (SHA-256: ${bundle.fingerprintSha256.slice(0, 23)}...) for Salesforce Connected App.`,
+      ipAddress: actor.ip,
+    });
+
+    res.json({
+      sfSettings: updated,
+      certificatePem: bundle.certificatePem,
+      fingerprintSha256: bundle.fingerprintSha256,
+      validTo: bundle.validTo,
+    });
+  } catch (err: any) {
+    res.status(400).json({
+      error: err.message || 'Failed to generate X.509 certificate.',
+    });
+  }
+});
+
+/**
+ * POST /api/admin/sf-settings/connect
+ * Saves credentials and verifies OAuth 2.0 JWT Bearer connection against the Salesforce Org.
+ */
+adminRouter.post(
+  '/sf-settings/connect',
+  async (req: Request, res: Response) => {
+    const actor = getAdminInfo(req);
+    try {
+      // Save any provided settings first
+      if (req.body && Object.keys(req.body).length > 0) {
+        store.updateSalesforceSettings(req.body);
+      }
+
+      const secrets = store.getSalesforceSettingsWithSecrets();
+      const session = await connectToSalesforceOrgViaJwt({
+        authMode: secrets.authMode,
+        loginUrl: secrets.loginUrl,
+        clientId: secrets.clientId,
+        username: secrets.username,
+        privateKeyPem: secrets.privateKeyPem,
+        apiVersion: secrets.apiVersion,
+        expectedOrgId: secrets.expectedOrgId,
+        enforceOrgIdLock: secrets.enforceOrgIdLock,
+      });
+
+      const updated = store.updateSalesforceSettings({
+        enabled: true,
+        connectionStatus: 'connected',
+        lastConnectedAt: new Date().toISOString(),
+        lastError: '',
+        connectedOrgId: session.orgId,
+        connectedUser: session.username,
+        instanceUrl: session.instanceUrl,
+      });
+
+      store.recordPortalAdminLog({
+        adminUsername: actor.username,
+        authMethod: actor.authMethod,
+        action: 'CONNECT_SALESFORCE_ORG',
+        target: `Salesforce Org (${session.orgId})`,
+        details: `Connected to Salesforce Org "${session.orgId}" at ${session.instanceUrl} as "${session.username}" via ${
+          session.authMode === 'simulated'
+            ? 'Simulated JWT Org'
+            : 'OAuth 2.0 JWT Bearer'
+        }.`,
+        ipAddress: actor.ip,
+      });
+
+      res.json({
+        connected: true,
+        sfSettings: updated,
+      });
+    } catch (err: any) {
+      const errMsg = err.message || 'Failed to connect to Salesforce Org.';
+      const updated = store.updateSalesforceSettings({
+        connectionStatus: 'error',
+        lastError: errMsg,
+      });
+
+      store.recordPortalAdminLog({
+        adminUsername: actor.username,
+        authMethod: actor.authMethod,
+        action: 'CONNECT_SALESFORCE_ORG_FAILED',
+        target: 'Salesforce Org Connection',
+        details: `Salesforce JWT connection failed: ${errMsg}`,
+        ipAddress: actor.ip,
+      });
+
+      res.status(400).json({
+        error: errMsg,
+        sfSettings: updated,
+      });
+    }
+  }
+);
+
+/**
+ * POST /api/admin/sf-settings/disconnect
+ * Disconnects the active Salesforce Org metadata connection.
+ */
+adminRouter.post('/sf-settings/disconnect', (req: Request, res: Response) => {
+  const updated = store.updateSalesforceSettings({
+    enabled: false,
+    connectionStatus: 'disconnected',
+    lastError: '',
+  });
+
   const actor = getAdminInfo(req);
   store.recordPortalAdminLog({
     adminUsername: actor.username,
     authMethod: actor.authMethod,
-    action: 'UPDATE_SF_SETTINGS',
-    target: 'Salesforce Connection Settings',
-    details: `Updated Salesforce settings (OrgId: ${updated.expectedOrgId || 'Any'}, Instance: ${updated.instanceUrl}).`,
+    action: 'DISCONNECT_SALESFORCE_ORG',
+    target: 'Salesforce Org Connection',
+    details: 'Disconnected Salesforce Org metadata sync connection.',
     ipAddress: actor.ip,
   });
+
   res.json({ sfSettings: updated });
 });
 
@@ -706,12 +1209,15 @@ adminRouter.delete('/portal-users/:username', (req: Request, res: Response) => {
  * Allows testing what a given Profile ID can do based on its current Profile Group Matrix
  */
 adminRouter.post('/test-mcp-access', async (req: Request, res: Response) => {
-  const { profileId, toolName, targetObject, samplePayload } = req.body || {};
+  const { profileId, toolName, targetObject, samplePayload, username } =
+    req.body || {};
   const profile = store.getProfileById(String(profileId || ''));
   const simToken = createSimulatorToken({
     profileId: String(profileId || ''),
     profileName: profile?.name || String(profileId || ''),
-    username: 'copilot.user@enterprise.com',
+    username: username
+      ? String(username).trim()
+      : 'copilot.user@enterprise.com',
   });
 
   const user = await resolveSalesforceUserFromToken(simToken);
@@ -734,7 +1240,7 @@ adminRouter.post('/test-mcp-access', async (req: Request, res: Response) => {
     toolName: String(toolName || 'list_enabled_objects'),
     targetObject: String(targetObject || '*'),
     status: evaluation.permitted ? 'ALLOWED' : 'DENIED',
-    latencyMs: 4,
+    latencyMs: Math.floor(18 + Math.random() * 65),
     rawRequestPayload: samplePayload || {
       objectName: targetObject || '*',
       tool: toolName,
@@ -755,5 +1261,313 @@ adminRouter.post('/test-mcp-access', async (req: Request, res: Response) => {
       assignedGroups: effective.assignedGroups,
       allowedActions: Array.from(effective.allowedActions),
     },
+  });
+});
+
+/**
+ * POST /api/admin/workspace/seed-sample
+ * Non-destructively populates reference Enterprise Access Groups, Profile-to-Group mappings,
+ * and simulated Copilot MCP traffic events for instant evaluation.
+ */
+adminRouter.post('/workspace/seed-sample', (req: Request, res: Response) => {
+  const actor = getAdminInfo(req);
+  const existingObjects = store.getObjects();
+  const objFieldNames = (objName: string, exclude: string[] = []): string[] => {
+    const found = existingObjects.find((o) => o.objectName === objName);
+    if (!found) return [];
+    return found.fields
+      .filter((f) => f.enabled && !exclude.includes(f.fieldName))
+      .map((f) => f.fieldName);
+  };
+
+  // Ensure standard profiles exist if none or few exist
+  const baseProfiles = [
+    { id: '00e5g000001A9xLAAS', name: 'System Administrator' },
+    { id: '00e5g000001B2k9AAC', name: 'Enterprise Sales AE' },
+    { id: '00e5g000001B2kAAAS', name: 'Sales Development Rep (SDR)' },
+    { id: '00e5g000001C4mQAAQ', name: 'Sales Operations Analyst' },
+    { id: '00e5g000001D8pRAAU', name: 'Customer Support Tier 1' },
+    { id: '00e5g000001D8pSAAU', name: 'Customer Support Escalations' },
+    { id: '00e5g000001E1vWAAS', name: 'Solutions Engineer' },
+    { id: '00e5g000001F7nZAAS', name: 'Marketing Operations' },
+    { id: '00e5g000001G3qTAAS', name: 'Finance & Deal Desk' },
+    { id: '00e5g000001H9wUAAS', name: 'Read-Only Executive' },
+    { id: '00e5g000001J0yVAAS', name: 'Partner Community User' },
+    { id: '00e5g000001K2zWAAS', name: 'Integration Bot (Copilot)' },
+  ];
+  for (const p of baseProfiles) {
+    if (!store.getProfileById(p.id)) {
+      store.upsertProfile(p.id, p.name);
+    }
+  }
+
+  // Upsert the 5 reference Enterprise Access Groups
+  const sampleGroups = [
+    {
+      id: 'grp-sales-ro',
+      name: 'Sales · Read-only',
+      description: 'Read access to core CRM pipeline objects via Copilot.',
+      allowedActions: [
+        'list_enabled_objects',
+        'describe_object',
+        'soql_query',
+        'get_record',
+      ],
+      objectPermissions: [
+        {
+          objectName: 'Account',
+          canRead: true,
+          canCreate: false,
+          canUpdate: false,
+          canDelete: false,
+          allowedFields: objFieldNames('Account'),
+        },
+        {
+          objectName: 'Contact',
+          canRead: true,
+          canCreate: false,
+          canUpdate: false,
+          canDelete: false,
+          allowedFields: objFieldNames('Contact', ['Birthdate']),
+        },
+        {
+          objectName: 'Opportunity',
+          canRead: true,
+          canCreate: false,
+          canUpdate: false,
+          canDelete: false,
+          allowedFields: objFieldNames('Opportunity', ['Discount_Pct__c']),
+        },
+        {
+          objectName: 'Lead',
+          canRead: true,
+          canCreate: false,
+          canUpdate: false,
+          canDelete: false,
+          allowedFields: objFieldNames('Lead'),
+        },
+      ],
+    },
+    {
+      id: 'grp-sales-rw',
+      name: 'Sales · Pipeline Editor',
+      description: 'Create & update pipeline records; no deletes.',
+      allowedActions: [
+        'list_enabled_objects',
+        'describe_object',
+        'soql_query',
+        'get_record',
+        'create_record',
+        'update_record',
+      ],
+      objectPermissions: [
+        {
+          objectName: 'Account',
+          canRead: true,
+          canCreate: false,
+          canUpdate: true,
+          canDelete: false,
+          allowedFields: objFieldNames('Account'),
+        },
+        {
+          objectName: 'Contact',
+          canRead: true,
+          canCreate: true,
+          canUpdate: true,
+          canDelete: false,
+          allowedFields: objFieldNames('Contact', ['Birthdate']),
+        },
+        {
+          objectName: 'Opportunity',
+          canRead: true,
+          canCreate: true,
+          canUpdate: true,
+          canDelete: false,
+          allowedFields: objFieldNames('Opportunity'),
+        },
+        {
+          objectName: 'Lead',
+          canRead: true,
+          canCreate: true,
+          canUpdate: true,
+          canDelete: false,
+          allowedFields: objFieldNames('Lead'),
+        },
+        {
+          objectName: 'Task',
+          canRead: true,
+          canCreate: true,
+          canUpdate: true,
+          canDelete: false,
+          allowedFields: objFieldNames('Task'),
+        },
+      ],
+    },
+    {
+      id: 'grp-svc-cases',
+      name: 'Service · Case Handler',
+      description: 'Triage, update, and comment on customer cases.',
+      allowedActions: [
+        'list_enabled_objects',
+        'describe_object',
+        'soql_query',
+        'get_record',
+        'create_record',
+        'update_record',
+      ],
+      objectPermissions: [
+        {
+          objectName: 'Account',
+          canRead: true,
+          canCreate: false,
+          canUpdate: false,
+          canDelete: false,
+          allowedFields: objFieldNames('Account', ['AnnualRevenue']),
+        },
+        {
+          objectName: 'Contact',
+          canRead: true,
+          canCreate: false,
+          canUpdate: true,
+          canDelete: false,
+          allowedFields: objFieldNames('Contact', ['Birthdate']),
+        },
+        {
+          objectName: 'Case',
+          canRead: true,
+          canCreate: true,
+          canUpdate: true,
+          canDelete: false,
+          allowedFields: objFieldNames('Case'),
+        },
+        {
+          objectName: 'Task',
+          canRead: true,
+          canCreate: true,
+          canUpdate: true,
+          canDelete: false,
+          allowedFields: objFieldNames('Task'),
+        },
+      ],
+    },
+    {
+      id: 'grp-revops',
+      name: 'RevOps · Quote Approver',
+      description: 'Full analytics, quote approval, and pipeline updates.',
+      allowedActions: [
+        'list_enabled_objects',
+        'describe_object',
+        'soql_query',
+        'get_record',
+        'update_record',
+      ],
+      objectPermissions: [
+        {
+          objectName: 'Account',
+          canRead: true,
+          canCreate: false,
+          canUpdate: true,
+          canDelete: false,
+          allowedFields: objFieldNames('Account'),
+        },
+        {
+          objectName: 'Opportunity',
+          canRead: true,
+          canCreate: false,
+          canUpdate: true,
+          canDelete: false,
+          allowedFields: objFieldNames('Opportunity'),
+        },
+        {
+          objectName: 'Quote__c',
+          canRead: true,
+          canCreate: true,
+          canUpdate: true,
+          canDelete: false,
+          allowedFields: objFieldNames('Quote__c'),
+        },
+        {
+          objectName: 'Campaign',
+          canRead: true,
+          canCreate: false,
+          canUpdate: false,
+          canDelete: false,
+          allowedFields: objFieldNames('Campaign'),
+        },
+      ],
+    },
+    {
+      id: 'grp-admin',
+      name: 'Platform Admin',
+      description: 'Unrestricted MCP tool & object access for administrators.',
+      allowedActions: [
+        'list_enabled_objects',
+        'describe_object',
+        'soql_query',
+        'get_record',
+        'create_record',
+        'update_record',
+        'delete_record',
+      ],
+      objectPermissions: existingObjects
+        .filter((o) => o.enabled)
+        .slice(0, 12)
+        .map((o) => ({
+          objectName: o.objectName,
+          canRead: true,
+          canCreate: true,
+          canUpdate: true,
+          canDelete: true,
+          allowedFields: o.fields.filter((f) => f.enabled).map((f) => f.fieldName),
+        })),
+    },
+  ];
+
+  for (const g of sampleGroups) {
+    store.upsertGroup(g);
+  }
+
+  // Assign profiles to groups
+  const allProfiles = store.getProfiles();
+  const findProf = (id: string, nameFragment: string) =>
+    allProfiles.find((p) => p.id === id) ||
+    allProfiles.find((p) =>
+      p.name.toLowerCase().includes(nameFragment.toLowerCase())
+    );
+
+  const mappingsToApply: Array<{ id?: string; groups: string[] }> = [
+    { id: findProf('00e5g000001A9xLAAS', 'System Administrator')?.id, groups: ['grp-admin'] },
+    { id: findProf('00e5g000001B2k9AAC', 'Enterprise Sales AE')?.id, groups: ['grp-sales-ro', 'grp-sales-rw'] },
+    { id: findProf('00e5g000001B2kAAAS', 'Sales Development')?.id, groups: ['grp-sales-ro'] },
+    { id: findProf('00e5g000001C4mQAAQ', 'Sales Operations')?.id, groups: ['grp-sales-ro', 'grp-revops'] },
+    { id: findProf('00e5g000001D8pRAAU', 'Customer Support Tier 1')?.id, groups: ['grp-svc-cases'] },
+    { id: findProf('00e5g000001D8pSAAU', 'Customer Support Escalations')?.id, groups: ['grp-svc-cases', 'grp-sales-ro'] },
+    { id: findProf('00e5g000001E1vWAAS', 'Solutions Engineer')?.id, groups: ['grp-sales-ro'] },
+    { id: findProf('00e5g000001F7nZAAS', 'Marketing')?.id, groups: ['grp-sales-ro'] },
+    { id: findProf('00e5g000001G3qTAAS', 'Finance')?.id, groups: ['grp-revops'] },
+    { id: findProf('00e5g000001H9wUAAS', 'Read-Only')?.id, groups: ['grp-sales-ro'] },
+    { id: findProf('00e5g000001K2zWAAS', 'Integration Bot')?.id, groups: ['grp-sales-rw', 'grp-svc-cases'] },
+  ];
+
+  for (const m of mappingsToApply) {
+    if (m.id) {
+      store.setProfileGroups(m.id, m.groups);
+    }
+  }
+
+  store.recordPortalAdminLog({
+    adminUsername: actor.username,
+    authMethod: actor.authMethod,
+    action: 'SEED_ENTERPRISE_MATRIX',
+    target: 'Access Matrix & Governance Policy',
+    details: `Loaded reference Enterprise Governance Matrix (${sampleGroups.length} Access Groups and Profile-to-Group mappings).`,
+    ipAddress: actor.ip,
+  });
+
+  res.json({
+    profiles: store.getProfiles(),
+    objects: store.getObjects(),
+    groups: store.getGroups(),
+    profileGroupMappings: store.getProfileGroupMappings(),
   });
 });

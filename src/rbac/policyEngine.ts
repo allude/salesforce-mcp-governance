@@ -17,6 +17,7 @@ export interface EffectiveProfilePermissions {
       canUpdate: boolean;
       canDelete: boolean;
       allowedFields: Set<string>;
+      missingInOrgFields: Set<string>;
     }
   >;
 }
@@ -59,15 +60,26 @@ export function resolveEffectiveProfilePermissions(
     store
       .getObjects()
       .filter((o) => o.enabled)
-      .map((o) => [
-        o.objectName.toLowerCase(),
-        {
-          objectName: o.objectName,
-          enabledFields: new Set(
-            o.fields.filter((f) => f.enabled).map((f) => f.fieldName)
-          ),
-        },
-      ])
+      .map((o) => {
+        const canonicalFieldMap = new Map<string, string>();
+        const missingInOrgFields = new Set<string>();
+        for (const f of o.fields) {
+          if (f.enabled) {
+            canonicalFieldMap.set(f.fieldName.toLowerCase(), f.fieldName);
+            if (f.missingInOrg) {
+              missingInOrgFields.add(f.fieldName);
+            }
+          }
+        }
+        return [
+          o.objectName.toLowerCase(),
+          {
+            objectName: o.objectName,
+            canonicalFieldMap,
+            missingInOrgFields,
+          },
+        ];
+      })
   );
 
   const allowedActions = new Set<string>();
@@ -80,17 +92,21 @@ export function resolveEffectiveProfilePermissions(
       canUpdate: boolean;
       canDelete: boolean;
       allowedFields: Set<string>;
+      missingInOrgFields: Set<string>;
     }
   >();
 
   for (const grp of assignedGroups) {
+    if (!Array.isArray(grp.allowedActions)) continue;
     for (const act of grp.allowedActions) {
       allowedActions.add(act);
     }
 
+    if (!Array.isArray(grp.objectPermissions)) continue;
     for (const objPerm of grp.objectPermissions) {
+      if (!objPerm || !objPerm.objectName) continue;
       const globalObj = enabledObjectsMap.get(objPerm.objectName.toLowerCase());
-      if (!globalObj) continue; // Object is disabled in Salesforce -> Objects
+      if (!globalObj) continue; // Object is disabled or removed in Salesforce -> Objects
 
       const existing = objectPermissions.get(globalObj.objectName) || {
         objectName: globalObj.objectName,
@@ -99,17 +115,29 @@ export function resolveEffectiveProfilePermissions(
         canUpdate: false,
         canDelete: false,
         allowedFields: new Set<string>(),
+        missingInOrgFields: globalObj.missingInOrgFields,
       };
 
-      existing.canRead = existing.canRead || objPerm.canRead;
-      existing.canCreate = existing.canCreate || objPerm.canCreate;
-      existing.canUpdate = existing.canUpdate || objPerm.canUpdate;
-      existing.canDelete = existing.canDelete || objPerm.canDelete;
+      existing.canRead = existing.canRead || Boolean(objPerm.canRead);
+      existing.canCreate = existing.canCreate || Boolean(objPerm.canCreate);
+      existing.canUpdate = existing.canUpdate || Boolean(objPerm.canUpdate);
+      existing.canDelete = existing.canDelete || Boolean(objPerm.canDelete);
 
-      for (const f of objPerm.allowedFields) {
-        if (globalObj.enabledFields.has(f)) {
-          existing.allowedFields.add(f);
+      for (const f of objPerm.allowedFields || []) {
+        if (!f) continue;
+        const canonical = globalObj.canonicalFieldMap.get(f.toLowerCase());
+        if (canonical) {
+          existing.allowedFields.add(canonical);
         }
+      }
+
+      // Ensure that if all configured fields were removed/disabled, Id remains safe as fallback when enabled
+      if (
+        existing.allowedFields.size === 0 &&
+        (existing.canRead || existing.canCreate || existing.canUpdate) &&
+        globalObj.canonicalFieldMap.has('id')
+      ) {
+        existing.allowedFields.add(globalObj.canonicalFieldMap.get('id')!);
       }
 
       if (

@@ -1,323 +1,508 @@
 'use client';
 
-import React, { useState, useRef } from 'react';
-import {
-  Upload,
-  Plus,
-  Trash2,
-  ArrowRight,
-  FolderOpen,
-  HardDrive,
-  Search,
-  ChevronRight,
-  Check,
-  X,
-  FileSpreadsheet,
-  Database,
-  SlidersHorizontal,
-} from 'lucide-react';
-import {
+import React, { useState, useMemo } from 'react';
+import type {
   SalesforceProfile,
   SalesforceObject,
-  ProfileGroupMapping,
+  SalesforceObjectField,
   AccessGroup,
-  NavViewId,
+  ProfileGroupMapping,
+  SalesforceConnectionSettings,
+  ProfileSyncDiffPreview,
+  OrgObjectCatalogEntry,
+  ObjectSyncDiffPreview,
+  RemovalResolutionAction,
 } from '@/types/governance';
-import { Card, Badge, Switch } from '@/components/ui/primitives';
+import { formatDateShort } from '@/components/ui/primitives';
+import type { FlyoutState } from './FlyoutDrawer';
 
 // ============================================================================
-// # SALESFORCE -> ## PROFILES
+// 1. SALESFORCE PROFILES VIEW
 // ============================================================================
+interface SalesforceProfilesViewProps {
+  profiles: SalesforceProfile[];
+  groups: AccessGroup[];
+  objects: SalesforceObject[];
+  mappings: ProfileGroupMapping[];
+  sfSettings: SalesforceConnectionSettings | null;
+  selectedFlyoutId?: string;
+  onOpenFlyout: (flyout: FlyoutState) => void;
+  onPreviewPullProfilesFromOrg: () => Promise<ProfileSyncDiffPreview>;
+  onApplyPullProfilesFromOrg: (payload: {
+    upserts: Array<{ id: string; name: string }>;
+    removeProfileIds: string[];
+    keptMissingProfileIds: string[];
+  }) => Promise<void>;
+  onNavigateToOrgConnection: () => void;
+}
+
 export function SalesforceProfilesView({
   profiles,
   groups,
+  objects,
   mappings,
-  apiFetch,
-  onRefresh,
-  onShowToast,
-  onNavigate,
-}: {
-  profiles: SalesforceProfile[];
-  groups: AccessGroup[];
-  mappings: ProfileGroupMapping[];
-  apiFetch: <T = any>(url: string, options?: RequestInit) => Promise<T>;
-  onRefresh: () => Promise<void>;
-  onShowToast: (msg: string, isError?: boolean) => void;
-  onNavigate: (view: NavViewId) => void;
-}) {
-  const [search, setSearch] = useState('');
-  const [newId, setNewId] = useState('');
-  const [newName, setNewName] = useState('');
-  const [showCsvModal, setShowCsvModal] = useState(false);
-  const [csvText, setCsvText] = useState('');
-  const [importing, setImporting] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  sfSettings,
+  selectedFlyoutId,
+  onOpenFlyout,
+  onPreviewPullProfilesFromOrg,
+  onApplyPullProfilesFromOrg,
+  onNavigateToOrgConnection,
+}: SalesforceProfilesViewProps) {
+  const [q, setQ] = useState('');
+  const [statusFilter, setStatusFilter] = useState<
+    'all' | 'assigned' | 'unassigned' | 'missing'
+  >('all');
 
-  const filtered = profiles.filter(
-    (p) =>
-      !search.trim() ||
-      p.id.toLowerCase().includes(search.toLowerCase()) ||
-      p.name.toLowerCase().includes(search.toLowerCase())
-  );
+  // Org Pull & Reconciliation state
+  const [pullBusy, setPullBusy] = useState(false);
+  const [pullError, setPullError] = useState('');
+  const [pullPreview, setPullPreview] =
+    useState<ProfileSyncDiffPreview | null>(null);
+  const [resolutions, setResolutions] = useState<
+    Record<string, RemovalResolutionAction>
+  >({});
 
-  const getGroupNamesForProfile = (profileId: string) => {
-    const m = mappings.find((item) => item.profileId === profileId);
-    if (!m || m.groupIds.length === 0) return [];
-    return m.groupIds.map(
-      (gid) => groups.find((g) => g.id === gid)?.name || gid
-    );
+  const getProfileGroupIds = (profileId: string): string[] => {
+    const found = mappings.find((m) => m.profileId === profileId);
+    return found ? found.groupIds : [];
   };
 
-  const handleAddOrUpdateProfile = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newId.trim() || !newName.trim()) return;
-    try {
-      await apiFetch('/api/admin/profiles', {
-        method: 'POST',
-        body: JSON.stringify({ id: newId.trim(), name: newName.trim() }),
-      });
-      setNewId('');
-      setNewName('');
-      await onRefresh();
-      onShowToast('Saved Salesforce Profile');
-    } catch (err: any) {
-      onShowToast(err.message, true);
+  const rows = useMemo(() => {
+    return profiles.filter((p) => {
+      const gIds = getProfileGroupIds(p.id);
+      if (statusFilter === 'assigned' && gIds.length === 0) return false;
+      if (statusFilter === 'unassigned' && gIds.length > 0) return false;
+      if (statusFilter === 'missing' && !p.missingInOrg) return false;
+      if (
+        q &&
+        !p.name.toLowerCase().includes(q.toLowerCase()) &&
+        !p.id.toLowerCase().includes(q.toLowerCase())
+      ) {
+        return false;
+      }
+      return true;
+    });
+  }, [profiles, mappings, statusFilter, q]);
+
+  const computeEffectiveSummary = (profileId: string) => {
+    const gIds = getProfileGroupIds(profileId);
+    const assigned = groups.filter((g) => gIds.includes(g.id));
+    const actSet = new Set<string>();
+    const objSet = new Set<string>();
+    for (const g of assigned) {
+      (g.allowedActions || []).forEach((a) => actSet.add(a));
+      for (const op of g.objectPermissions || []) {
+        const objMeta = objects.find((o) => o.objectName === op.objectName);
+        if (objMeta && !objMeta.enabled) continue;
+        if (op.canRead || op.canCreate || op.canUpdate || op.canDelete) {
+          objSet.add(op.objectName);
+        }
+      }
     }
+    return {
+      assignedGroups: assigned,
+      actionCount: actSet.size,
+      objectCount: objSet.size,
+    };
   };
 
-  const handleDeleteProfile = async (id: string, name: string) => {
-    try {
-      await apiFetch(`/api/admin/profiles/${encodeURIComponent(id)}`, {
-        method: 'DELETE',
-      });
-      await onRefresh();
-      onShowToast(`Deleted profile "${name}"`);
-    } catch (err: any) {
-      onShowToast(err.message, true);
+  const exportCsv = () => {
+    const header = 'ProfileId,ProfileName,UpdatedAt\n';
+    const body = profiles
+      .map(
+        (p) =>
+          `"${p.id}","${p.name.replace(/"/g, '""')}","${p.updatedAt}"`
+      )
+      .join('\n');
+    const blob = new Blob([header + body], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'salesforce-profiles.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handlePullFromOrg = async () => {
+    setPullError('');
+    if (sfSettings?.connectionStatus !== 'connected') {
+      onNavigateToOrgConnection();
+      return;
     }
-  };
-
-  const handleCsvFileUpload = async (
-    e: React.ChangeEvent<HTMLInputElement>
-  ) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const text = await file.text();
-    setCsvText(text);
-    setShowCsvModal(true);
-    e.target.value = '';
-  };
-
-  const handleImportCsvSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!csvText.trim()) return;
-    setImporting(true);
+    setPullBusy(true);
     try {
-      const res = await apiFetch<{
-        summary: { inserted: number; updated: number; total: number };
-      }>('/api/admin/profiles/import-csv', {
-        method: 'POST',
-        body: JSON.stringify({ csvText }),
-      });
-      await onRefresh();
-      setShowCsvModal(false);
-      setCsvText('');
-      onShowToast(
-        `CSV Imported: ${res.summary.inserted} added, ${res.summary.updated} updated (${res.summary.total} total)`
-      );
+      const preview = await onPreviewPullProfilesFromOrg();
+      const upserts = [
+        ...preview.added.map((a) => ({ id: a.id, name: a.name })),
+        ...preview.updated.map((u) => ({ id: u.id, name: u.name })),
+      ];
+      if (preview.removedFromOrg.length === 0) {
+        await onApplyPullProfilesFromOrg({
+          upserts,
+          removeProfileIds: [],
+          keptMissingProfileIds: [],
+        });
+      } else {
+        const initRes: Record<string, RemovalResolutionAction> = {};
+        preview.removedFromOrg.forEach((mp) => {
+          initRes[mp.id] = 'KEEP_FLAGGED';
+        });
+        setResolutions(initRes);
+        setPullPreview(preview);
+      }
     } catch (err: any) {
-      onShowToast(err.message, true);
+      setPullError(err.message || 'Failed to pull profiles from Salesforce.');
     } finally {
-      setImporting(false);
+      setPullBusy(false);
     }
   };
 
   return (
-    <div className="space-y-5">
-      {/* Top Action Header */}
-      <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
-        <div>
-          <h2 className="text-base font-bold text-slate-900">
-            Salesforce Profiles
-          </h2>
-          <p className="text-xs text-slate-500">
-            Manage Salesforce Profile IDs and Names (`00e...`). Import via CSV (`id, name`) to bulk-insert or update existing profiles.
+    <div>
+      <div className="ph">
+        <div className="ph-l">
+          <h1>Salesforce profiles</h1>
+          <p>
+            Map Salesforce Profile IDs to human-readable profile names used by
+            the access matrix.
           </p>
         </div>
-
-        <div className="flex flex-wrap items-center gap-2.5">
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".csv,text/csv,text/plain"
-            onChange={handleCsvFileUpload}
-            className="hidden"
-          />
+        <div className="ph-act">
           <button
             type="button"
-            onClick={() => fileInputRef.current?.click()}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 shadow-2xs transition hover:bg-slate-50"
+            className="btn"
+            disabled={pullBusy}
+            onClick={handlePullFromOrg}
           >
-            <Upload className="h-3.5 w-3.5 text-indigo-600" />
-            Upload CSV File
+            <span
+              className={`dot ${
+                sfSettings?.connectionStatus === 'connected' ? 'ok' : 'off'
+              }`}
+            />
+            {pullBusy ? 'Pulling from Org…' : 'Pull from Salesforce Org'}
           </button>
-
-          <button
-            type="button"
-            onClick={() => setShowCsvModal(true)}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 shadow-2xs transition hover:bg-slate-50"
-          >
-            <FileSpreadsheet className="h-3.5 w-3.5 text-indigo-600" />
-            Paste CSV
+          <button type="button" className="btn" onClick={exportCsv}>
+            Export CSV
           </button>
-
           <button
             type="button"
-            onClick={() => onNavigate('matrix-profile-groups')}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3.5 py-1.5 text-xs font-semibold text-white shadow-2xs transition hover:bg-indigo-700"
+            className="btn"
+            onClick={() => onOpenFlyout({ type: 'import' })}
           >
-            <span>Go to Profile Group Matrix</span>
-            <ArrowRight className="h-3.5 w-3.5" />
+            Import CSV
+          </button>
+          <button
+            type="button"
+            className="btn pri"
+            onClick={() => onOpenFlyout({ type: 'newprofile' })}
+          >
+            + Add profile
           </button>
         </div>
       </div>
 
-      {/* Inline Add / Update Single Profile Bar */}
-      <Card className="p-3.5">
-        <form
-          onSubmit={handleAddOrUpdateProfile}
-          className="flex flex-col gap-2.5 sm:flex-row sm:items-center"
+      {pullError && (
+        <div
+          className="card"
+          style={{
+            marginBottom: 12,
+            borderColor: 'var(--err)',
+            padding: '10px 14px',
+            color: 'var(--err)',
+          }}
         >
-          <div className="flex-1 sm:max-w-xs">
-            <input
-              type="text"
-              required
-              value={newId}
-              onChange={(e) => setNewId(e.target.value)}
-              placeholder="Salesforce Profile ID (e.g. 00e8b000001SalesRp)"
-              className="w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
-            />
-          </div>
-          <div className="flex-1">
-            <input
-              type="text"
-              required
-              value={newName}
-              onChange={(e) => setNewName(e.target.value)}
-              placeholder="Profile Name (e.g. Sales Representative)"
-              className="w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
-            />
-          </div>
-          <button
-            type="submit"
-            className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-slate-900 px-3.5 py-1.5 text-xs font-semibold text-white transition hover:bg-slate-800"
-          >
-            <Plus className="h-3.5 w-3.5" />
-            Add / Update Profile
-          </button>
-        </form>
-      </Card>
+          {pullError}
+        </div>
+      )}
 
-      {/* Dense Profiles Table */}
-      <Card className="overflow-hidden">
-        <div className="flex items-center justify-between border-b border-slate-200/80 bg-slate-50/60 px-4 py-2.5">
-          <span className="text-xs font-bold text-slate-700">
-            Registered Profiles ({filtered.length})
-          </span>
-          <div className="relative">
-            <Search className="pointer-events-none absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-            <input
-              type="text"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Filter by ID or Name..."
-              className="w-56 rounded-lg border border-slate-200 bg-white py-1 pr-2.5 pl-8 text-xs text-slate-800 focus:border-indigo-500 focus:outline-none"
-            />
+      {/* Org Profile Removal Reconciliation Modal */}
+      {pullPreview && (
+        <div className="cmdk-scrim" onClick={() => setPullPreview(null)}>
+          <div
+            className="cmdk-box"
+            style={{ maxWidth: 680 }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="card-h">
+              <div>
+                <div className="card-t">
+                  Reconcile Profiles with Salesforce Org
+                </div>
+                <div className="card-s">
+                  {pullPreview.added.length} new ·{' '}
+                  {pullPreview.updated.length} existing ·{' '}
+                  {pullPreview.removedFromOrg.length} local profile(s) missing
+                  in Org
+                </div>
+              </div>
+              <button
+                type="button"
+                className="btn gh sm"
+                onClick={() => setPullPreview(null)}
+              >
+                ✕
+              </button>
+            </div>
+            <div className="card-b">
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  marginBottom: 8,
+                }}
+              >
+                <span style={{ fontSize: 12, color: 'var(--t2)' }}>
+                  Choose how to handle local profiles missing from the
+                  Salesforce Org:
+                </span>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <button
+                    type="button"
+                    className="btn sm"
+                    onClick={() => {
+                      const next: Record<string, RemovalResolutionAction> = {};
+                      pullPreview.removedFromOrg.forEach(
+                        (p) => (next[p.id] = 'KEEP_FLAGGED')
+                      );
+                      setResolutions(next);
+                    }}
+                  >
+                    Keep all (flag Missing in Org)
+                  </button>
+                  <button
+                    type="button"
+                    className="btn dng sm"
+                    onClick={() => {
+                      const next: Record<string, RemovalResolutionAction> = {};
+                      pullPreview.removedFromOrg.forEach(
+                        (p) => (next[p.id] = 'DELETE')
+                      );
+                      setResolutions(next);
+                    }}
+                  >
+                    Remove all missing
+                  </button>
+                </div>
+              </div>
+              <div className="chk-list" style={{ maxHeight: 280 }}>
+                {pullPreview.removedFromOrg.map((mp) => {
+                  const choice = resolutions[mp.id] || 'KEEP_FLAGGED';
+                  return (
+                    <div className="chk-row" key={mp.id}>
+                      <div>
+                        <div style={{ fontWeight: 500 }}>{mp.name}</div>
+                        <div className="mono" style={{ color: 'var(--t3)' }}>
+                          {mp.id} · Mapped groups:{' '}
+                          {mp.mappedGroupNames.join(', ') || 'None'}
+                        </div>
+                      </div>
+                      <div className="seg">
+                        <button
+                          type="button"
+                          className={choice === 'KEEP_FLAGGED' ? 'on' : ''}
+                          onClick={() =>
+                            setResolutions({
+                              ...resolutions,
+                              [mp.id]: 'KEEP_FLAGGED',
+                            })
+                          }
+                        >
+                          Keep &amp; Flag
+                        </button>
+                        <button
+                          type="button"
+                          className={choice === 'DELETE' ? 'on' : ''}
+                          onClick={() =>
+                            setResolutions({
+                              ...resolutions,
+                              [mp.id]: 'DELETE',
+                            })
+                          }
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'flex-end',
+                  gap: 8,
+                  marginTop: 12,
+                }}
+              >
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => setPullPreview(null)}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="btn pri"
+                  disabled={pullBusy}
+                  onClick={async () => {
+                    setPullBusy(true);
+                    try {
+                      const upserts = [
+                        ...pullPreview.added.map((a) => ({
+                          id: a.id,
+                          name: a.name,
+                        })),
+                        ...pullPreview.updated.map((u) => ({
+                          id: u.id,
+                          name: u.name,
+                        })),
+                      ];
+                      const removeProfileIds = pullPreview.removedFromOrg
+                        .filter((p) => resolutions[p.id] === 'DELETE')
+                        .map((p) => p.id);
+                      const keptMissingProfileIds = pullPreview.removedFromOrg
+                        .filter((p) => resolutions[p.id] !== 'DELETE')
+                        .map((p) => p.id);
+                      await onApplyPullProfilesFromOrg({
+                        upserts,
+                        removeProfileIds,
+                        keptMissingProfileIds,
+                      });
+                      setPullPreview(null);
+                    } finally {
+                      setPullBusy(false);
+                    }
+                  }}
+                >
+                  Apply Org Sync
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="card">
+        <div className="tbar">
+          <div className="tbar-l">
+            <div className="srch">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.75"
+              >
+                <circle cx="11" cy="11" r="7" />
+                <path d="M20 20l-3.5-3.5" />
+              </svg>
+              <input
+                placeholder="Search profile name or ID…"
+                value={q}
+                onChange={(e) => setQ(e.target.value)}
+              />
+            </div>
+            <div className="seg">
+              {(
+                [
+                  ['all', 'All'],
+                  ['assigned', 'Assigned'],
+                  ['unassigned', 'Unassigned'],
+                  ...(profiles.some((p) => p.missingInOrg)
+                    ? [['missing', 'Missing in Org'] as const]
+                    : []),
+                ] as const
+              ).map(([k, lbl]) => (
+                <button
+                  key={k}
+                  type="button"
+                  className={statusFilter === k ? 'on' : ''}
+                  onClick={() => setStatusFilter(k as any)}
+                >
+                  {lbl}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="tbar-r">
+            <span className="mono" style={{ color: 'var(--t3)' }}>
+              {rows.length} of {profiles.length} profiles
+            </span>
           </div>
         </div>
 
-        <div className="overflow-x-auto">
-          <table className="w-full border-collapse text-left text-xs">
+        <div className="tbl-wrap">
+          <table className="tbl">
             <thead>
-              <tr className="border-b border-slate-200/80 bg-slate-50/40 text-[11px] font-bold tracking-wider text-slate-400 uppercase">
-                <th className="py-2.5 pr-3 pl-4">Profile ID</th>
-                <th className="px-3 py-2.5">Profile Name</th>
-                <th className="px-3 py-2.5">Assigned Access Groups</th>
-                <th className="px-3 py-2.5">Last Updated</th>
-                <th className="py-2.5 pr-4 pl-3 text-right">Actions</th>
+              <tr>
+                <th>Profile name</th>
+                <th>Profile ID</th>
+                <th>Assigned groups</th>
+                <th>Effective access</th>
+                <th>Org status</th>
+                <th>Updated</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-100">
-              {filtered.length === 0 ? (
+            <tbody>
+              {rows.length === 0 ? (
                 <tr>
-                  <td
-                    colSpan={5}
-                    className="py-10 text-center text-xs text-slate-400"
-                  >
-                    No profiles configured yet. Add a profile above or click{' '}
-                    <span className="font-semibold text-slate-600">
-                      Upload CSV File
-                    </span>{' '}
-                    to import `id, name`.
+                  <td colSpan={6} className="empty">
+                    No profiles match your filter.
                   </td>
                 </tr>
               ) : (
-                filtered.map((p) => {
-                  const assignedGroups = getGroupNamesForProfile(p.id);
+                rows.map((p) => {
+                  const eff = computeEffectiveSummary(p.id);
                   return (
-                    <tr key={p.id} className="hover:bg-slate-50/80">
-                      <td className="py-2.5 pr-3 pl-4 font-mono text-xs font-semibold text-indigo-600">
+                    <tr
+                      key={p.id}
+                      className={`row ${
+                        selectedFlyoutId === p.id ? 'sel' : ''
+                      }`}
+                      onClick={() =>
+                        onOpenFlyout({ type: 'profile', data: p })
+                      }
+                    >
+                      <td style={{ fontWeight: 500 }}>{p.name}</td>
+                      <td className="mono" style={{ color: 'var(--t2)' }}>
                         {p.id}
                       </td>
-                      <td className="px-3 py-2.5 font-semibold text-slate-900">
-                        {p.name}
-                      </td>
-                      <td className="px-3 py-2.5">
-                        {assignedGroups.length === 0 ? (
-                          <span className="text-[11px] text-slate-400">
-                            No groups mapped
+                      <td>
+                        {eff.assignedGroups.length === 0 ? (
+                          <span className="tag warn">
+                            <span className="dot warn" /> Unassigned
                           </span>
                         ) : (
-                          <div className="flex flex-wrap gap-1">
-                            {assignedGroups.map((gName) => (
-                              <Badge key={gName} variant="indigo">
-                                {gName}
-                              </Badge>
+                          <div
+                            style={{
+                              display: 'flex',
+                              gap: 4,
+                              flexWrap: 'wrap',
+                            }}
+                          >
+                            {eff.assignedGroups.map((g) => (
+                              <span key={g.id} className="tag acc">
+                                {g.name}
+                              </span>
                             ))}
                           </div>
                         )}
                       </td>
-                      <td className="px-3 py-2.5 font-mono text-[11px] text-slate-400">
-                        {new Date(p.updatedAt).toLocaleString()}
+                      <td className="mono" style={{ color: 'var(--t2)' }}>
+                        {eff.assignedGroups.length === 0
+                          ? 'No MCP access'
+                          : `${eff.actionCount} actions · ${eff.objectCount} objects`}
                       </td>
-                      <td className="py-2.5 pr-4 pl-3 text-right">
-                        <div className="inline-flex items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setNewId(p.id);
-                              setNewName(p.name);
-                            }}
-                            className="rounded-md border border-slate-200 px-2 py-1 text-[11px] font-semibold text-slate-600 hover:bg-slate-100"
-                          >
-                            Edit
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => onNavigate('matrix-profile-groups')}
-                            className="rounded-md border border-indigo-200 bg-indigo-50 px-2 py-1 text-[11px] font-semibold text-indigo-600 hover:bg-indigo-100"
-                          >
-                            Matrix →
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleDeleteProfile(p.id, p.name)}
-                            className="rounded-md p-1 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
-                            title="Delete Profile"
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </button>
-                        </div>
+                      <td>
+                        {p.missingInOrg ? (
+                          <span className="tag warn">Missing in Org</span>
+                        ) : (
+                          <span className="tag ok">Active</span>
+                        )}
+                      </td>
+                      <td className="mono" style={{ color: 'var(--t2)' }}>
+                        {formatDateShort(p.updatedAt)}
                       </td>
                     </tr>
                   );
@@ -326,609 +511,731 @@ export function SalesforceProfilesView({
             </tbody>
           </table>
         </div>
-      </Card>
-
-      {/* CSV Import Modal */}
-      {showCsvModal && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-[1px]"
-          onClick={() => setShowCsvModal(false)}
-        >
-          <div
-            className="w-full max-w-lg rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-              <div>
-                <h3 className="text-sm font-bold text-slate-900">
-                  Import Salesforce Profiles from CSV
-                </h3>
-                <p className="text-[11px] text-slate-500">
-                  Format: 2 columns (`id, name`). Matching Profile IDs will update their name; new IDs will be inserted.
-                </p>
-              </div>
-              <button
-                onClick={() => setShowCsvModal(false)}
-                className="rounded-lg p-1 text-slate-400 hover:bg-slate-100"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-
-            <form onSubmit={handleImportCsvSubmit} className="mt-4 space-y-4">
-              <textarea
-                rows={8}
-                value={csvText}
-                onChange={(e) => setCsvText(e.target.value)}
-                placeholder={`Id,Name\n00e8b000000SysAdmA,System Administrator\n00e8b000001SalesRp,Sales Representative\n00e8b000002SuppAgt,Support Agent`}
-                className="w-full rounded-xl border border-slate-200 bg-slate-50 p-3 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
-              />
-
-              <div className="flex items-center justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={() => setShowCsvModal(false)}
-                  className="rounded-lg border border-slate-200 px-3.5 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-50"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={importing}
-                  className="rounded-lg bg-indigo-600 px-4 py-1.5 text-xs font-semibold text-white hover:bg-indigo-700 disabled:opacity-50"
-                >
-                  {importing ? 'Importing...' : 'Import & Upsert Profiles'}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
+      </div>
     </div>
   );
 }
 
 // ============================================================================
-// # SALESFORCE -> ## OBJECTS
+// 2. SALESFORCE OBJECTS VIEW
 // ============================================================================
+interface SalesforceObjectsViewProps {
+  objects: SalesforceObject[];
+  groups: AccessGroup[];
+  sfSettings: SalesforceConnectionSettings | null;
+  selectedFlyoutId?: string;
+  externalCatalogTrigger?: number;
+  onToggleObject: (objectName: string, enabled: boolean) => Promise<void>;
+  onBulkToggleAllObjects: (enabled: boolean) => Promise<void>;
+  onOpenFlyout: (flyout: FlyoutState) => void;
+  onFetchOrgObjectCatalog: () => Promise<OrgObjectCatalogEntry[]>;
+  onPreviewPullObjectsFromOrg: (objectNames: string[]) => Promise<{
+    preview: ObjectSyncDiffPreview;
+    pulledMetadata: any[];
+  }>;
+  onApplyPullObjectsFromOrg: (payload: {
+    pulledMetadata: any[];
+    removeObjectNames: string[];
+    removeFields: Array<{ objectName: string; fieldName: string }>;
+  }) => Promise<void>;
+  onNavigateToOrgConnection: () => void;
+}
+
 export function SalesforceObjectsView({
   objects,
-  savedFolderPath,
-  apiFetch,
-  onRefresh,
-  onShowToast,
-}: {
-  objects: SalesforceObject[];
-  savedFolderPath: string;
-  apiFetch: <T = any>(url: string, options?: RequestInit) => Promise<T>;
-  onRefresh: () => Promise<void>;
-  onShowToast: (msg: string, isError?: boolean) => void;
-}) {
-  const [search, setSearch] = useState('');
-  const [localFolderPath, setLocalFolderPath] = useState(savedFolderPath || '');
-  const [syncingFolder, setSyncingFolder] = useState(false);
-  const [uploadingBrowserFolder, setUploadingBrowserFolder] = useState(false);
+  groups,
+  sfSettings,
+  selectedFlyoutId,
+  externalCatalogTrigger,
+  onToggleObject,
+  onBulkToggleAllObjects,
+  onOpenFlyout,
+  onFetchOrgObjectCatalog,
+  onPreviewPullObjectsFromOrg,
+  onApplyPullObjectsFromOrg,
+  onNavigateToOrgConnection,
+}: SalesforceObjectsViewProps) {
+  const [q, setQ] = useState('');
+  const [statusFilter, setStatusFilter] = useState<
+    'all' | 'enabled' | 'disabled'
+  >('all');
+  const [kindFilter, setKindFilter] = useState<'all' | 'std' | 'custom'>('all');
 
-  // Manual Object addition
-  const [showAddModal, setShowAddModal] = useState(false);
-  const [manualObjName, setManualObjName] = useState('');
-  const [manualObjLabel, setManualObjLabel] = useState('');
-  const [manualFieldsCsv, setManualFieldsCsv] = useState(
-    'Id, Name, Status__c, OwnerId'
-  );
+  // Org Object Catalog & Reconciliation Modal state
+  const [catalogOpen, setCatalogOpen] = useState(false);
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  const [catalogError, setCatalogError] = useState('');
+  const [catalogEntries, setCatalogEntries] = useState<
+    OrgObjectCatalogEntry[]
+  >([]);
+  const [selectedOrgObjs, setSelectedOrgObjs] = useState<string[]>([]);
+  const [catalogSearch, setCatalogSearch] = useState('');
+  const [syncPreview, setSyncPreview] =
+    useState<ObjectSyncDiffPreview | null>(null);
+  const [pulledMetadataCache, setPulledMetadataCache] = useState<any[]>([]);
+  const [objResolutions, setObjResolutions] = useState<
+    Record<string, RemovalResolutionAction>
+  >({});
+  const [fldResolutions, setFldResolutions] = useState<
+    Record<string, RemovalResolutionAction>
+  >({});
 
-  // Selected Object for inspecting/toggling its fields
-  const [selectedObjName, setSelectedObjName] = useState<string | null>(null);
-  const folderInputRef = useRef<HTMLInputElement | null>(null);
-
-  const selectedObject =
-    objects.find((o) => o.objectName === selectedObjName) || null;
-
-  const filtered = objects.filter(
-    (o) =>
-      !search.trim() ||
-      o.objectName.toLowerCase().includes(search.toLowerCase()) ||
-      o.label.toLowerCase().includes(search.toLowerCase())
-  );
-
-  // Option 1: Browser Directory Picker (`webkitdirectory`)
-  const handleBrowserDirectoryPick = async (
-    e: React.ChangeEvent<HTMLInputElement>
-  ) => {
-    const fileList = e.target.files;
-    if (!fileList || fileList.length === 0) return;
-
-    setUploadingBrowserFolder(true);
+  const openOrgCatalog = async () => {
+    setCatalogError('');
+    if (sfSettings?.connectionStatus !== 'connected') {
+      onNavigateToOrgConnection();
+      return;
+    }
+    setCatalogOpen(true);
+    setCatalogLoading(true);
+    setSyncPreview(null);
     try {
-      const xmlFiles: Array<{ relativePath: string; content: string }> = [];
-      for (let i = 0; i < fileList.length; i++) {
-        const f = fileList[i];
-        const rel = (f as any).webkitRelativePath || f.name;
-        if (
-          f.name.endsWith('.xml') ||
-          f.name.endsWith('.object') ||
-          f.name.endsWith('.field')
-        ) {
-          const text = await f.text();
-          xmlFiles.push({ relativePath: rel, content: text });
-        }
-      }
+      const items = await onFetchOrgObjectCatalog();
+      setCatalogEntries(items);
+      const trackedNames = new Set(objects.map((o) => o.objectName));
+      const preselected = items
+        .filter((it) => trackedNames.has(it.objectName))
+        .map((it) => it.objectName);
+      setSelectedOrgObjs(
+        preselected.length > 0
+          ? preselected
+          : items.slice(0, 6).map((it) => it.objectName)
+      );
+    } catch (err: any) {
+      setCatalogError(
+        err.message || 'Failed to fetch SObject catalog from Salesforce Org.'
+      );
+    } finally {
+      setCatalogLoading(false);
+    }
+  };
 
-      if (xmlFiles.length === 0) {
-        onShowToast(
-          'No .object-meta.xml, .field-meta.xml, or .object files found in that directory.',
-          true
+  React.useEffect(() => {
+    if (externalCatalogTrigger && externalCatalogTrigger > 0) {
+      openOrgCatalog();
+    }
+  }, [externalCatalogTrigger]);
+
+  const rows = useMemo(() => {
+    return objects.filter(
+      (o) =>
+        (statusFilter === 'all' ||
+          (statusFilter === 'enabled' ? o.enabled : !o.enabled)) &&
+        (kindFilter === 'all' ||
+          (kindFilter === 'custom' ? o.isCustom : !o.isCustom)) &&
+        (!q ||
+          o.objectName.toLowerCase().includes(q.toLowerCase()) ||
+          o.label.toLowerCase().includes(q.toLowerCase()))
+    );
+  }, [objects, statusFilter, kindFilter, q]);
+
+  const totalFields = objects.reduce((acc, o) => acc + o.fields.length, 0);
+  const enabledFields = objects.reduce(
+    (acc, o) =>
+      acc +
+      o.fields.filter((f: SalesforceObjectField) => f.enabled).length,
+    0
+  );
+
+  const handlePreviewOrgSync = async () => {
+    setCatalogLoading(true);
+    setCatalogError('');
+    try {
+      const { preview, pulledMetadata } =
+        await onPreviewPullObjectsFromOrg(selectedOrgObjs);
+      setPulledMetadataCache(pulledMetadata);
+
+      const allRemovedFields = preview.upsertedObjects.flatMap(
+        (uo) => uo.removedFieldsFromOrg
+      );
+
+      if (
+        preview.removedObjectsFromOrg.length === 0 &&
+        allRemovedFields.length === 0
+      ) {
+        await onApplyPullObjectsFromOrg({
+          pulledMetadata,
+          removeObjectNames: [],
+          removeFields: [],
+        });
+        setCatalogOpen(false);
+      } else {
+        const initObjRes: Record<string, RemovalResolutionAction> = {};
+        preview.removedObjectsFromOrg.forEach(
+          (mo) => (initObjRes[mo.objectName] = 'KEEP_FLAGGED')
         );
-        return;
+        const initFldRes: Record<string, RemovalResolutionAction> = {};
+        allRemovedFields.forEach(
+          (mf) =>
+            (initFldRes[`${mf.objectName}.${mf.fieldName}`] = 'KEEP_FLAGGED')
+        );
+        setObjResolutions(initObjRes);
+        setFldResolutions(initFldRes);
+        setSyncPreview(preview);
       }
-
-      const res = await apiFetch<{
-        summary: { objectsImported: number; fieldsImported: number };
-      }>('/api/admin/objects/import-sfdx-files', {
-        method: 'POST',
-        body: JSON.stringify({ files: xmlFiles }),
-      });
-
-      await onRefresh();
-      onShowToast(
-        `Imported ${res.summary.objectsImported} Objects and ${res.summary.fieldsImported} Fields from folder`
-      );
     } catch (err: any) {
-      onShowToast(err.message, true);
+      setCatalogError(err.message || 'Failed to preview Org object sync.');
     } finally {
-      setUploadingBrowserFolder(false);
-      e.target.value = '';
+      setCatalogLoading(false);
     }
   };
 
-  // Option 2: Sync from Local Server Path
-  const handleLocalPathSync = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!localFolderPath.trim()) return;
-    setSyncingFolder(true);
-    try {
-      const res = await apiFetch<{
-        summary: {
-          objectsImported: number;
-          fieldsImported: number;
-          resolvedPath: string;
-        };
-      }>('/api/admin/objects/import-local-folder', {
-        method: 'POST',
-        body: JSON.stringify({ folderPath: localFolderPath.trim() }),
-      });
-      await onRefresh();
-      onShowToast(
-        `Synced ${res.summary.objectsImported} Objects (${res.summary.fieldsImported} Fields) from ${res.summary.resolvedPath}`
-      );
-    } catch (err: any) {
-      onShowToast(err.message, true);
-    } finally {
-      setSyncingFolder(false);
-    }
-  };
-
-  // Option 3: Manual Object + Fields creation
-  const handleManualAddObject = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!manualObjName.trim()) return;
-    try {
-      const fields = manualFieldsCsv
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean)
-        .map((fn) => ({
-          fieldName: fn,
-          label: fn,
-          fieldType: fn === 'Id' ? 'Id' : 'Text',
-          isCustom: fn.endsWith('__c'),
-          required: fn === 'Id',
-          enabled: true,
-        }));
-
-      await apiFetch('/api/admin/objects', {
-        method: 'POST',
-        body: JSON.stringify({
-          objectName: manualObjName.trim(),
-          label: manualObjLabel.trim() || manualObjName.trim(),
-          fields,
-        }),
-      });
-      await onRefresh();
-      setShowAddModal(false);
-      setManualObjName('');
-      setManualObjLabel('');
-      onShowToast(`Added Object "${manualObjName.trim()}"`);
-    } catch (err: any) {
-      onShowToast(err.message, true);
-    }
-  };
-
-  const handleToggleObject = async (objectName: string, enabled: boolean) => {
-    try {
-      await apiFetch(
-        `/api/admin/objects/${encodeURIComponent(objectName)}/toggle`,
-        {
-          method: 'PUT',
-          body: JSON.stringify({ enabled }),
-        }
-      );
-      await onRefresh();
-      onShowToast(
-        `${enabled ? 'Enabled' : 'Disabled'} Object "${objectName}"`
-      );
-    } catch (err: any) {
-      onShowToast(err.message, true);
-    }
-  };
-
-  const handleToggleField = async (
-    objectName: string,
-    fieldName: string,
-    enabled: boolean
-  ) => {
-    try {
-      await apiFetch(
-        `/api/admin/objects/${encodeURIComponent(
-          objectName
-        )}/fields/${encodeURIComponent(fieldName)}/toggle`,
-        {
-          method: 'PUT',
-          body: JSON.stringify({ enabled }),
-        }
-      );
-      await onRefresh();
-    } catch (err: any) {
-      onShowToast(err.message, true);
-    }
-  };
-
-  const handleDeleteObject = async (objectName: string) => {
-    try {
-      await apiFetch(`/api/admin/objects/${encodeURIComponent(objectName)}`, {
-        method: 'DELETE',
-      });
-      if (selectedObjName === objectName) setSelectedObjName(null);
-      await onRefresh();
-      onShowToast(`Deleted Object "${objectName}"`);
-    } catch (err: any) {
-      onShowToast(err.message, true);
-    }
-  };
+  const allRemovedFieldsInPreview = useMemo(() => {
+    if (!syncPreview) return [];
+    return syncPreview.upsertedObjects.flatMap((uo) => uo.removedFieldsFromOrg);
+  }, [syncPreview]);
 
   return (
-    <div className="space-y-5">
-      {/* Header */}
-      <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
-        <div>
-          <h2 className="text-base font-bold text-slate-900">
-            Salesforce Objects & Fields
-          </h2>
-          <p className="text-xs text-slate-500">
-            Import your Salesforce DX `force-app/main/default/objects` directory to load objects and fields, then toggle which objects and fields are active.
+    <div>
+      <div className="ph">
+        <div className="ph-l">
+          <h1>Salesforce objects</h1>
+          <p>
+            Enable or disable SObjects and individual fields exposed by the MCP
+            server.
           </p>
         </div>
-
-        <div className="flex flex-wrap items-center gap-2.5">
-          {/* Hidden Directory Input for SFDX `objects/` folder */}
-          <input
-            ref={(el) => {
-              folderInputRef.current = el;
-              if (el) {
-                el.setAttribute('webkitdirectory', '');
-                el.setAttribute('directory', '');
-              }
-            }}
-            type="file"
-            multiple
-            onChange={handleBrowserDirectoryPick}
-            className="hidden"
-          />
-
-          <button
-            type="button"
-            disabled={uploadingBrowserFolder}
-            onClick={() => folderInputRef.current?.click()}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3.5 py-1.5 text-xs font-semibold text-white shadow-2xs transition hover:bg-indigo-700 disabled:opacity-50"
-          >
-            <FolderOpen className="h-3.5 w-3.5" />
-            {uploadingBrowserFolder
-              ? 'Reading Folder...'
-              : 'Select SFDX `objects/` Folder'}
+        <div className="ph-act">
+          <button type="button" className="btn" onClick={openOrgCatalog}>
+            <span
+              className={`dot ${
+                sfSettings?.connectionStatus === 'connected' ? 'ok' : 'off'
+              }`}
+            />
+            Pull from Salesforce Org
           </button>
-
           <button
             type="button"
-            onClick={() => setShowAddModal(true)}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 shadow-2xs transition hover:bg-slate-50"
+            className="btn"
+            onClick={() => onBulkToggleAllObjects(true)}
           >
-            <Plus className="h-3.5 w-3.5" />
-            Add Object Manually
+            Enable all
+          </button>
+          <button
+            type="button"
+            className="btn"
+            onClick={() => onBulkToggleAllObjects(false)}
+          >
+            Disable all
+          </button>
+          <button
+            type="button"
+            className="btn pri"
+            onClick={() => onOpenFlyout({ type: 'sync' })}
+          >
+            Sync SFDX / Upload
           </button>
         </div>
       </div>
 
-      {/* Local SFDX Path Sync Bar */}
-      <Card className="p-3.5">
-        <form
-          onSubmit={handleLocalPathSync}
-          className="flex flex-col gap-2.5 sm:flex-row sm:items-center"
-        >
-          <div className="flex items-center gap-2 text-xs font-semibold text-slate-700">
-            <HardDrive className="h-4 w-4 text-indigo-600 shrink-0" />
-            <span className="whitespace-nowrap">Local SFDX Folder Path:</span>
-          </div>
-          <input
-            type="text"
-            value={localFolderPath}
-            onChange={(e) => setLocalFolderPath(e.target.value)}
-            placeholder="/Users/you/my-sfdx-project/force-app/main/default/objects"
-            className="flex-1 rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
-          />
-          <button
-            type="submit"
-            disabled={syncingFolder}
-            className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-slate-900 px-3.5 py-1.5 text-xs font-semibold text-white transition hover:bg-slate-800 disabled:opacity-50"
-          >
-            {syncingFolder ? 'Syncing...' : 'Sync from Local Path'}
-          </button>
-        </form>
-      </Card>
-
-      {/* Main Split Grid: Objects Table (Left) + Field Toggles (Right when selected) */}
-      <div className="grid grid-cols-1 gap-5 lg:grid-cols-12">
-        <Card
-          className={`overflow-hidden ${
-            selectedObject ? 'lg:col-span-7' : 'lg:col-span-12'
-          }`}
-        >
-          <div className="flex items-center justify-between border-b border-slate-200/80 bg-slate-50/60 px-4 py-2.5">
-            <span className="text-xs font-bold text-slate-700">
-              Objects ({filtered.filter((o) => o.enabled).length} enabled /{' '}
-              {filtered.length} total)
-            </span>
-            <div className="relative">
-              <Search className="pointer-events-none absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-              <input
-                type="text"
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                placeholder="Search objects..."
-                className="w-52 rounded-lg border border-slate-200 bg-white py-1 pr-2.5 pl-8 text-xs text-slate-800 focus:border-indigo-500 focus:outline-none"
-              />
-            </div>
-          </div>
-
-          <div className="overflow-x-auto">
-            <table className="w-full border-collapse text-left text-xs">
-              <thead>
-                <tr className="border-b border-slate-200/80 bg-slate-50/40 text-[11px] font-bold tracking-wider text-slate-400 uppercase">
-                  <th className="py-2.5 pr-3 pl-4">Enabled</th>
-                  <th className="px-3 py-2.5">Object API Name</th>
-                  <th className="px-3 py-2.5">Label</th>
-                  <th className="px-3 py-2.5">Fields</th>
-                  <th className="py-2.5 pr-4 pl-3 text-right">Actions</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {filtered.length === 0 ? (
-                  <tr>
-                    <td
-                      colSpan={5}
-                      className="py-10 text-center text-xs text-slate-400"
-                    >
-                      No Salesforce Objects imported yet. Click{' '}
-                      <span className="font-semibold text-slate-600">
-                        Select SFDX `objects/` Folder
-                      </span>{' '}
-                      or enter a local folder path above.
-                    </td>
-                  </tr>
-                ) : (
-                  filtered.map((obj) => {
-                    const isSelected =
-                      selectedObject?.objectName === obj.objectName;
-                    return (
-                      <tr
-                        key={obj.objectName}
-                        className={`transition-colors ${
-                          isSelected
-                            ? 'bg-indigo-50/60'
-                            : 'hover:bg-slate-50/80'
-                        } ${!obj.enabled ? 'opacity-60' : ''}`}
-                      >
-                        <td className="py-2.5 pr-3 pl-4">
-                          <Switch
-                            checked={obj.enabled}
-                            onCheckedChange={(val) =>
-                              handleToggleObject(obj.objectName, val)
-                            }
-                          />
-                        </td>
-                        <td className="px-3 py-2.5 font-mono font-bold text-slate-900">
-                          {obj.objectName}
-                        </td>
-                        <td className="px-3 py-2.5 text-slate-700">
-                          {obj.label}
-                        </td>
-                        <td className="px-3 py-2.5">
-                          <Badge variant={obj.enabled ? 'indigo' : 'slate'}>
-                            {obj.enabledFieldCount} / {obj.fieldCount} fields
-                          </Badge>
-                        </td>
-                        <td className="py-2.5 pr-4 pl-3 text-right">
-                          <div className="inline-flex items-center gap-2">
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setSelectedObjName(
-                                  isSelected ? null : obj.objectName
-                                )
-                              }
-                              className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-700 hover:border-indigo-200 hover:text-indigo-600"
-                            >
-                              <SlidersHorizontal className="h-3 w-3" />
-                              <span>Fields</span>
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleDeleteObject(obj.objectName)}
-                              className="rounded-md p-1 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
-                              title="Delete Object"
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    );
-                  })
-                )}
-              </tbody>
-            </table>
-          </div>
-        </Card>
-
-        {/* Right Field Inspector Panel */}
-        {selectedObject && (
-          <Card className="flex flex-col overflow-hidden lg:col-span-5">
-            <div className="flex items-center justify-between border-b border-slate-200/80 bg-slate-50/70 px-4 py-3">
-              <div>
-                <div className="flex items-center gap-2">
-                  <span className="font-mono text-xs font-bold text-indigo-600">
-                    {selectedObject.objectName}
-                  </span>
-                  <Badge variant="slate">
-                    {selectedObject.fields.length} Fields
-                  </Badge>
-                </div>
-                <p className="text-[11px] text-slate-500">
-                  Toggle which fields of `{selectedObject.objectName}` are exposed to Access Groups.
-                </p>
-              </div>
-              <button
-                onClick={() => setSelectedObjName(null)}
-                className="rounded-lg p-1 text-slate-400 hover:bg-slate-200/60 hover:text-slate-700"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-
-            <div className="max-h-[460px] divide-y divide-slate-100 overflow-y-auto">
-              {selectedObject.fields.map((f) => (
-                <div
-                  key={f.fieldName}
-                  className="flex items-center justify-between px-4 py-2.5 text-xs hover:bg-slate-50"
-                >
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <span className="font-mono font-semibold text-slate-900">
-                        {f.fieldName}
-                      </span>
-                      <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-500">
-                        {f.fieldType}
-                      </span>
-                    </div>
-                    <p className="text-[11px] text-slate-500">{f.label}</p>
-                  </div>
-                  <Switch
-                    checked={f.enabled}
-                    onCheckedChange={(val) =>
-                      handleToggleField(
-                        selectedObject.objectName,
-                        f.fieldName,
-                        val
-                      )
-                    }
-                  />
-                </div>
-              ))}
-            </div>
-          </Card>
-        )}
-      </div>
-
-      {/* Manual Add Object Modal */}
-      {showAddModal && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-[1px]"
-          onClick={() => setShowAddModal(false)}
-        >
+      {/* Org Object Catalog & Reconciliation Modal */}
+      {catalogOpen && (
+        <div className="cmdk-scrim" onClick={() => setCatalogOpen(false)}>
           <div
-            className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl"
+            className="cmdk-box"
+            style={{ maxWidth: 720 }}
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-              <h3 className="text-sm font-bold text-slate-900">
-                Add Salesforce Object Manually
-              </h3>
+            <div className="card-h">
+              <div>
+                <div className="card-t">
+                  {syncPreview
+                    ? 'Reconcile Missing SObjects & Fields'
+                    : 'Pull SObjects from Connected Salesforce Org'}
+                </div>
+                <div className="card-s">
+                  {syncPreview
+                    ? `${syncPreview.removedObjectsFromOrg.length} missing object(s) · ${allRemovedFieldsInPreview.length} missing field(s)`
+                    : `Select SObjects from describeGlobal to describe & sync into the MCP server`}
+                </div>
+              </div>
               <button
-                onClick={() => setShowAddModal(false)}
-                className="rounded-lg p-1 text-slate-400 hover:bg-slate-100"
+                type="button"
+                className="btn gh sm"
+                onClick={() => setCatalogOpen(false)}
               >
-                <X className="h-4 w-4" />
+                ✕
               </button>
             </div>
 
-            <form onSubmit={handleManualAddObject} className="mt-4 space-y-3.5">
-              <div>
-                <label className="block text-xs font-semibold text-slate-700">
-                  Object API Name
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={manualObjName}
-                  onChange={(e) => setManualObjName(e.target.value)}
-                  placeholder="e.g. Account, Case, Change_Request__c"
-                  className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:outline-none"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-700">
-                  Display Label
-                </label>
-                <input
-                  type="text"
-                  value={manualObjLabel}
-                  onChange={(e) => setManualObjLabel(e.target.value)}
-                  placeholder="e.g. Customer Account"
-                  className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-1.5 text-xs text-slate-900 focus:border-indigo-500 focus:outline-none"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-700">
-                  Fields (comma-separated API names)
-                </label>
-                <textarea
-                  rows={3}
-                  value={manualFieldsCsv}
-                  onChange={(e) => setManualFieldsCsv(e.target.value)}
-                  className="mt-1 w-full rounded-lg border border-slate-200 p-2.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:outline-none"
-                />
-              </div>
-
-              <div className="flex justify-end gap-2 pt-2">
-                <button
-                  type="button"
-                  onClick={() => setShowAddModal(false)}
-                  className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-600"
+            <div className="card-b">
+              {catalogError && (
+                <div
+                  style={{
+                    color: 'var(--err)',
+                    marginBottom: 10,
+                    fontSize: 12,
+                  }}
                 >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  className="rounded-lg bg-indigo-600 px-4 py-1.5 text-xs font-semibold text-white hover:bg-indigo-700"
-                >
-                  Save Object
-                </button>
-              </div>
-            </form>
+                  {catalogError}
+                </div>
+              )}
+
+              {!syncPreview ? (
+                <>
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      gap: 8,
+                      marginBottom: 8,
+                    }}
+                  >
+                    <input
+                      className="inp"
+                      placeholder="Filter Org SObjects…"
+                      value={catalogSearch}
+                      onChange={(e) => setCatalogSearch(e.target.value)}
+                    />
+                    <button
+                      type="button"
+                      className="btn sm"
+                      onClick={() =>
+                        setSelectedOrgObjs(
+                          catalogEntries.map((c) => c.objectName)
+                        )
+                      }
+                    >
+                      Select all ({catalogEntries.length})
+                    </button>
+                    <button
+                      type="button"
+                      className="btn sm"
+                      onClick={() => setSelectedOrgObjs([])}
+                    >
+                      Clear
+                    </button>
+                  </div>
+                  <div className="chk-list" style={{ maxHeight: 300 }}>
+                    {catalogLoading ? (
+                      <div className="empty">
+                        Querying Salesforce REST describeGlobal…
+                      </div>
+                    ) : (
+                      catalogEntries
+                        .filter(
+                          (c) =>
+                            !catalogSearch ||
+                            c.objectName
+                              .toLowerCase()
+                              .includes(catalogSearch.toLowerCase()) ||
+                            c.label
+                              .toLowerCase()
+                              .includes(catalogSearch.toLowerCase())
+                        )
+                        .map((c) => {
+                          const on = selectedOrgObjs.includes(c.objectName);
+                          const inStore = objects.some(
+                            (o) => o.objectName === c.objectName
+                          );
+                          return (
+                            <div className="chk-row" key={c.objectName}>
+                              <div>
+                                <span
+                                  className="mono"
+                                  style={{ fontWeight: 600 }}
+                                >
+                                  {c.objectName}
+                                </span>{' '}
+                                <span style={{ color: 'var(--t2)' }}>
+                                  · {c.label}
+                                </span>
+                                {(c.isCustom || c.custom) && (
+                                  <span
+                                    className="tag pur"
+                                    style={{ marginLeft: 6 }}
+                                  >
+                                    custom
+                                  </span>
+                                )}
+                                {inStore && (
+                                  <span
+                                    className="tag acc"
+                                    style={{ marginLeft: 6 }}
+                                  >
+                                    in store
+                                  </span>
+                                )}
+                              </div>
+                              <button
+                                type="button"
+                                className={`sw ${on ? 'on' : ''}`}
+                                onClick={() => {
+                                  if (on) {
+                                    setSelectedOrgObjs(
+                                      selectedOrgObjs.filter(
+                                        (x) => x !== c.objectName
+                                      )
+                                    );
+                                  } else {
+                                    setSelectedOrgObjs([
+                                      ...selectedOrgObjs,
+                                      c.objectName,
+                                    ]);
+                                  }
+                                }}
+                              />
+                            </div>
+                          );
+                        })
+                    )}
+                  </div>
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      marginTop: 12,
+                    }}
+                  >
+                    <span className="mono" style={{ color: 'var(--t3)' }}>
+                      {selectedOrgObjs.length} SObjects selected
+                    </span>
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <button
+                        type="button"
+                        className="btn"
+                        onClick={() => setCatalogOpen(false)}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        className="btn pri"
+                        disabled={
+                          catalogLoading || selectedOrgObjs.length === 0
+                        }
+                        onClick={handlePreviewOrgSync}
+                      >
+                        {catalogLoading
+                          ? 'Inspecting Schemas…'
+                          : `Pull ${selectedOrgObjs.length} Objects`}
+                      </button>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="chk-list" style={{ maxHeight: 300 }}>
+                    {syncPreview.removedObjectsFromOrg.map((mo) => {
+                      const choice =
+                        objResolutions[mo.objectName] || 'KEEP_FLAGGED';
+                      return (
+                        <div className="chk-row" key={mo.objectName}>
+                          <div>
+                            <span className="tag warn">Object</span>{' '}
+                            <b className="mono">{mo.objectName}</b> ({mo.label})
+                            <div
+                              style={{ fontSize: 11, color: 'var(--t3)' }}
+                            >
+                              {mo.fieldCount} fields · Used by groups:{' '}
+                              {mo.referencedInGroups.join(', ') || 'None'}
+                            </div>
+                          </div>
+                          <div className="seg">
+                            <button
+                              type="button"
+                              className={choice === 'KEEP_FLAGGED' ? 'on' : ''}
+                              onClick={() =>
+                                setObjResolutions({
+                                  ...objResolutions,
+                                  [mo.objectName]: 'KEEP_FLAGGED',
+                                })
+                              }
+                            >
+                              Keep &amp; Flag
+                            </button>
+                            <button
+                              type="button"
+                              className={choice === 'DELETE' ? 'on' : ''}
+                              onClick={() =>
+                                setObjResolutions({
+                                  ...objResolutions,
+                                  [mo.objectName]: 'DELETE',
+                                })
+                              }
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                    {allRemovedFieldsInPreview.map((mf) => {
+                      const key = `${mf.objectName}.${mf.fieldName}`;
+                      const choice = fldResolutions[key] || 'KEEP_FLAGGED';
+                      return (
+                        <div className="chk-row" key={key}>
+                          <div>
+                            <span className="tag">Field</span>{' '}
+                            <span className="mono">
+                              {mf.objectName}.{mf.fieldName}
+                            </span>{' '}
+                            ({mf.label})
+                          </div>
+                          <div className="seg">
+                            <button
+                              type="button"
+                              className={choice === 'KEEP_FLAGGED' ? 'on' : ''}
+                              onClick={() =>
+                                setFldResolutions({
+                                  ...fldResolutions,
+                                  [key]: 'KEEP_FLAGGED',
+                                })
+                              }
+                            >
+                              Keep &amp; Flag
+                            </button>
+                            <button
+                              type="button"
+                              className={choice === 'DELETE' ? 'on' : ''}
+                              onClick={() =>
+                                setFldResolutions({
+                                  ...fldResolutions,
+                                  [key]: 'DELETE',
+                                })
+                              }
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'flex-end',
+                      gap: 8,
+                      marginTop: 12,
+                    }}
+                  >
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() => setSyncPreview(null)}
+                    >
+                      Back
+                    </button>
+                    <button
+                      type="button"
+                      className="btn pri"
+                      disabled={catalogLoading}
+                      onClick={async () => {
+                        setCatalogLoading(true);
+                        try {
+                          const removeObjectNames =
+                            syncPreview.removedObjectsFromOrg
+                              .filter(
+                                (mo) =>
+                                  objResolutions[mo.objectName] === 'DELETE'
+                              )
+                              .map((mo) => mo.objectName);
+                          const removeFields = allRemovedFieldsInPreview
+                            .filter(
+                              (mf) =>
+                                fldResolutions[
+                                  `${mf.objectName}.${mf.fieldName}`
+                                ] === 'DELETE'
+                            )
+                            .map((mf) => ({
+                              objectName: mf.objectName,
+                              fieldName: mf.fieldName,
+                            }));
+
+                          await onApplyPullObjectsFromOrg({
+                            pulledMetadata: pulledMetadataCache,
+                            removeObjectNames,
+                            removeFields,
+                          });
+                          setCatalogOpen(false);
+                        } finally {
+                          setCatalogLoading(false);
+                        }
+                      }}
+                    >
+                      Apply Sync &amp; Resolutions
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
           </div>
         </div>
       )}
+
+      <div className="card">
+        <div className="tbar">
+          <div className="tbar-l">
+            <div className="srch">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.75"
+              >
+                <circle cx="11" cy="11" r="7" />
+                <path d="M20 20l-3.5-3.5" />
+              </svg>
+              <input
+                placeholder="Search object API name or label…"
+                value={q}
+                onChange={(e) => setQ(e.target.value)}
+              />
+            </div>
+            <div className="seg">
+              {(
+                [
+                  ['all', 'All'],
+                  ['enabled', 'Enabled'],
+                  ['disabled', 'Disabled'],
+                ] as const
+              ).map(([k, lbl]) => (
+                <button
+                  key={k}
+                  type="button"
+                  className={statusFilter === k ? 'on' : ''}
+                  onClick={() => setStatusFilter(k)}
+                >
+                  {lbl}
+                </button>
+              ))}
+            </div>
+            <div className="seg">
+              {(
+                [
+                  ['all', 'All'],
+                  ['std', 'Standard'],
+                  ['custom', 'Custom (__c)'],
+                ] as const
+              ).map(([k, lbl]) => (
+                <button
+                  key={k}
+                  type="button"
+                  className={kindFilter === k ? 'on' : ''}
+                  onClick={() => setKindFilter(k)}
+                >
+                  {lbl}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="tbar-r">
+            <span className="mono" style={{ color: 'var(--t3)' }}>
+              {objects.filter((o) => o.enabled).length} enabled ·{' '}
+              {enabledFields}/{totalFields} fields
+            </span>
+          </div>
+        </div>
+
+        <div className="tbl-wrap">
+          <table className="tbl">
+            <thead>
+              <tr>
+                <th style={{ width: 64 }}>Enabled</th>
+                <th>Object API name</th>
+                <th>Label</th>
+                <th>Category</th>
+                <th>Fields enabled</th>
+                <th>Used in groups</th>
+                <th>Source</th>
+                <th>Last synced</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.length === 0 ? (
+                <tr>
+                  <td colSpan={8} className="empty">
+                    No objects match your filter.
+                  </td>
+                </tr>
+              ) : (
+                rows.map((o) => {
+                  const fOn = o.fields.filter(
+                    (f: SalesforceObjectField) => f.enabled
+                  ).length;
+                  const usedBy = groups.filter((g) =>
+                    g.objectPermissions?.some(
+                      (op) =>
+                        op.objectName === o.objectName &&
+                        (op.canRead ||
+                          op.canCreate ||
+                          op.canUpdate ||
+                          op.canDelete)
+                    )
+                  );
+
+                  return (
+                    <tr
+                      key={o.objectName}
+                      className={`row ${
+                        selectedFlyoutId === o.objectName ? 'sel' : ''
+                      }`}
+                      onClick={() =>
+                        onOpenFlyout({ type: 'object', data: o })
+                      }
+                    >
+                      <td onClick={(e) => e.stopPropagation()}>
+                        <button
+                          type="button"
+                          className={`sw ${o.enabled ? 'on' : ''}`}
+                          onClick={() =>
+                            onToggleObject(o.objectName, !o.enabled)
+                          }
+                        />
+                      </td>
+                      <td className="mono" style={{ fontWeight: 600 }}>
+                        <div
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 6,
+                          }}
+                        >
+                          <span>{o.objectName}</span>
+                          {o.missingInOrg && (
+                            <span className="tag warn">Missing in Org</span>
+                          )}
+                        </div>
+                      </td>
+                      <td>{o.label}</td>
+                      <td>
+                        <span className={`tag ${o.isCustom ? 'pur' : ''}`}>
+                          {o.isCustom ? 'Custom' : 'Standard'}
+                        </span>
+                      </td>
+                      <td>
+                        <span className="mono">
+                          {fOn} / {o.fields.length}
+                        </span>
+                      </td>
+                      <td>
+                        {usedBy.length === 0 ? (
+                          <span style={{ color: 'var(--t3)', fontSize: 12 }}>
+                            —
+                          </span>
+                        ) : (
+                          <span className="tag">
+                            {usedBy.length} group
+                            {usedBy.length === 1 ? '' : 's'}
+                          </span>
+                        )}
+                      </td>
+                      <td>
+                        <span className="tag mono">{o.sourcePath}</span>
+                      </td>
+                      <td className="mono" style={{ color: 'var(--t2)' }}>
+                        {formatDateShort(o.updatedAt)}
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
   );
 }
