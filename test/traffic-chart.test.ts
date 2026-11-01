@@ -3,7 +3,7 @@ import './helpers/env.js';
 // and leave simulator rows out. `now` is a parameter so the boundaries can be pinned exactly.
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { trafficBuckets, trafficChartSubtitle, type TrafficRange } from '../src/components/views/trafficChart.js';
+import { estimateClockOffsetMs, trafficBuckets, trafficChartSubtitle, type TrafficRange } from '../src/components/views/trafficChart.js';
 
 const NOW = Date.parse('2026-11-01T12:00:00.000Z');
 const MIN = 60_000;
@@ -113,10 +113,38 @@ describe('rows that cannot be placed', () => {
     assert.deepEqual(filled([ago(-MIN)], '1h'), [0]);
   });
 
-  test('a timestamp further in the future is dropped', () => {
-    assert.deepEqual(filled([ago(-MIN - 1)], '1h'), []);
-    assert.deepEqual(filled([ago(-DAY)], '7d'), []);
+  test('a timestamp further in the future is clamped into the newest bucket, not dropped', () => {
+    assert.deepEqual(filled([ago(-MIN - 1)], '1h'), [0]);
+    assert.deepEqual(filled([ago(-DAY)], '7d'), [0]);
   });
+});
+
+describe('estimateClockOffsetMs', () => {
+  const at = (ms: number) => new Date(ms).toISOString();
+
+  test('is zero when both clocks agree, measured at the middle of the request', () => {
+    assert.equal(estimateClockOffsetMs(at(NOW), NOW - 200, NOW + 200), 0);
+  });
+
+  test('is positive for a slow browser and negative for a fast one', () => {
+    assert.equal(estimateClockOffsetMs(at(NOW), NOW - 2 * MIN - 100, NOW - 2 * MIN + 100), 2 * MIN);
+    assert.equal(estimateClockOffsetMs(at(NOW), NOW + 2 * HOUR - 100, NOW + 2 * HOUR + 100), -2 * HOUR);
+  });
+
+  test('an absent or unreadable server time leaves the browser clock alone', () => {
+    for (const value of [undefined, null, '', 'not a date', 1_700_000_000_000]) {
+      assert.equal(estimateClockOffsetMs(value, NOW, NOW + 100), 0);
+    }
+  });
+
+  for (const [name, skew] of [['slow', -2 * MIN], ['fast', 2 * HOUR]] as const) {
+    test(`a browser clock this ${name} still places a 5-second-old call in the newest bucket`, () => {
+      const browserNow = NOW + skew;
+      const offset = estimateClockOffsetMs(at(NOW), browserNow, browserNow);
+      const newest = trafficBuckets([ago(5000)], '1h', browserNow + offset).at(-1);
+      assert.equal(newest?.ok, 1);
+    });
+  }
 });
 
 describe('what is counted', () => {

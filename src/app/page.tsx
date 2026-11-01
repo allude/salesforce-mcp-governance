@@ -39,6 +39,7 @@ import {
 import { CommandPalette } from '@/components/views/CommandPalette';
 import { profileSyncResultMessage } from '@/components/views/profileSyncReview';
 import { mcpActivityStatus } from '@/components/views/mcpActivity';
+import { estimateClockOffsetMs } from '@/components/views/trafficChart';
 import {
   ENTERPRISE_MATRIX_WARNING,
   enterpriseMatrixAction,
@@ -158,6 +159,7 @@ export default function AdminPortalPage() {
   const [portalUsers, setPortalUsers] = useState<PortalUserSummary[]>([]);
   const [mcpStats, setMcpStats] = useState<McpRequestStats | null>(null);
   const [clockNow, setClockNow] = useState(() => Date.now());
+  const [clockOffsetMs, setClockOffsetMs] = useState(0);
   // Starts off so the burst button cannot show in production before the first overview loads.
   const [devToolsEnabled, setDevToolsEnabled] = useState(false);
   const [seedConfirmOpen, setSeedConfirmOpen] = useState(false);
@@ -253,6 +255,7 @@ export default function AdminPortalPage() {
 
   const fetchWorkspace = useCallback(async () => {
     try {
+      const sentAt = Date.now();
       const res = await fetch('/api/admin/overview', {
         credentials: 'include',
       });
@@ -262,6 +265,10 @@ export default function AdminPortalPage() {
       }
       if (!res.ok) return;
       const data = await readJsonBody(res);
+      const receivedAt = Date.now();
+      setClockOffsetMs(estimateClockOffsetMs(data.serverTime, sentAt, receivedAt));
+      // New rows are measured against a fresh reading, not the last 30-second tick.
+      setClockNow(receivedAt);
       setProfiles(data.profiles || []);
       setObjects(data.objects || []);
       setGroups(data.groups || []);
@@ -1220,6 +1227,7 @@ export default function AdminPortalPage() {
           {view === 'dashboard' && (
             <TrafficDashboardView
               clockNow={clockNow}
+              clockOffsetMs={clockOffsetMs}
               copilotLogs={copilotLogs}
               mcpStats={mcpStats}
               portalLogs={portalLogs}

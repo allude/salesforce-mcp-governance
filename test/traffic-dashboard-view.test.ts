@@ -26,10 +26,11 @@ const call: CopilotMcpLogEntry = {
   sanitizedResponseSummary: '{}',
 };
 
-const render = (clockNow: number) =>
+const render = (clockNow: number, clockOffsetMs = 0) =>
   renderToStaticMarkup(
     createElement(TrafficDashboardView, {
       clockNow,
+      clockOffsetMs,
       copilotLogs: [call],
       portalLogs: [],
       profiles: [],
@@ -44,6 +45,10 @@ describe('TrafficDashboardView clock', () => {
   test('places a call relative to the clockNow prop', () => {
     assert.ok(render(NOW).includes('0–1 h ago — 1 allowed'));
     assert.ok(render(NOW + 3 * HOUR).includes('3–4 h ago — 1 allowed'));
+  });
+
+  test('reads the clock on the server: a browser 3 hours fast still shows a new call as new', () => {
+    assert.ok(render(NOW + 3 * HOUR, -3 * HOUR).includes('0–1 h ago — 1 allowed'));
   });
 
   test('a call that has aged out of the window leaves the chart', () => {

@@ -6,9 +6,6 @@ const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
 const DAY_MS = 24 * HOUR_MS;
 
-/** A browser clock slightly behind the server must not lose the newest calls. */
-const CLOCK_SKEW_TOLERANCE_MS = MINUTE_MS;
-
 const RANGES: Record<
   TrafficRange,
   { count: number; step: number; unitMs: number; suffix: string; unit: string; per: string }
@@ -35,9 +32,21 @@ interface TrafficRow {
 }
 
 /**
- * Buckets, oldest first, each holding the real calls made that long before `now`. A bucket covers
- * [k, k + 1) bucket sizes ago, and calls at or beyond the window's edge or with an unreadable
- * timestamp are left out.
+ * How far the server's clock is ahead of the browser's, to add to a browser time. Log timestamps come
+ * from the server. The server's reading is taken as the request's midpoint, which is off by at most
+ * half the round trip. An unreadable reading gives 0, leaving the browser's clock in charge.
+ */
+export function estimateClockOffsetMs(serverTime: unknown, sentAt: number, receivedAt: number): number {
+  const time = typeof serverTime === 'string' ? Date.parse(serverTime) : NaN;
+  if (Number.isNaN(time)) return 0;
+  return time - (sentAt + receivedAt) / 2;
+}
+
+/**
+ * Buckets, oldest first, each holding the real calls made that long before `now`, which should be on
+ * the server's clock. A bucket covers [k, k + 1) bucket sizes ago. A call ahead of `now` counts in the
+ * newest bucket, as the header pill clamps it, because leftover skew must not hide the newest calls.
+ * Calls at or beyond the window's edge or with an unreadable timestamp are left out.
  */
 export function trafficBuckets(rows: TrafficRow[], range: TrafficRange, now: number): TrafficBucket[] {
   const { count, step, unitMs, suffix, unit } = RANGES[range];
@@ -58,9 +67,7 @@ export function trafficBuckets(rows: TrafficRow[], range: TrafficRange, now: num
   for (const row of realTraffic(rows)) {
     const time = Date.parse(row.timestamp);
     if (Number.isNaN(time)) continue;
-    const age = now - time;
-    if (age < -CLOCK_SKEW_TOLERANCE_MS) continue;
-    const ago = Math.floor(Math.max(age, 0) / sizeMs);
+    const ago = Math.floor(Math.max(now - time, 0) / sizeMs);
     if (ago >= count) continue;
     const bucket = buckets[count - 1 - ago];
     if (row.status === 'ALLOWED') bucket.ok += 1;

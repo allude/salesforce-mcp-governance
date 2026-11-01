@@ -293,6 +293,8 @@ export interface PortalOverviewPayload {
   objects: SalesforceObject[];
   groups: AccessGroup[];
   profileGroupMappings: ProfileGroupMapping[];
+  /** The server's clock when it answered, for placing log rows from a browser with a different clock. */
+  serverTime: string;
   copilotLogs: CopilotMcpLogRecord[];
   portalLogs: PortalAdminLogRecord[];
   oktaSettings: OktaSsoSettings;

@@ -125,3 +125,13 @@ describe('Portal rows in /overview', () => {
     assert.equal(portalLogs.filter((l: any) => l.action !== 'SIMULATE_MCP_CALL').length, 150);
   });
 });
+
+describe('serverTime in /overview', () => {
+  test("is the server's current clock", async () => {
+    const before = Date.now();
+    const { serverTime } = await overview();
+    const time = Date.parse(serverTime);
+    assert.equal(new Date(time).toISOString(), serverTime);
+    assert.ok(time >= before && time <= Date.now(), serverTime);
+  });
+});

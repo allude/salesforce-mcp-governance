@@ -390,6 +390,7 @@ adminRouter.get('/overview', (_req: Request, res: Response) => {
   const mcpStats = store.getCopilotMcpLogStats();
 
   res.json({
+    serverTime: new Date().toISOString(),
     stats: {
       totalMcpRequests: mcpStats.total,
       allowedMcpRequests: mcpStats.allowed,
