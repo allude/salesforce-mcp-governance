@@ -1,13 +1,17 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
-const testDbPath = path.join(process.cwd(), 'data', 'test-self-check.sqlite');
-for (const ext of ['', '-wal', '-shm']) {
-  if (fs.existsSync(testDbPath + ext)) {
-    fs.unlinkSync(testDbPath + ext);
-  }
-}
-process.env.DB_PATH = testDbPath;
+// Always run against a throwaway database so the self-test can never read or wipe real
+// governance data or audit logs (it must be set before the store module opens SQLite).
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sf-mcp-selftest-'));
+process.env.DB_PATH = path.join(tmpDir, 'self-test.sqlite');
+// (Next.js types mark NODE_ENV read-only, hence the cast)
+(process.env as Record<string, string | undefined>).NODE_ENV ||= 'test';
+
+const { app } = await import('./index.js');
+const { store } = await import('./db/store.js');
+const { config } = await import('./config.js');
 
 async function runSelfTests() {
   const { app } = await import('./index.js');
@@ -32,7 +36,10 @@ async function runSelfTests() {
     const loginRes = await fetch(`${baseUrl}/api/admin/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'admin', password: 'admin123' }),
+      body: JSON.stringify({
+        username: config.bootstrapAdmin.username,
+        password: config.bootstrapAdmin.password,
+      }),
     });
     if (loginRes.status !== 200) {
       throw new Error(`Login failed (${loginRes.status}): ${await loginRes.text()}`);
@@ -255,47 +262,10 @@ async function runSelfTests() {
     }
     console.log('✅ 7. Object/Field pull diff & runtime resilience with left-over deleted fields verified');
 
-    // Clean up test data so database remains 100% empty of demo/test data
-    const { DatabaseSync } = await import('node:sqlite');
-    const { config } = await import('./config.js');
-    const cleanDb = new DatabaseSync(config.dbPath);
-    cleanDb.exec(`
-      DELETE FROM profile_group_memberships;
-      DELETE FROM access_groups;
-      DELETE FROM sf_object_fields;
-      DELETE FROM sf_objects;
-      DELETE FROM sf_profiles;
-      DELETE FROM mcp_copilot_logs;
-      DELETE FROM portal_admin_logs;
-      UPDATE sf_connection_settings
-      SET enabled = 0,
-          auth_mode = 'jwt_bearer',
-          client_id = '',
-          username = '',
-          private_key_enc = '',
-          certificate_pem = '',
-          cert_fingerprint = '',
-          connection_status = 'disconnected',
-          last_connected_at = NULL,
-          last_error = '',
-          connected_org_id = '',
-          connected_user = ''
-      WHERE id = 1;
-    `);
-    cleanDb.close();
-
     console.log('\n🎉 ALL CLEAN PORTAL & MCP SERVER TESTS PASSED!');
   } finally {
     server.close();
-    for (const ext of ['', '-wal', '-shm']) {
-      if (fs.existsSync(testDbPath + ext)) {
-        try {
-          fs.unlinkSync(testDbPath + ext);
-        } catch {
-          // ignore
-        }
-      }
-    }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 }
 

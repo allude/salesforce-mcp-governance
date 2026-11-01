@@ -1,6 +1,14 @@
 import { store } from '../db/store.js';
-import { VerifiedSalesforceUser } from '../salesforce/client.js';
+import { VerifiedSalesforceUser, salesforceIdsMatch } from '../salesforce/client.js';
 import { AVAILABLE_MCP_ACTIONS, GroupObjectPermission } from '../types/governance.js';
+
+/** Thrown when a permitted tool call asks for fields or filters outside the caller's allowlist. */
+export class PolicyViolationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PolicyViolationError';
+  }
+}
 
 export interface EffectiveProfilePermissions {
   profileFound: boolean;
@@ -33,7 +41,7 @@ export function resolveEffectiveProfilePermissions(
 ): EffectiveProfilePermissions {
   const profiles = store.getProfiles();
   const matchedProfile =
-    profiles.find((p) => p.id === profileId) ||
+    profiles.find((p) => salesforceIdsMatch(p.id, profileId)) ||
     (profileNameHint
       ? profiles.find((p) => p.name.toLowerCase() === profileNameHint.toLowerCase())
       : undefined);
@@ -105,6 +113,11 @@ export function resolveEffectiveProfilePermissions(
     if (!Array.isArray(grp.objectPermissions)) continue;
     for (const objPerm of grp.objectPermissions) {
       if (!objPerm || !objPerm.objectName) continue;
+      // An entry that grants no CRUD access grants nothing, including its field list. Without this,
+      // its fields would be merged only when another group had already granted the object, so the
+      // result would depend on the groups' (alphabetical) processing order.
+      if (!(objPerm.canRead || objPerm.canCreate || objPerm.canUpdate || objPerm.canDelete)) continue;
+
       const globalObj = enabledObjectsMap.get(objPerm.objectName.toLowerCase());
       if (!globalObj) continue; // Object is disabled or removed in Salesforce -> Objects
 
@@ -166,7 +179,19 @@ export interface PolicyEvaluationResult {
   reason: string;
   matchedGroups: string[];
   allowedFields: string[];
+  /** Canonical API name of the permitted target object (set when an object-scoped call is permitted). */
+  objectName?: string;
 }
+
+// Tools that operate on one Salesforce object and must name it via `objectName`.
+const OBJECT_SCOPED_TOOLS = new Set([
+  'describe_object',
+  'soql_query',
+  'get_record',
+  'create_record',
+  'update_record',
+  'delete_record',
+]);
 
 export function evaluateMcpToolCall(
   user: VerifiedSalesforceUser,
@@ -179,10 +204,21 @@ export function evaluateMcpToolCall(
   );
   const groupNames = effective.assignedGroups.map((g) => g.name);
 
+  if (!AVAILABLE_MCP_ACTIONS.some((a) => a.id === toolName)) {
+    return {
+      permitted: false,
+      reason: `Unknown MCP tool '${toolName}'.`,
+      matchedGroups: groupNames,
+      allowedFields: [],
+    };
+  }
+
   if (!effective.profileFound) {
     return {
       permitted: false,
-      reason: `Profile '${user.profileId}' (${user.profileName}) is not registered in Salesforce > Profiles.`,
+      reason: user.profileId
+        ? `Profile '${user.profileId}' (${user.profileName}) is not registered in Salesforce > Profiles.`
+        : "The caller's Salesforce Profile could not be determined (the User/Profile lookup failed), so no MCP action is permitted.",
       matchedGroups: [],
       allowedFields: [],
     };
@@ -206,7 +242,17 @@ export function evaluateMcpToolCall(
     };
   }
 
-  if (targetObject && targetObject !== '*') {
+  const hasTargetObject = Boolean(targetObject && targetObject !== '*');
+  if (OBJECT_SCOPED_TOOLS.has(toolName) && !hasTargetObject) {
+    return {
+      permitted: false,
+      reason: `MCP Action '${toolName}' requires an objectName argument.`,
+      matchedGroups: groupNames,
+      allowedFields: [],
+    };
+  }
+
+  if (targetObject && hasTargetObject) {
     const objPerm = Array.from(effective.objectPermissions.values()).find(
       (o) => o.objectName.toLowerCase() === targetObject.toLowerCase()
     );
@@ -265,6 +311,7 @@ export function evaluateMcpToolCall(
       reason: `Permitted via Groups [${groupNames.join(', ')}]`,
       matchedGroups: groupNames,
       allowedFields: Array.from(objPerm.allowedFields),
+      objectName: objPerm.objectName,
     };
   }
 

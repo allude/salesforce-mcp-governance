@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import type {
   SalesforceProfile,
   SalesforceObject,
@@ -75,14 +75,47 @@ const VIEW_META: Record<ActiveView, { crumb: string; title: string }> = {
   'auth-settings': { crumb: 'Logs & Security', title: 'Portal Auth & SSO' },
 };
 
+// Fixed messages for the codes /auth/okta/callback redirects with; any other value is ignored
+// so a crafted link cannot put its own text on the login screen.
+const OKTA_AUTH_ERRORS: Record<string, string> = {
+  okta_error: 'Okta returned an error. Details are in the Portal audit log.',
+  invalid_callback: 'The Okta sign-in response was incomplete. Please try again.',
+  expired_state: 'The Okta sign-in took too long or was started in another browser. Please try again.',
+  state_mismatch: 'The Okta sign-in response did not match this browser session. Please try again.',
+  group_denied: 'Your Okta account is not in the group required for this portal.',
+  sso_failed: 'Okta sign-in failed. Details are in the Portal audit log.',
+};
+
+/** Parses a JSON body without throwing on HTML/text error pages (e.g. a proxy 500). */
+async function readJsonBody(res: Response): Promise<any> {
+  const text = await res.text();
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch {
+    return { error: `${res.status} ${res.statusText || 'Request failed'}` };
+  }
+}
+
+function toAdminSession(user: any): AdminSession {
+  return {
+    username: user.username,
+    name: user.name,
+    displayName: user.name,
+    role: user.role || user.groups?.[0] || 'Platform Admin',
+    authMethod: user.authMethod,
+    groups: user.groups,
+  };
+}
+
 export default function AdminPortalPage() {
   // Session & Auth state
   const [session, setSession] = useState<AdminSession | null>(null);
   const [csrfToken, setCsrfToken] = useState<string>('');
   const [authLoading, setAuthLoading] = useState(true);
-  const [loginUsername, setLoginUsername] = useState('admin');
-  const [loginPassword, setLoginPassword] = useState('admin123');
-  const [oktaEmail, setOktaEmail] = useState('elena.rostova@acme.io');
+  const [loginUsername, setLoginUsername] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [oktaEnabled, setOktaEnabled] = useState(false);
+  const savingProfileIds = useRef<Set<string>>(new Set());
   const [loginError, setLoginError] = useState('');
   const [loginBusy, setLoginBusy] = useState(false);
 
@@ -104,13 +137,13 @@ export default function AdminPortalPage() {
   const [copilotLogs, setCopilotLogs] = useState<CopilotMcpLogRecord[]>([]);
   const [portalLogs, setPortalLogs] = useState<PortalAdminLogRecord[]>([]);
   const [oktaSettings, setOktaSettings] = useState<OktaSsoSettings>({
-    enabled: true,
-    oktaDomain: 'https://acme-enterprise.okta.com',
-    clientId: '0oa8x92kLpQ7EnterpriseMcp',
-    issuer: 'https://acme-enterprise.okta.com/oauth2/default',
+    enabled: false,
+    oktaDomain: '',
+    clientId: '',
+    issuer: '',
     hasClientSecret: false,
-    redirectUri: 'http://localhost:3000/api/admin/okta/callback',
-    adminGroup: 'MCP-Admins',
+    redirectUri: '',
+    adminGroup: '',
     updatedAt: '',
   });
   const [sfSettings, setSfSettings] =
@@ -163,37 +196,37 @@ export default function AdminPortalPage() {
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
-  // Authenticated API helper with CSRF header
-  const apiFetch = useCallback(
-    async <T = any>(url: string, options: RequestInit = {}): Promise<T> => {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        ...(options.headers as Record<string, string>),
-      };
-      if (csrfToken) {
-        headers['x-csrf-token'] = csrfToken;
-      }
-      const res = await fetch(url, {
-        ...options,
-        credentials: 'include',
-        headers,
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        throw new Error(data.error || `Request failed (${res.status})`);
-      }
-      return data as T;
-    },
-    [csrfToken]
-  );
+  // Refreshes what the login screen offers (Okta may have been enabled while signed in).
+  const refreshLoginOptions = useCallback(async () => {
+    try {
+      const res = await fetch('/api/admin/session', { credentials: 'include' });
+      const data = await readJsonBody(res);
+      setOktaEnabled(Boolean(data.oktaSso?.enabled));
+    } catch {
+      // keep the previous value
+    }
+  }, []);
+
+  const handleSessionExpired = useCallback(() => {
+    setSession(null);
+    setFlyout(null);
+    setCsrfToken('');
+    setLoginPassword('');
+    setLoginError('Your session has ended. Please sign in again.');
+    void refreshLoginOptions();
+  }, [refreshLoginOptions]);
 
   const fetchWorkspace = useCallback(async () => {
     try {
       const res = await fetch('/api/admin/overview', {
         credentials: 'include',
       });
+      if (res.status === 401) {
+        handleSessionExpired();
+        return;
+      }
       if (!res.ok) return;
-      const data = await res.json();
+      const data = await readJsonBody(res);
       setProfiles(data.profiles || []);
       setObjects(data.objects || []);
       setGroups(data.groups || []);
@@ -206,25 +239,83 @@ export default function AdminPortalPage() {
     } catch {
       // ignore transient poll error
     }
-  }, []);
+  }, [handleSessionExpired]);
+
+  // Authenticated API helper with CSRF header
+  const apiFetch = useCallback(
+    async <T = any>(url: string, options: RequestInit = {}): Promise<T> => {
+      const send = (token: string) => {
+        const headers = new Headers(options.headers || {});
+        if (!headers.has('Content-Type') && options.body) {
+          headers.set('Content-Type', 'application/json');
+        }
+        if (token) {
+          headers.set('X-CSRF-Token', token);
+        }
+        return fetch(url, { ...options, credentials: 'include', headers });
+      };
+
+      let res = await send(csrfToken);
+      let data = await readJsonBody(res);
+
+      // Signed in again in another tab: pick up the session's current CSRF token and retry once,
+      // but only if it is still the same account. Never replay a change as someone else.
+      if (res.status === 403 && /CSRF/i.test(String(data.error))) {
+        const sessionRes = await fetch('/api/admin/session', { credentials: 'include' });
+        const current = await readJsonBody(sessionRes);
+        if (current.authenticated && current.csrfToken) {
+          const sameAccount =
+            current.user?.username === session?.username &&
+            current.user?.authMethod === session?.authMethod;
+          setCsrfToken(current.csrfToken);
+          if (!sameAccount) {
+            setSession(toAdminSession(current.user));
+            await fetchWorkspace();
+            throw new Error(
+              `This browser is now signed in as "${current.user?.username}" (another tab). The change was not applied; review it and try again.`
+            );
+          }
+          res = await send(current.csrfToken);
+          data = await readJsonBody(res);
+        }
+      }
+
+      if (res.status === 401) {
+        handleSessionExpired();
+      }
+      if (!res.ok) {
+        throw new Error(data.error || `Request failed (${res.status})`);
+      }
+      return data as T;
+    },
+    [csrfToken, session, fetchWorkspace, handleSessionExpired]
+  );
 
   // Check session on mount
   useEffect(() => {
+    // Okta callback failures come back as /?auth_error=<code>
+    const params = new URLSearchParams(window.location.search);
+    const authError = params.get('auth_error');
+    if (authError) {
+      setLoginError(OKTA_AUTH_ERRORS[authError] || 'Okta sign-in failed. Please try again.');
+      params.delete('auth_error');
+      const query = params.toString();
+      window.history.replaceState(null, '', `${window.location.pathname}${query ? `?${query}` : ''}`);
+    }
     (async () => {
       try {
         const res = await fetch('/api/admin/session', {
           credentials: 'include',
         });
-        const data = await res.json();
+        const data = await readJsonBody(res);
+        if (!res.ok) {
+          setLoginError(
+            `The MCP backend is not reachable (${res.status}). Start it with \`npm run dev\` (backend on :3001).`
+          );
+        }
+        setOktaEnabled(Boolean(data.oktaSso?.enabled));
         if (data.authenticated && data.user) {
-          setSession({
-            username: data.user.username,
-            name: data.user.name,
-            displayName: data.user.name,
-            role: data.user.groups?.[0] || 'Platform Admin',
-            authMethod: data.user.authMethod,
-            groups: data.user.groups,
-          });
+          setSession(toAdminSession(data.user));
           if (data.csrfToken) setCsrfToken(data.csrfToken);
           await fetchWorkspace();
         }
@@ -260,17 +351,12 @@ export default function AdminPortalPage() {
           password: loginPassword,
         }),
       });
-      const data = await res.json();
+      const data = await readJsonBody(res);
       if (!res.ok) {
         throw new Error(data.error || 'Authentication failed');
       }
-      setSession({
-        username: data.user.username,
-        name: data.user.name,
-        displayName: data.user.name,
-        role: data.user.role || 'Platform Admin',
-        authMethod: data.user.authMethod,
-      });
+      setSession(toAdminSession(data.user));
+      setLoginPassword('');
       if (data.csrfToken) setCsrfToken(data.csrfToken);
       await fetchWorkspace();
       notify(`Signed in as ${data.user.name}`);
@@ -281,48 +367,19 @@ export default function AdminPortalPage() {
     }
   };
 
-  const handleOktaLogin = async () => {
-    setLoginError('');
-    setLoginBusy(true);
-    try {
-      const res = await fetch('/api/admin/login-okta', {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: oktaEmail || 'elena.rostova@acme.io',
-          displayName: 'Elena Rostova',
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Okta SSO login failed');
-      }
-      setSession({
-        username: data.user.username,
-        name: data.user.name,
-        displayName: data.user.name,
-        role: data.user.role || 'Okta SSO Admin',
-        authMethod: 'okta_sso',
-      });
-      if (data.csrfToken) setCsrfToken(data.csrfToken);
-      await fetchWorkspace();
-      notify('Authenticated via Okta OIDC Single Sign-On');
-    } catch (err: any) {
-      setLoginError(err.message || 'Okta SSO failed');
-    } finally {
-      setLoginBusy(false);
-    }
-  };
-
   const handleLogout = async () => {
     try {
       await apiFetch('/api/admin/logout', { method: 'POST' });
-    } catch {
-      // ignore
+    } catch (err: any) {
+      // Keep the user signed in so they know the session is still active.
+      notify(err?.message || 'Sign out failed');
+      return;
     }
     setSession(null);
     setFlyout(null);
+    setCsrfToken('');
+    setLoginPassword('');
+    void refreshLoginOptions();
   };
 
   // Mutation handlers
@@ -361,6 +418,23 @@ export default function AdminPortalPage() {
   };
 
   const handleToggleProfileGroup = async (
+    profileId: string,
+    groupId: string
+  ) => {
+    // One save per Profile at a time: a second click would send a replacement list computed from
+    // stale state, which could silently undo a revocation.
+    if (savingProfileIds.current.has(profileId)) return;
+    savingProfileIds.current.add(profileId);
+    try {
+      await saveProfileGroupToggle(profileId, groupId);
+    } finally {
+      savingProfileIds.current.delete(profileId);
+      // Always reload so the row shows what the server actually stored
+      await fetchWorkspace();
+    }
+  };
+
+  const saveProfileGroupToggle = async (
     profileId: string,
     groupId: string
   ) => {
@@ -687,47 +761,37 @@ export default function AdminPortalPage() {
               </div>
             )}
 
-            {/* Okta OIDC SSO */}
-            <div style={{ marginBottom: 16 }}>
-              <div className="fld" style={{ marginBottom: 8 }}>
-                <label>Enterprise Single Sign-On (Okta OIDC)</label>
-                <input
-                  className="inp mono"
-                  value={oktaEmail}
-                  onChange={(e) => setOktaEmail(e.target.value)}
-                  placeholder="elena.rostova@acme.io"
-                />
-              </div>
-              <button
-                type="button"
-                className="btn pri"
-                style={{ width: '100%', padding: '8px 12px' }}
-                disabled={loginBusy}
-                onClick={handleOktaLogin}
-              >
-                <span className="dot ok" />
-                Continue with Okta SSO
-              </button>
-            </div>
-
-            <div
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 10,
-                margin: '14px 0',
-                color: 'var(--t3)',
-                fontSize: 11,
-              }}
-            >
-              <div
-                style={{ flex: 1, height: 1, background: 'var(--bd)' }}
-              />
-              <span>OR LOCAL ADMINISTRATOR</span>
-              <div
-                style={{ flex: 1, height: 1, background: 'var(--bd)' }}
-              />
-            </div>
+            {/* Okta OIDC SSO: the server redirects to Okta and verifies the callback */}
+            {oktaEnabled && (
+              <>
+                <a
+                  className="btn pri"
+                  style={{ width: '100%', padding: '8px 12px', marginBottom: 16 }}
+                  href="/auth/okta/login"
+                >
+                  <span className="dot ok" />
+                  Continue with Okta SSO
+                </a>
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 10,
+                    margin: '14px 0',
+                    color: 'var(--t3)',
+                    fontSize: 11,
+                  }}
+                >
+                  <div
+                    style={{ flex: 1, height: 1, background: 'var(--bd)' }}
+                  />
+                  <span>OR LOCAL ADMINISTRATOR</span>
+                  <div
+                    style={{ flex: 1, height: 1, background: 'var(--bd)' }}
+                  />
+                </div>
+              </>
+            )}
 
             <form onSubmit={handlePasswordLogin}>
               <div className="fld">
@@ -747,17 +811,19 @@ export default function AdminPortalPage() {
                   }}
                 >
                   <label>Password</label>
-                  <button
-                    type="button"
-                    className="btn gh sm"
-                    style={{ padding: '1px 5px', fontSize: 10.5 }}
-                    onClick={() => {
-                      setLoginUsername('admin');
-                      setLoginPassword('admin123');
-                    }}
-                  >
-                    Fill default (admin / admin123)
-                  </button>
+                  {process.env.NODE_ENV !== 'production' && (
+                    <button
+                      type="button"
+                      className="btn gh sm"
+                      style={{ padding: '1px 5px', fontSize: 10.5 }}
+                      onClick={() => {
+                        setLoginUsername('admin');
+                        setLoginPassword('admin123');
+                      }}
+                    >
+                      Fill development default
+                    </button>
+                  )}
                 </div>
                 <input
                   type="password"

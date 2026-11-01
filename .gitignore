@@ -20,3 +20,7 @@ data/*.sqlite-wal
 .DS_Store
 *.log
 npm-debug.log*
+
+# TypeScript build output & incremental cache
+dist/
+*.tsbuildinfo

@@ -372,6 +372,9 @@ export async function connectToSalesforceOrgViaJwt(settings: {
   const apiVersion = settings.apiVersion || config.salesforce.apiVersion || 'v62.0';
 
   if (settings.authMode === 'simulated') {
+    if (config.isProd) {
+      throw new Error('Simulated Salesforce connections are not available in production.');
+    }
     if (!settings.privateKeyPem) {
       throw new Error(
         'Please generate or provide an X.509 Certificate & RSA Private Key first so the JWT signature can be verified.'

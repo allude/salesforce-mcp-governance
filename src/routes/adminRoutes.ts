@@ -1,5 +1,6 @@
-import { Router, Request, Response } from 'express';
-import { store, parseSfdxFilesToObjects } from '../db/store.js';
+import { Router, Request, Response, NextFunction } from 'express';
+import { store } from '../db/store.js';
+import { parseProfilesCsv, parseSfdxFilesToObjects } from '../db/importers.js';
 import {
   requireAdminAuth,
   issueAdminSessionCookie,
@@ -9,6 +10,7 @@ import {
 import {
   createSimulatorToken,
   resolveSalesforceUserFromToken,
+  validateSalesforceInstanceUrl,
 } from '../salesforce/client.js';
 import {
   generateSelfSignedCertificateBundle,
@@ -18,12 +20,75 @@ import {
   fetchObjectsMetadataFromOrgSession,
   SalesforceOrgTokenSession,
 } from '../salesforce/jwtConnection.js';
+import { config } from '../config.js';
 import {
   evaluateMcpToolCall,
   resolveEffectiveProfilePermissions,
 } from '../rbac/policyEngine.js';
 
 export const adminRouter = Router();
+
+type SalesforceSettingsInput = Parameters<typeof store.updateSalesforceSettings>[0];
+
+/**
+ * The Salesforce settings an admin may set from a request. Connection state (enabled, status, connected
+ * org, last error) is written only by the connect and disconnect routes.
+ */
+function parseSalesforceSettingsInput(body: Record<string, any>): SalesforceSettingsInput {
+  const input: SalesforceSettingsInput = {};
+  if (body.instanceUrl !== undefined) {
+    input.instanceUrl = validateSalesforceInstanceUrl(String(body.instanceUrl));
+  }
+  if (body.loginUrl !== undefined) {
+    // The signed JWT assertion is posted here, so it passes the same allowlist as instance URLs.
+    input.loginUrl = validateSalesforceInstanceUrl(String(body.loginUrl));
+  }
+  if (body.apiVersion !== undefined) {
+    if (!/^v\d+\.\d$/.test(String(body.apiVersion).trim())) {
+      throw new Error('API version must look like v62.0.');
+    }
+    input.apiVersion = String(body.apiVersion).trim();
+  }
+  if (body.expectedOrgId !== undefined) {
+    const orgId = String(body.expectedOrgId).trim();
+    if (orgId && !/^00D[a-zA-Z0-9]{12}(?:[a-zA-Z0-9]{3})?$/.test(orgId)) {
+      throw new Error('Expected Org ID must be a 15 or 18-character Salesforce Org ID (00D...).');
+    }
+    input.expectedOrgId = orgId;
+  }
+  if (body.enforceOrgIdLock !== undefined) {
+    input.enforceOrgIdLock = Boolean(body.enforceOrgIdLock);
+  }
+  if (body.sfdxObjectsFolderPath !== undefined) {
+    input.sfdxObjectsFolderPath = String(body.sfdxObjectsFolderPath);
+  }
+  if (body.authMode !== undefined) {
+    if (body.authMode !== 'jwt_bearer' && body.authMode !== 'simulated') {
+      throw new Error("Auth mode must be 'jwt_bearer' or 'simulated'.");
+    }
+    if (body.authMode === 'simulated' && config.isProd) {
+      throw new Error('Simulated Salesforce connections are not available in production.');
+    }
+    input.authMode = body.authMode;
+  }
+  if (body.clientId !== undefined) input.clientId = String(body.clientId);
+  if (body.username !== undefined) input.username = String(body.username);
+  if (body.privateKeyPem !== undefined) input.privateKeyPem = String(body.privateKeyPem);
+  if (body.certificatePem !== undefined) input.certificatePem = String(body.certificatePem);
+
+  const current = store.getSalesforceSettings();
+  if ((input.enforceOrgIdLock ?? current.enforceOrgIdLock) && !(input.expectedOrgId ?? current.expectedOrgId)) {
+    throw new Error('Set an expected Org ID before enforcing the Org ID lock.');
+  }
+  return input;
+}
+
+/** Express 4 ignores rejected promises, so async handlers must hand failures to `next` explicitly. */
+const asyncRoute =
+  (handler: (req: Request, res: Response) => Promise<void>) =>
+  (req: Request, res: Response, next: NextFunction) => {
+    handler(req, res).catch(next);
+  };
 
 function getAdminInfo(req: Request): {
   username: string;
@@ -42,7 +107,7 @@ function getAdminInfo(req: Request): {
  * GET /api/admin/session
  * Checks if the portal user is currently signed in (no auto-login bypass).
  */
-adminRouter.get('/session', async (req: Request, res: Response) => {
+adminRouter.get('/session', asyncRoute(async (req: Request, res: Response) => {
   const session = await verifyAdminSessionFromRequest(req);
   const okta = store.getOktaConfig();
 
@@ -62,16 +127,24 @@ adminRouter.get('/session', async (req: Request, res: Response) => {
       oktaDomain: okta.oktaDomain,
     },
   });
-});
+}));
 
 /**
  * POST /api/admin/login
  * Signs into the portal using Username + Password.
  */
-adminRouter.post('/login', async (req: Request, res: Response) => {
+adminRouter.post('/login', asyncRoute(async (req: Request, res: Response) => {
   const { username, email, password } = req.body || {};
-  const loginIdentifier = String(username || email || '').trim();
-  const rawPassword = String(password || '');
+  const identifierInput = username ?? email;
+  if (
+    (identifierInput !== undefined && typeof identifierInput !== 'string') ||
+    (password !== undefined && typeof password !== 'string')
+  ) {
+    res.status(400).json({ error: 'Username and password must be strings.' });
+    return;
+  }
+  const loginIdentifier = (identifierInput || '').trim();
+  const rawPassword = password || '';
 
   if (!loginIdentifier || !rawPassword) {
     res.status(400).json({ error: 'Username and password are required.' });
@@ -83,12 +156,13 @@ adminRouter.post('/login', async (req: Request, res: Response) => {
     rawPassword
   );
   if (!verifiedUser) {
+    const attemptedUsername = loginIdentifier.slice(0, 120);
     store.recordPortalAdminLog({
-      adminUsername: loginIdentifier,
+      adminUsername: attemptedUsername,
       authMethod: 'password',
       action: 'LOGIN_FAILED',
       target: 'Portal Auth',
-      details: `Failed password login attempt for username "${loginIdentifier}".`,
+      details: `Failed password login attempt for username "${attemptedUsername}".`,
       ipAddress: req.ip || '127.0.0.1',
     });
     res.status(401).json({ error: 'Invalid username or password.' });
@@ -122,50 +196,12 @@ adminRouter.post('/login', async (req: Request, res: Response) => {
       authMethod: 'password',
     },
   });
-});
-
-/**
- * POST /api/admin/login-okta
- * Signs into the portal via Okta OIDC SSO session assertion.
- */
-adminRouter.post('/login-okta', async (req: Request, res: Response) => {
-  const { email, displayName } = req.body || {};
-  const oktaEmail = String(email || 'elena.rostova@acme.io').trim();
-  const oktaName = String(displayName || 'Elena Rostova').trim();
-
-  const { csrfToken } = await issueAdminSessionCookie(res, {
-    sub: `okta_${oktaEmail}`,
-    email: oktaEmail,
-    name: oktaName,
-    authMethod: 'okta_oidc',
-    groups: ['Okta SSO Admin'],
-  });
-
-  store.recordPortalAdminLog({
-    adminUsername: oktaEmail,
-    authMethod: 'okta_sso',
-    action: 'LOGIN_OKTA_SSO',
-    target: 'Portal Auth (Okta OIDC)',
-    details: `Administrator "${oktaName}" (${oktaEmail}) signed in via Okta OIDC Single Sign-On.`,
-    ipAddress: req.ip || '127.0.0.1',
-  });
-
-  res.json({
-    success: true,
-    csrfToken,
-    user: {
-      username: oktaEmail,
-      name: oktaName,
-      role: 'Okta SSO Admin',
-      authMethod: 'okta_sso',
-    },
-  });
-});
+}));
 
 /**
  * POST /api/admin/logout
  */
-adminRouter.post('/logout', async (req: Request, res: Response) => {
+adminRouter.post('/logout', asyncRoute(async (req: Request, res: Response) => {
   const session = await verifyAdminSessionFromRequest(req);
   if (session) {
     store.recordPortalAdminLog({
@@ -179,12 +215,14 @@ adminRouter.post('/logout', async (req: Request, res: Response) => {
   }
   clearAdminSessionCookie(res);
   res.json({ success: true });
-});
+}));
 
 // ============================================================================
 // PROTECTED PORTAL API ROUTES
 // ============================================================================
-adminRouter.use(requireAdminAuth);
+adminRouter.use((req: Request, res: Response, next: NextFunction) => {
+  requireAdminAuth(req, res, next).catch(next);
+});
 
 /**
  * GET /api/admin/overview
@@ -200,18 +238,15 @@ adminRouter.get('/overview', (_req: Request, res: Response) => {
   const sfSettings = store.getSalesforceSettings();
   const portalUsers = store.getPortalUsers();
 
-  const allowedMcpRequests = copilotLogs.filter(
-    (l) => l.status === 'ALLOWED'
-  ).length;
-  const deniedMcpRequests = copilotLogs.filter(
-    (l) => l.status !== 'ALLOWED'
-  ).length;
+  // Totals cover every logged call; the log lists themselves are the latest 150 rows.
+  const mcpStats = store.getCopilotMcpLogStats();
 
   res.json({
     stats: {
-      totalMcpRequests: copilotLogs.length,
-      allowedMcpRequests,
-      deniedMcpRequests,
+      totalMcpRequests: mcpStats.total,
+      allowedMcpRequests: mcpStats.allowed,
+      deniedMcpRequests: mcpStats.denied,
+      erroredMcpRequests: mcpStats.errors,
       totalProfiles: profiles.length,
       totalObjects: objects.length,
       enabledObjects: objects.filter((o) => o.enabled).length,
@@ -282,32 +317,7 @@ adminRouter.post('/profiles/import-csv', (req: Request, res: Response) => {
       }
     }
   } else if (typeof csvText === 'string') {
-    const lines = csvText
-      .split(/\r?\n/)
-      .map((l) => l.trim())
-      .filter(Boolean);
-
-    for (let i = 0; i < lines.length; i++) {
-      // Split CSV line respecting simple quotes
-      const cols = lines[i]
-        .split(',')
-        .map((c) => c.trim().replace(/^["']|["']$/g, ''));
-      if (cols.length < 2) continue;
-
-      // Skip header row if it looks like `id,name` or `ProfileId,ProfileName`
-      if (
-        i === 0 &&
-        (cols[0].toLowerCase() === 'id' ||
-          cols[0].toLowerCase() === 'profileid' ||
-          cols[0].toLowerCase() === 'profile_id')
-      ) {
-        continue;
-      }
-
-      if (cols[0] && cols[1]) {
-        parsedRows.push({ id: cols[0], name: cols[1] });
-      }
-    }
+    parsedRows.push(...parseProfilesCsv(csvText));
   }
 
   if (parsedRows.length === 0) {
@@ -540,11 +550,17 @@ adminRouter.post('/objects', (req: Request, res: Response) => {
     return;
   }
 
-  const saved = store.upsertObjectWithFields({
-    objectName: String(objectName),
-    label: label ? String(label) : undefined,
-    fields: Array.isArray(fields) ? fields : undefined,
-  });
+  let saved;
+  try {
+    saved = store.upsertObjectWithFields({
+      objectName: String(objectName),
+      label: label ? String(label) : undefined,
+      fields: Array.isArray(fields) ? fields : undefined,
+    });
+  } catch (err: any) {
+    res.status(400).json({ error: err?.message || 'Invalid object.' });
+    return;
+  }
 
   const actor = getAdminInfo(req);
   store.recordPortalAdminLog({
@@ -607,7 +623,7 @@ adminRouter.put(
       Boolean(enabled)
     );
     if (!updated) {
-      res.status(404).json({ error: `Object '${objectName}' not found.` });
+      res.status(404).json({ error: `Field '${fieldName}' on object '${objectName}' not found.` });
       return;
     }
 
@@ -695,6 +711,9 @@ adminRouter.delete(
 
 adminRouter.delete('/objects/:objectName', (req: Request, res: Response) => {
   const objectName = String(req.params.objectName);
+  const revokedFrom = store
+    .getGroups()
+    .filter((g) => g.objectPermissions.some((p) => String(p.objectName).toLowerCase() === objectName.toLowerCase()));
   const deleted = store.deleteObject(objectName);
   if (!deleted) {
     res.status(404).json({ error: `Object '${objectName}' not found.` });
@@ -707,7 +726,11 @@ adminRouter.delete('/objects/:objectName', (req: Request, res: Response) => {
     authMethod: actor.authMethod,
     action: 'DELETE_OBJECT',
     target: `Object: ${objectName}`,
-    details: `Deleted Salesforce Object "${objectName}" and its fields from the MCP Server.`,
+    details: `Deleted Salesforce Object "${objectName}" and its fields from the MCP Server${
+      revokedFrom.length > 0
+        ? ` and revoked it from ${revokedFrom.length} Access Group(s): ${revokedFrom.map((g) => g.name).join(', ')}`
+        : ''
+    }.`,
     ipAddress: actor.ip,
   });
 
@@ -880,15 +903,24 @@ adminRouter.post('/groups', (req: Request, res: Response) => {
   }
 
   const isUpdate = Boolean(id && store.getGroups().some((g) => g.id === id));
-  const saved = store.upsertGroup({
-    id: id ? String(id) : undefined,
-    name: String(name),
-    description: description ? String(description) : '',
-    allowedActions: Array.isArray(allowedActions) ? allowedActions : [],
-    objectPermissions: Array.isArray(objectPermissions)
-      ? objectPermissions
-      : [],
-  });
+  let saved;
+  try {
+    saved = store.upsertGroup({
+      id: id ? String(id) : undefined,
+      name: String(name),
+      description: description ? String(description) : '',
+      allowedActions: Array.isArray(allowedActions) ? allowedActions : [],
+      objectPermissions: Array.isArray(objectPermissions)
+        ? objectPermissions
+        : [],
+    });
+  } catch (err: any) {
+    if (/UNIQUE constraint failed: access_groups\.name/.test(String(err?.message))) {
+      res.status(409).json({ error: `An Access Group named "${String(name).trim()}" already exists.` });
+      return;
+    }
+    throw err;
+  }
 
   const actor = getAdminInfo(req);
   store.recordPortalAdminLog({
@@ -955,10 +987,16 @@ adminRouter.put(
       return;
     }
 
-    const updated = store.setProfileGroups(
-      profileId,
-      groupIds.map((g) => String(g))
-    );
+    let updated;
+    try {
+      updated = store.setProfileGroups(
+        profileId,
+        groupIds.map((g) => String(g))
+      );
+    } catch (err: any) {
+      res.status(400).json({ error: err?.message || 'Invalid groupIds.' });
+      return;
+    }
     const allGroups = store.getGroups();
     const groupNames = updated.groupIds.map(
       (gid) => allGroups.find((g) => g.id === gid)?.name || gid
@@ -1001,21 +1039,32 @@ adminRouter.put('/okta', (req: Request, res: Response) => {
 });
 
 adminRouter.put('/sf-settings', (req: Request, res: Response) => {
+  let input: SalesforceSettingsInput;
   try {
-    const updated = store.updateSalesforceSettings(req.body || {});
-    const actor = getAdminInfo(req);
-    store.recordPortalAdminLog({
-      adminUsername: actor.username,
-      authMethod: actor.authMethod,
-      action: 'UPDATE_SF_SETTINGS',
-      target: 'Salesforce Org Connection',
-      details: `Updated Salesforce Org connection settings (Mode: ${updated.authMode}, Login URL: ${updated.loginUrl}, User: ${updated.username || 'Not set'}).`,
-      ipAddress: actor.ip,
-    });
-    res.json({ sfSettings: updated });
+    input = parseSalesforceSettingsInput(req.body || {});
   } catch (err: any) {
-    res.status(400).json({ error: err.message || 'Invalid Salesforce settings.' });
+    res.status(400).json({ error: err?.message || 'Invalid Salesforce settings.' });
+    return;
   }
+
+  let updated;
+  try {
+    updated = store.updateSalesforceSettings(input);
+  } catch (err: any) {
+    // e.g. a private key that cannot be parsed
+    res.status(400).json({ error: err?.message || 'Invalid Salesforce settings.' });
+    return;
+  }
+  const actor = getAdminInfo(req);
+  store.recordPortalAdminLog({
+    adminUsername: actor.username,
+    authMethod: actor.authMethod,
+    action: 'UPDATE_SF_SETTINGS',
+    target: 'Salesforce Org Connection',
+    details: `Updated Salesforce Org connection settings (Mode: ${updated.authMode}, Login URL: ${updated.loginUrl}, User: ${updated.username || 'Not set'}, OrgId: ${updated.expectedOrgId || 'Any'}, Instance: ${updated.instanceUrl}).`,
+    ipAddress: actor.ip,
+  });
+  res.json({ sfSettings: updated });
 });
 
 /**
@@ -1063,12 +1112,12 @@ adminRouter.post('/sf-settings/generate-cert', (req: Request, res: Response) => 
  */
 adminRouter.post(
   '/sf-settings/connect',
-  async (req: Request, res: Response) => {
+  asyncRoute(async (req: Request, res: Response) => {
     const actor = getAdminInfo(req);
     try {
       // Save any provided settings first
       if (req.body && Object.keys(req.body).length > 0) {
-        store.updateSalesforceSettings(req.body);
+        store.updateSalesforceSettings(parseSalesforceSettingsInput(req.body));
       }
 
       const secrets = store.getSalesforceSettingsWithSecrets();
@@ -1131,7 +1180,7 @@ adminRouter.post(
         sfSettings: updated,
       });
     }
-  }
+  })
 );
 
 /**
@@ -1167,9 +1216,9 @@ adminRouter.post('/portal-users', (req: Request, res: Response) => {
 
   const saved = store.upsertPortalUser({
     username: String(username),
-    displayName: String(displayName || username),
+    displayName: displayName ? String(displayName) : undefined,
     password: String(password),
-    role: role ? String(role) : 'Admin',
+    role: role ? String(role) : undefined,
   });
 
   const actor = getAdminInfo(req);
@@ -1188,7 +1237,10 @@ adminRouter.post('/portal-users', (req: Request, res: Response) => {
 adminRouter.delete('/portal-users/:username', (req: Request, res: Response) => {
   const username = String(req.params.username);
   try {
-    store.deletePortalUser(username);
+    if (!store.deletePortalUser(username)) {
+      res.status(404).json({ error: `Portal user '${username}' not found.` });
+      return;
+    }
     const actor = getAdminInfo(req);
     store.recordPortalAdminLog({
       adminUsername: actor.username,
@@ -1209,6 +1261,14 @@ adminRouter.delete('/portal-users/:username', (req: Request, res: Response) => {
  * Allows testing what a given Profile ID can do based on its current Profile Group Matrix
  */
 adminRouter.post('/test-mcp-access', async (req: Request, res: Response) => {
+  try {
+    await runMcpAccessSimulation(req, res);
+  } catch (err: any) {
+    res.status(400).json({ error: err?.message || 'Simulation failed.' });
+  }
+});
+
+async function runMcpAccessSimulation(req: Request, res: Response): Promise<void> {
   const { profileId, toolName, targetObject, samplePayload, username } =
     req.body || {};
   const profile = store.getProfileById(String(profileId || ''));
@@ -1262,14 +1322,19 @@ adminRouter.post('/test-mcp-access', async (req: Request, res: Response) => {
       allowedActions: Array.from(effective.allowedActions),
     },
   });
-});
+}
 
 /**
  * POST /api/admin/workspace/seed-sample
- * Non-destructively populates reference Enterprise Access Groups, Profile-to-Group mappings,
- * and simulated Copilot MCP traffic events for instant evaluation.
+ * Development only: creates sample Access Groups and replaces the group mappings of the sample
+ * Profiles (and of any Profile whose name matches one). Refused in production, where it could give
+ * real Profiles write and delete access.
  */
 adminRouter.post('/workspace/seed-sample', (req: Request, res: Response) => {
+  if (config.isProd) {
+    res.status(403).json({ error: 'Sample data can only be loaded outside production.' });
+    return;
+  }
   const actor = getAdminInfo(req);
   const existingObjects = store.getObjects();
   const objFieldNames = (objName: string, exclude: string[] = []): string[] => {

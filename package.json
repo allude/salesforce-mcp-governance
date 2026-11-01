@@ -4,11 +4,20 @@
   "description": "Zero-Trust Enterprise Salesforce MCP Server (Streamable HTTP) with Next.js App Router Admin & Governance Panel",
   "type": "module",
   "scripts": {
-    "dev": "next dev --port 3000",
+    "dev": "node scripts/run-stack.mjs dev",
+    "dev:web": "next dev --port 3000",
     "dev:mcp": "PORT=3001 tsx watch src/index.ts",
-    "build": "next build",
-    "start": "next start --port 3000",
-    "test": "tsx src/test-self.ts"
+    "build": "npm run build:mcp && next build",
+    "build:mcp": "tsc -p tsconfig.server.json",
+    "start": "node scripts/run-stack.mjs start",
+    "start:web": "next start --port 3000",
+    "start:mcp": "NODE_ENV=${NODE_ENV:-production} PORT=3001 node dist/index.js",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "npm run test:unit && npm run test:self",
+    "test:unit": "NODE_ENV=test tsx --test --test-concurrency=1 'test/**/*.test.ts'",
+    "test:self": "NODE_ENV=test tsx src/test-self.ts",
+    "test:e2e": "bash scripts/smoke-e2e.sh",
+    "verify": "npm run typecheck && npm test && npm run build && npm run test:e2e"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
@@ -39,5 +48,8 @@
     "@types/react-dom": "^19.2.3",
     "tsx": "^4.19.3",
     "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=22.13"
   }
 }

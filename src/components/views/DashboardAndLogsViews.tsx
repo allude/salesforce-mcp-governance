@@ -1223,10 +1223,10 @@ export function PortalAdminLogsView({
 interface PortalAuthSettingsViewProps {
   oktaSettings: OktaConfig;
   portalUsers: PortalUser[];
-  onSaveOkta: (settings: Partial<OktaConfig>) => Promise<void>;
+  onSaveOkta: (settings: Partial<OktaConfig> & { clientSecret?: string }) => Promise<void>;
   onCreatePortalUser: (user: {
     username: string;
-    displayName: string;
+    displayName?: string;
     password: string;
     role: string;
   }) => Promise<void>;
@@ -1241,6 +1241,9 @@ export function PortalAuthSettingsView({
   onDeletePortalUser,
 }: PortalAuthSettingsViewProps) {
   const [oktaDraft, setOktaDraft] = useState<OktaConfig>(oktaSettings);
+  const [oktaClientSecret, setOktaClientSecret] = useState('');
+  // Only send the issuer when the admin edited it, so changing the domain re-derives a default issuer
+  const [oktaIssuerEdited, setOktaIssuerEdited] = useState(false);
   const [newUsername, setNewUsername] = useState('');
   const [newDisplayName, setNewDisplayName] = useState('');
   const [newPassword, setNewPassword] = useState('');
@@ -1316,10 +1319,48 @@ export function PortalAuthSettingsView({
               <input
                 className="inp mono"
                 value={oktaDraft.issuer}
-                onChange={(e) =>
-                  setOktaDraft({ ...oktaDraft, issuer: e.target.value })
-                }
+                onChange={(e) => {
+                  setOktaDraft({ ...oktaDraft, issuer: e.target.value });
+                  setOktaIssuerEdited(true);
+                }}
                 placeholder="https://acme-enterprise.okta.com/oauth2/default"
+              />
+            </div>
+            <div className="fld">
+              <label>OIDC Client Secret</label>
+              <input
+                type="password"
+                autoComplete="new-password"
+                className="inp mono"
+                value={oktaClientSecret}
+                onChange={(e) => setOktaClientSecret(e.target.value)}
+                placeholder={
+                  oktaDraft.hasClientSecret
+                    ? 'Stored. Leave blank to keep it.'
+                    : 'Paste the client secret'
+                }
+              />
+            </div>
+            <div className="fld">
+              <label>Required Okta Group Claim</label>
+              <input
+                className="inp mono"
+                value={oktaDraft.adminGroup}
+                onChange={(e) =>
+                  setOktaDraft({ ...oktaDraft, adminGroup: e.target.value })
+                }
+                placeholder="MCP-Admins"
+              />
+            </div>
+            <div className="fld">
+              <label>Redirect URI (optional)</label>
+              <input
+                className="inp mono"
+                value={oktaDraft.redirectUri}
+                onChange={(e) =>
+                  setOktaDraft({ ...oktaDraft, redirectUri: e.target.value })
+                }
+                placeholder="<BASE_URL>/auth/okta/callback"
               />
             </div>
             <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
@@ -1330,7 +1371,15 @@ export function PortalAuthSettingsView({
                 onClick={async () => {
                   setBusy(true);
                   try {
-                    await onSaveOkta(oktaDraft);
+                    await onSaveOkta({
+                      ...oktaDraft,
+                      // Empty issuer means "derive https://<domain>/oauth2/default"; untouched means "keep or re-derive"
+                      issuer: oktaIssuerEdited ? oktaDraft.issuer.trim() : undefined,
+                      clientSecret: oktaClientSecret.trim() || undefined,
+                      redirectUri: oktaDraft.redirectUri.trim(),
+                    });
+                    setOktaClientSecret('');
+                    setOktaIssuerEdited(false);
                   } finally {
                     setBusy(false);
                   }
@@ -1434,7 +1483,8 @@ export function PortalAuthSettingsView({
                   try {
                     await onCreatePortalUser({
                       username: newUsername.trim(),
-                      displayName: newDisplayName.trim() || newUsername.trim(),
+                      // Omitted when blank so updating an existing user's password keeps their display name
+                      displayName: newDisplayName.trim() || undefined,
                       password: newPassword,
                       role: newRole,
                     });

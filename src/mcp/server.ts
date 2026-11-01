@@ -7,7 +7,10 @@ import {
   VerifiedSalesforceUser,
   salesforceRestRequest,
 } from '../salesforce/client.js';
+import { assertSafeSoqlWhereClause } from './soqlGuard.js';
+import { SALESFORCE_API_NAME_PATTERN } from '../db/importers.js';
 import {
+  PolicyViolationError,
   evaluateMcpToolCall,
   getVisibleToolsForUser,
   resolveEffectiveProfilePermissions,
@@ -43,7 +46,8 @@ const TOOL_INPUT_SCHEMAS: Record<string, object> = {
       },
       whereClause: {
         type: 'string',
-        description: 'Optional WHERE filter expression',
+        description:
+          "Optional WHERE filter expression using only allowed fields, literals and operators (no subqueries), e.g. StageName = 'Closed Won' AND Amount > 1000",
       },
       limit: {
         type: 'number',
@@ -57,6 +61,11 @@ const TOOL_INPUT_SCHEMAS: Record<string, object> = {
     properties: {
       objectName: { type: 'string', description: 'Salesforce Object API Name' },
       recordId: { type: 'string', description: '15 or 18-character Record ID' },
+      fields: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Fields to return (defaults to every field allowed for your Profile)',
+      },
     },
     required: ['objectName', 'recordId'],
   },
@@ -92,6 +101,44 @@ const TOOL_INPUT_SCHEMAS: Record<string, object> = {
     required: ['objectName', 'recordId'],
   },
 };
+
+const RECORD_ID_PATTERN = /^[a-zA-Z0-9]{15}(?:[a-zA-Z0-9]{3})?$/;
+const API_NAME_PATTERN = SALESFORCE_API_NAME_PATTERN;
+
+function requireRecordId(args: Record<string, any>): string {
+  const recordId = typeof args.recordId === 'string' ? args.recordId.trim() : '';
+  if (!RECORD_ID_PATTERN.test(recordId)) {
+    throw new Error('recordId must be a 15 or 18-character Salesforce Record ID.');
+  }
+  return recordId;
+}
+
+/** Field names must all be in the Profile's allowlist (case-insensitive). */
+function assertFieldsAllowed(
+  fieldNames: string[],
+  allowedFields: string[],
+  objectName: string,
+  profileName: string
+): void {
+  // Names stored before API-name validation existed are re-checked, since they go into SOQL/URLs.
+  const permittedSet = new Set(
+    allowedFields.filter((f) => API_NAME_PATTERN.test(f)).map((f) => f.toLowerCase())
+  );
+  const disallowed = fieldNames.filter((f) => !permittedSet.has(f.toLowerCase()));
+  if (disallowed.length > 0) {
+    throw new PolicyViolationError(
+      `Fields [${disallowed.join(', ')}] on ${objectName} are not permitted for Profile '${profileName}'.`
+    );
+  }
+}
+
+function requireFieldValues(args: Record<string, any>): Record<string, unknown> {
+  const fields = args.fields;
+  if (!fields || typeof fields !== 'object' || Array.isArray(fields) || Object.keys(fields).length === 0) {
+    throw new Error('fields must be an object of field names to values.');
+  }
+  return fields as Record<string, unknown>;
+}
 
 export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server {
   const server = new Server(
@@ -193,161 +240,147 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
           assignedGroups: effective.assignedGroups.map((g) => g.name),
           objects,
         };
-      } else if (toolName === 'describe_object') {
-        const objPerm = Array.from(effective.objectPermissions.values()).find(
-          (o) => o.objectName.toLowerCase() === targetObject.toLowerCase()
-        );
-        const missingSet = objPerm?.missingInOrgFields || new Set<string>();
-        responsePayload = {
-          objectName: objPerm?.objectName || targetObject,
-          permissions: {
-            canRead: objPerm?.canRead || false,
-            canCreate: objPerm?.canCreate || false,
-            canUpdate: objPerm?.canUpdate || false,
-            canDelete: objPerm?.canDelete || false,
-          },
-          allowedFields: evaluation.allowedFields,
-          activeOrgFields: evaluation.allowedFields.filter(
-            (f) => !missingSet.has(f)
-          ),
-        };
-      } else if (toolName === 'soql_query') {
-        const objPerm = Array.from(effective.objectPermissions.values()).find(
-          (o) => o.objectName.toLowerCase() === targetObject.toLowerCase()
-        );
-        const missingInOrgSet = new Set(
-          Array.from(objPerm?.missingInOrgFields || []).map((f) =>
-            f.toLowerCase()
-          )
-        );
-
-        const rawRequestedFields: string[] = Array.isArray(args.fields)
-          ? args.fields.map(String)
-          : evaluation.allowedFields;
-        const permittedSet = new Set(
-          evaluation.allowedFields.map((f) => f.toLowerCase())
-        );
-        const disallowed = rawRequestedFields.filter(
-          (f) => !permittedSet.has(f.toLowerCase())
-        );
-        if (disallowed.length > 0) {
-          throw new Error(
-            `Fields [${disallowed.join(', ')}] on ${targetObject} are not permitted for Profile '${effective.profileName}'.`
-          );
+      } else {
+        // Every other tool is object-scoped; the policy engine returned the canonical object name.
+        const objectName = evaluation.objectName || targetObject;
+        if (!API_NAME_PATTERN.test(objectName)) {
+          throw new Error(`Object '${objectName}' is not a valid Salesforce API name.`);
         }
 
-        // Automatically ignore fields known to be missing in the Salesforce Org so left-over fields never break queries
-        const ignoredMissingFields: string[] = [];
-        let activeFields = rawRequestedFields.filter((f) => {
-          if (missingInOrgSet.has(f.toLowerCase())) {
-            ignoredMissingFields.push(f);
-            return false;
+        // Fields an admin kept after a sync removed them from the org. They stay in policy, but
+        // sending them to Salesforce would fail the whole call, so they are left out and reported.
+        const objPerm = effective.objectPermissions.get(objectName);
+        const missingInOrg = new Set(
+          Array.from(objPerm?.missingInOrgFields || []).map((f) => f.toLowerCase())
+        );
+        const isMissingInOrg = (field: string) => missingInOrg.has(field.toLowerCase());
+        const withIgnoredFields = (ignored: string[]) =>
+          ignored.length > 0 ? { ignoredMissingFields: ignored } : {};
+
+        if (toolName === 'describe_object') {
+          responsePayload = {
+            objectName,
+            permissions: {
+              canRead: objPerm?.canRead || false,
+              canCreate: objPerm?.canCreate || false,
+              canUpdate: objPerm?.canUpdate || false,
+              canDelete: objPerm?.canDelete || false,
+            },
+            allowedFields: evaluation.allowedFields,
+            activeOrgFields: evaluation.allowedFields.filter((f) => !isMissingInOrg(f)),
+          };
+        } else if (toolName === 'soql_query') {
+          const requestedFields: string[] = Array.isArray(args.fields)
+            ? args.fields.map(String)
+            : evaluation.allowedFields.filter((f) => API_NAME_PATTERN.test(f));
+          assertFieldsAllowed(requestedFields, evaluation.allowedFields, objectName, effective.profileName);
+
+          const whereClause =
+            typeof args.whereClause === 'string' && args.whereClause.trim()
+              ? args.whereClause.trim()
+              : '';
+          if (whereClause) {
+            assertSafeSoqlWhereClause(whereClause, evaluation.allowedFields);
           }
-          return true;
-        });
-        if (activeFields.length === 0) {
-          activeFields = ['Id'];
-        }
 
-        const limit = Math.min(Number(args.limit || 50), 200);
-        const buildSoql = (fieldsList: string[]) =>
-          `SELECT ${fieldsList.length > 0 ? fieldsList.join(', ') : 'Id'} FROM ${targetObject}${
-            args.whereClause ? ` WHERE ${args.whereClause}` : ''
-          } LIMIT ${limit}`;
+          const ignoredMissingFields = requestedFields.filter(isMissingInOrg);
+          let activeFields = requestedFields.filter((f) => !isMissingInOrg(f));
 
-        let sfRes: any;
-        try {
-          sfRes = await salesforceRestRequest(
+          const requestedLimit = Math.floor(Number(args.limit));
+          const limit = Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.min(requestedLimit, 200) : 50;
+          const runQuery = () => {
+            const soql = `SELECT ${activeFields.length > 0 ? activeFields.join(', ') : 'Id'} FROM ${objectName}${
+              whereClause ? ` WHERE ${whereClause}` : ''
+            } LIMIT ${limit}`;
+            return salesforceRestRequest(user, 'GET', `/query?q=${encodeURIComponent(soql)}`);
+          };
+
+          let sfRes: unknown;
+          try {
+            sfRes = await runQuery();
+          } catch (queryErr: any) {
+            // A field deleted in the org since the last sync: drop it from the SELECT and retry once.
+            // Only a field this call selected qualifies; a bad WHERE field still fails.
+            const invalidField = String(queryErr?.message || '').match(/No such column '([^']+)'/i)?.[1];
+            const selected = invalidField
+              ? activeFields.find((f) => f.toLowerCase() === invalidField.toLowerCase())
+              : undefined;
+            if (!selected) throw queryErr;
+            ignoredMissingFields.push(selected);
+            activeFields = activeFields.filter((f) => f !== selected);
+            sfRes = await runQuery();
+          }
+          responsePayload = {
+            objectName,
+            fieldsQueried: activeFields.length > 0 ? activeFields : ['Id'],
+            ...withIgnoredFields(ignoredMissingFields),
+            totalSize: (sfRes as any)?.totalSize ?? 0,
+            records: (sfRes as any)?.records ?? [],
+          };
+        } else if (toolName === 'get_record') {
+          const recordId = requireRecordId(args);
+          const requestedFields: string[] = Array.isArray(args.fields)
+            ? args.fields.map(String)
+            : evaluation.allowedFields.filter((f) => API_NAME_PATTERN.test(f));
+          assertFieldsAllowed(requestedFields, evaluation.allowedFields, objectName, effective.profileName);
+          const activeFields = requestedFields.filter((f) => !isMissingInOrg(f));
+          const fieldList = activeFields.length > 0 ? activeFields : ['Id'];
+
+          const record = await salesforceRestRequest(
             user,
             'GET',
-            `/query?q=${encodeURIComponent(buildSoql(activeFields))}`
+            `/sobjects/${objectName}/${recordId}?fields=${encodeURIComponent(fieldList.join(','))}`
           );
-        } catch (queryErr: any) {
-          // Resilient fallback: If a field was deleted in Salesforce Org (`No such column 'FieldName'`), strip it and retry
-          const errMsg = String(queryErr?.message || '');
-          const match = errMsg.match(/No such column '([^']+)'/i);
-          if (match && match[1]) {
-            const invalidField = match[1];
-            ignoredMissingFields.push(invalidField);
-            activeFields = activeFields.filter(
-              (f) => f.toLowerCase() !== invalidField.toLowerCase()
-            );
-            if (activeFields.length === 0) activeFields = ['Id'];
-            sfRes = await salesforceRestRequest(
-              user,
-              'GET',
-              `/query?q=${encodeURIComponent(buildSoql(activeFields))}`
-            );
+          responsePayload = {
+            objectName,
+            recordId,
+            fieldsReturned: fieldList,
+            ...withIgnoredFields(requestedFields.filter(isMissingInOrg)),
+            record,
+          };
+        } else if (toolName === 'create_record' || toolName === 'update_record') {
+          const recordId = toolName === 'update_record' ? requireRecordId(args) : undefined;
+          const fieldValues = requireFieldValues(args);
+          assertFieldsAllowed(Object.keys(fieldValues), evaluation.allowedFields, objectName, effective.profileName);
+
+          const ignoredMissingFields = Object.keys(fieldValues).filter(isMissingInOrg);
+          const activeValues = Object.fromEntries(
+            Object.entries(fieldValues).filter(([field]) => !isMissingInOrg(field))
+          );
+          if (Object.keys(activeValues).length === 0) {
+            throw new Error(`Every field in this ${toolName} call no longer exists in the Salesforce org.`);
+          }
+
+          let writtenId = recordId;
+          if (recordId) {
+            await salesforceRestRequest(user, 'PATCH', `/sobjects/${objectName}/${recordId}`, activeValues);
           } else {
-            throw queryErr;
-          }
-        }
-
-        responsePayload = {
-          objectName: targetObject,
-          fieldsQueried: activeFields,
-          ...(ignoredMissingFields.length > 0
-            ? { ignoredMissingFields }
-            : {}),
-          totalSize: (sfRes as any)?.totalSize ?? 0,
-          records: (sfRes as any)?.records ?? [],
-        };
-      } else if (
-        toolName === 'get_record' ||
-        toolName === 'create_record' ||
-        toolName === 'update_record' ||
-        toolName === 'delete_record'
-      ) {
-        const objPerm = Array.from(effective.objectPermissions.values()).find(
-          (o) => o.objectName.toLowerCase() === targetObject.toLowerCase()
-        );
-        const missingInOrgSet = new Set(
-          Array.from(objPerm?.missingInOrgFields || []).map((f) =>
-            f.toLowerCase()
-          )
-        );
-        const ignoredMissingFields: string[] = [];
-
-        // Validate field-level permissions for create/update
-        if (
-          (toolName === 'create_record' || toolName === 'update_record') &&
-          args.fields &&
-          typeof args.fields === 'object'
-        ) {
-          const permittedSet = new Set(
-            evaluation.allowedFields.map((f) => f.toLowerCase())
-          );
-          const inputFieldNames = Object.keys(args.fields);
-          const disallowed = inputFieldNames.filter(
-            (f) => !permittedSet.has(f.toLowerCase())
-          );
-          if (disallowed.length > 0) {
-            throw new Error(
-              `Fields [${disallowed.join(', ')}] on ${targetObject} are not permitted for Profile '${effective.profileName}'.`
+            const sfRes = await salesforceRestRequest<{ id?: string; success?: boolean; errors?: unknown[] }>(
+              user,
+              'POST',
+              `/sobjects/${objectName}`,
+              activeValues
             );
+            writtenId = sfRes?.id;
           }
-          for (const fn of inputFieldNames) {
-            if (missingInOrgSet.has(fn.toLowerCase())) {
-              ignoredMissingFields.push(fn);
-            }
-          }
+          responsePayload = {
+            status: 'SUCCESS',
+            tool: toolName,
+            objectName,
+            recordId: writtenId,
+            fieldNames: Object.keys(activeValues),
+            ...withIgnoredFields(ignoredMissingFields),
+          };
+        } else if (toolName === 'delete_record') {
+          const recordId = requireRecordId(args);
+          await salesforceRestRequest(user, 'DELETE', `/sobjects/${objectName}/${recordId}`);
+          responsePayload = {
+            status: 'SUCCESS',
+            tool: toolName,
+            objectName,
+            recordId,
+          };
         }
-
-        const effectiveFieldNames = (
-          args.fields ? Object.keys(args.fields) : evaluation.allowedFields
-        ).filter((f) => !missingInOrgSet.has(f.toLowerCase()));
-
-        responsePayload = {
-          status: 'SUCCESS',
-          tool: toolName,
-          objectName: targetObject,
-          recordId: args.recordId || '001000000000001AAA',
-          fieldNames:
-            effectiveFieldNames.length > 0 ? effectiveFieldNames : ['Id'],
-          ...(ignoredMissingFields.length > 0
-            ? { ignoredMissingFields }
-            : {}),
-        };
       }
 
       const latencyMs = Math.max(1, Date.now() - startTime);
@@ -374,6 +407,7 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
       };
     } catch (err: any) {
       const latencyMs = Math.max(1, Date.now() - startTime);
+      const denied = err instanceof PolicyViolationError;
       store.recordCopilotMcpLog({
         sfUsername: user.username,
         profileId: user.profileId,
@@ -381,10 +415,12 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
         matchedGroups: evaluation.matchedGroups,
         toolName,
         targetObject,
-        status: 'ERROR',
+        status: denied ? 'DENIED' : 'ERROR',
         latencyMs,
         rawRequestPayload: args,
-        rawResponseSummary: { error: err.message || 'Execution error' },
+        rawResponseSummary: denied
+          ? { error: 'ACCESS_DENIED', reason: err.message }
+          : { error: err.message || 'Execution error' },
       });
 
       return {
@@ -392,7 +428,13 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
         content: [
           {
             type: 'text',
-            text: JSON.stringify({ error: err.message }, null, 2),
+            text: JSON.stringify(
+              denied
+                ? { error: 'ACCESS_DENIED', tool: toolName, targetObject, reason: err.message }
+                : { error: err.message },
+              null,
+              2
+            ),
           },
         ],
       };

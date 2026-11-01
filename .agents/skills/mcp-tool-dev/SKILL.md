@@ -35,9 +35,10 @@ Add the new action definition to `AVAILABLE_MCP_ACTIONS` in `src/types/governanc
 Adding it to `AVAILABLE_MCP_ACTIONS` automatically surfaces the checkbox in `# Access Matrix > ## Groups` (`src/components/views/AccessMatrixViews.tsx`).
 
 ### Step 2: Define the JSON Schema in `src/mcp/server.ts`
-Add the input schema to `TOOL_INPUT_SCHEMAS` in `src/mcp/server.ts`. If the tool targets a specific Salesforce object, always name the parameter `objectName` so the policy engine automatically extracts `targetObject = String(args.objectName)`.
+Add the input schema to `TOOL_INPUT_SCHEMAS` in `src/mcp/server.ts`. If the tool targets a specific Salesforce object, always name the parameter `objectName`: the `tools/call` handler in `src/mcp/server.ts` passes `targetObject = String(args.objectName)` (or `'*'`) to `evaluateMcpToolCall`.
 
 ### Step 3: Enforce Object CRUD in `src/rbac/policyEngine.ts`
+If the tool targets one object, add it to `OBJECT_SCOPED_TOOLS` so a call without `objectName` is denied. Unknown tool names (not in `AVAILABLE_MCP_ACTIONS`) are always denied, even if a group lists them.
 In `evaluateMcpToolCall` (`src/rbac/policyEngine.ts`), verify that the tool's required CRUD capability (`canRead`, `canCreate`, `canUpdate`, or `canDelete`) is checked against `objPerm`:
 - Read tools (`soql_query`, `get_record`, `describe_object`, custom read tools) require `objPerm.canRead`.
 - Create tools require `objPerm.canCreate`.
@@ -46,10 +47,12 @@ In `evaluateMcpToolCall` (`src/rbac/policyEngine.ts`), verify that the tool's re
 
 ### Step 4: Implement the Handler & Field Scoping in `src/mcp/server.ts`
 Inside `CallToolRequestSchema` handler in `src/mcp/server.ts`:
-1. Validate any caller-supplied field names against `evaluation.allowedFields` (case-insensitive).
-2. Escape any user-supplied filter strings using `escapeSoqlString(val)` from `src/salesforce/client.ts`.
-3. Execute the Salesforce call via `salesforceRestRequest(user, method, path, body)` so the per-user Salesforce OAuth Bearer token is used.
-4. Return a concise response structure and let `store.recordCopilotMcpLog(...)` redact literal values before persisting to SQLite.
+1. Use the canonical `evaluation.objectName` (not the caller's casing) in REST paths and SOQL.
+2. Validate any caller-supplied field names with `assertFieldsAllowed(...)` against `evaluation.allowedFields` (case-insensitive). Validate free-form filters with `assertSafeSoqlWhereClause(...)` from `src/mcp/soqlGuard.ts`, and escape literal values you build yourself with `escapeSoqlString(val)` from `src/salesforce/client.ts`.
+3. Validate record IDs with `requireRecordId(args)` before putting them in a URL path.
+4. Throw `PolicyViolationError` for allowlist violations so the call is logged as `DENIED` (other errors are logged as `ERROR`).
+5. Execute the Salesforce call via `salesforceRestRequest(user, method, path, body)` so the per-user Salesforce OAuth Bearer token is used. Never report success without making the call.
+6. Return a concise response structure and let `store.recordCopilotMcpLog(...)` redact literal values before persisting to SQLite.
 
 ### Step 5: Verify
-Run the `verify-and-test` skill (`NODE_ENV=test npx tsx src/test-self.ts && npx next build`) to confirm no TypeScript or policy regressions were introduced.
+Add cases to `test/policy-engine.test.ts` and `test/mcp-tools.test.ts` (allowed, denied, audit row, and what was sent to the Salesforce mock), then run the `verify-and-test` skill (`npm run verify`) to confirm no TypeScript or policy regressions were introduced.
