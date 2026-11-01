@@ -303,11 +303,28 @@ db.exec(`
   );
 `);
 
-function ensureColumnExists(tableName: string, columnName: string, columnDef: string) {
+/** Returns true only when this call added the column. */
+function ensureColumnExists(tableName: string, columnName: string, columnDef: string): boolean {
   const cols = db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>;
-  if (!cols.some((c) => c.name === columnName)) {
-    db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnDef}`);
-  }
+  if (cols.some((c) => c.name === columnName)) return false;
+  db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnDef}`);
+  return true;
+}
+
+/**
+ * Before this column existed, simulator calls were logged unmarked under these default names, which
+ * would otherwise count as real traffic. It runs only when the column is added, in one transaction
+ * with it, so an interrupted upgrade retries and a later real row under such a name is left alone.
+ * Naming the identities also leaves rejected-token rows out: those are logged as unverified_caller.
+ */
+function addSimulatedColumnAndMarkLegacyRows() {
+  runInTransaction(() => {
+    if (!ensureColumnExists('mcp_copilot_logs', 'simulated', 'INTEGER NOT NULL DEFAULT 0')) return;
+    db.prepare(
+      `UPDATE mcp_copilot_logs SET simulated = 1
+       WHERE sf_username IN ('copilot.user@enterprise.com', 'alex.demo@company.my.salesforce.com')`
+    ).run();
+  });
 }
 
 function runSchemaMigrations() {
@@ -330,7 +347,7 @@ function runSchemaMigrations() {
   ensureColumnExists('sf_connection_settings', 'connected_user', "TEXT NOT NULL DEFAULT ''");
   ensureColumnExists('sf_connection_settings', 'sync_instance_url', "TEXT NOT NULL DEFAULT ''");
 
-  ensureColumnExists('mcp_copilot_logs', 'simulated', 'INTEGER NOT NULL DEFAULT 0');
+  addSimulatedColumnAndMarkLegacyRows();
   repairConnectInstanceUrls();
 }
 
