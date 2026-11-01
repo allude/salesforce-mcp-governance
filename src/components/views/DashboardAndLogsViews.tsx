@@ -30,6 +30,8 @@ export interface McpRequestStats {
 }
 
 interface TrafficDashboardProps {
+  /** Ticks while the live refresh is paused, so calls keep ageing through the buckets. */
+  clockNow: number;
   mcpStats?: McpRequestStats | null;
   copilotLogs: CopilotMcpLogEntry[];
   portalLogs: PortalAdminLogEntry[];
@@ -45,6 +47,7 @@ interface TrafficDashboardProps {
 }
 
 export function TrafficDashboardView({
+  clockNow,
   copilotLogs,
   mcpStats,
   profiles,
@@ -107,10 +110,9 @@ export function TrafficDashboardView({
     [realLogs]
   );
 
-  // Recomputed on every poll, so calls age through the buckets while the view is live.
   const buckets = useMemo(
-    () => trafficBuckets(realLogs, range, Date.now()),
-    [realLogs, range]
+    () => trafficBuckets(realLogs, range, clockNow),
+    [realLogs, range, clockNow]
   );
 
   const maxBucket = Math.max(

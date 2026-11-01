@@ -1219,6 +1219,7 @@ export default function AdminPortalPage() {
         <main className="cnt">
           {view === 'dashboard' && (
             <TrafficDashboardView
+              clockNow={clockNow}
               copilotLogs={copilotLogs}
               mcpStats={mcpStats}
               portalLogs={portalLogs}
