@@ -670,11 +670,13 @@ export const store = {
   upsertProfile(
     id: string,
     name: string,
-    missingInOrg = false
+    // Only org sync passes this; a re-import or manual save must not clear what sync flagged.
+    missingInOrg?: boolean
   ): { profile: SalesforceProfile; action: 'inserted' | 'updated' } {
     const cleanId = id.trim();
     const cleanName = name.trim();
     const existing = this.getProfileById(cleanId);
+    const nextMissing = missingInOrg ?? existing?.missingInOrg ?? false;
     const now = new Date().toISOString();
     db.prepare(`
       INSERT INTO sf_profiles (id, name, missing_in_org, updated_at)
@@ -683,9 +685,9 @@ export const store = {
         name = excluded.name,
         missing_in_org = excluded.missing_in_org,
         updated_at = excluded.updated_at
-    `).run(cleanId, cleanName, missingInOrg ? 1 : 0, now);
+    `).run(cleanId, cleanName, nextMissing ? 1 : 0, now);
     return {
-      profile: { id: cleanId, name: cleanName, missingInOrg, updatedAt: now },
+      profile: { id: cleanId, name: cleanName, missingInOrg: nextMissing, updatedAt: now },
       action: existing ? 'updated' : 'inserted',
     };
   },
@@ -697,7 +699,7 @@ export const store = {
     let updated = 0;
     for (const r of rows) {
       if (!r.id || !r.name) continue;
-      const res = this.upsertProfile(r.id, r.name, false);
+      const res = this.upsertProfile(r.id, r.name);
       if (res.action === 'inserted') inserted++;
       else updated++;
     }
