@@ -16,6 +16,7 @@ import { MCP_TOOL_CATALOG, formatShortTime } from '@/components/ui/primitives';
 import type { FlyoutState } from './FlyoutDrawer';
 import { realTraffic } from './simulatedTraffic';
 import { portalAuditCsv, trafficLogCsv } from './csvExport';
+import { trafficBuckets, trafficChartSubtitle, type TrafficRange } from './trafficChart';
 
 // ============================================================================
 // 1. DASHBOARD VIEW
@@ -54,7 +55,7 @@ export function TrafficDashboardView({
   onOpenFlyout,
   onSeedEnterpriseMatrix,
 }: TrafficDashboardProps) {
-  const [range, setRange] = useState<'1h' | '24h' | '7d'>('24h');
+  const [range, setRange] = useState<TrafficRange>('24h');
 
   const getProfileGroupIds = (profileId: string): string[] => {
     const found = mappings.find((m) => m.profileId === profileId);
@@ -105,38 +106,11 @@ export function TrafficDashboardView({
     [realLogs]
   );
 
-  // Stacked bar chart buckets (24 bars)
-  const buckets = useMemo(() => {
-    const count = range === '1h' ? 12 : range === '24h' ? 24 : 14;
-    const result = Array.from({ length: count }, (_, idx) => {
-      const lbl =
-        range === '1h'
-          ? `-${(count - 1 - idx) * 5}m`
-          : range === '24h'
-            ? `${String(idx).padStart(2, '0')}:00`
-            : `D-${count - 1 - idx}`;
-      return { lbl, ok: 0, warn: 0, err: 0 };
-    });
-
-    if (realLogs.length === 0) return result;
-
-    // Distribute real logs across buckets (by timestamp hash/hour so chart is informative & deterministic)
-    realLogs.forEach((log, i) => {
-      const d = new Date(log.timestamp);
-      const bucketIdx = !Number.isNaN(d.getTime())
-        ? range === '24h'
-          ? d.getHours() % count
-          : (d.getMinutes() + i) % count
-        : i % count;
-      const b = result[bucketIdx];
-      if (!b) return;
-      if (log.status === 'ALLOWED') b.ok += 1;
-      else if (log.status === 'DENIED') b.warn += 1;
-      else b.err += 1;
-    });
-
-    return result;
-  }, [realLogs, range]);
+  // Recomputed on every poll, so calls age through the buckets while the view is live.
+  const buckets = useMemo(
+    () => trafficBuckets(realLogs, range, Date.now()),
+    [realLogs, range]
+  );
 
   const maxBucket = Math.max(
     1,
@@ -322,7 +296,7 @@ export function TrafficDashboardView({
             <div>
               <div className="card-t">MCP server traffic</div>
               <div className="card-s">
-                Requests per bucket by policy outcome
+                {trafficChartSubtitle(range, realLogs.length)}
               </div>
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -363,7 +337,7 @@ export function TrafficDashboardView({
                   <div
                     className="b-col"
                     key={i}
-                    title={`${b.lbl} — ${b.ok} allowed, ${b.warn} denied, ${b.err} error`}
+                    title={`${b.span} — ${b.ok} allowed, ${b.warn} denied, ${b.err} error`}
                   >
                     <div className="b-stk" style={{ height: `${h}px` }}>
                       <div
@@ -380,7 +354,7 @@ export function TrafficDashboardView({
                       />
                     </div>
                     <div className="b-lbl">
-                      {i % 3 === 0 ? b.lbl.replace(':00', 'h') : ''}
+                      {(buckets.length - 1 - i) % 3 === 0 ? b.lbl : ''}
                     </div>
                   </div>
                 );
