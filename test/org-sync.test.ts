@@ -121,3 +121,50 @@ describe('deleting a field', () => {
     assert.equal(store.getPortalAdminLogs(500).length, logsBefore);
   });
 });
+
+describe('a sync whose names differ from the local row only by case', () => {
+  test('does not re-enable a disabled object', () => {
+    const objectName = newObjectName();
+    store.upsertObjectWithFields({ objectName, fields: [{ fieldName: 'Id' }] });
+    store.toggleObject(objectName, false);
+
+    syncFromOrg(objectName.toUpperCase(), ['Id']);
+
+    const rows = store.getObjects().filter((o) => o.objectName.toLowerCase() === objectName.toLowerCase());
+    assert.deepEqual(rows.map((o) => [o.objectName, o.enabled]), [[objectName, false]]);
+  });
+
+  test('does not re-enable a disabled field or flag it as missing', () => {
+    const objectName = newObjectName();
+    store.upsertObjectWithFields({ objectName, fields: [{ fieldName: 'Id' }, { fieldName: 'Secret__c' }] });
+    store.toggleObjectField(objectName, 'Secret__c', false);
+
+    syncFromOrg(objectName, ['Id', 'SECRET__C']);
+
+    const rows = objectNamed(objectName).fields.filter((f) => f.fieldName.toLowerCase() === 'secret__c');
+    assert.deepEqual(rows.map((f) => [f.fieldName, f.enabled, f.missingInOrg]), [['Secret__c', false, false]]);
+  });
+
+  test('an SFDX re-import in different casing also updates the existing row', () => {
+    const objectName = newObjectName();
+    store.upsertObjectWithFields({ objectName, fields: [{ fieldName: 'Id' }] });
+    store.toggleObject(objectName, false);
+
+    store.importObjectsFromParsedSfdx([
+      { objectName: objectName.toLowerCase(), label: 'x', isCustom: true, sourcePath: 'p', fields: [] },
+    ] as any);
+
+    const rows = store.getObjects().filter((o) => o.objectName.toLowerCase() === objectName.toLowerCase());
+    assert.deepEqual(rows.map((o) => [o.objectName, o.enabled]), [[objectName, false]]);
+  });
+
+  test('an explicit enable in different casing is still applied', () => {
+    const objectName = newObjectName();
+    store.upsertObjectWithFields({ objectName, fields: [{ fieldName: 'Id' }] });
+    store.toggleObject(objectName, false);
+
+    store.upsertObjectWithFields({ objectName: objectName.toLowerCase(), enabled: true, fields: [{ fieldName: 'Id' }] });
+
+    assert.equal(objectNamed(objectName).enabled, true);
+  });
+});
