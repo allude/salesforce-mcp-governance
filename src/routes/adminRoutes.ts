@@ -83,6 +83,27 @@ function parseSalesforceSettingsInput(body: Record<string, any>): SalesforceSett
   return input;
 }
 
+/**
+ * Why a production Okta save must be refused, if it should be. The issuer's discovery and token
+ * endpoints receive the client secret, and the redirect URI receives the authorization code.
+ * A blank value is allowed: it means the https issuer derived from the domain, or the default URI.
+ */
+function insecureOktaUrlError(body: Record<string, unknown>): string | null {
+  const urls: Array<[string, unknown]> = [
+    ['Okta Issuer', body.issuer],
+    ['Okta Redirect URI', body.redirectUri],
+  ];
+  for (const [label, value] of urls) {
+    if (value === undefined || value === null) continue;
+    const url = typeof value === 'string' ? value.trim() : null;
+    if (url === '') continue;
+    if (url === null || !/^https:\/\//i.test(url) || !URL.canParse(url)) {
+      return `${label} must be an https:// URL in production.`;
+    }
+  }
+  return null;
+}
+
 /** Express 4 ignores rejected promises, so async handlers must hand failures to `next` explicitly. */
 const asyncRoute =
   (handler: (req: Request, res: Response) => Promise<void>) =>
@@ -1027,6 +1048,13 @@ adminRouter.put(
 // 4. SETTINGS (Okta SSO, Salesforce Connection, Portal Users, Test MCP Call)
 // ============================================================================
 adminRouter.put('/okta', (req: Request, res: Response) => {
+  if (config.isProd) {
+    const insecure = insecureOktaUrlError(req.body || {});
+    if (insecure) {
+      res.status(400).json({ error: insecure });
+      return;
+    }
+  }
   const updated = store.updateOktaConfig(req.body || {});
   const actor = getAdminInfo(req);
   store.recordPortalAdminLog({

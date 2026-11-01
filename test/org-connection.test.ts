@@ -145,6 +145,80 @@ describe('outside production only', () => {
   });
 });
 
+describe('Okta settings URLs', () => {
+  const HTTPS_ISSUER = 'https://acme.okta.com/oauth2/default';
+  const HTTPS_REDIRECT = 'https://portal.example.com/auth/okta/callback';
+
+  const putOkta = (body: Record<string, unknown>) =>
+    adminFetch(server.baseUrl, session, '/api/admin/okta', { method: 'PUT', body });
+
+  function seedHttps(t: { after: (fn: () => void) => void }) {
+    store.updateOktaConfig({ oktaDomain: 'acme.okta.com', issuer: HTTPS_ISSUER, redirectUri: HTTPS_REDIRECT });
+    t.after(() => {
+      store.updateOktaConfig({ oktaDomain: '', issuer: '', redirectUri: '' });
+    });
+  }
+
+  for (const [name, body] of Object.entries({
+    'an http issuer': { issuer: 'http://acme.okta.com/oauth2/default' },
+    'an http issuer in capitals': { issuer: 'HTTP://acme.okta.com/oauth2/default' },
+    'an issuer with no scheme': { issuer: 'acme.okta.com/oauth2/default' },
+    'an issuer with an https prefix only': { issuer: 'https://' },
+    'an issuer that is not a string': { issuer: ['https://acme.okta.com'] },
+    'an http redirect URI': { redirectUri: 'http://portal.example.com/auth/okta/callback' },
+    'an https issuer with an http redirect URI': {
+      issuer: HTTPS_ISSUER,
+      redirectUri: 'http://portal.example.com/auth/okta/callback',
+    },
+  })) {
+    test(`production refuses ${name} and saves nothing`, async (t) => {
+      seedHttps(t);
+      const before = store.getOktaConfig();
+
+      const res = await asProduction(() => putOkta({ ...body, adminGroup: 'Changed-Group' }));
+
+      assert.equal(res.status, 400);
+      assert.match(res.body.error, /must be an https:\/\/ URL in production/);
+      assert.deepEqual(store.getOktaConfig(), before);
+    });
+  }
+
+  test('production accepts https URLs in any letter case', async (t) => {
+    seedHttps(t);
+    const res = await asProduction(() =>
+      putOkta({ issuer: 'HTTPS://other.okta.com/oauth2/default', redirectUri: HTTPS_REDIRECT })
+    );
+
+    assert.equal(res.status, 200);
+    assert.equal(res.body.oktaSettings.issuer, 'HTTPS://other.okta.com/oauth2/default');
+    assert.equal(res.body.oktaSettings.redirectUri, HTTPS_REDIRECT);
+  });
+
+  test('production accepts a save that sets no URL, or leaves the issuer to be derived', async (t) => {
+    seedHttps(t);
+    const unrelated = await asProduction(() => putOkta({ adminGroup: 'Other-Group' }));
+    assert.equal(unrelated.status, 200);
+    assert.equal(unrelated.body.oktaSettings.issuer, HTTPS_ISSUER);
+
+    const derived = await asProduction(() => putOkta({ oktaDomain: 'http://derived.okta.com', issuer: '', redirectUri: '' }));
+    assert.equal(derived.status, 200);
+    assert.equal(derived.body.oktaSettings.issuer, 'https://derived.okta.com/oauth2/default');
+    assert.equal(derived.body.oktaSettings.redirectUri, '');
+  });
+
+  test('outside production a local http issuer and redirect URI still work', async (t) => {
+    seedHttps(t);
+    const res = await putOkta({
+      issuer: 'http://127.0.0.1:9999',
+      redirectUri: 'http://localhost:3000/auth/okta/callback',
+    });
+
+    assert.equal(res.status, 200);
+    assert.equal(res.body.oktaSettings.issuer, 'http://127.0.0.1:9999');
+    assert.equal(res.body.oktaSettings.redirectUri, 'http://localhost:3000/auth/okta/callback');
+  });
+});
+
 describe('fields removed from the org', () => {
   /** A Profile allowed on an object whose Legacy__c field was kept after being removed from the org. */
   function seed(t: { after: (fn: () => void) => void }) {
