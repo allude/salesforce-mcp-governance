@@ -4,6 +4,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { portalAuditResult } from './portalAudit';
 import { DEFAULT_SIMULATED_USERNAME, trafficBurstCalls } from './simulatedTraffic';
 import { savedAccessGroup, splitMcpActions } from './accessGroupDraft';
+import { isSalesforceId } from '@/salesforce/ids';
 import type {
   SalesforceProfile,
   SalesforceObject,
@@ -121,7 +122,7 @@ export function FlyoutDrawer({
 
   // Profile state
   const [profNameEdit, setProfNameEdit] = useState('');
-  const [newProfId, setNewProfId] = useState('00e5g000001P5xAAAS');
+  const [newProfId, setNewProfId] = useState('');
   const [newProfName, setNewProfName] = useState('');
 
   // Import CSV state
@@ -176,8 +177,7 @@ export function FlyoutDrawer({
         profiles.find((p) => p.id === flyout.data.id) || flyout.data;
       setProfNameEdit(liveProf.name);
     } else if (flyout.type === 'newprofile') {
-      const suffix = Math.random().toString(36).substring(2, 6).toUpperCase();
-      setNewProfId(`00e5g000001${suffix}AAS`);
+      setNewProfId('');
       setNewProfName('');
     } else if (flyout.type === 'group' && flyout.data) {
       const liveGrp =
@@ -226,6 +226,8 @@ export function FlyoutDrawer({
     const found = mappings.find((m) => m.profileId === profileId);
     return found ? found.groupIds : [];
   };
+
+  const newProfIdInvalid = newProfId.trim() !== '' && !isSalesforceId(newProfId);
 
   const liveProfile: SalesforceProfile | null =
     flyout.type === 'profile'
@@ -804,11 +806,18 @@ export function FlyoutDrawer({
                   value={newProfId}
                   onChange={(e) => setNewProfId(e.target.value)}
                   placeholder="00e5g000001X9zAAAS"
+                  aria-invalid={newProfIdInvalid}
                 />
-                <div className="hint">
-                  Standard Salesforce Profile prefix is{' '}
-                  <span className="mono">00e</span>.
-                </div>
+                {newProfIdInvalid ? (
+                  <div className="hint" role="alert" style={{ color: 'var(--err)' }}>
+                    Enter the 15 or 18 letter and number ID from Salesforce.
+                  </div>
+                ) : (
+                  <div className="hint">
+                    Standard Salesforce Profile prefix is{' '}
+                    <span className="mono">00e</span>.
+                  </div>
+                )}
               </div>
               <div className="fld">
                 <label>Profile name</label>
@@ -2133,7 +2142,7 @@ export function FlyoutDrawer({
               <button
                 type="button"
                 className="btn pri"
-                disabled={busy || !newProfId.trim() || !newProfName.trim()}
+                disabled={busy || !isSalesforceId(newProfId) || !newProfName.trim()}
                 onClick={async () => {
                   setBusy(true);
                   try {

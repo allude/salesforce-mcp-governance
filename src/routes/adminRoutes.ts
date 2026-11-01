@@ -24,6 +24,7 @@ import {
 } from '../salesforce/jwtConnection.js';
 import { config } from '../config.js';
 import { parseObjectSyncPayload, parseProfileSyncPayload } from './orgSyncPayload.js';
+import { isSalesforceId } from '../salesforce/ids.js';
 import { AVAILABLE_MCP_ACTIONS, unknownMcpActionIds } from '../types/governance.js';
 import type { SalesforceConnectionSettings } from '../types/governance.js';
 import {
@@ -418,6 +419,11 @@ adminRouter.post('/profiles', (req: Request, res: Response) => {
   const { id, name } = req.body || {};
   if (!id || !name) {
     res.status(400).json({ error: 'Profile ID and Profile Name are required.' });
+    return;
+  }
+  // Only a new ID is checked, so a row stored before this rule can still be renamed.
+  if (!isSalesforceId(String(id)) && !store.getProfileById(String(id))) {
+    res.status(400).json({ error: 'Profile ID must be a 15 or 18 character Salesforce ID.' });
     return;
   }
 
