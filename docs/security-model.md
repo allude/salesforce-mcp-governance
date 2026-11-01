@@ -47,7 +47,7 @@ When **Reject tokens from other orgs** is on and an expected Org ID is set (**Se
 
 ## 5. Signed Policy-Simulator Tokens
 
-The portal's policy simulator (`POST /api/admin/test-mcp-access`, admins only) issues `sf_sim_<payload>.<signature>` tokens so an admin can exercise `/mcp` as a given Profile. Each token is signed with HMAC-SHA256 under a sub-key derived (HKDF) from `APP_SECRET_KEY` and expires after 15 minutes. Simulated calls never reach Salesforce. Unsigned, tampered or expired simulator tokens are rejected.
+The portal's policy simulator (`POST /api/admin/test-mcp-access`, admins only) issues `sf_sim_<payload>.<signature>` tokens so an admin can exercise `/mcp` as a given Profile. Each token is signed with HMAC-SHA256 under a sub-key derived (HKDF) from `APP_SECRET_KEY` and expires after 15 minutes. Simulated calls never reach Salesforce. They are logged with a `simulated` marker set from the verified token or the route, under the name `simulated:<name>`, so they cannot pass as a real user, and each simulation writes a portal admin log row naming the admin. Unsigned, tampered or expired simulator tokens are rejected.
 
 ---
 

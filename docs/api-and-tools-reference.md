@@ -29,7 +29,7 @@ Stateless Model Context Protocol endpoint used by Microsoft Copilot Studio and o
 * **CORS:** any origin, never with credentials. `WWW-Authenticate` and `Mcp-Session-Id` are exposed.
 * **Rate limit:** 120 requests per minute per bearer token (requests without a token: per client IP).
 
-**Simulator tokens.** `POST /api/admin/test-mcp-access` returns a `simulatorBearerToken` (`sf_sim_<payload>.<signature>`). It is HMAC-signed with a key derived from `APP_SECRET_KEY`, expires after 15 minutes, and lets an admin exercise `/mcp` as a given Profile. Calls made with it get simulated Salesforce responses and never reach Salesforce. Unsigned, tampered or expired simulator tokens get `401`.
+**Simulator tokens.** `POST /api/admin/test-mcp-access` returns a `simulatorBearerToken` (`sf_sim_<payload>.<signature>`). It is HMAC-signed with a key derived from `APP_SECRET_KEY`, expires after 15 minutes, and lets an admin exercise `/mcp` as a given Profile. Calls made with it get simulated Salesforce responses and never reach Salesforce, and are logged with `simulated: true` under the name `simulated:<name>`. Each simulation also writes a `SIMULATE_MCP_CALL` portal admin log row naming the admin. Unsigned, tampered or expired simulator tokens get `401`.
 
 ### `GET /.well-known/oauth-protected-resource`
 RFC 9728 OAuth 2.0 Protected Resource Metadata. `authorization_servers` is the instance URL from the portal's Salesforce settings:

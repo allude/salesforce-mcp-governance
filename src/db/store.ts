@@ -329,6 +329,8 @@ function runSchemaMigrations() {
   ensureColumnExists('sf_connection_settings', 'connected_org_id', "TEXT NOT NULL DEFAULT ''");
   ensureColumnExists('sf_connection_settings', 'connected_user', "TEXT NOT NULL DEFAULT ''");
   ensureColumnExists('sf_connection_settings', 'sync_instance_url', "TEXT NOT NULL DEFAULT ''");
+
+  ensureColumnExists('mcp_copilot_logs', 'simulated', 'INTEGER NOT NULL DEFAULT 0');
   repairConnectInstanceUrls();
 }
 
@@ -1581,6 +1583,7 @@ export const store = {
       latencyMs: r.latency_ms,
       sanitizedRequestPayload: r.sanitized_request_payload,
       sanitizedResponseSummary: r.sanitized_response_summary,
+      ...(r.simulated ? { simulated: true as const } : {}),
     }));
   },
 
@@ -1608,6 +1611,8 @@ export const store = {
     latencyMs: number;
     rawRequestPayload: unknown;
     rawResponseSummary: unknown;
+    /** Callers pass this from a verified token or a server route, never from request input. */
+    simulated?: boolean;
   }): CopilotMcpLogRecord {
     const id = `mcp_${Date.now().toString(36)}_${crypto.randomBytes(8).toString('hex')}`;
     const timestamp = new Date().toISOString();
@@ -1626,8 +1631,8 @@ export const store = {
       INSERT INTO mcp_copilot_logs (
         id, timestamp, sf_username, profile_id, profile_name, matched_groups_json,
         tool_name, target_object, status, latency_ms,
-        sanitized_request_payload, sanitized_response_summary
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        sanitized_request_payload, sanitized_response_summary, simulated
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       timestamp,
@@ -1640,7 +1645,8 @@ export const store = {
       input.status,
       input.latencyMs,
       sanitizedReq,
-      sanitizedRes
+      sanitizedRes,
+      input.simulated ? 1 : 0
     );
 
     return {
@@ -1656,6 +1662,7 @@ export const store = {
       latencyMs: input.latencyMs,
       sanitizedRequestPayload: sanitizedReq,
       sanitizedResponseSummary: sanitizedRes,
+      ...(input.simulated ? { simulated: true as const } : {}),
     };
   },
 

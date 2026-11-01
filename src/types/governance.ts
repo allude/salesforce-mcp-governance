@@ -143,6 +143,7 @@ export interface CopilotMcpLogRecord {
   latencyMs: number;
   sanitizedRequestPayload: string; // JSON with PII / record values stripped
   sanitizedResponseSummary: string; // JSON with record values stripped
+  simulated?: true; // Present only on rows from the policy simulator, never on real traffic
 }
 
 export interface PortalAdminLogRecord {

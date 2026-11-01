@@ -14,6 +14,8 @@ export interface VerifiedSalesforceUser {
   profileName: string;
   instanceUrl: string;
   accessToken: string;
+  /** Set only by verifySimulatorToken, so it cannot be claimed by a caller. */
+  simulated?: true;
 }
 
 interface CachedIdentity {
@@ -28,6 +30,9 @@ const CACHE_MAX_ENTRIES = 5000;
 
 const SIMULATOR_TOKEN_PREFIX = 'sf_sim_';
 const SIMULATOR_TOKEN_TTL_SECONDS = 15 * 60;
+const SIMULATED_IDENTITY_PREFIX = 'simulated:';
+const SIMULATED_NAME_MAX_LENGTH = 64;
+const DEFAULT_SIMULATED_NAME = 'test-user';
 
 /**
  * Validates that a Salesforce instance URL belongs to an allowed Salesforce domain
@@ -329,6 +334,20 @@ function signSimulatorPayload(encodedPayload: string): string {
 }
 
 /**
+ * The identity simulated traffic is logged under. Admins choose the name, so the prefix keeps it
+ * from passing as a real Salesforce user; removing control and bidi characters keeps it from being
+ * made to look like something else in the log.
+ */
+function simulatedIdentity(rawName: unknown): string {
+  const cleaned = String(rawName ?? '')
+    .replace(/[\p{C}\p{Zl}\p{Zp}]/gu, '')
+    .trim()
+    .replace(/^(simulated:\s*)+/i, '');
+  const name = Array.from(cleaned).slice(0, SIMULATED_NAME_MAX_LENGTH).join('').trim();
+  return `${SIMULATED_IDENTITY_PREFIX}${name || DEFAULT_SIMULATED_NAME}`;
+}
+
+/**
  * Creates an HMAC-signed simulation token (valid 15 minutes) for testing Profile RBAC policies on `/mcp`.
  * Only authenticated portal admins can mint one, via `POST /api/admin/test-mcp-access`.
  */
@@ -341,8 +360,8 @@ export function createSimulatorToken(params: {
   const payload = {
     userId: '005SIM000000001AAA',
     organizationId: '00DSIM000000001AAA',
-    username: params.username || 'alex.demo@company.my.salesforce.com',
-    email: params.email || 'alex.demo@company.com',
+    username: simulatedIdentity(params.username),
+    email: params.email || 'simulated.user@example.invalid',
     displayName: `Simulated User (${params.profileName})`,
     profileId: params.profileId,
     profileName: params.profileName,
@@ -375,13 +394,15 @@ function verifySimulatorToken(token: string): VerifiedSalesforceUser {
   return {
     userId: String(decoded.userId || ''),
     organizationId: String(decoded.organizationId || ''),
-    username: String(decoded.username || ''),
+    // Applied here too: a token minted before this rule existed stays valid for up to 15 minutes.
+    username: simulatedIdentity(decoded.username),
     email: String(decoded.email || ''),
     displayName: String(decoded.displayName || ''),
     profileId: String(decoded.profileId || ''),
     profileName: String(decoded.profileName || ''),
     instanceUrl: String(decoded.instanceUrl || ''),
     accessToken: token,
+    simulated: true,
   };
 }
 

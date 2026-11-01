@@ -180,6 +180,7 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
       const latencyMs = Math.max(1, Date.now() - startTime);
       store.recordCopilotMcpLog({
         sfUsername: user.username,
+        simulated: user.simulated,
         profileId: user.profileId,
         profileName: user.profileName,
         matchedGroups: evaluation.matchedGroups,
@@ -386,6 +387,7 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
       const latencyMs = Math.max(1, Date.now() - startTime);
       store.recordCopilotMcpLog({
         sfUsername: user.username,
+        simulated: user.simulated,
         profileId: effective.profileId,
         profileName: effective.profileName,
         matchedGroups: evaluation.matchedGroups,
@@ -410,6 +412,7 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
       const denied = err instanceof PolicyViolationError;
       store.recordCopilotMcpLog({
         sfUsername: user.username,
+        simulated: user.simulated,
         profileId: user.profileId,
         profileName: user.profileName,
         matchedGroups: evaluation.matchedGroups,

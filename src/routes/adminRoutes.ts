@@ -1467,9 +1467,7 @@ async function runMcpAccessSimulation(req: Request, res: Response): Promise<void
   const simToken = createSimulatorToken({
     profileId: String(profileId || ''),
     profileName: profile?.name || String(profileId || ''),
-    username: username
-      ? String(username).trim()
-      : 'copilot.user@enterprise.com',
+    username: username ? String(username) : undefined,
   });
 
   const user = await resolveSalesforceUserFromToken(simToken);
@@ -1485,6 +1483,7 @@ async function runMcpAccessSimulation(req: Request, res: Response): Promise<void
 
   // Also record this test call into the Copilot MCP log (with sensitive data stripped!)
   store.recordCopilotMcpLog({
+    simulated: true,
     sfUsername: user.username,
     profileId: user.profileId,
     profileName: effective.profileName,
@@ -1502,6 +1501,17 @@ async function runMcpAccessSimulation(req: Request, res: Response): Promise<void
       reason: evaluation.reason,
       allowedFields: evaluation.allowedFields,
     },
+  });
+
+  // The MCP row only shows the simulated name, so this row is what ties it to the acting admin.
+  const actor = getAdminInfo(req);
+  store.recordPortalAdminLog({
+    adminUsername: actor.username,
+    authMethod: actor.authMethod,
+    action: 'SIMULATE_MCP_CALL',
+    target: `Profile: ${effective.profileName} (${effective.profileId})`,
+    details: `Simulated ${String(toolName || 'list_enabled_objects')} on ${String(targetObject || '*')} as "${user.username}": ${evaluation.permitted ? 'ALLOWED' : 'DENIED'}. A 15-minute simulator token was issued.`,
+    ipAddress: actor.ip,
   });
 
   res.json({
