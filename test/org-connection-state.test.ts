@@ -8,7 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { config } from '../src/config.js';
 import { repairConnectInstanceUrls, store } from '../src/db/store.js';
 import { generateSelfSignedCertificateBundle } from '../src/salesforce/jwtConnection.js';
-import { SIMULATED_ORG_INSTANCE_URL } from '../src/salesforce/simulatedOrg.js';
+import { isUninitialisedMcpTokenHost, SIMULATED_ORG_INSTANCE_URL } from '../src/salesforce/simulatedOrg.js';
 import { installSalesforceMock, type SalesforceMock } from './helpers/salesforceMock.js';
 import {
   adminFetch,
@@ -163,6 +163,60 @@ describe('the instance URL MCP uses to verify tokens', () => {
     assert.equal(rawInstanceUrl(), SYNC_HOST);
   });
 
+  for (const seeded of ['https://login.salesforce.com', 'https://test.salesforce.com', SIMULATED_ORG_INSTANCE_URL]) {
+    test(`a real connect moves an uninitialised MCP host off ${seeded}, and logs it`, async () => {
+      setRawInstanceUrl(seeded);
+      answerTokenExchange(tokenGranted());
+      const res = await connect();
+
+      assert.equal(res.status, 200, JSON.stringify(res.body));
+      assert.equal(res.body.sfSettings.instanceUrl, SYNC_HOST);
+      assert.equal(rawInstanceUrl(), SYNC_HOST);
+      const entry = store.getPortalAdminLogs(50).find((row) => row.action === 'CONNECT_SALESFORCE_ORG');
+      assert.ok(entry?.details.includes(`"instanceUrl":{"before":"${seeded}","after":"${SYNC_HOST}"}`), entry?.details);
+    });
+  }
+
+  test('a sandbox connect on a fresh install verifies MCP tokens at the sandbox', async () => {
+    const sandbox = 'https://acme--uat.sandbox.my.salesforce.com';
+    setRawInstanceUrl('https://login.salesforce.com');
+    answerTokenExchange(tokenGranted(sandbox));
+    assert.equal((await connect({ loginUrl: 'https://test.salesforce.com' })).status, 200);
+
+    const doc = await (await fetch(`${server.baseUrl}/.well-known/oauth-protected-resource`)).json();
+    assert.deepEqual(doc.authorization_servers, [sandbox]);
+  });
+
+  test('a later connect to another host does not move a host the first one set', async () => {
+    setRawInstanceUrl('https://login.salesforce.com');
+    answerTokenExchange(tokenGranted());
+    assert.equal((await connect()).status, 200);
+
+    answerTokenExchange(tokenGranted('https://second-org.my.salesforce.com'));
+    assert.equal((await connect()).status, 200);
+    assert.equal(rawInstanceUrl(), SYNC_HOST);
+  });
+
+  test('a failed connect does not initialise the MCP host', async () => {
+    setRawInstanceUrl('https://login.salesforce.com');
+    answerTokenExchange(tokenRefused());
+    assert.equal((await connect()).status, 400);
+    assert.equal(rawInstanceUrl(), 'https://login.salesforce.com');
+  });
+
+  test('a real connect that reports the simulated host does not adopt it', async () => {
+    setRawInstanceUrl('https://login.salesforce.com');
+    answerTokenExchange(tokenGranted(SIMULATED_ORG_INSTANCE_URL));
+    assert.equal((await connect()).status, 200);
+    assert.equal(rawInstanceUrl(), 'https://login.salesforce.com');
+  });
+
+  test('a simulated connect does not initialise a generic login host', async () => {
+    setRawInstanceUrl('https://login.salesforce.com');
+    assert.equal((await connect({ authMode: 'simulated' })).status, 200);
+    assert.equal(rawInstanceUrl(), 'https://login.salesforce.com');
+  });
+
   test('a simulated connect never writes its host to the MCP host, even when empty', async () => {
     const overExisting = await connect({ authMode: 'simulated' });
     assert.equal(overExisting.status, 200, JSON.stringify(overExisting.body));
@@ -194,6 +248,20 @@ describe('the instance URL MCP uses to verify tokens', () => {
     repairConnectInstanceUrls();
 
     assert.equal(rawInstanceUrl(), SIMULATED_ORG_INSTANCE_URL);
+  });
+});
+
+describe('isUninitialisedMcpTokenHost', () => {
+  test('blank, generic login hosts and the simulated host are uninitialised, however they are written', () => {
+    for (const host of ['', '  ', 'https://login.salesforce.com', 'https://LOGIN.salesforce.com/', 'https://test.salesforce.com', SIMULATED_ORG_INSTANCE_URL]) {
+      assert.equal(isUninitialisedMcpTokenHost(host), true, JSON.stringify(host));
+    }
+  });
+
+  test('any other value counts as the admin\'s', () => {
+    for (const host of [MCP_HOST, 'https://login.salesforce.com.my.salesforce.com', 'https://acme--uat.sandbox.my.salesforce.com', 'not a url']) {
+      assert.equal(isUninitialisedMcpTokenHost(host), false, host);
+    }
   });
 });
 

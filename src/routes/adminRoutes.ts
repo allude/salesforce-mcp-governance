@@ -1314,7 +1314,7 @@ adminRouter.post(
 
     let input: SalesforceSettingsInput;
     try {
-      // instance_url is MCP's token host, which connect never sets.
+      // instance_url is MCP's token host. A request cannot set it here: the store decides from the session.
       const { instanceUrl: _mcpHost, ...parsed } = parseSalesforceSettingsInput(req.body || {});
       input = parsed;
       if (input.privateKeyPem?.trim()) {

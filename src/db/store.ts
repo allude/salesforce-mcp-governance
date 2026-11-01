@@ -26,7 +26,7 @@ import {
   validatePrivateKeyPem,
 } from '../salesforce/jwtConnection.js';
 import { salesforceIdKey } from '../salesforce/ids.js';
-import { SIMULATED_ORG_INSTANCE_URL } from '../salesforce/simulatedOrg.js';
+import { isUninitialisedMcpTokenHost, SIMULATED_ORG_INSTANCE_URL } from '../salesforce/simulatedOrg.js';
 
 const dbDir = path.dirname(config.dbPath);
 if (!fs.existsSync(dbDir)) {
@@ -1960,19 +1960,24 @@ export const store = {
   },
 
   /**
-   * Saves a successful connect. Its host goes in sync_instance_url, never over a non-empty instance_url,
-   * which decides where MCP sends bearer tokens: a connect must not be able to redirect those. An empty
-   * instance_url would leave MCP with no host, so a real connect may set it. A simulated one may not.
+   * Saves a successful connect. Its host always goes in sync_instance_url. instance_url decides where MCP
+   * sends bearer tokens, so a real connect may only initialise it, and a host an admin set is never moved.
+   * A simulated connect never writes it, and the simulated host is never adopted.
    */
   saveVerifiedSalesforceConnection(
     input: Partial<SalesforceConnectionSettings> & { privateKeyPem?: string },
     session: { orgId: string; username: string; instanceUrl: string; authMode: 'jwt_bearer' | 'simulated' }
   ): SalesforceConnectionSettings {
     return runInTransaction(() => {
-      if (session.authMode !== 'simulated') {
-        db.prepare("UPDATE sf_connection_settings SET instance_url = ? WHERE id = 1 AND TRIM(instance_url) = ''").run(
-          session.instanceUrl
-        );
+      const { instance_url: currentHost } = db
+        .prepare('SELECT instance_url FROM sf_connection_settings WHERE id = 1')
+        .get() as { instance_url: string };
+      if (
+        session.authMode !== 'simulated' &&
+        session.instanceUrl !== SIMULATED_ORG_INSTANCE_URL &&
+        isUninitialisedMcpTokenHost(currentHost)
+      ) {
+        db.prepare('UPDATE sf_connection_settings SET instance_url = ? WHERE id = 1').run(session.instanceUrl);
       }
       return this.updateSalesforceSettings({
         ...input,
