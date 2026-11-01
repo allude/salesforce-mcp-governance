@@ -573,6 +573,8 @@ export function FlyoutDrawer({
       setSimResult(lastRes);
       await onRefreshWorkspace();
       notify('Simulated 6 Copilot MCP traffic events');
+    } catch {
+      // The error toast is already showing; stay here so the admin can retry.
     } finally {
       setBusy(false);
     }
@@ -659,6 +661,8 @@ export function FlyoutDrawer({
                                 liveProfile.id,
                                 profNameEdit.trim()
                               );
+                            } catch {
+                              // The error toast is already showing; stay here so the admin can retry.
                             } finally {
                               setBusy(false);
                             }
@@ -1325,6 +1329,8 @@ export function FlyoutDrawer({
                       try {
                         await onSyncSfdxPath(sfdxPath);
                         onClose();
+                      } catch {
+                        // The error toast is already showing; stay here so the admin can retry.
                       } finally {
                         setBusy(false);
                       }
@@ -1989,6 +1995,8 @@ export function FlyoutDrawer({
                         });
                         setSimResult(res);
                         await onRefreshWorkspace();
+                      } catch {
+                        // The error toast is already showing; stay here so the admin can retry.
                       } finally {
                         setBusy(false);
                       }
@@ -2078,6 +2086,8 @@ export function FlyoutDrawer({
                     try {
                       await onDeleteProfile(liveProfile.id);
                       onClose();
+                    } catch {
+                      // The error toast is already showing; stay here so the admin can retry.
                     } finally {
                       setBusy(false);
                     }
@@ -2116,6 +2126,8 @@ export function FlyoutDrawer({
                   try {
                     await onDeleteGroup(liveGroup.id);
                     onClose();
+                  } catch {
+                    // The error toast is already showing; stay here so the admin can retry.
                   } finally {
                     setBusy(false);
                   }
@@ -2142,6 +2154,8 @@ export function FlyoutDrawer({
                       newProfName.trim()
                     );
                     onClose();
+                  } catch {
+                    // The error toast is already showing; stay here so the admin can retry.
                   } finally {
                     setBusy(false);
                   }
@@ -2161,6 +2175,8 @@ export function FlyoutDrawer({
                   try {
                     await onImportCsv(csvText);
                     onClose();
+                  } catch {
+                    // The error toast is already showing; stay here so the admin can retry.
                   } finally {
                     setBusy(false);
                   }
@@ -2180,6 +2196,8 @@ export function FlyoutDrawer({
                   try {
                     await onSyncUploadedFiles(pendingUploadFiles);
                     onClose();
+                  } catch {
+                    // The error toast is already showing; stay here so the admin can retry.
                   } finally {
                     setBusy(false);
                   }
@@ -2199,6 +2217,8 @@ export function FlyoutDrawer({
                   try {
                     await onSaveGroup(grpDraft);
                     onClose();
+                  } catch {
+                    // The error toast is already showing; stay here so the admin can retry.
                   } finally {
                     setBusy(false);
                   }

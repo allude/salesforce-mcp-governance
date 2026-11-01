@@ -1390,6 +1390,8 @@ export function PortalAuthSettingsView({
                     setOktaDraft(saved);
                     setOktaClientSecret('');
                     setOktaIssuerEdited(false);
+                  } catch {
+                    // The error toast is already showing; stay here so the admin can retry.
                   } finally {
                     setBusy(false);
                   }
@@ -1501,6 +1503,8 @@ export function PortalAuthSettingsView({
                     setNewUsername('');
                     setNewDisplayName('');
                     setNewPassword('');
+                  } catch {
+                    // The error toast is already showing; stay here so the admin can retry.
                   } finally {
                     setBusy(false);
                   }

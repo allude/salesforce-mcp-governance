@@ -371,6 +371,8 @@ export function SalesforceProfilesView({
                         keptMissingProfileIds,
                       });
                       setPullPreview(null);
+                    } catch {
+                      // The error toast is already showing; stay here so the admin can retry.
                     } finally {
                       setPullBusy(false);
                     }
@@ -1050,6 +1052,8 @@ export function SalesforceObjectsView({
                             removeFields,
                           });
                           setCatalogOpen(false);
+                        } catch {
+                          // The error toast is already showing; stay here so the admin can retry.
                         } finally {
                           setCatalogLoading(false);
                         }

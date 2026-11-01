@@ -125,7 +125,7 @@ export default function AdminPortalPage() {
   const [cmdkOpen, setCmdkOpen] = useState(false);
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
   const [liveStream, setLiveStream] = useState(true);
-  const [toast, setToast] = useState<string | null>(null);
+  const [toast, setToast] = useState<{ msg: string; isError: boolean } | null>(null);
   const [trafficSearchFilter, setTrafficSearchFilter] = useState('');
   const [orgCatalogTrigger, setOrgCatalogTrigger] = useState(0);
 
@@ -150,13 +150,36 @@ export default function AdminPortalPage() {
     useState<SalesforceConnectionSettings | null>(null);
   const [portalUsers, setPortalUsers] = useState<PortalUserSummary[]>([]);
 
-  const notify = useCallback((msg: string) => {
-    setToast(msg);
+  const notify = useCallback((msg: string, isError = false) => {
+    setToast({ msg, isError });
   }, []);
+
+  /** Shows a failed change to the admin, then rethrows so the caller keeps its form or drawer open. */
+  const reportFailure =
+    <A extends unknown[], R>(fn: (...args: A) => Promise<R>) =>
+    async (...args: A): Promise<R> => {
+      try {
+        return await fn(...args);
+      } catch (err: any) {
+        notify(err?.message || 'The change could not be saved.', true);
+        throw err;
+      }
+    };
+
+  /** For one-click actions with nothing to keep open: shows the failure and ends there. */
+  const reportFailureAndStop =
+    <A extends unknown[]>(fn: (...args: A) => Promise<unknown>) =>
+    async (...args: A): Promise<void> => {
+      try {
+        await fn(...args);
+      } catch (err: any) {
+        notify(err?.message || 'The change could not be saved.', true);
+      }
+    };
 
   useEffect(() => {
     if (!toast) return;
-    const t = setTimeout(() => setToast(null), 3200);
+    const t = setTimeout(() => setToast(null), toast.isError ? 8000 : 3200);
     return () => clearTimeout(t);
   }, [toast]);
 
@@ -1172,7 +1195,7 @@ export default function AdminPortalPage() {
               selectedFlyoutId={selectedFlyoutId}
               onNavigateTab={(next) => setView(next as ActiveView)}
               onOpenFlyout={(f) => setFlyout(f)}
-              onSeedEnterpriseMatrix={handleSeedEnterpriseMatrix}
+              onSeedEnterpriseMatrix={reportFailureAndStop(handleSeedEnterpriseMatrix)}
             />
           )}
 
@@ -1186,7 +1209,7 @@ export default function AdminPortalPage() {
               selectedFlyoutId={selectedFlyoutId}
               onOpenFlyout={(f) => setFlyout(f)}
               onPreviewPullProfilesFromOrg={handlePreviewPullProfilesFromOrg}
-              onApplyPullProfilesFromOrg={handleApplyPullProfilesFromOrg}
+              onApplyPullProfilesFromOrg={reportFailure(handleApplyPullProfilesFromOrg)}
               onNavigateToOrgConnection={() => setView('sf-connection')}
             />
           )}
@@ -1198,12 +1221,12 @@ export default function AdminPortalPage() {
               sfSettings={sfSettings}
               selectedFlyoutId={selectedFlyoutId}
               externalCatalogTrigger={orgCatalogTrigger}
-              onToggleObject={handleToggleObject}
-              onBulkToggleAllObjects={handleBulkToggleAllObjects}
+              onToggleObject={reportFailureAndStop(handleToggleObject)}
+              onBulkToggleAllObjects={reportFailureAndStop(handleBulkToggleAllObjects)}
               onOpenFlyout={(f) => setFlyout(f)}
               onFetchOrgObjectCatalog={handleFetchOrgObjectCatalog}
               onPreviewPullObjectsFromOrg={handlePreviewPullObjectsFromOrg}
-              onApplyPullObjectsFromOrg={handleApplyPullObjectsFromOrg}
+              onApplyPullObjectsFromOrg={reportFailure(handleApplyPullObjectsFromOrg)}
               onNavigateToOrgConnection={() => setView('sf-connection')}
             />
           )}
@@ -1213,7 +1236,7 @@ export default function AdminPortalPage() {
               sfSettings={sfSettings}
               apiFetch={apiFetch}
               onRefresh={fetchWorkspace}
-              onShowToast={(msg) => notify(msg)}
+              onShowToast={notify}
               onNavigate={(navId) => setView(mapNavIdToView(navId))}
             />
           )}
@@ -1226,7 +1249,7 @@ export default function AdminPortalPage() {
               mappings={mappings}
               selectedFlyoutId={selectedFlyoutId}
               onOpenFlyout={(f) => setFlyout(f)}
-              onSeedEnterpriseMatrix={handleSeedEnterpriseMatrix}
+              onSeedEnterpriseMatrix={reportFailureAndStop(handleSeedEnterpriseMatrix)}
             />
           )}
 
@@ -1236,9 +1259,9 @@ export default function AdminPortalPage() {
               groups={groups}
               objects={objects}
               mappings={mappings}
-              onToggleProfileGroup={handleToggleProfileGroup}
+              onToggleProfileGroup={reportFailureAndStop(handleToggleProfileGroup)}
               onOpenFlyout={(f) => setFlyout(f)}
-              onSeedEnterpriseMatrix={handleSeedEnterpriseMatrix}
+              onSeedEnterpriseMatrix={reportFailureAndStop(handleSeedEnterpriseMatrix)}
             />
           )}
 
@@ -1268,7 +1291,7 @@ export default function AdminPortalPage() {
             <PortalAuthSettingsView
               oktaSettings={oktaSettings}
               portalUsers={portalUsers}
-              onSaveOkta={async (updated) => {
+              onSaveOkta={reportFailure(async (updated) => {
                 const data = await apiFetch('/api/admin/okta', {
                   method: 'PUT',
                   body: JSON.stringify(updated),
@@ -1277,8 +1300,8 @@ export default function AdminPortalPage() {
                 await fetchWorkspace();
                 notify('Updated Okta OIDC SSO settings');
                 return data.oktaSettings;
-              }}
-              onCreatePortalUser={async (user) => {
+              })}
+              onCreatePortalUser={reportFailure(async (user) => {
                 const data = await apiFetch('/api/admin/portal-users', {
                   method: 'POST',
                   body: JSON.stringify(user),
@@ -1286,8 +1309,8 @@ export default function AdminPortalPage() {
                 if (data.portalUsers) setPortalUsers(data.portalUsers);
                 await fetchWorkspace();
                 notify(`Saved administrator "${user.username}"`);
-              }}
-              onDeletePortalUser={async (username) => {
+              })}
+              onDeletePortalUser={reportFailureAndStop(async (username) => {
                 const data = await apiFetch(
                   `/api/admin/portal-users/${encodeURIComponent(username)}`,
                   { method: 'DELETE' }
@@ -1295,7 +1318,7 @@ export default function AdminPortalPage() {
                 if (data.portalUsers) setPortalUsers(data.portalUsers);
                 await fetchWorkspace();
                 notify(`Removed administrator "${username}"`);
-              }}
+              })}
             />
           )}
         </main>
@@ -1315,22 +1338,22 @@ export default function AdminPortalPage() {
         groups={groups}
         mappings={mappings}
         sfSettings={sfSettings}
-        onUpsertProfile={handleUpsertProfile}
-        onDeleteProfile={handleDeleteProfile}
-        onImportCsv={handleImportCsv}
-        onToggleProfileGroup={handleToggleProfileGroup}
-        onToggleObject={handleToggleObject}
-        onToggleField={handleToggleField}
-        onBulkToggleFields={handleBulkToggleFields}
-        onSyncSfdxPath={handleSyncSfdxPath}
-        onSyncUploadedFiles={handleSyncUploadedFiles}
+        onUpsertProfile={reportFailure(handleUpsertProfile)}
+        onDeleteProfile={reportFailure(handleDeleteProfile)}
+        onImportCsv={reportFailure(handleImportCsv)}
+        onToggleProfileGroup={reportFailureAndStop(handleToggleProfileGroup)}
+        onToggleObject={reportFailureAndStop(handleToggleObject)}
+        onToggleField={reportFailureAndStop(handleToggleField)}
+        onBulkToggleFields={reportFailureAndStop(handleBulkToggleFields)}
+        onSyncSfdxPath={reportFailure(handleSyncSfdxPath)}
+        onSyncUploadedFiles={reportFailure(handleSyncUploadedFiles)}
         onOpenOrgObjectCatalogModal={() => {
           setView('objects');
           setOrgCatalogTrigger((c) => c + 1);
         }}
-        onSaveGroup={handleSaveGroup}
-        onDeleteGroup={handleDeleteGroup}
-        onTestMcpCall={handleTestMcpCall}
+        onSaveGroup={reportFailure(handleSaveGroup)}
+        onDeleteGroup={reportFailure(handleDeleteGroup)}
+        onTestMcpCall={reportFailure(handleTestMcpCall)}
         onRefreshWorkspace={fetchWorkspace}
         notify={notify}
       />
@@ -1341,7 +1364,7 @@ export default function AdminPortalPage() {
         onClose={() => setCmdkOpen(false)}
         onNavigateView={(v) => setView(v as ActiveView)}
         onOpenFlyout={(f) => setFlyout(f)}
-        onSeedEnterpriseMatrix={handleSeedEnterpriseMatrix}
+        onSeedEnterpriseMatrix={reportFailureAndStop(handleSeedEnterpriseMatrix)}
         onToggleTheme={toggleTheme}
         theme={theme}
         profiles={profiles}
@@ -1351,9 +1374,9 @@ export default function AdminPortalPage() {
 
       {/* TOAST BANNER */}
       {toast && (
-        <div className="toast-banner" role="status">
-          <span className="dot ok" />
-          <span>{toast}</span>
+        <div className="toast-banner" role={toast.isError ? 'alert' : 'status'}>
+          <span className={`dot ${toast.isError ? 'err' : 'ok'}`} />
+          <span>{toast.msg}</span>
         </div>
       )}
     </div>
