@@ -422,7 +422,7 @@ adminRouter.get('/overview', (_req: Request, res: Response) => {
 // 1. SALESFORCE -> PROFILES (Add/Update, CSV Import, Delete)
 // ============================================================================
 adminRouter.post('/profiles', (req: Request, res: Response) => {
-  const { id, name } = req.body || {};
+  const { id, name, creating } = req.body || {};
   if (!id || !name) {
     res.status(400).json({ error: 'Profile ID and Profile Name are required.' });
     return;
@@ -431,6 +431,19 @@ adminRouter.post('/profiles', (req: Request, res: Response) => {
   if (!isSalesforceId(String(id)) && !store.getProfileById(String(id))) {
     res.status(400).json({ error: 'Profile ID must be a 15 or 18 character Salesforce ID.' });
     return;
+  }
+
+  // Only the New Profile form sets `creating`: someone pasting an ID there means a new Profile, so
+  // finding it stored under another form is news to them, not a save to apply over the stored row.
+  if (creating === true) {
+    const cleanId = String(id).trim();
+    const forms = store.getProfiles().filter((p) => salesforceIdsMatch(p.id, cleanId));
+    if (forms.some((p) => p.id !== cleanId)) {
+      res.status(409).json({
+        error: `This Profile is already stored as ${forms[0].id} ("${forms[0].name}"). Open that row to edit it.`,
+      });
+      return;
+    }
   }
 
   const result = store.upsertProfile(String(id), String(name));

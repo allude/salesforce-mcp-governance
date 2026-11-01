@@ -46,7 +46,11 @@ interface FlyoutDrawerProps {
   groups: AccessGroup[];
   mappings: ProfileGroupMapping[];
   sfSettings: SalesforceConnectionSettings | null;
-  onUpsertProfile: (id: string, name: string) => Promise<void>;
+  onUpsertProfile: (
+    id: string,
+    name: string,
+    options?: { creating?: boolean }
+  ) => Promise<void>;
   onDeleteProfile: (id: string) => Promise<void>;
   onImportCsv: (csvText: string) => Promise<void>;
   onToggleProfileGroup: (profileId: string, groupId: string) => Promise<void>;
@@ -124,6 +128,7 @@ export function FlyoutDrawer({
   const [profNameEdit, setProfNameEdit] = useState('');
   const [newProfId, setNewProfId] = useState('');
   const [newProfName, setNewProfName] = useState('');
+  const [newProfError, setNewProfError] = useState('');
 
   // Import CSV state
   const [csvText, setCsvText] = useState('');
@@ -179,6 +184,7 @@ export function FlyoutDrawer({
     } else if (flyout.type === 'newprofile') {
       setNewProfId('');
       setNewProfName('');
+      setNewProfError('');
     } else if (flyout.type === 'group' && flyout.data) {
       const liveGrp =
         groups.find((g) => g.id === flyout.data.id) || flyout.data;
@@ -804,11 +810,19 @@ export function FlyoutDrawer({
                 <input
                   className="inp mono"
                   value={newProfId}
-                  onChange={(e) => setNewProfId(e.target.value)}
+                  onChange={(e) => {
+                    setNewProfId(e.target.value);
+                    setNewProfError('');
+                  }}
                   placeholder="00e5g000001X9zAAAS"
-                  aria-invalid={newProfIdInvalid}
+                  aria-invalid={newProfIdInvalid || newProfError !== ''}
                 />
-                {newProfIdInvalid ? (
+                {newProfError ? (
+                  // The toast fades; this stays until the admin changes the ID.
+                  <div className="hint" role="alert" style={{ color: 'var(--err)' }}>
+                    {newProfError}
+                  </div>
+                ) : newProfIdInvalid ? (
                   <div className="hint" role="alert" style={{ color: 'var(--err)' }}>
                     Enter the 15 or 18 letter and number ID from Salesforce.
                   </div>
@@ -2145,14 +2159,17 @@ export function FlyoutDrawer({
                 disabled={busy || !isSalesforceId(newProfId) || !newProfName.trim()}
                 onClick={async () => {
                   setBusy(true);
+                  setNewProfError('');
                   try {
                     await onUpsertProfile(
                       newProfId.trim(),
-                      newProfName.trim()
+                      newProfName.trim(),
+                      { creating: true }
                     );
                     onClose();
-                  } catch {
-                    // The error toast is already showing; stay here so the admin can retry.
+                  } catch (err: any) {
+                    // The toast is showing too; stay here so the admin can read it and retry.
+                    setNewProfError(err?.message || 'The Profile could not be created.');
                   } finally {
                     setBusy(false);
                   }

@@ -428,10 +428,14 @@ export default function AdminPortalPage() {
   };
 
   // Mutation handlers
-  const handleUpsertProfile = async (id: string, name: string) => {
+  const handleUpsertProfile = async (
+    id: string,
+    name: string,
+    options?: { creating?: boolean }
+  ) => {
     const data = await apiFetch('/api/admin/profiles', {
       method: 'POST',
-      body: JSON.stringify({ id, name }),
+      body: JSON.stringify({ id, name, creating: options?.creating === true }),
     });
     if (data.profiles) setProfiles(data.profiles);
     await fetchWorkspace();

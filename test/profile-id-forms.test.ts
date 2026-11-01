@@ -282,6 +282,55 @@ describe('Profile ID forms outside org sync', () => {
       assert.match(log?.details || '', new RegExp(`upgraded from "${id}"`));
     });
 
+    describe('from the New Profile form', () => {
+      const create = (id: string, name: string) => post({ id, name, creating: true });
+      const auditedFor = (id: string) => store.getPortalAdminLogs().some((l) => l.target.includes(id));
+
+      test('the 15-character form of a stored ID is refused, naming the stored ID', async (t) => {
+        const id = newId15();
+        const group = mapped(t, to18(id), 'Sales');
+
+        const res = await create(id, 'Sales copy');
+
+        assert.equal(res.status, 409);
+        assert.match(res.body.error, new RegExp(`stored as ${to18(id)}`));
+        assert.deepEqual(rowsOf(id).map((p) => [p.id, p.name]), [[to18(id), 'Sales']]);
+        assert.deepEqual(inForce(to18(id)), [group.id]);
+        assert.equal(auditedFor(id), false);
+      });
+
+      test('the 18-character form of a stored ID is refused and upgrades nothing', async (t) => {
+        const id = newId15();
+        const group = mapped(t, id, 'Sales');
+
+        const res = await create(to18(id), 'Sales copy');
+
+        assert.equal(res.status, 409);
+        assert.match(res.body.error, new RegExp(`stored as ${id}`));
+        assert.deepEqual(rowsOf(id).map((p) => [p.id, p.name]), [[id, 'Sales']]);
+        assert.deepEqual(groupsOf(id), [group.id]);
+      });
+
+      test('with both forms stored it names the row in force, even for an exact ID', async (t) => {
+        const id = newId15();
+        storedTwice(t, [{ id, name: 'A in force' }, { id: to18(id), name: 'B other' }]);
+
+        const res = await create(to18(id), 'Copy');
+
+        assert.equal(res.status, 409);
+        assert.match(res.body.error, new RegExp(`stored as ${id} `));
+        assert.deepEqual(rowsOf(id).map((p) => p.name), ['A in force', 'B other']);
+      });
+
+      test('an unknown ID is still created', async (t) => {
+        const id = newId15();
+        cleanUp(t, id);
+        const res = await create(` ${id} `, 'Fresh');
+        assert.equal(res.status, 200, JSON.stringify(res.body));
+        assert.equal(store.getProfileById(id)?.name, 'Fresh');
+      });
+    });
+
     test('CSV import over HTTP reports another form as an update', async (t) => {
       const id = newId15();
       mapped(t, to18(id), 'Sales');

@@ -68,7 +68,7 @@ Pulling Profiles from the org stores each one under its 18-character ID and keep
    ```bash
    sf data query --query "SELECT Id, Name FROM Profile ORDER BY Name" --result-format csv --target-org <alias>
    ```
-2. In **Salesforce > Profiles**, click **Upload CSV File** or **Paste CSV**. The format is two columns, `id,name`; a header row is skipped and existing Profiles are updated. A row in either ID form updates the Profile already stored, and an 18-character ID upgrades a stored 15-character one, keeping its Access Groups. You can also add one Profile at a time.
+2. In **Salesforce > Profiles**, click **Upload CSV File** or **Paste CSV**. The format is two columns, `id,name`; a header row is skipped and existing Profiles are updated. A row in either ID form updates the Profile already stored, and an 18-character ID upgrades a stored 15-character one, keeping its Access Groups. You can also add one Profile at a time; **Add profile** refuses an ID already stored in its other form and names the stored row, which you can open to edit.
 
 ## 4. Importing Objects & Fields
 
