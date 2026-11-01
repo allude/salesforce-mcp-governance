@@ -62,6 +62,8 @@ You can also pre-fill these settings from `OKTA_ISSUER`, `OKTA_CLIENT_ID`, `OKTA
 
 Every Copilot user is matched to a Profile registered here by the `ProfileId` of their Salesforce user (15- and 18-character IDs match each other). If no registered ID matches, the user's Profile name is matched instead, so keep Profile names unique. Users whose Profile matches neither get no tools at all.
 
+Pulling Profiles from the org stores each one under its 18-character ID and keeps its Access Group assignments. If an older version left a Profile stored under both forms, the pull merges the rows when that adds no access beyond the row in force, or when only one row has groups, which the review names. If the rows have different groups and merging would add access, both stay unchanged and the review lists them: delete one or give them the same groups, then pull again.
+
 1. Export your Profiles, for example with the Salesforce CLI:
    ```bash
    sf data query --query "SELECT Id, Name FROM Profile ORDER BY Name" --result-format csv --target-org <alias>

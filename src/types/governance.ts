@@ -197,6 +197,8 @@ export interface ProfileSyncDiffPreview {
     id: string;
     name: string;
     previousName: string;
+    /** The stored ID, when the sync replaces it with the org's 18-character form. */
+    previousId?: string;
     unchanged: boolean;
   }>;
   removedFromOrg: Array<{
@@ -204,6 +206,21 @@ export interface ProfileSyncDiffPreview {
     name: string;
     mappedGroupNames: string[];
   }>;
+  /** Org Profiles stored as more than one local row, as older versions could leave them. */
+  duplicates: ProfileSyncDuplicate[];
+}
+
+export interface ProfileSyncDuplicate {
+  id: string;
+  name: string;
+  /** Listed in resolution order: the first is the row whose groups are in force today. */
+  rows: Array<{ id: string; name: string; groupNames: string[] }>;
+  /** 'merge' collapses the rows into one. 'conflict' leaves them untouched for an admin to resolve. */
+  outcome: 'merge' | 'conflict';
+  /** The groups the merged row keeps. Empty for a conflict, where nothing changes. */
+  resultGroupNames: string[];
+  /** Groups a merge puts in force that are not today. Empty for a conflict. */
+  grantedGroupNames: string[];
 }
 
 export interface ObjectSyncDiffPreview {

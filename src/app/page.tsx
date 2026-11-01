@@ -37,6 +37,7 @@ import {
   type FlyoutState,
 } from '@/components/views/FlyoutDrawer';
 import { CommandPalette } from '@/components/views/CommandPalette';
+import { profileSyncResultMessage } from '@/components/views/profileSyncReview';
 
 type ActiveView =
   | 'dashboard'
@@ -644,11 +645,7 @@ export default function AdminPortalPage() {
     });
     if (data.profiles) setProfiles(data.profiles);
     await fetchWorkspace();
-    notify(
-      `Synced Profiles from Salesforce Org (${
-        (data.summary?.inserted || 0) + (data.summary?.updated || 0)
-      } upserted)`
-    );
+    notify(profileSyncResultMessage(data.summary));
   };
 
   const handleFetchOrgObjectCatalog = async () => {

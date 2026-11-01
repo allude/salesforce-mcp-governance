@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { config } from '../config.js';
 import { store } from '../db/store.js';
 import { hashToken, timingSafeStringEqual } from '../security/crypto.js';
+import { salesforceIdsMatch } from './ids.js';
 
 export interface VerifiedSalesforceUser {
   userId: string;
@@ -84,15 +85,7 @@ export function salesforceAuthorizationBase(): string {
   return 'https://login.salesforce.com';
 }
 
-/** Salesforce IDs are 15-char case-sensitive or 18-char with a checksum suffix; compare on the first 15. */
-export function salesforceIdsMatch(a: string, b: string): boolean {
-  const left = (a || '').trim();
-  const right = (b || '').trim();
-  if (!left || !right) return false;
-  if (left === right) return true;
-  const isSfId = (v: string) => /^[a-zA-Z0-9]{15}([a-zA-Z0-9]{3})?$/.test(v);
-  return isSfId(left) && isSfId(right) && left.slice(0, 15) === right.slice(0, 15);
-}
+export { salesforceIdsMatch };
 
 /** Rejects identities from any org other than the configured one when the Org ID lock is on. */
 function enforceOrgIdLock(organizationId: string): void {

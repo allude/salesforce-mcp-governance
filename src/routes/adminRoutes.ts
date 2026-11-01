@@ -505,7 +505,11 @@ adminRouter.post('/profiles/pull-apply', (req: Request, res: Response) => {
           namesClause('Synced', applied.affected.upserted, SYNCED_NAMES_LOGGED) +
           namesClause('Removed', applied.affected.removed) +
           namesClause('Kept as missing', applied.affected.keptMissing) +
-          namesClause('Access Groups that lost a Profile', applied.affected.groupsLosingMembers),
+          namesClause('Access Groups that lost a Profile', applied.affected.groupsLosingMembers) +
+          namesClause('Stored ID upgraded to the 18-character form', applied.affected.idsUpgraded) +
+          namesClause('Duplicate rows merged', applied.affected.duplicatesMerged) +
+          namesClause('Access granted by merging duplicates', applied.affected.accessGranted) +
+          namesClause('Duplicate rows left unchanged because their groups differ', applied.affected.duplicatesUnresolved),
         ipAddress: actor.ip,
       });
       return applied;

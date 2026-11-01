@@ -25,6 +25,7 @@ import {
   inspectCertificatePem,
   validatePrivateKeyPem,
 } from '../salesforce/jwtConnection.js';
+import { salesforceIdKey } from '../salesforce/ids.js';
 
 const dbDir = path.dirname(config.dbPath);
 if (!fs.existsSync(dbDir)) {
@@ -489,6 +490,39 @@ export function stripSensitivePayloadData(input: unknown): unknown {
 
 export { parseSfdxFilesToObjects } from './importers.js';
 
+/** Local Profile rows by Salesforce ID key, keeping `rows` order within each key. */
+function groupProfileForms(rows: SalesforceProfile[]): Map<string, SalesforceProfile[]> {
+  const forms = new Map<string, SalesforceProfile[]>();
+  for (const row of rows) {
+    const key = salesforceIdKey(row.id);
+    forms.set(key, [...(forms.get(key) || []), row]);
+  }
+  return forms;
+}
+
+/** The ID a Profile is stored under after a sync: an 18-character form is never given up for a 15. */
+function profileSyncTargetId(orgId: string, forms: SalesforceProfile[]): string {
+  return forms.find((f) => f.id.length > orgId.length)?.id ?? orgId;
+}
+
+/**
+ * Decides what a sync may do with several local rows that are forms of one org Profile. `forms` must
+ * be in `getProfiles` order, so the first row is the one the policy engine resolves and its groups
+ * are the access in force. Rows with different groups merge only if the union adds nothing to that;
+ * otherwise neither dropping a row (a membership disappears) nor the union (access grows) is safe.
+ * When only one set of groups exists it is kept even if an empty row is in force today, as that is
+ * the assignment an admin made; the caller must report `granted`.
+ */
+function planProfileForms(forms: SalesforceProfile[], groupIdsOf: (profileId: string) => string[]) {
+  const inForce = new Set(groupIdsOf(forms[0].id));
+  const union = Array.from(new Set(forms.flatMap((f) => groupIdsOf(f.id))));
+  const granted = union.filter((groupId) => !inForce.has(groupId));
+  const distinctSets = new Set(
+    forms.map((f) => [...groupIdsOf(f.id)].sort().join('\n')).filter((set) => set !== '')
+  );
+  return { conflict: distinctSets.size > 1 && granted.length > 0, union, granted };
+}
+
 export const store = {
   // ============================================================================
   // 1. PORTAL USERS & AUTHENTICATION
@@ -588,7 +622,7 @@ export const store = {
   // 2. SALESFORCE -> PROFILES (List + CSV Import + Org Pull & Reconciliation)
   // ============================================================================
   getProfiles(): SalesforceProfile[] {
-    const rows = db.prepare('SELECT * FROM sf_profiles ORDER BY name ASC').all() as any[];
+    const rows = db.prepare('SELECT * FROM sf_profiles ORDER BY name ASC, id ASC').all() as any[];
     return rows.map((r) => ({
       id: r.id,
       name: r.name,
@@ -655,46 +689,62 @@ export const store = {
     orgInfo: { orgId: string; instanceUrl: string }
   ): ProfileSyncDiffPreview {
     const existingProfiles = this.getProfiles();
-    const existingMap = new Map(existingProfiles.map((p) => [p.id, p]));
-    const orgMap = new Map(orgProfiles.map((p) => [p.id.trim(), p]));
+    const formsByKey = groupProfileForms(existingProfiles);
+    const orgKeys = new Set(orgProfiles.map((p) => salesforceIdKey(p.id)));
 
     const mappings = this.getProfileGroupMappings();
     const groups = this.getGroups();
+    const groupIdsOf = (profileId: string) =>
+      mappings.find((item) => item.profileId === profileId)?.groupIds || [];
+    const groupNames = (groupIds: string[]) =>
+      groupIds.map((gid) => groups.find((g) => g.id === gid)?.name || gid);
 
     const added: ProfileSyncDiffPreview['added'] = [];
     const updated: ProfileSyncDiffPreview['updated'] = [];
     const removedFromOrg: ProfileSyncDiffPreview['removedFromOrg'] = [];
+    const duplicates: ProfileSyncDiffPreview['duplicates'] = [];
 
     for (const op of orgProfiles) {
       const cleanId = op.id.trim();
       const cleanName = op.name.trim();
-      const prev = existingMap.get(cleanId);
-      if (!prev) {
+      const forms = formsByKey.get(salesforceIdKey(cleanId)) || [];
+      if (forms.length === 0) {
         added.push({
           id: cleanId,
           name: cleanName,
           userType: op.userType || 'Standard',
         });
-      } else {
-        updated.push({
-          id: cleanId,
-          name: cleanName,
-          previousName: prev.name,
-          unchanged: prev.name === cleanName && !prev.missingInOrg,
-        });
+        continue;
       }
+      const targetId = profileSyncTargetId(cleanId, forms);
+      if (forms.length > 1) {
+        const plan = planProfileForms(forms, groupIdsOf);
+        duplicates.push({
+          id: targetId,
+          name: cleanName,
+          rows: forms.map((f) => ({ id: f.id, name: f.name, groupNames: groupNames(groupIdsOf(f.id)) })),
+          outcome: plan.conflict ? 'conflict' : 'merge',
+          resultGroupNames: plan.conflict ? [] : groupNames(plan.union),
+          grantedGroupNames: plan.conflict ? [] : groupNames(plan.granted),
+        });
+        if (plan.conflict) continue;
+      }
+      const prev = forms[0];
+      updated.push({
+        id: cleanId,
+        name: cleanName,
+        previousName: prev.name,
+        ...(prev.id !== targetId ? { previousId: prev.id } : {}),
+        unchanged: forms.length === 1 && prev.id === targetId && prev.name === cleanName && !prev.missingInOrg,
+      });
     }
 
     for (const local of existingProfiles) {
-      if (!orgMap.has(local.id)) {
-        const m = mappings.find((item) => item.profileId === local.id);
-        const mappedGroupNames = (m?.groupIds || []).map(
-          (gid) => groups.find((g) => g.id === gid)?.name || gid
-        );
+      if (!orgKeys.has(salesforceIdKey(local.id))) {
         removedFromOrg.push({
           id: local.id,
           name: local.name,
-          mappedGroupNames,
+          mappedGroupNames: groupNames(groupIdsOf(local.id)),
         });
       }
     }
@@ -705,12 +755,16 @@ export const store = {
       added,
       updated,
       removedFromOrg,
+      duplicates,
     };
   },
 
   /**
    * Applies a Profile sync in one transaction: any failure leaves the database untouched. An id in
-   * `upserts` is present in the org, so a remove or keep-as-missing entry for it is ignored.
+   * `upserts` is present in the org, so a remove or keep-as-missing entry for any form of it is
+   * ignored. Local forms of an upserted id become one row under its 18-character form, memberships
+   * included, unless `planProfileForms` finds a conflict: those rows stay exactly as they are, since
+   * even a rename could change which one the policy engine resolves.
    */
   applyProfilesSyncFromOrg(input: {
     upserts: Array<{ id: string; name: string }>;
@@ -727,6 +781,10 @@ export const store = {
       removed: string[];
       keptMissing: string[];
       groupsLosingMembers: string[];
+      idsUpgraded: string[];
+      duplicatesMerged: string[];
+      duplicatesUnresolved: string[];
+      accessGranted: string[];
     };
   } {
     return runInTransaction(() => {
@@ -737,16 +795,56 @@ export const store = {
         removed: [] as string[],
         keptMissing: [] as string[],
         groupsLosingMembers: [] as string[],
+        idsUpgraded: [] as string[],
+        duplicatesMerged: [] as string[],
+        duplicatesUnresolved: [] as string[],
+        accessGranted: [] as string[],
       };
       const presentInOrg = new Set<string>();
+      const formsByKey = groupProfileForms(this.getProfiles());
+      const groupIdsOf = (profileId: string) =>
+        (db
+          .prepare('SELECT group_id FROM profile_group_memberships WHERE profile_id = ?')
+          .all(profileId) as Array<{ group_id: string }>).map((row) => row.group_id);
+      const groupName = db.prepare('SELECT name FROM access_groups WHERE id = ?');
+      const moveMemberships = db.prepare(`
+        INSERT OR IGNORE INTO profile_group_memberships (profile_id, group_id)
+        SELECT ?, group_id FROM profile_group_memberships WHERE profile_id = ?
+      `);
 
       for (const p of input.upserts) {
         if (!p.id || !p.name) continue;
-        presentInOrg.add(p.id.trim());
-        const res = this.upsertProfile(p.id, p.name, false);
-        if (res.action === 'inserted') inserted++;
+        const key = salesforceIdKey(p.id);
+        presentInOrg.add(key);
+        const forms = formsByKey.get(key) || [];
+
+        if (forms.length > 1) {
+          const plan = planProfileForms(forms, groupIdsOf);
+          if (plan.conflict) {
+            affected.duplicatesUnresolved.push(p.name.trim());
+            continue;
+          }
+          affected.duplicatesMerged.push(p.name.trim());
+          for (const groupId of plan.granted) {
+            const group = groupName.get(groupId) as { name: string } | undefined;
+            affected.accessGranted.push(`${p.name.trim()} now grants ${group?.name || groupId}`);
+          }
+        }
+
+        const targetId = profileSyncTargetId(p.id.trim(), forms);
+        const res = this.upsertProfile(targetId, p.name, false);
+        if (forms.length === 0) inserted++;
         else updated++;
         affected.upserted.push(res.profile.name);
+
+        const replaced = forms.filter((f) => f.id !== targetId);
+        for (const form of replaced) {
+          // The foreign key has no ON UPDATE CASCADE, so memberships move before the old row goes.
+          moveMemberships.run(targetId, form.id);
+          this.deleteProfile(form.id);
+        }
+        if (forms.length === 1 && replaced.length === 1) affected.idsUpgraded.push(res.profile.name);
+        formsByKey.set(key, [res.profile]);
       }
 
       const lostGroups = new Set<string>();
@@ -757,7 +855,7 @@ export const store = {
       `);
       for (const remId of input.removeProfileIds || []) {
         const id = remId.trim();
-        if (presentInOrg.has(id)) continue;
+        if (presentInOrg.has(salesforceIdKey(id))) continue;
         const existing = this.getProfileById(id);
         if (!existing) continue;
         for (const row of groupNamesOfProfile.all(id) as Array<{ name: string }>) {
@@ -771,7 +869,7 @@ export const store = {
 
       for (const keptId of input.keptMissingProfileIds || []) {
         const id = keptId.trim();
-        if (presentInOrg.has(id)) continue;
+        if (presentInOrg.has(salesforceIdKey(id))) continue;
         const existing = this.getProfileById(id);
         if (existing) {
           db.prepare('UPDATE sf_profiles SET missing_in_org = 1 WHERE id = ?').run(id);

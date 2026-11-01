@@ -15,6 +15,7 @@ import type {
 } from '@/types/governance';
 import { formatDateShort } from '@/components/ui/primitives';
 import type { FlyoutState } from './FlyoutDrawer';
+import { describeProfileDuplicate, profileSyncNeedsReview } from './profileSyncReview';
 
 // ============================================================================
 // 1. SALESFORCE PROFILES VIEW
@@ -136,7 +137,7 @@ export function SalesforceProfilesView({
         ...preview.added.map((a) => ({ id: a.id, name: a.name })),
         ...preview.updated.map((u) => ({ id: u.id, name: u.name })),
       ];
-      if (preview.removedFromOrg.length === 0) {
+      if (!profileSyncNeedsReview(preview)) {
         await onApplyPullProfilesFromOrg({
           upserts,
           removeProfileIds: [],
@@ -233,6 +234,8 @@ export function SalesforceProfilesView({
                   {pullPreview.updated.length} existing ·{' '}
                   {pullPreview.removedFromOrg.length} local profile(s) missing
                   in Org
+                  {pullPreview.duplicates.length > 0 &&
+                    ` · ${pullPreview.duplicates.length} stored more than once`}
                 </div>
               </div>
               <button
@@ -244,89 +247,125 @@ export function SalesforceProfilesView({
               </button>
             </div>
             <div className="card-b">
-              <div
-                style={{
-                  display: 'flex',
-                  justifyContent: 'space-between',
-                  alignItems: 'center',
-                  marginBottom: 8,
-                }}
-              >
-                <span style={{ fontSize: 12, color: 'var(--t2)' }}>
-                  Choose how to handle local profiles missing from the
-                  Salesforce Org:
-                </span>
-                <div style={{ display: 'flex', gap: 6 }}>
-                  <button
-                    type="button"
-                    className="btn sm"
-                    onClick={() => {
-                      const next: Record<string, RemovalResolutionAction> = {};
-                      pullPreview.removedFromOrg.forEach(
-                        (p) => (next[p.id] = 'KEEP_FLAGGED')
-                      );
-                      setResolutions(next);
-                    }}
+              {pullPreview.duplicates.length > 0 && (
+                <div style={{ marginBottom: 12 }}>
+                  <div
+                    style={{ fontSize: 12, color: 'var(--t2)', marginBottom: 8 }}
                   >
-                    Keep all (flag Missing in Org)
-                  </button>
-                  <button
-                    type="button"
-                    className="btn dng sm"
-                    onClick={() => {
-                      const next: Record<string, RemovalResolutionAction> = {};
-                      pullPreview.removedFromOrg.forEach(
-                        (p) => (next[p.id] = 'DELETE')
-                      );
-                      setResolutions(next);
-                    }}
-                  >
-                    Remove all missing
-                  </button>
-                </div>
-              </div>
-              <div className="chk-list" style={{ maxHeight: 280 }}>
-                {pullPreview.removedFromOrg.map((mp) => {
-                  const choice = resolutions[mp.id] || 'KEEP_FLAGGED';
-                  return (
-                    <div className="chk-row" key={mp.id}>
-                      <div>
-                        <div style={{ fontWeight: 500 }}>{mp.name}</div>
-                        <div className="mono" style={{ color: 'var(--t3)' }}>
-                          {mp.id} · Mapped groups:{' '}
-                          {mp.mappedGroupNames.join(', ') || 'None'}
+                    These Profiles are stored under both forms of their
+                    Salesforce ID:
+                  </div>
+                  <div className="chk-list" style={{ maxHeight: 200 }}>
+                    {pullPreview.duplicates.map((dup) => (
+                      <div className="chk-row" key={dup.id}>
+                        <div>
+                          <div style={{ fontWeight: 500 }}>{dup.name}</div>
+                          {dup.rows.map((row) => (
+                            <div
+                              className="mono"
+                              style={{ color: 'var(--t3)' }}
+                              key={row.id}
+                            >
+                              {row.id} · Groups:{' '}
+                              {row.groupNames.join(', ') || 'None'}
+                            </div>
+                          ))}
+                          <div style={{ fontSize: 12, marginTop: 4 }}>
+                            {describeProfileDuplicate(dup)}
+                          </div>
                         </div>
                       </div>
-                      <div className="seg">
-                        <button
-                          type="button"
-                          className={choice === 'KEEP_FLAGGED' ? 'on' : ''}
-                          onClick={() =>
-                            setResolutions({
-                              ...resolutions,
-                              [mp.id]: 'KEEP_FLAGGED',
-                            })
-                          }
-                        >
-                          Keep &amp; Flag
-                        </button>
-                        <button
-                          type="button"
-                          className={choice === 'DELETE' ? 'on' : ''}
-                          onClick={() =>
-                            setResolutions({
-                              ...resolutions,
-                              [mp.id]: 'DELETE',
-                            })
-                          }
-                        >
-                          Delete
-                        </button>
-                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {pullPreview.removedFromOrg.length > 0 && (
+                <>
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      marginBottom: 8,
+                    }}
+                  >
+                    <span style={{ fontSize: 12, color: 'var(--t2)' }}>
+                      Choose how to handle local profiles missing from the
+                      Salesforce Org:
+                    </span>
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      <button
+                        type="button"
+                        className="btn sm"
+                        onClick={() => {
+                          const next: Record<string, RemovalResolutionAction> = {};
+                          pullPreview.removedFromOrg.forEach(
+                            (p) => (next[p.id] = 'KEEP_FLAGGED')
+                          );
+                          setResolutions(next);
+                        }}
+                      >
+                        Keep all (flag Missing in Org)
+                      </button>
+                      <button
+                        type="button"
+                        className="btn dng sm"
+                        onClick={() => {
+                          const next: Record<string, RemovalResolutionAction> = {};
+                          pullPreview.removedFromOrg.forEach(
+                            (p) => (next[p.id] = 'DELETE')
+                          );
+                          setResolutions(next);
+                        }}
+                      >
+                        Remove all missing
+                      </button>
                     </div>
-                  );
-                })}
-              </div>
+                  </div>
+                  <div className="chk-list" style={{ maxHeight: 280 }}>
+                    {pullPreview.removedFromOrg.map((mp) => {
+                      const choice = resolutions[mp.id] || 'KEEP_FLAGGED';
+                      return (
+                        <div className="chk-row" key={mp.id}>
+                          <div>
+                            <div style={{ fontWeight: 500 }}>{mp.name}</div>
+                            <div className="mono" style={{ color: 'var(--t3)' }}>
+                              {mp.id} · Mapped groups:{' '}
+                              {mp.mappedGroupNames.join(', ') || 'None'}
+                            </div>
+                          </div>
+                          <div className="seg">
+                            <button
+                              type="button"
+                              className={choice === 'KEEP_FLAGGED' ? 'on' : ''}
+                              onClick={() =>
+                                setResolutions({
+                                  ...resolutions,
+                                  [mp.id]: 'KEEP_FLAGGED',
+                                })
+                              }
+                            >
+                              Keep &amp; Flag
+                            </button>
+                            <button
+                              type="button"
+                              className={choice === 'DELETE' ? 'on' : ''}
+                              onClick={() =>
+                                setResolutions({
+                                  ...resolutions,
+                                  [mp.id]: 'DELETE',
+                                })
+                              }
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
               <div
                 style={{
                   display: 'flex',
