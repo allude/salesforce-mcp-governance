@@ -264,6 +264,8 @@ export interface ObjectSyncDiffPreview {
       enabled: boolean;
       referencedInGroups: string[];
     }>;
+    /** Every local spelling this sync updates, when an older version left more than one. */
+    caseVariants: string[];
   }>;
   removedObjectsFromOrg: Array<{
     objectName: string;

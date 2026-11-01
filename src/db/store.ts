@@ -159,6 +159,47 @@ function deleteObjectAndRevokeGrants(objectName: string): { deleted: boolean; re
   });
 }
 
+/**
+ * Local rows by lower-case name. Salesforce API names are case-insensitive, but a database from an
+ * older version can hold 'Account' and 'account' as separate rows: org sync acts on all of them.
+ */
+function groupObjectsByLowerName(objects: SalesforceObject[]): Map<string, SalesforceObject[]> {
+  const groups = new Map<string, SalesforceObject[]>();
+  for (const obj of objects) {
+    const key = obj.objectName.toLowerCase();
+    groups.set(key, [...(groups.get(key) || []), obj]);
+  }
+  return groups;
+}
+
+/**
+ * One entry per object, however many spellings the pull asked about: the routes pull every tracked
+ * name, so a case-variant database reports the same object twice. A field any entry reports is
+ * present, and so is an object, so that a disagreement can never lead to a deletion.
+ */
+function mergePulledEntriesByObject<
+  F extends { fieldName: string },
+  T extends { objectName: string; label?: string; isCustom?: boolean; existsInOrg: boolean; fields: F[] },
+>(entries: T[]): T[] {
+  const merged = new Map<string, { entry: T; fields: Map<string, F> }>();
+  for (const entry of entries) {
+    const key = entry.objectName.toLowerCase();
+    const seen = merged.get(key);
+    if (!seen) {
+      merged.set(key, { entry, fields: new Map(entry.fields.map((f) => [f.fieldName.toLowerCase(), f])) });
+      continue;
+    }
+    seen.entry = {
+      ...seen.entry,
+      label: entry.label ?? seen.entry.label,
+      isCustom: entry.isCustom ?? seen.entry.isCustom,
+      existsInOrg: seen.entry.existsInOrg || entry.existsInOrg,
+    };
+    for (const f of entry.fields) seen.fields.set(f.fieldName.toLowerCase(), f);
+  }
+  return Array.from(merged.values(), ({ entry, fields }) => ({ ...entry, fields: Array.from(fields.values()) }));
+}
+
 let warnedUndecryptableOktaSecret = false;
 let warnedUndecryptablePrivateKey = false;
 
@@ -1335,32 +1376,29 @@ export const store = {
     pulledMetadata: PulledOrgObjectMetadata[],
     orgInfo: { orgId: string; instanceUrl: string }
   ): ObjectSyncDiffPreview {
-    const existingObjects = this.getObjects();
-    const existingObjMap = new Map(
-      existingObjects.map((o) => [o.objectName.toLowerCase(), o])
-    );
+    const localByName = groupObjectsByLowerName(this.getObjects());
     const groups = this.getGroups();
 
     const upsertedObjects: ObjectSyncDiffPreview['upsertedObjects'] = [];
     const removedObjectsFromOrg: ObjectSyncDiffPreview['removedObjectsFromOrg'] = [];
 
-    for (const pulled of pulledMetadata) {
-      const localObj = existingObjMap.get(pulled.objectName.toLowerCase());
+    for (const pulled of mergePulledEntriesByObject(pulledMetadata)) {
+      const variants = localByName.get(pulled.objectName.toLowerCase()) || [];
 
       if (!pulled.existsInOrg) {
-        if (localObj) {
-          const referencedInGroups = groups
-            .filter((g) =>
-              g.objectPermissions.some(
-                (op) => op.objectName.toLowerCase() === localObj.objectName.toLowerCase()
-              )
+        const referencedInGroups = groups
+          .filter((g) =>
+            g.objectPermissions.some(
+              (op) => op.objectName.toLowerCase() === pulled.objectName.toLowerCase()
             )
-            .map((g) => g.name);
+          )
+          .map((g) => g.name);
 
+        for (const variant of variants) {
           removedObjectsFromOrg.push({
-            objectName: localObj.objectName,
-            label: localObj.label,
-            fieldCount: localObj.fields.length,
+            objectName: variant.objectName,
+            label: variant.label,
+            fieldCount: variant.fields.length,
             referencedInGroups,
           });
         }
@@ -1370,15 +1408,15 @@ export const store = {
       const orgFieldMap = new Map(
         pulled.fields.map((f) => [f.fieldName.toLowerCase(), f])
       );
-      const localFieldMap = new Map(
-        (localObj?.fields || []).map((f) => [f.fieldName.toLowerCase(), f])
+      const localFieldNames = new Set(
+        variants.flatMap((v) => v.fields.map((f) => f.fieldName.toLowerCase()))
       );
 
       const addedFields: ObjectSyncDiffPreview['upsertedObjects'][number]['addedFields'] = [];
       let updatedFieldsCount = 0;
 
       for (const f of pulled.fields) {
-        if (!localFieldMap.has(f.fieldName.toLowerCase())) {
+        if (!localFieldNames.has(f.fieldName.toLowerCase())) {
           addedFields.push(f);
         } else {
           updatedFieldsCount++;
@@ -1386,14 +1424,14 @@ export const store = {
       }
 
       const removedFieldsFromOrg: ObjectSyncDiffPreview['upsertedObjects'][number]['removedFieldsFromOrg'] = [];
-      if (localObj) {
-        for (const lf of localObj.fields) {
+      for (const variant of variants) {
+        for (const lf of variant.fields) {
           if (!orgFieldMap.has(lf.fieldName.toLowerCase())) {
             const referencedInGroups = groups
               .filter((g) =>
                 g.objectPermissions.some(
                   (op) =>
-                    op.objectName.toLowerCase() === localObj.objectName.toLowerCase() &&
+                    op.objectName.toLowerCase() === pulled.objectName.toLowerCase() &&
                     op.allowedFields.some(
                       (af) => af.toLowerCase() === lf.fieldName.toLowerCase()
                     )
@@ -1402,7 +1440,7 @@ export const store = {
               .map((g) => g.name);
 
             removedFieldsFromOrg.push({
-              objectName: localObj.objectName,
+              objectName: variant.objectName,
               fieldName: lf.fieldName,
               label: lf.label,
               fieldType: lf.fieldType,
@@ -1417,11 +1455,12 @@ export const store = {
         objectName: pulled.objectName,
         label: pulled.label,
         isCustom: pulled.isCustom,
-        isNewObject: !localObj,
+        isNewObject: variants.length === 0,
         totalOrgFields: pulled.fields.length,
         addedFields,
         updatedFieldsCount,
         removedFieldsFromOrg,
+        caseVariants: variants.length > 1 ? variants.map((v) => v.objectName) : [],
       });
     }
 
@@ -1437,6 +1476,9 @@ export const store = {
    * Applies the Object & Field sync from Salesforce Org in one transaction, so any failure leaves the
    * database untouched. Deletes ONLY the objects/fields the user explicitly chose to remove and the
    * pull reports as gone, and marks kept removed items with `missing_in_org = 1`.
+   *
+   * Case variants of an object are one object in the org, so each decision covers them all, but their
+   * rows are not merged: that would change access without an admin choosing it.
    */
   applyObjectsSyncFromOrg(input: {
     pulledMetadata: Array<{
@@ -1478,15 +1520,6 @@ export const store = {
         (f) => `${f.objectName.toLowerCase()}.${f.fieldName.toLowerCase()}`
       )
     );
-    // Across every entry for a name: a field any of them reports is present, whatever the others say.
-    const reportedFields = new Map<string, Set<string>>();
-    for (const pulled of input.pulledMetadata) {
-      const key = pulled.objectName.toLowerCase();
-      const names = reportedFields.get(key) || new Set<string>();
-      for (const f of pulled.fields) names.add(f.fieldName.toLowerCase());
-      reportedFields.set(key, names);
-    }
-
     return runInTransaction(() => {
       let fieldsUpserted = 0;
       const lostGrants = new Set<string>();
@@ -1499,61 +1532,75 @@ export const store = {
         groupsLosingGrants: [] as string[],
       };
 
-      const existingObjects = this.getObjects();
-      const existingObjMap = new Map(
-        existingObjects.map((o) => [o.objectName.toLowerCase(), o])
-      );
+      const localByName = groupObjectsByLowerName(this.getObjects());
 
-      for (const pulled of input.pulledMetadata) {
-        const localObj = existingObjMap.get(pulled.objectName.toLowerCase());
+      for (const pulled of mergePulledEntriesByObject(input.pulledMetadata)) {
+        const variants = localByName.get(pulled.objectName.toLowerCase()) || [];
 
         if (!pulled.existsInOrg) {
-          if (localObj) {
-            if (removeObjSet.has(localObj.objectName.toLowerCase())) {
-              const result = deleteObjectAndRevokeGrants(localObj.objectName);
+          for (const variant of variants) {
+            if (removeObjSet.has(variant.objectName.toLowerCase())) {
+              // Grants are revoked with the last variant: until then they still refer to a row.
+              const result = deleteObjectAndRevokeGrants(variant.objectName);
               if (result.deleted) {
-                affected.objectsRemoved.push(localObj.objectName);
+                affected.objectsRemoved.push(variant.objectName);
                 result.revokedGroups.forEach((g) => lostGrants.add(g));
               }
             } else {
               db.prepare(
                 'UPDATE sf_objects SET missing_in_org = 1, updated_at = ? WHERE object_name = ?'
-              ).run(new Date().toISOString(), localObj.objectName);
-              affected.objectsKeptMissing.push(localObj.objectName);
+              ).run(new Date().toISOString(), variant.objectName);
+              affected.objectsKeptMissing.push(variant.objectName);
             }
           }
           continue;
         }
 
-        // Upsert the object and all present org fields (setting missing_in_org = 0). Named one by one
-        // so `enabled` stays the admin's: nothing in a pull may decide what is exposed.
-        const syncedObject = this.upsertObjectWithFields({
-          objectName: this.resolveObjectName(pulled.objectName),
-          label: pulled.label,
-          isCustom: pulled.isCustom,
-          sourcePath: 'salesforce-org-jwt',
-          missingInOrg: false,
-          fields: pulled.fields.map((f) => ({
-            fieldName: f.fieldName,
-            label: f.label,
-            fieldType: f.fieldType,
-            isCustom: f.isCustom,
-            required: f.required,
+        // A new field goes on one row, and only if no variant has it yet: a new row starts enabled,
+        // which would expose a field an admin disabled on the other variant.
+        const newFieldsRow = this.resolveObjectName(pulled.objectName);
+        const heldByAnyVariant = new Set(
+          variants.flatMap((v) => v.fields.map((f) => f.fieldName.toLowerCase()))
+        );
+        const rowsToSync = variants.length > 0 ? variants : [{ objectName: newFieldsRow, fields: [] }];
+
+        for (const row of rowsToSync) {
+          const heldByRow = new Set(row.fields.map((f) => f.fieldName.toLowerCase()));
+          const fields = pulled.fields.filter((f) => {
+            const name = f.fieldName.toLowerCase();
+            return heldByRow.has(name) || (row.objectName === newFieldsRow && !heldByAnyVariant.has(name));
+          });
+
+          // Upsert the object and its present org fields (setting missing_in_org = 0). Named one by one
+          // so `enabled` stays the admin's: nothing in a pull may decide what is exposed.
+          const syncedObject = this.upsertObjectWithFields({
+            objectName: row.objectName,
+            label: pulled.label,
+            isCustom: pulled.isCustom,
+            sourcePath: 'salesforce-org-jwt',
             missingInOrg: false,
-          })),
-        });
-        affected.objectsSynced.push(syncedObject.objectName);
-        fieldsUpserted += pulled.fields.length;
+            fields: fields.map((f) => ({
+              fieldName: f.fieldName,
+              label: f.label,
+              fieldType: f.fieldType,
+              isCustom: f.isCustom,
+              required: f.required,
+              missingInOrg: false,
+            })),
+          });
+          affected.objectsSynced.push(syncedObject.objectName);
+          fieldsUpserted += fields.length;
+        }
 
         // Handle local fields on this object that were NOT in the Salesforce Org
-        if (localObj) {
-          const orgFieldSet = reportedFields.get(pulled.objectName.toLowerCase())!;
-          for (const lf of localObj.fields) {
+        const orgFieldSet = new Set(pulled.fields.map((f) => f.fieldName.toLowerCase()));
+        for (const variant of variants) {
+          for (const lf of variant.fields) {
             if (!orgFieldSet.has(lf.fieldName.toLowerCase())) {
-              const key = `${localObj.objectName.toLowerCase()}.${lf.fieldName.toLowerCase()}`;
-              const qualifiedName = `${localObj.objectName}.${lf.fieldName}`;
+              const key = `${variant.objectName.toLowerCase()}.${lf.fieldName.toLowerCase()}`;
+              const qualifiedName = `${variant.objectName}.${lf.fieldName}`;
               if (removeFieldSet.has(key)) {
-                const result = deleteFieldAndRevokeGrants(localObj.objectName, lf.fieldName);
+                const result = deleteFieldAndRevokeGrants(variant.objectName, lf.fieldName);
                 if (result.deleted) {
                   affected.fieldsRemoved.push(qualifiedName);
                   result.revokedGroups.forEach((g) => lostGrants.add(g));
@@ -1561,7 +1608,7 @@ export const store = {
               } else {
                 db.prepare(
                   'UPDATE sf_object_fields SET missing_in_org = 1 WHERE object_name = ? AND field_name = ?'
-                ).run(localObj.objectName, lf.fieldName);
+                ).run(variant.objectName, lf.fieldName);
                 affected.fieldsKeptMissing.push(qualifiedName);
               }
             }

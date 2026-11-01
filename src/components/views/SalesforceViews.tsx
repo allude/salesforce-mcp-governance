@@ -17,6 +17,14 @@ import { formatDateShort } from '@/components/ui/primitives';
 import type { FlyoutState } from './FlyoutDrawer';
 import { describeProfileDuplicate, profileSyncNeedsReview } from './profileSyncReview';
 import { profilesCsv } from './csvExport';
+import {
+  fieldResolutionKey,
+  objectResolutionKey,
+  objectSyncNeedsReview,
+  objectSyncRemovals,
+  otherFieldVariants,
+  otherObjectVariants,
+} from './objectSyncReview';
 
 // ============================================================================
 // 1. SALESFORCE PROFILES VIEW
@@ -680,14 +688,7 @@ export function SalesforceObjectsView({
         await onPreviewPullObjectsFromOrg(selectedOrgObjs);
       setPulledMetadataCache(pulledMetadata);
 
-      const allRemovedFields = preview.upsertedObjects.flatMap(
-        (uo) => uo.removedFieldsFromOrg
-      );
-
-      if (
-        preview.removedObjectsFromOrg.length === 0 &&
-        allRemovedFields.length === 0
-      ) {
+      if (!objectSyncNeedsReview(preview)) {
         await onApplyPullObjectsFromOrg({
           pulledMetadata,
           removeObjectNames: [],
@@ -695,17 +696,9 @@ export function SalesforceObjectsView({
         });
         setCatalogOpen(false);
       } else {
-        const initObjRes: Record<string, RemovalResolutionAction> = {};
-        preview.removedObjectsFromOrg.forEach(
-          (mo) => (initObjRes[mo.objectName] = 'KEEP_FLAGGED')
-        );
-        const initFldRes: Record<string, RemovalResolutionAction> = {};
-        allRemovedFields.forEach(
-          (mf) =>
-            (initFldRes[`${mf.objectName}.${mf.fieldName}`] = 'KEEP_FLAGGED')
-        );
-        setObjResolutions(initObjRes);
-        setFldResolutions(initFldRes);
+        // Nothing is resolved yet, and an unresolved removal reads as Keep & Flag.
+        setObjResolutions({});
+        setFldResolutions({});
         setSyncPreview(preview);
       }
     } catch (err: any) {
@@ -952,9 +945,31 @@ export function SalesforceObjectsView({
               ) : (
                 <>
                   <div className="chk-list" style={{ maxHeight: 300 }}>
+                    {syncPreview.upsertedObjects
+                      .filter((uo) => uo.caseVariants.length > 0)
+                      .map((uo) => (
+                        <div className="chk-row" key={`variants-${uo.objectName}`}>
+                          <div>
+                            <span className="tag warn">Case variants</span>{' '}
+                            <b className="mono">
+                              {uo.caseVariants.join(', ')}
+                            </b>
+                            <div style={{ fontSize: 11, color: 'var(--t3)' }}>
+                              One object in the org, stored as separate rows.
+                              This sync updates each row and does not merge
+                              them.
+                            </div>
+                          </div>
+                        </div>
+                      ))}
                     {syncPreview.removedObjectsFromOrg.map((mo) => {
+                      const resolutionKey = objectResolutionKey(mo.objectName);
                       const choice =
-                        objResolutions[mo.objectName] || 'KEEP_FLAGGED';
+                        objResolutions[resolutionKey] || 'KEEP_FLAGGED';
+                      const variants = otherObjectVariants(
+                        syncPreview,
+                        mo.objectName
+                      );
                       return (
                         <div className="chk-row" key={mo.objectName}>
                           <div>
@@ -966,6 +981,11 @@ export function SalesforceObjectsView({
                               {mo.fieldCount} fields · Used by groups:{' '}
                               {mo.referencedInGroups.join(', ') || 'None'}
                             </div>
+                            {variants.length > 0 && (
+                              <div style={{ fontSize: 11, color: 'var(--t3)' }}>
+                                Your choice also applies to {variants.join(', ')}
+                              </div>
+                            )}
                           </div>
                           <div className="seg">
                             <button
@@ -974,7 +994,7 @@ export function SalesforceObjectsView({
                               onClick={() =>
                                 setObjResolutions({
                                   ...objResolutions,
-                                  [mo.objectName]: 'KEEP_FLAGGED',
+                                  [resolutionKey]: 'KEEP_FLAGGED',
                                 })
                               }
                             >
@@ -986,7 +1006,7 @@ export function SalesforceObjectsView({
                               onClick={() =>
                                 setObjResolutions({
                                   ...objResolutions,
-                                  [mo.objectName]: 'DELETE',
+                                  [resolutionKey]: 'DELETE',
                                 })
                               }
                             >
@@ -997,16 +1017,23 @@ export function SalesforceObjectsView({
                       );
                     })}
                     {allRemovedFieldsInPreview.map((mf) => {
-                      const key = `${mf.objectName}.${mf.fieldName}`;
+                      const rowKey = `${mf.objectName}.${mf.fieldName}`;
+                      const key = fieldResolutionKey(mf.objectName, mf.fieldName);
                       const choice = fldResolutions[key] || 'KEEP_FLAGGED';
+                      const variants = otherFieldVariants(syncPreview, mf);
                       return (
-                        <div className="chk-row" key={key}>
+                        <div className="chk-row" key={rowKey}>
                           <div>
                             <span className="tag">Field</span>{' '}
                             <span className="mono">
                               {mf.objectName}.{mf.fieldName}
                             </span>{' '}
                             ({mf.label})
+                            {variants.length > 0 && (
+                              <div style={{ fontSize: 11, color: 'var(--t3)' }}>
+                                Your choice also applies to {variants.join(', ')}
+                              </div>
+                            )}
                           </div>
                           <div className="seg">
                             <button
@@ -1060,24 +1087,12 @@ export function SalesforceObjectsView({
                       onClick={async () => {
                         setCatalogLoading(true);
                         try {
-                          const removeObjectNames =
-                            syncPreview.removedObjectsFromOrg
-                              .filter(
-                                (mo) =>
-                                  objResolutions[mo.objectName] === 'DELETE'
-                              )
-                              .map((mo) => mo.objectName);
-                          const removeFields = allRemovedFieldsInPreview
-                            .filter(
-                              (mf) =>
-                                fldResolutions[
-                                  `${mf.objectName}.${mf.fieldName}`
-                                ] === 'DELETE'
-                            )
-                            .map((mf) => ({
-                              objectName: mf.objectName,
-                              fieldName: mf.fieldName,
-                            }));
+                          const { removeObjectNames, removeFields } =
+                            objectSyncRemovals(
+                              syncPreview,
+                              objResolutions,
+                              fldResolutions
+                            );
 
                           await onApplyPullObjectsFromOrg({
                             pulledMetadata: pulledMetadataCache,
