@@ -1282,6 +1282,7 @@ export default function AdminPortalPage() {
               onRefresh={fetchWorkspace}
               onShowToast={notify}
               onNavigate={(navId) => setView(mapNavIdToView(navId))}
+              devToolsEnabled={devToolsEnabled}
             />
           )}
 

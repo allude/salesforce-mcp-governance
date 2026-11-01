@@ -17,6 +17,17 @@ export function connectionStatusBadge(
   }
 }
 
+/**
+ * Whether the Simulated connection mode is offered. The server refuses it in production, so it shows
+ * there only when already stored, to keep that state visible until the admin moves to a live org.
+ */
+export function showSimulatedConnectionOption(
+  devToolsEnabled: boolean,
+  storedAuthMode: SalesforceConnectionSettings['authMode']
+): boolean {
+  return devToolsEnabled || storedAuthMode === 'simulated';
+}
+
 type StoredKeyState = Pick<SalesforceConnectionSettings, 'hasPrivateKey' | 'privateKeyUndecryptable'>;
 
 /** A key is stored, whether or not this server can currently decrypt it. */

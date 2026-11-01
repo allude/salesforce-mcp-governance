@@ -34,6 +34,7 @@ import {
   mcpTokenHostWarning,
   privateKeyBadge,
   replaceKeyDialog,
+  showSimulatedConnectionOption,
   storedKeyExists,
   UNDECRYPTABLE_KEY_WARNING,
   type ReplaceKeyConfirmation,
@@ -45,12 +46,14 @@ export function SalesforceOrgConnectionView({
   onRefresh,
   onShowToast,
   onNavigate,
+  devToolsEnabled,
 }: {
   sfSettings: SalesforceConnectionSettings;
   apiFetch: <T = any>(url: string, options?: RequestInit) => Promise<T>;
   onRefresh: () => Promise<void>;
   onShowToast: (msg: string, isError?: boolean) => void;
   onNavigate: (view: NavViewId) => void;
+  devToolsEnabled: boolean;
 }) {
   const [activeTab, setActiveTab] = useState<'connect' | 'guide'>('connect');
 
@@ -675,30 +678,24 @@ export function SalesforceOrgConnectionView({
                     </span>
                   </button>
 
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setAuthMode('simulated');
-                      if (!clientId)
-                        setClientId('3MVG9_EXTERNAL_CONNECTED_APP_JWT');
-                      if (!username)
-                        setUsername(
-                          'mcp-metadata-sync@enterprise.my.salesforce.com'
-                        );
-                    }}
-                    className={`flex flex-col items-start rounded-xl border p-3 text-left text-xs transition ${
-                      authMode === 'simulated'
-                        ? 'border-indigo-300 bg-indigo-50/60 ring-1 ring-indigo-300'
-                        : 'border-slate-200 bg-white hover:bg-slate-50'
-                    }`}
-                  >
-                    <span className="font-bold text-slate-900">
-                      Simulated Salesforce Org (Local Testing)
-                    </span>
-                    <span className="mt-0.5 text-[11px] text-slate-500">
-                      Verifies your RSA JWT signature locally &amp; connects to a built-in mock org to test pulling &amp; removal diffs.
-                    </span>
-                  </button>
+                  {showSimulatedConnectionOption(devToolsEnabled, sfSettings.authMode) && (
+                    <button
+                      type="button"
+                      onClick={() => setAuthMode('simulated')}
+                      className={`flex flex-col items-start rounded-xl border p-3 text-left text-xs transition ${
+                        authMode === 'simulated'
+                          ? 'border-indigo-300 bg-indigo-50/60 ring-1 ring-indigo-300'
+                          : 'border-slate-200 bg-white hover:bg-slate-50'
+                      }`}
+                    >
+                      <span className="font-bold text-slate-900">
+                        Simulated Salesforce Org (Local Testing)
+                      </span>
+                      <span className="mt-0.5 text-[11px] text-slate-500">
+                        Verifies your RSA JWT signature locally &amp; connects to a built-in mock org to test pulling &amp; removal diffs.
+                      </span>
+                    </button>
+                  )}
                 </div>
               </div>
 

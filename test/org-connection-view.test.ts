@@ -1,7 +1,9 @@
+import './helpers/env.js';
 // Covers the decisions behind the Org Connection view: its status badge, the key replacement confirmation
 // and the MCP token host warning.
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import {
   connectionStatusBadge,
   dialogClickCounts,
@@ -9,6 +11,7 @@ import {
   generateCertRequestBody,
   privateKeyBadge,
   replaceKeyDialog,
+  showSimulatedConnectionOption,
   storedKeyExists,
   REPLACE_KEY_WARNING,
   UNDECRYPTABLE_KEY_WARNING,
@@ -25,6 +28,24 @@ describe('connectionStatusBadge', () => {
     assert.deepEqual(connectionStatusBadge('connected', '00D1'), { label: 'Connected (00D1)', variant: 'emerald' });
     assert.deepEqual(connectionStatusBadge('error', ''), { label: 'Connection Error', variant: 'rose' });
     assert.deepEqual(connectionStatusBadge('disconnected', ''), { label: 'Not Connected', variant: 'slate' });
+  });
+});
+
+describe('showSimulatedConnectionOption', () => {
+  test('is offered wherever dev tools are enabled', () => {
+    assert.equal(showSimulatedConnectionOption(true, 'jwt_bearer'), true);
+    assert.equal(showSimulatedConnectionOption(true, 'simulated'), true);
+  });
+
+  test('is hidden in production unless simulated is the stored mode, which stays visible', () => {
+    assert.equal(showSimulatedConnectionOption(false, 'jwt_bearer'), false);
+    assert.equal(showSimulatedConnectionOption(false, 'simulated'), true);
+  });
+
+  test('choosing it writes no placeholder credentials into the form, where they would satisfy Live mode', () => {
+    const view = fs.readFileSync(new URL('../src/components/views/SalesforceOrgConnectionView.tsx', import.meta.url), 'utf8');
+    assert.ok(!view.includes('3MVG9_EXTERNAL_CONNECTED_APP_JWT'));
+    assert.ok(!view.includes('mcp-metadata-sync@enterprise.my.salesforce.com'));
   });
 });
 

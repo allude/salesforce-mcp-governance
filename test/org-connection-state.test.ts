@@ -230,6 +230,22 @@ describe('the instance URL MCP uses to verify tokens', () => {
     assert.equal(rawInstanceUrl(), 'https://login.salesforce.com');
   });
 
+  test('a simulated connect needs no credentials from the form, and keeps none it made up', async () => {
+    const res = await connect({ authMode: 'simulated', clientId: '', username: '' });
+
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(res.body.connected, true);
+    assert.equal(res.body.sfSettings.connectionStatus, 'connected');
+    assert.equal(res.body.sfSettings.connectedUser, 'mcp-metadata-sync@enterprise.my.salesforce.com');
+    // The placeholders stay server-side, so switching back to a live org starts from blank fields.
+    assert.equal(res.body.sfSettings.clientId, '');
+    assert.equal(res.body.sfSettings.username, '');
+
+    // Later org calls rebuild the session from these stored blank values.
+    const pulled = await adminFetch(server.baseUrl, session, '/api/admin/profiles/pull-preview', { method: 'POST', body: {} });
+    assert.equal(pulled.status, 200, JSON.stringify(pulled.body));
+  });
+
   test('a simulated connect never writes its host to the MCP host, even when empty', async () => {
     const overExisting = await connect({ authMode: 'simulated' });
     assert.equal(overExisting.status, 200, JSON.stringify(overExisting.body));
