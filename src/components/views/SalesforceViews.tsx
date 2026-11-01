@@ -16,6 +16,7 @@ import type {
 import { formatDateShort } from '@/components/ui/primitives';
 import type { FlyoutState } from './FlyoutDrawer';
 import { describeProfileDuplicate, profileSyncNeedsReview } from './profileSyncReview';
+import { profilesCsv } from './csvExport';
 
 // ============================================================================
 // 1. SALESFORCE PROFILES VIEW
@@ -108,14 +109,7 @@ export function SalesforceProfilesView({
   };
 
   const exportCsv = () => {
-    const header = 'ProfileId,ProfileName,UpdatedAt\n';
-    const body = profiles
-      .map(
-        (p) =>
-          `"${p.id}","${p.name.replace(/"/g, '""')}","${p.updatedAt}"`
-      )
-      .join('\n');
-    const blob = new Blob([header + body], { type: 'text/csv;charset=utf-8;' });
+    const blob = new Blob([profilesCsv(profiles)], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;

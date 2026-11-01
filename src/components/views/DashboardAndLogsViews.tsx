@@ -15,6 +15,7 @@ import type {
 import { MCP_TOOL_CATALOG, formatShortTime } from '@/components/ui/primitives';
 import type { FlyoutState } from './FlyoutDrawer';
 import { realTraffic } from './simulatedTraffic';
+import { portalAuditCsv, trafficLogCsv } from './csvExport';
 
 // ============================================================================
 // 1. DASHBOARD VIEW
@@ -823,15 +824,7 @@ export function CopilotMcpLogsView({
   }, [logs, statusFilter, toolFilter, objFilter, q]);
 
   const exportCsv = () => {
-    const header =
-      'Id,Timestamp,User,ProfileId,ProfileName,Tool,TargetObject,Status,LatencyMs,Simulated\n';
-    const body = rows
-      .map(
-        (r) =>
-          `"${r.id}","${r.timestamp}","${r.sfUsername}","${r.profileId}","${r.profileName}","${r.toolName}","${r.targetObject}","${r.status}",${r.latencyMs},${r.simulated ? 'true' : 'false'}`
-      )
-      .join('\n');
-    const blob = new Blob([header + body], { type: 'text/csv;charset=utf-8;' });
+    const blob = new Blob([trafficLogCsv(rows)], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -1093,15 +1086,7 @@ export function PortalAdminLogsView({
   }, [logs, method, actionFilter, q]);
 
   const exportCsv = () => {
-    const header =
-      'Id,Timestamp,AdminUsername,AuthMethod,Action,Target,Details,IpAddress\n';
-    const body = rows
-      .map(
-        (r) =>
-          `"${r.id}","${r.timestamp}","${r.adminUsername}","${r.authMethod}","${r.action}","${r.target}","${r.details.replace(/"/g, '""')}","${r.ipAddress}"`
-      )
-      .join('\n');
-    const blob = new Blob([header + body], { type: 'text/csv;charset=utf-8;' });
+    const blob = new Blob([portalAuditCsv(rows)], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
