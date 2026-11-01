@@ -580,6 +580,8 @@ export function TrafficDashboardView({
                     Salesforce Org JWT:{' '}
                     {sfSettings?.connectionStatus === 'connected'
                       ? `Connected (${sfSettings.connectedOrgId})`
+                      : sfSettings?.connectionStatus === 'not_verified'
+                      ? 'Not verified'
                       : 'Disconnected'}
                   </b>
                 </div>
@@ -592,6 +594,8 @@ export function TrafficDashboardView({
                 >
                   {sfSettings?.connectionStatus === 'connected'
                     ? `User: ${sfSettings.connectedUser} · ${sfSettings.syncInstanceUrl}`
+                    : sfSettings?.connectionStatus === 'not_verified'
+                    ? 'Settings changed. Connect & Verify again to pull live Profiles & Objects'
                     : 'Configure OAuth 2.0 JWT Bearer to pull live Profiles & Objects'}
                 </div>
               </div>

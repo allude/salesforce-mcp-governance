@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useRef } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import {
   KeyRound,
   ShieldCheck,
@@ -24,6 +24,14 @@ import {
   NavViewId,
 } from '@/types/governance';
 import { Card, Badge, Switch } from '@/components/ui/primitives';
+import {
+  connectionStatusBadge,
+  generateCertClick,
+  generateCertLabel,
+  KEY_GENERATED_NOTICE,
+  KEY_REPLACED_NOTICE,
+  REPLACE_KEY_WARNING,
+} from './orgConnectionState';
 
 export function SalesforceOrgConnectionView({
   sfSettings,
@@ -66,6 +74,7 @@ export function SalesforceOrgConnectionView({
     sfSettings.certificatePem || ''
   );
   const [generatingCert, setGeneratingCert] = useState(false);
+  const [confirmReplaceKey, setConfirmReplaceKey] = useState(false);
   const [connecting, setConnecting] = useState(false);
   const [saving, setSaving] = useState(false);
   const [copiedCert, setCopiedCert] = useState(false);
@@ -74,8 +83,23 @@ export function SalesforceOrgConnectionView({
   const certFileInputRef = useRef<HTMLInputElement | null>(null);
 
   const isConnected = sfSettings.connectionStatus === 'connected';
+  const statusBadge = connectionStatusBadge(
+    sfSettings.connectionStatus,
+    sfSettings.connectedOrgId
+  );
+
+  // A click armed on one tab must not count for the other tab's button.
+  useEffect(() => {
+    setConfirmReplaceKey(false);
+  }, [activeTab]);
 
   const handleGenerateCertBundle = async () => {
+    if (generateCertClick(sfSettings.hasPrivateKey, confirmReplaceKey) === 'arm') {
+      setConfirmReplaceKey(true);
+      return;
+    }
+    const replacingKey = sfSettings.hasPrivateKey;
+    setConfirmReplaceKey(false);
     setGeneratingCert(true);
     try {
       const res = await apiFetch<{
@@ -91,9 +115,7 @@ export function SalesforceOrgConnectionView({
       setCertificatePem(res.certificatePem);
       setPrivateKeyInput('');
       await onRefresh();
-      onShowToast(
-        'Generated 2048-bit RSA Private Key & X.509 Certificate (.crt)'
-      );
+      onShowToast(replacingKey ? KEY_REPLACED_NOTICE : KEY_GENERATED_NOTICE);
     } catch (err: any) {
       onShowToast(err.message, true);
     } finally {
@@ -168,13 +190,20 @@ export function SalesforceOrgConnectionView({
     e.preventDefault();
     setSaving(true);
     try {
-      await apiFetch('/api/admin/sf-settings', {
-        method: 'PUT',
-        body: JSON.stringify(buildPayload()),
-      });
+      const res = await apiFetch<{ sfSettings: SalesforceConnectionSettings }>(
+        '/api/admin/sf-settings',
+        {
+          method: 'PUT',
+          body: JSON.stringify(buildPayload()),
+        }
+      );
       setPrivateKeyInput('');
       await onRefresh();
-      onShowToast('Saved Salesforce Org connection settings');
+      onShowToast(
+        res.sfSettings.connectionStatus === 'not_verified'
+          ? 'Saved. The connection is not verified until you Connect & Verify again.'
+          : 'Saved Salesforce Org connection settings'
+      );
     } catch (err: any) {
       onShowToast(err.message, true);
     } finally {
@@ -226,21 +255,7 @@ export function SalesforceOrgConnectionView({
             <h2 className="text-base font-bold text-slate-900">
               Connect to Salesforce Org (JWT Metadata Sync)
             </h2>
-            <Badge
-              variant={
-                isConnected
-                  ? 'emerald'
-                  : sfSettings.connectionStatus === 'error'
-                  ? 'rose'
-                  : 'slate'
-              }
-            >
-              {isConnected
-                ? `Connected (${sfSettings.connectedOrgId || 'Active'})`
-                : sfSettings.connectionStatus === 'error'
-                ? 'Connection Error'
-                : 'Not Connected'}
-            </Badge>
+            <Badge variant={statusBadge.variant}>{statusBadge.label}</Badge>
           </div>
           <p className="mt-0.5 text-xs text-slate-500">
             Configure an External Connected App with X.509 JWT Certificate authentication to automatically pull Salesforce Profiles, Objects, and Fields without requiring customer record data access.
@@ -294,6 +309,9 @@ export function SalesforceOrgConnectionView({
                 <div className="mt-0.5 flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-[11px] text-emerald-800">
                   <span>Org ID: {sfSettings.connectedOrgId}</span>
                   <span>Instance: {sfSettings.syncInstanceUrl}</span>
+                  {sfSettings.instanceUrl !== sfSettings.syncInstanceUrl && (
+                    <span>MCP token host: {sfSettings.instanceUrl}</span>
+                  )}
                   <span>User: {sfSettings.connectedUser}</span>
                   {sfSettings.lastConnectedAt && (
                     <span>
@@ -331,6 +349,20 @@ export function SalesforceOrgConnectionView({
                 <Unplug className="h-3.5 w-3.5" />
                 <span>Disconnect</span>
               </button>
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {sfSettings.connectionStatus === 'not_verified' && (
+        <Card className="border-amber-200 bg-amber-50/70 p-4">
+          <div className="flex items-start gap-2.5 text-xs text-amber-900">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+            <div>
+              <div className="font-bold">Connection Not Verified</div>
+              <div className="mt-0.5 text-[11px]">
+                The key or connection settings changed after the last connection. Pulling from the org is off until you Connect &amp; Verify. If the key changed, upload the new certificate to the Connected App first.
+              </div>
             </div>
           </div>
         </Card>
@@ -393,6 +425,7 @@ export function SalesforceOrgConnectionView({
                   type="button"
                   disabled={generatingCert}
                   onClick={handleGenerateCertBundle}
+                  onBlur={() => setConfirmReplaceKey(false)}
                   className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white shadow-2xs transition hover:bg-indigo-700 disabled:opacity-50"
                 >
                   <RefreshCw
@@ -401,9 +434,13 @@ export function SalesforceOrgConnectionView({
                     }`}
                   />
                   <span>
-                    {sfSettings.hasPrivateKey
-                      ? 'Regenerate Certificate & Key'
-                      : 'Generate X.509 Certificate & Key'}
+                    {generateCertLabel(
+                      sfSettings.hasPrivateKey,
+                      confirmReplaceKey,
+                      sfSettings.hasPrivateKey
+                        ? 'Regenerate Certificate & Key'
+                        : 'Generate X.509 Certificate & Key'
+                    )}
                   </span>
                 </button>
 
@@ -433,6 +470,12 @@ export function SalesforceOrgConnectionView({
                   </>
                 )}
               </div>
+
+              {confirmReplaceKey && (
+                <p role="alert" className="mt-2 text-[11px] font-semibold text-amber-800">
+                  {REPLACE_KEY_WARNING}
+                </p>
+              )}
 
               {sfSettings.certFingerprint && (
                 <div className="mt-3 rounded-lg bg-white/90 px-3 py-2 font-mono text-[10px] text-slate-600 ring-1 ring-indigo-100">
@@ -786,11 +829,21 @@ export function SalesforceOrgConnectionView({
                 <div className="mt-3 flex flex-wrap gap-2">
                   <button
                     type="button"
+                    disabled={generatingCert}
                     onClick={handleGenerateCertBundle}
-                    className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-indigo-700"
+                    onBlur={() => setConfirmReplaceKey(false)}
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-indigo-700 disabled:opacity-50"
                   >
                     <FileKey className="h-3.5 w-3.5" />
-                    <span>1-Click Generate Cert &amp; Key</span>
+                    <span>
+                      {generateCertLabel(
+                        sfSettings.hasPrivateKey,
+                        confirmReplaceKey,
+                        sfSettings.hasPrivateKey
+                          ? 'Regenerate Cert & Key'
+                          : '1-Click Generate Cert & Key'
+                      )}
+                    </span>
                   </button>
                   {(certificatePem || sfSettings.certificatePem) && (
                     <button
@@ -803,6 +856,11 @@ export function SalesforceOrgConnectionView({
                     </button>
                   )}
                 </div>
+                {confirmReplaceKey && (
+                  <p role="alert" className="mt-2 text-[11px] font-semibold text-amber-800">
+                    {REPLACE_KEY_WARNING}
+                  </p>
+                )}
                 <div className="mt-3 rounded-lg bg-slate-900 p-3 font-mono text-[11px] text-slate-200">
                   <div className="text-slate-400">
                     # Optional: If generating via OpenSSL CLI instead:

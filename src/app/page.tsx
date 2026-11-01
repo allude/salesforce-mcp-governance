@@ -1156,6 +1156,8 @@ export default function AdminPortalPage() {
                 <span className="mono">
                   {sfSettings?.connectionStatus === 'connected'
                     ? sfSettings.connectedOrgId
+                    : sfSettings?.connectionStatus === 'not_verified'
+                    ? 'not verified'
                     : 'JWT setup'}
                 </span>
               </span>

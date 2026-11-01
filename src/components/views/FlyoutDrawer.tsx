@@ -1354,7 +1354,11 @@ export function FlyoutDrawer({
                       Connected · {sfSettings.connectedOrgId}
                     </span>
                   ) : (
-                    <span className="tag warn">Not connected</span>
+                    <span className="tag warn">
+                      {sfSettings?.connectionStatus === 'not_verified'
+                        ? 'Not verified'
+                        : 'Not connected'}
+                    </span>
                   )}
                 </div>
                 <div
