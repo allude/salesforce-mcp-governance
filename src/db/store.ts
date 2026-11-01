@@ -1602,6 +1602,22 @@ export const store = {
     return { total: row.total, allowed: row.allowed, denied: row.denied, errors: row.errors };
   },
 
+  /**
+   * When the last real call reached the MCP tools, read from the table because simulator rows can
+   * fill the capped list. A rejected token does not count: anyone can send one, and it would
+   * present an unauthenticated request as MCP activity.
+   */
+  getLastRealMcpCallAt(): string | null {
+    const row = db
+      .prepare(
+        `SELECT timestamp FROM mcp_copilot_logs
+         WHERE simulated = 0 AND sf_username <> 'unverified_caller'
+         ORDER BY rowid DESC LIMIT 1`
+      )
+      .get() as { timestamp: string } | undefined;
+    return row?.timestamp ?? null;
+  },
+
   recordCopilotMcpLog(input: {
     sfUsername: string;
     profileId: string;

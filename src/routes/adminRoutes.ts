@@ -385,6 +385,7 @@ adminRouter.get('/overview', (_req: Request, res: Response) => {
       allowedMcpRequests: mcpStats.allowed,
       deniedMcpRequests: mcpStats.denied,
       erroredMcpRequests: mcpStats.errors,
+      lastMcpCallAt: store.getLastRealMcpCallAt(),
       totalProfiles: profiles.length,
       totalObjects: objects.length,
       enabledObjects: objects.filter((o) => o.enabled).length,

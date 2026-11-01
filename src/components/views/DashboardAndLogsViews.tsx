@@ -26,6 +26,7 @@ export interface McpRequestStats {
   allowedMcpRequests: number;
   deniedMcpRequests: number;
   erroredMcpRequests: number;
+  lastMcpCallAt: string | null;
 }
 
 interface TrafficDashboardProps {

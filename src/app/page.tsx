@@ -38,6 +38,7 @@ import {
 } from '@/components/views/FlyoutDrawer';
 import { CommandPalette } from '@/components/views/CommandPalette';
 import { profileSyncResultMessage } from '@/components/views/profileSyncReview';
+import { mcpActivityStatus } from '@/components/views/mcpActivity';
 import {
   ENTERPRISE_MATRIX_WARNING,
   enterpriseMatrixAction,
@@ -156,6 +157,7 @@ export default function AdminPortalPage() {
     useState<SalesforceConnectionSettings | null>(null);
   const [portalUsers, setPortalUsers] = useState<PortalUserSummary[]>([]);
   const [mcpStats, setMcpStats] = useState<McpRequestStats | null>(null);
+  const [clockNow, setClockNow] = useState(() => Date.now());
   // Starts off so the burst button cannot show in production before the first overview loads.
   const [devToolsEnabled, setDevToolsEnabled] = useState(false);
   const [seedConfirmOpen, setSeedConfirmOpen] = useState(false);
@@ -370,6 +372,14 @@ export default function AdminPortalPage() {
     }, 5000);
     return () => clearInterval(iv);
   }, [session, liveStream, fetchWorkspace]);
+
+  // Keeps relative times moving while the live refresh is paused
+  useEffect(() => {
+    if (!session) return;
+    setClockNow(Date.now());
+    const iv = setInterval(() => setClockNow(Date.now()), 30000);
+    return () => clearInterval(iv);
+  }, [session]);
 
   // Auth handlers
   const handlePasswordLogin = async (e: React.FormEvent) => {
@@ -888,6 +898,7 @@ export default function AdminPortalPage() {
     return found && found.groupIds.length > 0;
   }).length;
   const meta = VIEW_META[view] || VIEW_META.dashboard;
+  const mcpActivity = mcpActivityStatus(mcpStats ? mcpStats.lastMcpCallAt : undefined, clockNow);
   const selectedFlyoutId =
     flyout?.data?.id || flyout?.data?.objectName || undefined;
   const displayUser = session.displayName || session.name || session.username;
@@ -1145,10 +1156,12 @@ export default function AdminPortalPage() {
               type="button"
               className="pill"
               onClick={() => setFlyout({ type: 'simulator' })}
-              title="Test MCP tool access & generate live telemetry"
+              title="Time of the last real MCP call; simulated calls are not counted. Click to open the MCP call simulator."
+              aria-label={`${mcpActivity.label}. Open the MCP call simulator`}
             >
-              <span className="dot ok" />
-              <span>Copilot MCP connected</span>
+              <span className={`dot ${mcpActivity.tone}`} />
+              <span>{mcpActivity.label}</span>
+              <span className="kbd">Simulate</span>
             </button>
 
             <button
