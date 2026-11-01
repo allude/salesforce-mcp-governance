@@ -98,12 +98,12 @@ describe('overview lastMcpCallAt', () => {
     assert.equal(await lastCallAt(), row.timestamp);
   });
 
-  test('a real call pushed out of the capped list by simulator rows is still reported', async () => {
+  test('a real call followed by a full list of simulator rows is still listed and reported', async () => {
     const row = logRow(false);
     for (let i = 0; i < 151; i += 1) logRow(true);
 
     const overview = (await adminFetch(server.baseUrl, session, '/api/admin/overview')).body;
-    assert.ok(overview.copilotLogs.every((r: any) => r.simulated), 'the list should hold only simulator rows');
+    assert.ok(overview.copilotLogs.some((r: any) => r.id === row.id), 'simulator rows must not displace it');
     assert.equal(overview.stats.lastMcpCallAt, row.timestamp);
   });
 

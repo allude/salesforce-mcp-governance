@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { runInTransaction, store } from '../db/store.js';
+import { runInTransaction, SIMULATE_MCP_CALL_ACTION, store } from '../db/store.js';
 import { parseProfilesCsv, parseSfdxFilesToObjects } from '../db/importers.js';
 import {
   requireAdminAuth,
@@ -367,6 +367,11 @@ adminRouter.use((req: Request, res: Response, next: NextFunction) => {
   requireAdminAuth(req, res, next).catch(next);
 });
 
+// Each list holds up to this many rows of ordinary traffic, plus its own smaller allowance of simulated
+// rows, merged newest first. Simulated rows are told apart by `simulated` or the SIMULATE_MCP_CALL action.
+const OVERVIEW_LOG_ROWS = 150;
+const OVERVIEW_SIMULATED_LOG_ROWS = 50;
+
 /**
  * GET /api/admin/overview
  */
@@ -375,13 +380,13 @@ adminRouter.get('/overview', (_req: Request, res: Response) => {
   const objects = store.getObjects();
   const groups = store.getGroups();
   const profileGroupMappings = store.getProfileGroupMappings();
-  const copilotLogs = store.getCopilotMcpLogs(150);
-  const portalLogs = store.getPortalAdminLogs(150);
+  const copilotLogs = store.getCopilotMcpLogsCappedByKind(OVERVIEW_LOG_ROWS, OVERVIEW_SIMULATED_LOG_ROWS);
+  const portalLogs = store.getPortalAdminLogsCappedByKind(OVERVIEW_LOG_ROWS, OVERVIEW_SIMULATED_LOG_ROWS);
   const okta = store.getOktaConfig();
   const sfSettings = store.getSalesforceSettings();
   const portalUsers = store.getPortalUsers();
 
-  // Totals cover every real logged call; the log lists themselves are the latest 150 rows.
+  // Totals cover every real logged call; the log lists themselves are only the latest rows.
   const mcpStats = store.getCopilotMcpLogStats();
 
   res.json({
@@ -1562,7 +1567,7 @@ async function runMcpAccessSimulation(req: Request, res: Response): Promise<void
   store.recordPortalAdminLog({
     adminUsername: actor.username,
     authMethod: actor.authMethod,
-    action: 'SIMULATE_MCP_CALL',
+    action: SIMULATE_MCP_CALL_ACTION,
     target: `Profile: ${effective.profileName} (${effective.profileId})`,
     details: `Simulated ${String(toolName || 'list_enabled_objects')} on ${String(targetObject || '*')} as "${user.username}": ${evaluation.permitted ? 'ALLOWED' : 'DENIED'}. A 15-minute simulator token was issued.`,
     ipAddress: actor.ip,

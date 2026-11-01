@@ -458,6 +458,40 @@ function initializeSystemSingletons() {
 
 initializeSystemSingletons();
 
+/** The portal admin log action written once per policy simulation. */
+export const SIMULATE_MCP_CALL_ACTION = 'SIMULATE_MCP_CALL';
+
+function toCopilotMcpLogRecord(r: any): CopilotMcpLogRecord {
+  return {
+    id: r.id,
+    timestamp: r.timestamp,
+    sfUsername: r.sf_username,
+    profileId: r.profile_id,
+    profileName: r.profile_name,
+    matchedGroups: JSON.parse(r.matched_groups_json || '[]'),
+    toolName: r.tool_name,
+    targetObject: r.target_object,
+    status: r.status,
+    latencyMs: r.latency_ms,
+    sanitizedRequestPayload: r.sanitized_request_payload,
+    sanitizedResponseSummary: r.sanitized_response_summary,
+    ...(r.simulated ? { simulated: true as const } : {}),
+  };
+}
+
+function toPortalAdminLogRecord(r: any): PortalAdminLogRecord {
+  return {
+    id: r.id,
+    timestamp: r.timestamp,
+    adminUsername: r.admin_username,
+    authMethod: r.auth_method,
+    action: r.action,
+    target: r.target,
+    details: r.details,
+    ipAddress: r.ip_address,
+  };
+}
+
 /**
  * Strips all sensitive data values from a payload while preserving keys, field names, and structure
  * so Copilot MCP logs never store raw customer PII or record values.
@@ -1640,21 +1674,27 @@ export const store = {
     const rows = db
       .prepare('SELECT * FROM mcp_copilot_logs ORDER BY rowid DESC LIMIT ?')
       .all(limit) as any[];
-    return rows.map((r) => ({
-      id: r.id,
-      timestamp: r.timestamp,
-      sfUsername: r.sf_username,
-      profileId: r.profile_id,
-      profileName: r.profile_name,
-      matchedGroups: JSON.parse(r.matched_groups_json || '[]'),
-      toolName: r.tool_name,
-      targetObject: r.target_object,
-      status: r.status,
-      latencyMs: r.latency_ms,
-      sanitizedRequestPayload: r.sanitized_request_payload,
-      sanitizedResponseSummary: r.sanitized_response_summary,
-      ...(r.simulated ? { simulated: true as const } : {}),
-    }));
+    return rows.map(toCopilotMcpLogRecord);
+  },
+
+  /**
+   * Newest first, with real and simulated rows capped separately so a run of simulator calls cannot
+   * push real calls out of what the portal can see. Every row stays in the table.
+   */
+  getCopilotMcpLogsCappedByKind(realLimit: number, simulatedLimit: number): CopilotMcpLogRecord[] {
+    const rows = db
+      .prepare(
+        `SELECT * FROM (
+           SELECT rowid AS seq, * FROM mcp_copilot_logs WHERE simulated = 0 ORDER BY rowid DESC LIMIT ?
+         )
+         UNION ALL
+         SELECT * FROM (
+           SELECT rowid AS seq, * FROM mcp_copilot_logs WHERE simulated <> 0 ORDER BY rowid DESC LIMIT ?
+         )
+         ORDER BY seq DESC`
+      )
+      .all(realLimit, simulatedLimit) as any[];
+    return rows.map(toCopilotMcpLogRecord);
   },
 
   /** Totals for the dashboard KPIs: real traffic only, so the simulator cannot inflate them. */
@@ -1673,8 +1713,8 @@ export const store = {
   },
 
   /**
-   * When the last real call reached the MCP tools, read from the table because simulator rows can
-   * fill the capped list. A rejected token does not count: anyone can send one, and it would
+   * When the last real call reached the MCP tools, read from the table because rejected-token rows
+   * can fill the capped list. A rejected token does not count: anyone can send one, and it would
    * present an unauthenticated request as MCP activity.
    */
   getLastRealMcpCallAt(): string | null {
@@ -1758,16 +1798,27 @@ export const store = {
     const rows = db
       .prepare('SELECT * FROM portal_admin_logs ORDER BY rowid DESC LIMIT ?')
       .all(limit) as any[];
-    return rows.map((r) => ({
-      id: r.id,
-      timestamp: r.timestamp,
-      adminUsername: r.admin_username,
-      authMethod: r.auth_method,
-      action: r.action,
-      target: r.target,
-      details: r.details,
-      ipAddress: r.ip_address,
-    }));
+    return rows.map(toPortalAdminLogRecord);
+  },
+
+  /**
+   * Newest first, with policy simulations capped apart from every other action so a run of them
+   * cannot push earlier audit entries out of the portal view. Every row stays in the table.
+   */
+  getPortalAdminLogsCappedByKind(otherLimit: number, simulationLimit: number): PortalAdminLogRecord[] {
+    const rows = db
+      .prepare(
+        `SELECT * FROM (
+           SELECT rowid AS seq, * FROM portal_admin_logs WHERE action <> :action ORDER BY rowid DESC LIMIT :otherLimit
+         )
+         UNION ALL
+         SELECT * FROM (
+           SELECT rowid AS seq, * FROM portal_admin_logs WHERE action = :action ORDER BY rowid DESC LIMIT :simulationLimit
+         )
+         ORDER BY seq DESC`
+      )
+      .all({ action: SIMULATE_MCP_CALL_ACTION, otherLimit, simulationLimit }) as any[];
+    return rows.map(toPortalAdminLogRecord);
   },
 
   recordPortalAdminLog(input: {
