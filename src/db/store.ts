@@ -1974,7 +1974,7 @@ export const store = {
 
   getSalesforceSettings(): SalesforceConnectionSettings & { privateKeyPem?: string } {
     const row = db.prepare('SELECT * FROM sf_connection_settings WHERE id = 1').get() as any;
-    const { privateKeyPem } = readStoredPrivateKey(row.private_key_enc);
+    const { privateKeyPem, undecryptable } = readStoredPrivateKey(row.private_key_enc);
     return {
       enabled: Boolean(row.enabled),
       authMode: row.auth_mode === 'simulated' ? 'simulated' : 'jwt_bearer',
@@ -1982,6 +1982,7 @@ export const store = {
       clientId: row.client_id || '',
       username: row.username || '',
       hasPrivateKey: Boolean(privateKeyPem),
+      privateKeyUndecryptable: undecryptable,
       certificatePem: row.certificate_pem || '',
       certFingerprint: row.cert_fingerprint || '',
       connectionStatus:
@@ -2004,19 +2005,15 @@ export const store = {
     };
   },
 
-  getSalesforceSettingsWithSecrets(): SalesforceConnectionSettings & {
-    privateKeyPem: string;
-    privateKeyUndecryptable: boolean;
-  } {
+  getSalesforceSettingsWithSecrets(): SalesforceConnectionSettings & { privateKeyPem: string } {
     const row = db.prepare('SELECT private_key_enc FROM sf_connection_settings WHERE id = 1').get() as {
       private_key_enc: string;
     };
-    const { privateKeyPem, undecryptable } = readStoredPrivateKey(row.private_key_enc);
+    const { privateKeyPem } = readStoredPrivateKey(row.private_key_enc);
     const base = this.getSalesforceSettings();
     return {
       ...base,
       privateKeyPem,
-      privateKeyUndecryptable: undecryptable,
     };
   },
 

@@ -28,10 +28,15 @@ import {
   connectionStatusBadge,
   dialogClickCounts,
   generateCertClick,
+  generateCertRequestBody,
   KEY_GENERATED_NOTICE,
   KEY_REPLACED_NOTICE,
   mcpTokenHostWarning,
-  REPLACE_KEY_WARNING,
+  privateKeyBadge,
+  replaceKeyDialog,
+  storedKeyExists,
+  UNDECRYPTABLE_KEY_WARNING,
+  type ReplaceKeyConfirmation,
 } from './orgConnectionState';
 
 export function SalesforceOrgConnectionView({
@@ -80,7 +85,8 @@ export function SalesforceOrgConnectionView({
     sfSettings.certificatePem || ''
   );
   const [generatingCert, setGeneratingCert] = useState(false);
-  const [replaceKeyConfirmOpen, setReplaceKeyConfirmOpen] = useState(false);
+  // Held from the click, so what Confirm sends always matches the warning on screen.
+  const [replaceKeyConfirm, setReplaceKeyConfirm] = useState<ReplaceKeyConfirmation | null>(null);
   const replaceKeyConfirmOpenedAt = useRef(0);
   const [connecting, setConnecting] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -90,6 +96,8 @@ export function SalesforceOrgConnectionView({
   const certFileInputRef = useRef<HTMLInputElement | null>(null);
 
   const isConnected = sfSettings.connectionStatus === 'connected';
+  const keyExists = storedKeyExists(sfSettings);
+  const keyBadge = privateKeyBadge(sfSettings);
   const tokenHostWarning = mcpTokenHostWarning(sfSettings);
   const statusBadge = connectionStatusBadge(
     sfSettings.connectionStatus,
@@ -103,16 +111,16 @@ export function SalesforceOrgConnectionView({
   }, [sfSettings.instanceUrl]);
 
   const handleGenerateCertClick = () => {
-    if (generateCertClick(sfSettings.hasPrivateKey) === 'confirm') {
-      replaceKeyConfirmOpenedAt.current = Date.now();
-      setReplaceKeyConfirmOpen(true);
+    const action = generateCertClick(sfSettings);
+    if (action === 'generate') {
+      void generateCertBundle(null);
       return;
     }
-    void generateCertBundle();
+    replaceKeyConfirmOpenedAt.current = Date.now();
+    setReplaceKeyConfirm(action);
   };
 
-  const generateCertBundle = async () => {
-    const replacingKey = sfSettings.hasPrivateKey;
+  const generateCertBundle = async (confirmed: ReplaceKeyConfirmation | null) => {
     setGeneratingCert(true);
     try {
       const res = await apiFetch<{
@@ -121,16 +129,18 @@ export function SalesforceOrgConnectionView({
         fingerprintSha256: string;
       }>('/api/admin/sf-settings/generate-cert', {
         method: 'POST',
-        body: JSON.stringify({
-          commonName: 'Salesforce MCP Metadata Sync',
-        }),
+        body: JSON.stringify(
+          generateCertRequestBody('Salesforce MCP Metadata Sync', confirmed)
+        ),
       });
       setCertificatePem(res.certificatePem);
       setPrivateKeyInput('');
       await onRefresh();
-      onShowToast(replacingKey ? KEY_REPLACED_NOTICE : KEY_GENERATED_NOTICE);
+      onShowToast(confirmed ? KEY_REPLACED_NOTICE : KEY_GENERATED_NOTICE);
     } catch (err: any) {
       onShowToast(err.message, true);
+      // A refusal means this page's key state was stale: the next click must show the right warning.
+      void onRefresh().catch(() => {});
     } finally {
       setGeneratingCert(false);
     }
@@ -448,11 +458,7 @@ export function SalesforceOrgConnectionView({
                   Step 1: X.509 Certificate &amp; Private Key
                 </h3>
               </div>
-              <Badge variant={sfSettings.hasPrivateKey ? 'emerald' : 'amber'}>
-                {sfSettings.hasPrivateKey
-                  ? 'Private Key Stored (AES-256)'
-                  : 'No Key Configured'}
-              </Badge>
+              <Badge variant={keyBadge.variant}>{keyBadge.label}</Badge>
             </div>
 
             <p className="mt-2.5 text-xs text-slate-600">
@@ -485,7 +491,7 @@ export function SalesforceOrgConnectionView({
                     }`}
                   />
                   <span>
-                    {sfSettings.hasPrivateKey
+                    {keyExists
                       ? 'Regenerate Certificate & Key'
                       : 'Generate X.509 Certificate & Key'}
                   </span>
@@ -517,6 +523,11 @@ export function SalesforceOrgConnectionView({
                   </>
                 )}
               </div>
+              {sfSettings.privateKeyUndecryptable && (
+                <p role="alert" className="mt-2 text-[11px] font-semibold text-rose-700">
+                  {UNDECRYPTABLE_KEY_WARNING}
+                </p>
+              )}
 
 
               {sfSettings.certFingerprint && (
@@ -924,7 +935,7 @@ export function SalesforceOrgConnectionView({
                   >
                     <FileKey className="h-3.5 w-3.5" />
                     <span>
-                      {sfSettings.hasPrivateKey
+                      {keyExists
                         ? 'Regenerate Cert & Key'
                         : '1-Click Generate Cert & Key'}
                     </span>
@@ -940,6 +951,11 @@ export function SalesforceOrgConnectionView({
                     </button>
                   )}
                 </div>
+                {sfSettings.privateKeyUndecryptable && (
+                  <p role="alert" className="mt-2 text-[11px] font-semibold text-rose-700">
+                    {UNDECRYPTABLE_KEY_WARNING}
+                  </p>
+                )}
                 <div className="mt-3 rounded-lg bg-slate-900 p-3 font-mono text-[11px] text-slate-200">
                   <div className="text-slate-400">
                     # Optional: If generating via OpenSSL CLI instead:
@@ -1119,12 +1135,12 @@ export function SalesforceOrgConnectionView({
       )}
 
       {/* KEY REPLACEMENT CONFIRMATION */}
-      {replaceKeyConfirmOpen && (
+      {replaceKeyConfirm && (
         <div
           className="cmdk-scrim"
           onClick={() => {
             if (dialogClickCounts(replaceKeyConfirmOpenedAt.current, Date.now())) {
-              setReplaceKeyConfirmOpen(false);
+              setReplaceKeyConfirm(null);
             }
           }}
         >
@@ -1137,18 +1153,22 @@ export function SalesforceOrgConnectionView({
             style={{ maxWidth: 480 }}
             onClick={(e) => e.stopPropagation()}
             onKeyDown={(e) => {
-              if (e.key === 'Escape') setReplaceKeyConfirmOpen(false);
+              if (e.key === 'Escape') setReplaceKeyConfirm(null);
             }}
           >
             <div className="card-h">
               <div className="card-t" id="replace-key-confirm-title">
-                Replace the stored private key?
+                {replaceKeyDialog(replaceKeyConfirm).title}
               </div>
             </div>
             <div className="card-b">
-              <p id="replace-key-confirm-body" style={{ fontSize: 12.5, color: 'var(--t2)' }}>
-                {REPLACE_KEY_WARNING}
-              </p>
+              <div id="replace-key-confirm-body">
+                {replaceKeyDialog(replaceKeyConfirm).warnings.map((warning) => (
+                  <p key={warning} style={{ fontSize: 12.5, color: 'var(--t2)', marginBottom: 8 }}>
+                    {warning}
+                  </p>
+                ))}
+              </div>
               <div
                 style={{
                   display: 'flex',
@@ -1161,7 +1181,7 @@ export function SalesforceOrgConnectionView({
                   type="button"
                   className="btn"
                   autoFocus
-                  onClick={() => setReplaceKeyConfirmOpen(false)}
+                  onClick={() => setReplaceKeyConfirm(null)}
                 >
                   Cancel
                 </button>
@@ -1170,11 +1190,11 @@ export function SalesforceOrgConnectionView({
                   className="btn dng"
                   onClick={() => {
                     if (!dialogClickCounts(replaceKeyConfirmOpenedAt.current, Date.now())) return;
-                    setReplaceKeyConfirmOpen(false);
-                    void generateCertBundle();
+                    setReplaceKeyConfirm(null);
+                    void generateCertBundle(replaceKeyConfirm);
                   }}
                 >
-                  Replace the key
+                  {replaceKeyDialog(replaceKeyConfirm).confirmLabel}
                 </button>
               </div>
             </div>

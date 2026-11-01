@@ -1127,6 +1127,7 @@ describe('store: Salesforce connection settings', () => {
       clientId: '',
       username: '',
       hasPrivateKey: false,
+      privateKeyUndecryptable: false,
       certificatePem: '',
       certFingerprint: '',
       connectionStatus: 'disconnected',

@@ -17,12 +17,41 @@ export function connectionStatusBadge(
   }
 }
 
+type StoredKeyState = Pick<SalesforceConnectionSettings, 'hasPrivateKey' | 'privateKeyUndecryptable'>;
+
+/** A key is stored, whether or not this server can currently decrypt it. */
+export function storedKeyExists(settings: StoredKeyState): boolean {
+  return settings.hasPrivateKey || settings.privateKeyUndecryptable;
+}
+
+/** Which confirmation a replacement needs. An undecryptable key has its own: it could still be recovered. */
+export type ReplaceKeyConfirmation = 'replace' | 'destroy-undecryptable';
+
 /**
  * Replacing a key breaks the org connection until the new certificate reaches Salesforce, so with a
  * key already stored the click only opens a confirmation. A first key has nothing to break.
  */
-export function generateCertClick(hasPrivateKey: boolean): 'confirm' | 'generate' {
-  return hasPrivateKey ? 'confirm' : 'generate';
+export function generateCertClick(settings: StoredKeyState): ReplaceKeyConfirmation | 'generate' {
+  if (settings.privateKeyUndecryptable) return 'destroy-undecryptable';
+  return settings.hasPrivateKey ? 'replace' : 'generate';
+}
+
+/**
+ * Confirms the undecryptable key only when the admin was shown that warning. Settings that went stale
+ * must not confirm a destruction nobody saw, so the server refuses those and the portal refreshes.
+ */
+export function generateCertRequestBody(commonName: string, confirmed: ReplaceKeyConfirmation | null) {
+  return confirmed === 'destroy-undecryptable'
+    ? { commonName, confirmReplaceUndecryptableKey: true }
+    : { commonName };
+}
+
+/** The key badge in Step 1. Reads "unreadable", since "no key" would hide that one could be recovered. */
+export function privateKeyBadge(settings: StoredKeyState): { label: string; variant: 'emerald' | 'amber' | 'rose' } {
+  if (settings.privateKeyUndecryptable) return { label: 'Stored Key Cannot Be Decrypted', variant: 'rose' };
+  return settings.hasPrivateKey
+    ? { label: 'Private Key Stored (AES-256)', variant: 'emerald' }
+    : { label: 'No Key Configured', variant: 'amber' };
 }
 
 /** Past the window of a double-click, whose second click lands wherever the dialog has just appeared. */
@@ -35,6 +64,28 @@ export function dialogClickCounts(openedAt: number, now: number): boolean {
 
 export const REPLACE_KEY_WARNING =
   'This replaces the stored private key. Salesforce will reject the connection until you upload the new certificate to the Connected App and connect again.';
+
+export const UNDECRYPTABLE_KEY_WARNING =
+  'The stored private key cannot be decrypted with the current APP_SECRET_KEY, so this server cannot sign with it. Restoring the previous APP_SECRET_KEY could recover the key. Generating a new key destroys it for good, and so does saving a pasted one.';
+
+/** What the confirmation says and asks for each kind of replacement. */
+export function replaceKeyDialog(confirmation: ReplaceKeyConfirmation): {
+  title: string;
+  warnings: string[];
+  confirmLabel: string;
+} {
+  return confirmation === 'destroy-undecryptable'
+    ? {
+        title: 'Destroy the undecryptable private key?',
+        warnings: [UNDECRYPTABLE_KEY_WARNING, REPLACE_KEY_WARNING],
+        confirmLabel: 'Destroy it and generate',
+      }
+    : {
+        title: 'Replace the stored private key?',
+        warnings: [REPLACE_KEY_WARNING],
+        confirmLabel: 'Replace the key',
+      };
+}
 
 export const KEY_REPLACED_NOTICE =
   'Generated a new private key & certificate. Upload the new certificate to the Connected App, then Connect & Verify.';

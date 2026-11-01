@@ -6,7 +6,12 @@ import {
   connectionStatusBadge,
   dialogClickCounts,
   generateCertClick,
+  generateCertRequestBody,
+  privateKeyBadge,
+  replaceKeyDialog,
+  storedKeyExists,
   REPLACE_KEY_WARNING,
+  UNDECRYPTABLE_KEY_WARNING,
   KEY_REPLACED_NOTICE,
   mcpTokenHostWarning,
 } from '../src/components/views/orgConnectionState.js';
@@ -24,12 +29,52 @@ describe('connectionStatusBadge', () => {
 });
 
 describe('generating a certificate and key', () => {
+  const noKey = { hasPrivateKey: false, privateKeyUndecryptable: false };
+  const usableKey = { hasPrivateKey: true, privateKeyUndecryptable: false };
+  const undecryptableKey = { hasPrivateKey: false, privateKeyUndecryptable: true };
+
   test('with no key stored, a click generates', () => {
-    assert.equal(generateCertClick(false), 'generate');
+    assert.equal(generateCertClick(noKey), 'generate');
   });
 
   test('with a key stored, a click only opens the confirmation', () => {
-    assert.equal(generateCertClick(true), 'confirm');
+    assert.equal(generateCertClick(usableKey), 'replace');
+  });
+
+  test('an undecryptable key counts as a key that exists, with its own confirmation', () => {
+    assert.equal(storedKeyExists(undecryptableKey), true);
+    assert.equal(storedKeyExists(noKey), false);
+    assert.equal(generateCertClick(undecryptableKey), 'destroy-undecryptable');
+  });
+
+  test('an undecryptable key does not read as no key', () => {
+    assert.equal(privateKeyBadge(noKey).label, 'No Key Configured');
+    assert.equal(privateKeyBadge(usableKey).variant, 'emerald');
+    assert.notEqual(privateKeyBadge(undecryptableKey).label, 'No Key Configured');
+    assert.equal(privateKeyBadge(undecryptableKey).variant, 'rose');
+  });
+
+  test('the undecryptable warning says restoring could recover the key and generating destroys it', () => {
+    assert.match(UNDECRYPTABLE_KEY_WARNING, /Restoring the previous APP_SECRET_KEY could recover the key/);
+    assert.match(UNDECRYPTABLE_KEY_WARNING, /Generating a new key destroys it/);
+  });
+
+  test('each confirmation says what it destroys and that the certificate must be uploaded', () => {
+    const replace = replaceKeyDialog('replace');
+    assert.deepEqual(replace.warnings, [REPLACE_KEY_WARNING]);
+
+    const destroy = replaceKeyDialog('destroy-undecryptable');
+    assert.deepEqual(destroy.warnings, [UNDECRYPTABLE_KEY_WARNING, REPLACE_KEY_WARNING]);
+    assert.notEqual(destroy.confirmLabel, replace.confirmLabel);
+  });
+
+  test('the request confirms destroying a key only after that warning was shown', () => {
+    assert.deepEqual(generateCertRequestBody('CN', null), { commonName: 'CN' });
+    assert.deepEqual(generateCertRequestBody('CN', 'replace'), { commonName: 'CN' });
+    assert.deepEqual(generateCertRequestBody('CN', 'destroy-undecryptable'), {
+      commonName: 'CN',
+      confirmReplaceUndecryptableKey: true,
+    });
   });
 
   test('the second click of a double-click cannot answer the confirmation', () => {

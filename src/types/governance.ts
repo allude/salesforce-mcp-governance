@@ -182,7 +182,10 @@ export interface SalesforceConnectionSettings {
   loginUrl: string;
   clientId: string;
   username: string;
+  /** A key connect can sign with. False for one that cannot be decrypted: see privateKeyUndecryptable. */
   hasPrivateKey: boolean;
+  /** A key is stored but the current APP_SECRET_KEY cannot decrypt it. Restoring that secret could recover it. */
+  privateKeyUndecryptable: boolean;
   certificatePem: string;
   certFingerprint: string;
   /** `not_verified`: the settings changed after the last connect or failed attempt, so neither result holds. */

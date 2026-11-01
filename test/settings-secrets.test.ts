@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { store } from '../src/db/store.js';
+import { generateCertRequestBody } from '../src/components/views/orgConnectionState.js';
 import { installSalesforceMock, type SalesforceMock } from './helpers/salesforceMock.js';
 import { adminFetch, loginAsAdmin, startTestServer, type AdminSession, type TestServer } from './helpers/server.js';
 
@@ -172,6 +173,60 @@ describe('a stored private key that cannot be decrypted', () => {
     assert.equal((await settingsRoute('/connect', 'POST', {})).status, 400);
     assert.equal((await settingsRoute('/disconnect', 'POST', {})).status, 200);
     assert.equal(rawPrivateKeyEnc(), corrupted);
+  });
+
+  test('the settings response flags it as a boolean and carries no key material', async () => {
+    const res = await adminFetch(server.baseUrl, session, '/api/admin/overview');
+    assert.equal(res.status, 200);
+    assert.equal(res.body.sfSettings.privateKeyUndecryptable, true);
+    assert.equal(res.body.sfSettings.hasPrivateKey, false);
+    const text = JSON.stringify(res.body);
+    assert.ok(!text.includes(planted));
+    assert.ok(!('privateKeyPem' in res.body.sfSettings));
+  });
+
+  for (const [why, body] of [
+    ['no confirmation', {}],
+    ['a confirmation that is not exactly true', { confirmReplaceUndecryptableKey: 'true' }],
+  ] as const) {
+    test(`generate-cert refuses to overwrite it with ${why}, and logs the refusal`, async () => {
+      const res = await settingsRoute('/generate-cert', 'POST', body);
+
+      assert.equal(res.status, 409);
+      assert.match(res.body.error, /APP_SECRET_KEY/);
+      assert.equal(res.body.sfSettings.privateKeyUndecryptable, true);
+      assert.ok(!('certificatePem' in res.body), 'a refusal generates nothing');
+      assert.equal(rawPrivateKeyEnc(), planted, 'the ciphertext must survive');
+
+      const refused = store.getPortalAdminLogs(200).find((row) => row.action === 'GENERATE_SF_JWT_CERT_DENIED');
+      assert.ok(refused);
+      assert.ok(!refused.details.includes(planted));
+    });
+  }
+
+  test('generate-cert overwrites it once confirmed, and the audit log says the key was destroyed', async () => {
+    const res = await settingsRoute('/generate-cert', 'POST', generateCertRequestBody('CN', 'destroy-undecryptable'));
+
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(res.body.sfSettings.hasPrivateKey, true);
+    assert.equal(res.body.sfSettings.privateKeyUndecryptable, false);
+    assert.notEqual(rawPrivateKeyEnc(), planted);
+
+    const entry = store.getPortalAdminLogs(200).find((row) => row.action === 'GENERATE_SF_JWT_CERT');
+    assert.ok(entry);
+    assert.match(entry.details, /privateKeyReplaced: true\./);
+    assert.match(entry.details, /undecryptableKeyDestroyed: true\./);
+    assert.ok(!entry.details.includes(planted));
+  });
+
+  test('a key that decrypts needs no confirmation and logs no destruction', async () => {
+    store.updateSalesforceSettings({ privateKeyPem: newPrivateKeyPem() });
+    const res = await settingsRoute('/generate-cert', 'POST', {});
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+
+    const entry = store.getPortalAdminLogs(200).find((row) => row.action === 'GENERATE_SF_JWT_CERT');
+    assert.ok(entry);
+    assert.match(entry.details, /undecryptableKeyDestroyed: false\./);
   });
 
   test('entering a new key replaces it and makes it usable again', async () => {

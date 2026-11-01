@@ -1300,7 +1300,28 @@ adminRouter.put('/sf-settings', (req: Request, res: Response) => {
  */
 adminRouter.post('/sf-settings/generate-cert', (req: Request, res: Response) => {
   try {
-    const { commonName } = req.body || {};
+    const { commonName, confirmReplaceUndecryptableKey } = req.body || {};
+    const actor = getAdminInfo(req);
+    const current = store.getSalesforceSettings();
+    // Restoring APP_SECRET_KEY can still recover this key until it is overwritten, so the portal's
+    // warning is not enough: only a caller that says it knows may destroy it.
+    const replacesUndecryptableKey = current.privateKeyUndecryptable;
+    if (replacesUndecryptableKey && confirmReplaceUndecryptableKey !== true) {
+      store.recordPortalAdminLog({
+        adminUsername: actor.username,
+        authMethod: actor.authMethod,
+        action: 'GENERATE_SF_JWT_CERT_DENIED',
+        target: 'Salesforce JWT Certificate',
+        details: 'Refused to overwrite a stored private key that cannot be decrypted: the request did not confirm it.',
+        ipAddress: actor.ip,
+      });
+      res.status(409).json({
+        error:
+          'The stored private key cannot be decrypted with the current APP_SECRET_KEY. Restoring that key could recover it, and generating a new one destroys it. Set confirmReplaceUndecryptableKey to replace it anyway.',
+        sfSettings: current,
+      });
+      return;
+    }
     const bundle = generateSelfSignedCertificateBundle(
       commonName ? String(commonName) : 'Salesforce MCP Metadata Sync'
     );
@@ -1310,13 +1331,12 @@ adminRouter.post('/sf-settings/generate-cert', (req: Request, res: Response) => 
       certFingerprint: bundle.fingerprintSha256,
     });
 
-    const actor = getAdminInfo(req);
     store.recordPortalAdminLog({
       adminUsername: actor.username,
       authMethod: actor.authMethod,
       action: 'GENERATE_SF_JWT_CERT',
       target: 'Salesforce JWT Certificate',
-      details: `Generated new 2048-bit RSA Private Key & X.509 Certificate (SHA-256: ${bundle.fingerprintSha256.slice(0, 23)}...) for Salesforce Connected App. ${auditChanges(before, updated, privateKeyReplaced)}`,
+      details: `Generated new 2048-bit RSA Private Key & X.509 Certificate (SHA-256: ${bundle.fingerprintSha256.slice(0, 23)}...) for Salesforce Connected App. ${auditChanges(before, updated, privateKeyReplaced)} undecryptableKeyDestroyed: ${replacesUndecryptableKey}.`,
       ipAddress: actor.ip,
     });
 
