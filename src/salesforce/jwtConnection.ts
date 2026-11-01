@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { config } from '../config.js';
 import { validateSalesforceInstanceUrl, escapeSoqlString } from './client.js';
-import { SIMULATED_ORG_INSTANCE_URL } from './simulatedOrg.js';
+import { SIMULATED_ORG_ID, SIMULATED_ORG_INSTANCE_URL } from './simulatedOrg.js';
 
 export interface GeneratedCertBundle {
   privateKeyPem: string;
@@ -397,7 +397,7 @@ export async function connectToSalesforceOrgViaJwt(settings: {
       privateKeyPem: settings.privateKeyPem,
     });
 
-    const simOrgId = settings.expectedOrgId?.trim() || '00D8b000002MCPORG';
+    const simOrgId = settings.expectedOrgId?.trim() || SIMULATED_ORG_ID;
     return {
       accessToken: 'sf_jwt_sim_token',
       instanceUrl:

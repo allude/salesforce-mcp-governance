@@ -26,7 +26,7 @@ import {
   validatePrivateKeyPem,
 } from '../salesforce/jwtConnection.js';
 import { salesforceIdKey } from '../salesforce/ids.js';
-import { isUninitialisedMcpTokenHost, SIMULATED_ORG_INSTANCE_URL } from '../salesforce/simulatedOrg.js';
+import { isUninitialisedMcpTokenHost, SIMULATED_ORG_ID, SIMULATED_ORG_INSTANCE_URL } from '../salesforce/simulatedOrg.js';
 
 const dbDir = path.dirname(config.dbPath);
 if (!fs.existsSync(dbDir)) {
@@ -336,8 +336,9 @@ function runSchemaMigrations() {
 
 /**
  * Connect used to write its host into instance_url, which MCP sends bearer tokens to. A connected row
- * keeps showing that host as its sync instance. The simulated host is removed from instance_url
- * because it is not a real Salesforce org. Any other value may have been the admin's, so it stays.
+ * keeps showing that host as its sync instance. The simulated host is removed from instance_url unless
+ * a real org connected on it, because auth_mode alone does not show that: saving the mode or a failed
+ * live connect could leave jwt_bearer on a simulated host. Any other value may be the admin's, so it stays.
  */
 export function repairConnectInstanceUrls() {
   db.prepare(`
@@ -345,9 +346,11 @@ export function repairConnectInstanceUrls() {
     WHERE connection_status = 'connected' AND sync_instance_url = ''
   `).run();
   db.prepare(`
-    UPDATE sf_connection_settings SET instance_url = login_url
-    WHERE auth_mode = 'simulated' AND instance_url = ?
-  `).run(SIMULATED_ORG_INSTANCE_URL);
+    UPDATE sf_connection_settings
+    SET instance_url = CASE WHEN login_url = :host THEN 'https://login.salesforce.com' ELSE login_url END
+    WHERE instance_url = :host
+      AND (auth_mode = 'simulated' OR TRIM(connected_org_id) = '' OR connected_org_id = :orgId)
+  `).run({ host: SIMULATED_ORG_INSTANCE_URL, orgId: SIMULATED_ORG_ID });
 }
 
 runSchemaMigrations();

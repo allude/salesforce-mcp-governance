@@ -8,7 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { config } from '../src/config.js';
 import { repairConnectInstanceUrls, store } from '../src/db/store.js';
 import { generateSelfSignedCertificateBundle } from '../src/salesforce/jwtConnection.js';
-import { isUninitialisedMcpTokenHost, SIMULATED_ORG_INSTANCE_URL } from '../src/salesforce/simulatedOrg.js';
+import { isUninitialisedMcpTokenHost, SIMULATED_ORG_ID, SIMULATED_ORG_INSTANCE_URL } from '../src/salesforce/simulatedOrg.js';
 import { installSalesforceMock, type SalesforceMock } from './helpers/salesforceMock.js';
 import {
   adminFetch,
@@ -242,12 +242,60 @@ describe('the instance URL MCP uses to verify tokens', () => {
   });
 
   test('upgrading leaves a real org on the same host alone', () => {
-    store.updateSalesforceSettings({ authMode: 'jwt_bearer' });
+    store.updateSalesforceSettings({ authMode: 'jwt_bearer', connectionStatus: 'connected', connectedOrgId: ORG_ID });
     setRawInstanceUrl(SIMULATED_ORG_INSTANCE_URL);
 
     repairConnectInstanceUrls();
 
     assert.equal(rawInstanceUrl(), SIMULATED_ORG_INSTANCE_URL);
+  });
+
+  test('upgrading removes the simulated host from a jwt_bearer row whose live connect failed', () => {
+    store.updateSalesforceSettings({
+      authMode: 'jwt_bearer',
+      connectionStatus: 'error',
+      lastError: 'invalid_grant',
+      connectedOrgId: '',
+      loginUrl: 'https://test.salesforce.com',
+    });
+    setRawInstanceUrl(SIMULATED_ORG_INSTANCE_URL);
+
+    repairConnectInstanceUrls();
+
+    assert.equal(rawInstanceUrl(), 'https://test.salesforce.com');
+    assert.equal(store.getSalesforceSettings().connectionStatus, 'error');
+  });
+
+  test('upgrading treats the simulated Org ID as no evidence of a real org, whatever the mode', () => {
+    store.updateSalesforceSettings({ authMode: 'jwt_bearer', connectionStatus: 'connected', connectedOrgId: SIMULATED_ORG_ID });
+    setRawInstanceUrl(SIMULATED_ORG_INSTANCE_URL);
+
+    repairConnectInstanceUrls();
+
+    assert.equal(rawInstanceUrl(), 'https://login.salesforce.com');
+  });
+
+  test('upgrading still repairs a simulated row that reported an expected Org ID as its own', () => {
+    store.updateSalesforceSettings({ authMode: 'simulated', connectionStatus: 'connected', connectedOrgId: ORG_ID });
+    setRawInstanceUrl(SIMULATED_ORG_INSTANCE_URL);
+
+    repairConnectInstanceUrls();
+
+    assert.equal(rawInstanceUrl(), 'https://login.salesforce.com');
+  });
+
+  test('upgrading does not put the simulated host back when the login URL is that host too', () => {
+    store.updateSalesforceSettings({ authMode: 'jwt_bearer', loginUrl: SIMULATED_ORG_INSTANCE_URL });
+    setRawInstanceUrl(SIMULATED_ORG_INSTANCE_URL);
+
+    repairConnectInstanceUrls();
+
+    assert.equal(rawInstanceUrl(), 'https://login.salesforce.com');
+  });
+
+  test('upgrading leaves any other MCP host alone on a row with no connection evidence', () => {
+    repairConnectInstanceUrls();
+    assert.equal(rawInstanceUrl(), MCP_HOST);
   });
 });
 
