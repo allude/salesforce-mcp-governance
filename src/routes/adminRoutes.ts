@@ -24,7 +24,7 @@ import {
 } from '../salesforce/jwtConnection.js';
 import { config } from '../config.js';
 import { parseObjectSyncPayload, parseProfileSyncPayload } from './orgSyncPayload.js';
-import { isSalesforceId } from '../salesforce/ids.js';
+import { isSalesforceId, salesforceIdsMatch } from '../salesforce/ids.js';
 import { SIMULATED_ORG_INSTANCE_URL } from '../salesforce/simulatedOrg.js';
 import { AVAILABLE_MCP_ACTIONS, unknownMcpActionIds } from '../types/governance.js';
 import type { SalesforceConnectionSettings } from '../types/governance.js';
@@ -434,6 +434,16 @@ adminRouter.post('/profiles', (req: Request, res: Response) => {
   }
 
   const result = store.upsertProfile(String(id), String(name));
+  if (result.nameKept) {
+    const forms = store
+      .getProfiles()
+      .filter((p) => salesforceIdsMatch(p.id, result.profile.id))
+      .map((p) => p.id);
+    res.status(409).json({
+      error: `This Profile is stored under ${forms.join(' and ')}, and that name would change which row is in force. Delete one or pull Profiles from the org, then rename it.`,
+    });
+    return;
+  }
   const actor = getAdminInfo(req);
   store.recordPortalAdminLog({
     adminUsername: actor.username,
@@ -442,7 +452,9 @@ adminRouter.post('/profiles', (req: Request, res: Response) => {
     target: `Profile: ${result.profile.name} (${result.profile.id})`,
     details: `${
       result.action === 'inserted' ? 'Added new' : 'Updated existing'
-    } Salesforce Profile "${result.profile.name}" with ID "${result.profile.id}".`,
+    } Salesforce Profile "${result.profile.name}" with ID "${result.profile.id}".${
+      result.previousId ? ` Its ID was upgraded from "${result.previousId}", keeping its Access Groups.` : ''
+    }`,
     ipAddress: actor.ip,
   });
 
@@ -485,7 +497,11 @@ adminRouter.post('/profiles/import-csv', (req: Request, res: Response) => {
     authMethod: actor.authMethod,
     action: 'IMPORT_PROFILES_CSV',
     target: 'Salesforce > Profiles',
-    details: `Imported ${parsedRows.length} profile rows from CSV (${summary.inserted} added, ${summary.updated} updated; ${summary.total} total profiles).`,
+    details: `Imported ${parsedRows.length} profile rows from CSV (${summary.inserted} added, ${summary.updated} updated; ${summary.total} total profiles).${
+      summary.idsUpgraded ? ` ${summary.idsUpgraded} upgraded to their 18-character ID, keeping Access Groups.` : ''
+    }${
+      summary.namesKept ? ` ${summary.namesKept} kept their name because they are stored under two ID forms.` : ''
+    }`,
     ipAddress: actor.ip,
   });
 

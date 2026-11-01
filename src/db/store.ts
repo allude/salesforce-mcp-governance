@@ -25,7 +25,7 @@ import {
   inspectCertificatePem,
   validatePrivateKeyPem,
 } from '../salesforce/jwtConnection.js';
-import { salesforceIdKey } from '../salesforce/ids.js';
+import { salesforceIdKey, salesforceIdsMatch } from '../salesforce/ids.js';
 import { isUninitialisedMcpTokenHost, SIMULATED_ORG_ID, SIMULATED_ORG_INSTANCE_URL } from '../salesforce/simulatedOrg.js';
 
 const dbDir = path.dirname(config.dbPath);
@@ -531,6 +531,37 @@ function profileSyncTargetId(orgId: string, forms: SalesforceProfile[]): string 
 }
 
 /**
+ * Moves Profile rows onto `targetId` inside the caller's transaction, creating that row from the
+ * first replaced one if needed. The foreign key has no ON UPDATE CASCADE, so memberships move
+ * before the old rows go.
+ */
+function replaceProfileRows(targetId: string, replaced: SalesforceProfile[]): void {
+  const first = replaced[0];
+  db.prepare(`
+    INSERT OR IGNORE INTO sf_profiles (id, name, missing_in_org, updated_at) VALUES (?, ?, ?, ?)
+  `).run(targetId, first.name, first.missingInOrg ? 1 : 0, new Date().toISOString());
+  for (const row of replaced) {
+    db.prepare(`
+      INSERT OR IGNORE INTO profile_group_memberships (profile_id, group_id)
+      SELECT ?, group_id FROM profile_group_memberships WHERE profile_id = ?
+    `).run(targetId, row.id);
+    db.prepare('DELETE FROM sf_profiles WHERE id = ?').run(row.id);
+  }
+}
+
+/**
+ * The rows to rename so a Profile stored under several forms keeps the row in force, or null if no
+ * rename can. `forms` must be in `getProfiles` order, which sorts by name then ID: a form that would
+ * overtake the first row is renamed with it if its higher ID then loses the tie.
+ */
+function profileFormsToRename(forms: SalesforceProfile[], name: string): SalesforceProfile[] | null {
+  const [inForce, ...others] = forms;
+  const overtaking = others.filter((f) => f.name < name || (f.name === name && f.id < inForce.id));
+  if (overtaking.some((f) => f.id < inForce.id)) return null;
+  return [inForce, ...overtaking];
+}
+
+/**
  * Decides what a sync may do with several local rows that are forms of one org Profile. `forms` must
  * be in `getProfiles` order, so the first row is the one the policy engine resolves and its groups
  * are the access in force. Rows with different groups merge only if the union adds nothing to that;
@@ -667,43 +698,85 @@ export const store = {
     };
   },
 
+  /**
+   * Saves a Profile under whichever form of its ID is already stored, so no entry point adds a second
+   * row. An 18-character form upgrades a stored 15-character row and keeps its memberships. If several
+   * forms are stored already, the row the policy engine resolves is updated and the rest are left for
+   * org sync to reconcile; `nameKept` reports a rename refused because it would change that row.
+   */
   upsertProfile(
     id: string,
     name: string,
     // Only org sync passes this; a re-import or manual save must not clear what sync flagged.
     missingInOrg?: boolean
-  ): { profile: SalesforceProfile; action: 'inserted' | 'updated' } {
+  ): {
+    profile: SalesforceProfile;
+    action: 'inserted' | 'updated';
+    previousId?: string;
+    nameKept?: boolean;
+  } {
     const cleanId = id.trim();
     const cleanName = name.trim();
-    const existing = this.getProfileById(cleanId);
-    const nextMissing = missingInOrg ?? existing?.missingInOrg ?? false;
-    const now = new Date().toISOString();
-    db.prepare(`
-      INSERT INTO sf_profiles (id, name, missing_in_org, updated_at)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        name = excluded.name,
-        missing_in_org = excluded.missing_in_org,
-        updated_at = excluded.updated_at
-    `).run(cleanId, cleanName, nextMissing ? 1 : 0, now);
-    return {
-      profile: { id: cleanId, name: cleanName, missingInOrg: nextMissing, updatedAt: now },
-      action: existing ? 'updated' : 'inserted',
-    };
+    return runInTransaction(() => {
+      const forms = this.getProfiles().filter((p) => salesforceIdsMatch(p.id, cleanId));
+      const now = new Date().toISOString();
+
+      if (forms.length === 0) {
+        const nextMissing = missingInOrg ?? false;
+        db.prepare(`
+          INSERT INTO sf_profiles (id, name, missing_in_org, updated_at) VALUES (?, ?, ?, ?)
+        `).run(cleanId, cleanName, nextMissing ? 1 : 0, now);
+        return {
+          profile: { id: cleanId, name: cleanName, missingInOrg: nextMissing, updatedAt: now },
+          action: 'inserted' as const,
+        };
+      }
+
+      const stored = forms[0];
+      const nextMissing = missingInOrg ?? stored.missingInOrg;
+      const rename = db.prepare('UPDATE sf_profiles SET name = ?, updated_at = ? WHERE id = ?');
+      const setMissing = db.prepare('UPDATE sf_profiles SET missing_in_org = ? WHERE id = ?');
+
+      if (forms.length > 1) {
+        setMissing.run(nextMissing ? 1 : 0, stored.id);
+        const toRename = profileFormsToRename(forms, cleanName);
+        for (const form of toRename || []) rename.run(cleanName, now, form.id);
+        return {
+          profile: { ...stored, name: toRename ? cleanName : stored.name, missingInOrg: nextMissing },
+          action: 'updated' as const,
+          ...(toRename ? {} : { nameKept: true }),
+        };
+      }
+
+      const upgrades = cleanId.length > stored.id.length;
+      const targetId = upgrades ? cleanId : stored.id;
+      if (upgrades) replaceProfileRows(targetId, [stored]);
+      rename.run(cleanName, now, targetId);
+      setMissing.run(nextMissing ? 1 : 0, targetId);
+      return {
+        profile: { id: targetId, name: cleanName, missingInOrg: nextMissing, updatedAt: now },
+        action: 'updated' as const,
+        ...(upgrades ? { previousId: stored.id } : {}),
+      };
+    });
   },
 
   importProfilesFromCsvRows(
     rows: Array<{ id: string; name: string }>
-  ): { inserted: number; updated: number; total: number } {
+  ): { inserted: number; updated: number; idsUpgraded: number; namesKept: number; total: number } {
     let inserted = 0;
     let updated = 0;
+    let idsUpgraded = 0;
+    let namesKept = 0;
     for (const r of rows) {
       if (!r.id || !r.name) continue;
       const res = this.upsertProfile(r.id, r.name);
       if (res.action === 'inserted') inserted++;
       else updated++;
+      if (res.previousId) idsUpgraded++;
+      if (res.nameKept) namesKept++;
     }
-    return { inserted, updated, total: this.getProfiles().length };
+    return { inserted, updated, idsUpgraded, namesKept, total: this.getProfiles().length };
   },
 
   deleteProfile(id: string): boolean {
@@ -834,10 +907,6 @@ export const store = {
           .prepare('SELECT group_id FROM profile_group_memberships WHERE profile_id = ?')
           .all(profileId) as Array<{ group_id: string }>).map((row) => row.group_id);
       const groupName = db.prepare('SELECT name FROM access_groups WHERE id = ?');
-      const moveMemberships = db.prepare(`
-        INSERT OR IGNORE INTO profile_group_memberships (profile_id, group_id)
-        SELECT ?, group_id FROM profile_group_memberships WHERE profile_id = ?
-      `);
 
       for (const p of input.upserts) {
         if (!p.id || !p.name) continue;
@@ -859,17 +928,13 @@ export const store = {
         }
 
         const targetId = profileSyncTargetId(p.id.trim(), forms);
+        const replaced = forms.filter((f) => f.id !== targetId);
+        // One row is left, so the upsert below writes exactly the row sync chose.
+        if (replaced.length > 0) replaceProfileRows(targetId, replaced);
         const res = this.upsertProfile(targetId, p.name, false);
         if (forms.length === 0) inserted++;
         else updated++;
         affected.upserted.push(res.profile.name);
-
-        const replaced = forms.filter((f) => f.id !== targetId);
-        for (const form of replaced) {
-          // The foreign key has no ON UPDATE CASCADE, so memberships move before the old row goes.
-          moveMemberships.run(targetId, form.id);
-          this.deleteProfile(form.id);
-        }
         if (forms.length === 1 && replaced.length === 1) affected.idsUpgraded.push(res.profile.name);
         formsByKey.set(key, [res.profile]);
       }

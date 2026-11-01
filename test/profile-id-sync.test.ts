@@ -41,7 +41,10 @@ function newGroup(t: TestContext) {
 }
 
 function localProfile(t: TestContext, id: string, name: string, groupIds: string[] = []) {
-  store.upsertProfile(id, name);
+  // Written directly: upsertProfile no longer creates a second form, which these tests start from.
+  const raw = new DatabaseSync(process.env.DB_PATH as string);
+  raw.prepare('INSERT INTO sf_profiles (id, name, updated_at) VALUES (?, ?, ?)').run(id, name, new Date().toISOString());
+  raw.close();
   store.setProfileGroups(id, groupIds);
   t.after(() => store.deleteProfile(id));
 }

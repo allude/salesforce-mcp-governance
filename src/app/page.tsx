@@ -458,7 +458,11 @@ export default function AdminPortalPage() {
     notify(
       `Imported profiles from CSV (${data.summary?.inserted || 0} added, ${
         data.summary?.updated || 0
-      } updated)`
+      } updated${
+        data.summary?.namesKept
+          ? `; ${data.summary.namesKept} stored under two ID forms kept their name`
+          : ''
+      })`
     );
   };
 
