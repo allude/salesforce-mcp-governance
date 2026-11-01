@@ -14,7 +14,7 @@ import {
   handleOktaCallback,
   requireAdminAuth,
 } from './security/adminAuth.js';
-import { adminRouter } from './routes/adminRoutes.js';
+import { adminRouter, recordObjectSyncFailure } from './routes/adminRoutes.js';
 import { hashToken } from './security/crypto.js';
 
 export const app = express();
@@ -59,6 +59,28 @@ app.use(
     requireAdminAuth(req, res, next).catch(next);
   },
   express.json({ limit: '25mb' })
+);
+// Applying an org sync posts back the metadata its preview returned, which also outgrows 1 MB on a
+// large org. Same protections; a body the parser refuses is still a failed apply, so it is audited.
+const OBJECT_SYNC_BODY_LIMIT = '25mb';
+app.use(
+  '/api/admin/objects/pull-apply',
+  (req: Request, res: Response, next: NextFunction) => {
+    requireAdminAuth(req, res, next).catch(next);
+  },
+  express.json({ limit: OBJECT_SYNC_BODY_LIMIT }),
+  (err: any, req: Request, _res: Response, next: NextFunction) => {
+    // No session here means the auth check itself threw, which is not a failed apply by anyone.
+    if ((req as any).adminSession) {
+      recordObjectSyncFailure(
+        req,
+        err?.type === 'entity.too.large'
+          ? `the request body is larger than the ${OBJECT_SYNC_BODY_LIMIT} limit.`
+          : 'the request body could not be read as JSON.'
+      );
+    }
+    next(err);
+  }
 );
 app.use(express.json({ limit: '1mb' }));
 

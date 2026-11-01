@@ -561,3 +561,86 @@ describe('POST /profiles/pull-apply', () => {
     assert.match(latestLog().details, /forced failure/);
   });
 });
+
+describe('the body limit on POST /objects/pull-apply', () => {
+  const url = () => `${server.baseUrl}/api/admin/objects/pull-apply`;
+
+  /** Well over the general 1 MB limit, spread over many valid fields as a large org would be. */
+  function largePayload(objectName: string) {
+    const fields = Array.from({ length: 12000 }, (_, i) => ({
+      ...pulledField(`Field_${i}__c`),
+      label: `Label of a custom field number ${i} with a long name`,
+    }));
+    return JSON.stringify({ pulledMetadata: [{ ...presentObject(objectName, []), fields }] });
+  }
+
+  test('accepts a payload over 1 MB from an authenticated admin', async () => {
+    const objectName = newObjectName();
+    const body = largePayload(objectName);
+    assert.ok(Buffer.byteLength(body) > 1024 * 1024);
+
+    const res = await fetch(url(), {
+      method: 'POST',
+      headers: { Cookie: session.cookie, 'X-CSRF-Token': session.csrfToken, 'Content-Type': 'application/json' },
+      body,
+    });
+
+    assert.equal(res.status, 200);
+    assert.equal(store.getObjects().find((o) => o.objectName === objectName)?.fieldCount, 12000);
+  });
+
+  test('rejects a large payload without a session', async () => {
+    const objectName = newObjectName();
+    const res = await fetch(url(), {
+      method: 'POST',
+      headers: { 'X-CSRF-Token': session.csrfToken, 'Content-Type': 'application/json' },
+      body: largePayload(objectName),
+    });
+    assert.equal(res.status, 401);
+    assert.ok(!store.getObjects().some((o) => o.objectName === objectName));
+  });
+
+  test('rejects a large payload without the CSRF header', async () => {
+    const objectName = newObjectName();
+    const res = await fetch(url(), {
+      method: 'POST',
+      headers: { Cookie: session.cookie, 'Content-Type': 'application/json' },
+      body: largePayload(objectName),
+    });
+    assert.equal(res.status, 403);
+    assert.ok(!store.getObjects().some((o) => o.objectName === objectName));
+  });
+
+  test('the larger limit is bounded, and a body over it is audited as a failed apply', async () => {
+    const before = snapshot();
+    const res = await fetch(url(), {
+      method: 'POST',
+      headers: { Cookie: session.cookie, 'X-CSRF-Token': session.csrfToken, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pulledMetadata: [], padding: 'x'.repeat(26 * 1024 * 1024) }),
+    });
+    assert.equal(res.status, 413);
+    assert.equal(snapshot(), before);
+    assert.equal(latestLog().action, 'SYNC_OBJECTS_FROM_ORG_FAILED');
+    assert.match(latestLog().details, /larger than the 25mb limit/);
+  });
+
+  test('a body that is not JSON answers 400 and is audited as a failed apply', async () => {
+    const res = await fetch(url(), {
+      method: 'POST',
+      headers: { Cookie: session.cookie, 'X-CSRF-Token': session.csrfToken, 'Content-Type': 'application/json' },
+      body: '{not json',
+    });
+    assert.equal(res.status, 400);
+    assert.equal(latestLog().action, 'SYNC_OBJECTS_FROM_ORG_FAILED');
+    assert.match(latestLog().details, /could not be read as JSON/);
+  });
+
+  test('a large body elsewhere still meets the general limit', async () => {
+    const res = await fetch(`${server.baseUrl}/api/admin/profiles/pull-apply`, {
+      method: 'POST',
+      headers: { Cookie: session.cookie, 'X-CSRF-Token': session.csrfToken, 'Content-Type': 'application/json' },
+      body: largePayload(newObjectName()),
+    });
+    assert.equal(res.status, 413);
+  });
+});
