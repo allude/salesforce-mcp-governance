@@ -541,6 +541,19 @@ describe('a connection whose settings changed', () => {
     assert.equal(other.body.sfSettings.syncInstanceUrl, SYNC_HOST);
   });
 
+  test('saving only the MCP token host keeps the connection and logs the change', async () => {
+    await connected();
+    const host = 'https://chosen-host.my.salesforce.com';
+
+    const res = await route('', 'PUT', { instanceUrl: host });
+
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(res.body.sfSettings.instanceUrl, host);
+    assert.equal(res.body.sfSettings.connectionStatus, 'connected');
+    const entry = store.getPortalAdminLogs(50).find((row) => row.action === 'UPDATE_SF_SETTINGS');
+    assert.ok(entry?.details.includes(`"instanceUrl":{"before":"${MCP_HOST}","after":"${host}"}`), entry?.details);
+  });
+
   test('an org that was never connected stays disconnected', async () => {
     const res = await route('', 'PUT', { clientId: '3MVG9_OTHER' });
     assert.equal(res.body.sfSettings.connectionStatus, 'disconnected');

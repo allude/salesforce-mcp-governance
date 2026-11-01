@@ -30,6 +30,7 @@ import {
   generateCertLabel,
   KEY_GENERATED_NOTICE,
   KEY_REPLACED_NOTICE,
+  mcpTokenHostWarning,
   REPLACE_KEY_WARNING,
 } from './orgConnectionState';
 
@@ -67,6 +68,11 @@ export function SalesforceOrgConnectionView({
     Boolean(sfSettings.enforceOrgIdLock)
   );
 
+  // MCP token host, saved on its own: Connect ignores it, and the main form must not resend a stale value.
+  const [mcpTokenHost, setMcpTokenHost] = useState(sfSettings.instanceUrl || '');
+  const [mcpTokenHostError, setMcpTokenHostError] = useState('');
+  const [savingMcpTokenHost, setSavingMcpTokenHost] = useState(false);
+
   // Private key & certificate state
   const [showCustomKeyInput, setShowCustomKeyInput] = useState(false);
   const [privateKeyInput, setPrivateKeyInput] = useState('');
@@ -83,6 +89,7 @@ export function SalesforceOrgConnectionView({
   const certFileInputRef = useRef<HTMLInputElement | null>(null);
 
   const isConnected = sfSettings.connectionStatus === 'connected';
+  const tokenHostWarning = mcpTokenHostWarning(sfSettings);
   const statusBadge = connectionStatusBadge(
     sfSettings.connectionStatus,
     sfSettings.connectedOrgId
@@ -92,6 +99,12 @@ export function SalesforceOrgConnectionView({
   useEffect(() => {
     setConfirmReplaceKey(false);
   }, [activeTab]);
+
+  // A connect may initialise the host, so the input follows what the server holds.
+  useEffect(() => {
+    setMcpTokenHost(sfSettings.instanceUrl || '');
+    setMcpTokenHostError('');
+  }, [sfSettings.instanceUrl]);
 
   const handleGenerateCertBundle = async () => {
     if (generateCertClick(sfSettings.hasPrivateKey, confirmReplaceKey) === 'arm') {
@@ -211,6 +224,29 @@ export function SalesforceOrgConnectionView({
     }
   };
 
+  const handleSaveMcpTokenHost = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setMcpTokenHostError('');
+    setSavingMcpTokenHost(true);
+    try {
+      const res = await apiFetch<{ sfSettings: SalesforceConnectionSettings }>(
+        '/api/admin/sf-settings',
+        {
+          method: 'PUT',
+          body: JSON.stringify({ instanceUrl: mcpTokenHost.trim() }),
+        }
+      );
+      // The server keeps only the origin, which may not change the stored value.
+      setMcpTokenHost(res.sfSettings.instanceUrl);
+      await onRefresh();
+      onShowToast('Saved MCP token host');
+    } catch (err: any) {
+      setMcpTokenHostError(err.message);
+    } finally {
+      setSavingMcpTokenHost(false);
+    }
+  };
+
   const handleConnectAndVerify = async () => {
     setConnecting(true);
     try {
@@ -309,9 +345,7 @@ export function SalesforceOrgConnectionView({
                 <div className="mt-0.5 flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-[11px] text-emerald-800">
                   <span>Org ID: {sfSettings.connectedOrgId}</span>
                   <span>Instance: {sfSettings.syncInstanceUrl}</span>
-                  {sfSettings.instanceUrl !== sfSettings.syncInstanceUrl && (
-                    <span>MCP token host: {sfSettings.instanceUrl}</span>
-                  )}
+                  <span>MCP token host: {sfSettings.instanceUrl}</span>
                   <span>User: {sfSettings.connectedUser}</span>
                   {sfSettings.lastConnectedAt && (
                     <span>
@@ -349,6 +383,24 @@ export function SalesforceOrgConnectionView({
                 <Unplug className="h-3.5 w-3.5" />
                 <span>Disconnect</span>
               </button>
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {!isConnected && (
+        <p className="font-mono text-[11px] text-slate-600">
+          MCP token host: {sfSettings.instanceUrl}
+        </p>
+      )}
+
+      {tokenHostWarning && (
+        <Card className="border-amber-200 bg-amber-50/70 p-4">
+          <div className="flex items-start gap-2.5 text-xs text-amber-900">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+            <div>
+              <div className="font-bold">Check the MCP Token Host</div>
+              <div className="mt-0.5 text-[11px]">{tokenHostWarning}</div>
             </div>
           </div>
         </Card>
@@ -784,6 +836,53 @@ export function SalesforceOrgConnectionView({
                   </span>
                 </button>
               </div>
+            </form>
+
+            {/* MCP Token Host: a separate form, so Enter here cannot submit the connection settings */}
+            <form
+              onSubmit={handleSaveMcpTokenHost}
+              className="mt-4 border-t border-slate-100 pt-4"
+            >
+              <label
+                htmlFor="mcp-token-host"
+                className="block text-xs font-semibold text-slate-700"
+              >
+                MCP token host
+              </label>
+              <p className="text-[11px] text-slate-500">
+                Where MCP verifies users&apos; Salesforce tokens, and the authorization server it advertises to clients. A successful live connect replaces this only while it is `login.salesforce.com` or `test.salesforce.com`, so set your My Domain URL to keep it fixed.
+              </p>
+              <div className="mt-1 flex gap-2">
+                <input
+                  id="mcp-token-host"
+                  type="text"
+                  value={mcpTokenHost}
+                  onChange={(e) => {
+                    setMcpTokenHost(e.target.value);
+                    setMcpTokenHostError('');
+                  }}
+                  placeholder="https://yourcompany.my.salesforce.com"
+                  aria-invalid={Boolean(mcpTokenHostError)}
+                  aria-describedby={mcpTokenHostError ? 'mcp-token-host-error' : undefined}
+                  className="w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
+                />
+                <button
+                  type="submit"
+                  disabled={savingMcpTokenHost}
+                  className="shrink-0 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                >
+                  {savingMcpTokenHost ? 'Saving...' : 'Save Host'}
+                </button>
+              </div>
+              {mcpTokenHostError && (
+                <p
+                  id="mcp-token-host-error"
+                  role="alert"
+                  className="mt-1 text-[11px] font-semibold text-rose-700"
+                >
+                  {mcpTokenHostError}
+                </p>
+              )}
             </form>
           </Card>
         </div>

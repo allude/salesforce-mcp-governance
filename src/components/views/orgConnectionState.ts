@@ -37,3 +37,29 @@ export const KEY_REPLACED_NOTICE =
   'Generated a new private key & certificate. Upload the new certificate to the Connected App, then Connect & Verify.';
 
 export const KEY_GENERATED_NOTICE = 'Generated 2048-bit RSA Private Key & X.509 Certificate (.crt)';
+
+function hostnameOf(url: string): string {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+function isSandboxLoginHost(host: string): boolean {
+  return (
+    host === 'test.salesforce.com' ||
+    host.endsWith('.sandbox.my.salesforce.com') ||
+    host.endsWith('.sandbox.lightning.force.com')
+  );
+}
+
+/** A connection that logs in through a sandbox while MCP verifies user tokens at production login. */
+export function mcpTokenHostWarning(
+  settings: Pick<SalesforceConnectionSettings, 'connectionStatus' | 'loginUrl' | 'instanceUrl'>
+): string | null {
+  if (settings.connectionStatus !== 'connected') return null;
+  if (!isSandboxLoginHost(hostnameOf(settings.loginUrl))) return null;
+  if (hostnameOf(settings.instanceUrl) !== 'login.salesforce.com') return null;
+  return 'This connection logs in through a sandbox, but MCP verifies user tokens at login.salesforce.com, so sandbox users may be refused. Set the MCP token host to the sandbox My Domain URL, or Connect & Verify again to use the connected host.';
+}
