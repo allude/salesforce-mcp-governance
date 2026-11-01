@@ -26,8 +26,8 @@ import {
 import { Card, Badge, Switch } from '@/components/ui/primitives';
 import {
   connectionStatusBadge,
+  dialogClickCounts,
   generateCertClick,
-  generateCertLabel,
   KEY_GENERATED_NOTICE,
   KEY_REPLACED_NOTICE,
   mcpTokenHostWarning,
@@ -80,7 +80,8 @@ export function SalesforceOrgConnectionView({
     sfSettings.certificatePem || ''
   );
   const [generatingCert, setGeneratingCert] = useState(false);
-  const [confirmReplaceKey, setConfirmReplaceKey] = useState(false);
+  const [replaceKeyConfirmOpen, setReplaceKeyConfirmOpen] = useState(false);
+  const replaceKeyConfirmOpenedAt = useRef(0);
   const [connecting, setConnecting] = useState(false);
   const [saving, setSaving] = useState(false);
   const [copiedCert, setCopiedCert] = useState(false);
@@ -95,24 +96,23 @@ export function SalesforceOrgConnectionView({
     sfSettings.connectedOrgId
   );
 
-  // A click armed on one tab must not count for the other tab's button.
-  useEffect(() => {
-    setConfirmReplaceKey(false);
-  }, [activeTab]);
-
   // A connect may initialise the host, so the input follows what the server holds.
   useEffect(() => {
     setMcpTokenHost(sfSettings.instanceUrl || '');
     setMcpTokenHostError('');
   }, [sfSettings.instanceUrl]);
 
-  const handleGenerateCertBundle = async () => {
-    if (generateCertClick(sfSettings.hasPrivateKey, confirmReplaceKey) === 'arm') {
-      setConfirmReplaceKey(true);
+  const handleGenerateCertClick = () => {
+    if (generateCertClick(sfSettings.hasPrivateKey) === 'confirm') {
+      replaceKeyConfirmOpenedAt.current = Date.now();
+      setReplaceKeyConfirmOpen(true);
       return;
     }
+    void generateCertBundle();
+  };
+
+  const generateCertBundle = async () => {
     const replacingKey = sfSettings.hasPrivateKey;
-    setConfirmReplaceKey(false);
     setGeneratingCert(true);
     try {
       const res = await apiFetch<{
@@ -476,8 +476,7 @@ export function SalesforceOrgConnectionView({
                 <button
                   type="button"
                   disabled={generatingCert}
-                  onClick={handleGenerateCertBundle}
-                  onBlur={() => setConfirmReplaceKey(false)}
+                  onClick={handleGenerateCertClick}
                   className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white shadow-2xs transition hover:bg-indigo-700 disabled:opacity-50"
                 >
                   <RefreshCw
@@ -486,13 +485,9 @@ export function SalesforceOrgConnectionView({
                     }`}
                   />
                   <span>
-                    {generateCertLabel(
-                      sfSettings.hasPrivateKey,
-                      confirmReplaceKey,
-                      sfSettings.hasPrivateKey
-                        ? 'Regenerate Certificate & Key'
-                        : 'Generate X.509 Certificate & Key'
-                    )}
+                    {sfSettings.hasPrivateKey
+                      ? 'Regenerate Certificate & Key'
+                      : 'Generate X.509 Certificate & Key'}
                   </span>
                 </button>
 
@@ -523,11 +518,6 @@ export function SalesforceOrgConnectionView({
                 )}
               </div>
 
-              {confirmReplaceKey && (
-                <p role="alert" className="mt-2 text-[11px] font-semibold text-amber-800">
-                  {REPLACE_KEY_WARNING}
-                </p>
-              )}
 
               {sfSettings.certFingerprint && (
                 <div className="mt-3 rounded-lg bg-white/90 px-3 py-2 font-mono text-[10px] text-slate-600 ring-1 ring-indigo-100">
@@ -929,19 +919,14 @@ export function SalesforceOrgConnectionView({
                   <button
                     type="button"
                     disabled={generatingCert}
-                    onClick={handleGenerateCertBundle}
-                    onBlur={() => setConfirmReplaceKey(false)}
+                    onClick={handleGenerateCertClick}
                     className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-indigo-700 disabled:opacity-50"
                   >
                     <FileKey className="h-3.5 w-3.5" />
                     <span>
-                      {generateCertLabel(
-                        sfSettings.hasPrivateKey,
-                        confirmReplaceKey,
-                        sfSettings.hasPrivateKey
-                          ? 'Regenerate Cert & Key'
-                          : '1-Click Generate Cert & Key'
-                      )}
+                      {sfSettings.hasPrivateKey
+                        ? 'Regenerate Cert & Key'
+                        : '1-Click Generate Cert & Key'}
                     </span>
                   </button>
                   {(certificatePem || sfSettings.certificatePem) && (
@@ -955,11 +940,6 @@ export function SalesforceOrgConnectionView({
                     </button>
                   )}
                 </div>
-                {confirmReplaceKey && (
-                  <p role="alert" className="mt-2 text-[11px] font-semibold text-amber-800">
-                    {REPLACE_KEY_WARNING}
-                  </p>
-                )}
                 <div className="mt-3 rounded-lg bg-slate-900 p-3 font-mono text-[11px] text-slate-200">
                   <div className="text-slate-400">
                     # Optional: If generating via OpenSSL CLI instead:
@@ -1134,6 +1114,70 @@ export function SalesforceOrgConnectionView({
                 </ol>
               </div>
             </Card>
+          </div>
+        </div>
+      )}
+
+      {/* KEY REPLACEMENT CONFIRMATION */}
+      {replaceKeyConfirmOpen && (
+        <div
+          className="cmdk-scrim"
+          onClick={() => {
+            if (dialogClickCounts(replaceKeyConfirmOpenedAt.current, Date.now())) {
+              setReplaceKeyConfirmOpen(false);
+            }
+          }}
+        >
+          <div
+            className="cmdk-box"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="replace-key-confirm-title"
+            aria-describedby="replace-key-confirm-body"
+            style={{ maxWidth: 480 }}
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') setReplaceKeyConfirmOpen(false);
+            }}
+          >
+            <div className="card-h">
+              <div className="card-t" id="replace-key-confirm-title">
+                Replace the stored private key?
+              </div>
+            </div>
+            <div className="card-b">
+              <p id="replace-key-confirm-body" style={{ fontSize: 12.5, color: 'var(--t2)' }}>
+                {REPLACE_KEY_WARNING}
+              </p>
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'flex-end',
+                  gap: 8,
+                  marginTop: 12,
+                }}
+              >
+                <button
+                  type="button"
+                  className="btn"
+                  autoFocus
+                  onClick={() => setReplaceKeyConfirmOpen(false)}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="btn dng"
+                  onClick={() => {
+                    if (!dialogClickCounts(replaceKeyConfirmOpenedAt.current, Date.now())) return;
+                    setReplaceKeyConfirmOpen(false);
+                    void generateCertBundle();
+                  }}
+                >
+                  Replace the key
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       )}

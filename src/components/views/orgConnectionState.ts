@@ -19,15 +19,18 @@ export function connectionStatusBadge(
 
 /**
  * Replacing a key breaks the org connection until the new certificate reaches Salesforce, so with a
- * key already stored the first click only arms the button. A first key has nothing to break.
+ * key already stored the click only opens a confirmation. A first key has nothing to break.
  */
-export function generateCertClick(hasPrivateKey: boolean, armed: boolean): 'arm' | 'generate' {
-  return hasPrivateKey && !armed ? 'arm' : 'generate';
+export function generateCertClick(hasPrivateKey: boolean): 'confirm' | 'generate' {
+  return hasPrivateKey ? 'confirm' : 'generate';
 }
 
-/** The generate button's label, for its own wording when no key is stored or nothing is armed. */
-export function generateCertLabel(hasPrivateKey: boolean, armed: boolean, idleLabel: string): string {
-  return hasPrivateKey && armed ? 'Click again to replace the key' : idleLabel;
+/** Past the window of a double-click, whose second click lands wherever the dialog has just appeared. */
+const DIALOG_ARMING_MS = 500;
+
+/** Whether a click on the open dialog can be deliberate, so the click that opened it cannot answer it. */
+export function dialogClickCounts(openedAt: number, now: number): boolean {
+  return now - openedAt >= DIALOG_ARMING_MS;
 }
 
 export const REPLACE_KEY_WARNING =

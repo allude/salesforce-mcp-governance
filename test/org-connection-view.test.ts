@@ -1,11 +1,11 @@
-// Covers the decisions behind the Org Connection view: its status badge, the two-click key replacement
+// Covers the decisions behind the Org Connection view: its status badge, the key replacement confirmation
 // and the MCP token host warning.
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   connectionStatusBadge,
+  dialogClickCounts,
   generateCertClick,
-  generateCertLabel,
   REPLACE_KEY_WARNING,
   KEY_REPLACED_NOTICE,
   mcpTokenHostWarning,
@@ -24,19 +24,20 @@ describe('connectionStatusBadge', () => {
 });
 
 describe('generating a certificate and key', () => {
-  test('with no key stored, the first click generates', () => {
-    assert.equal(generateCertClick(false, false), 'generate');
+  test('with no key stored, a click generates', () => {
+    assert.equal(generateCertClick(false), 'generate');
   });
 
-  test('with a key stored, the first click only arms and the second generates', () => {
-    assert.equal(generateCertClick(true, false), 'arm');
-    assert.equal(generateCertClick(true, true), 'generate');
+  test('with a key stored, a click only opens the confirmation', () => {
+    assert.equal(generateCertClick(true), 'confirm');
   });
 
-  test('the label asks for the second click only while armed over a stored key', () => {
-    assert.equal(generateCertLabel(true, false, 'Regenerate'), 'Regenerate');
-    assert.equal(generateCertLabel(false, true, 'Generate'), 'Generate');
-    assert.match(generateCertLabel(true, true, 'Regenerate'), /click again/i);
+  test('the second click of a double-click cannot answer the confirmation', () => {
+    const openedAt = 1_000_000;
+    assert.equal(dialogClickCounts(openedAt, openedAt), false);
+    assert.equal(dialogClickCounts(openedAt, openedAt + 300), false);
+    assert.equal(dialogClickCounts(openedAt, openedAt + 499), false);
+    assert.equal(dialogClickCounts(openedAt, openedAt + 500), true);
   });
 
   test('the admin is told the new certificate must reach the Connected App, before and after', () => {
