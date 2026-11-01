@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { store } from '../db/store.js';
+import { runInTransaction, store } from '../db/store.js';
 import { parseProfilesCsv, parseSfdxFilesToObjects } from '../db/importers.js';
 import {
   requireAdminAuth,
@@ -21,6 +21,7 @@ import {
   SalesforceOrgTokenSession,
 } from '../salesforce/jwtConnection.js';
 import { config } from '../config.js';
+import { parseObjectSyncPayload, parseProfileSyncPayload } from './orgSyncPayload.js';
 import {
   evaluateMcpToolCall,
   resolveEffectiveProfilePermissions,
@@ -122,6 +123,38 @@ function getAdminInfo(req: Request): {
     authMethod: session?.authMethod === 'okta_oidc' ? 'okta_sso' : 'password',
     ip: req.ip || '127.0.0.1',
   };
+}
+
+const SYNC_OBJECTS_TARGET = 'Salesforce > Objects';
+const SYNC_PROFILES_TARGET = 'Salesforce > Profiles';
+const SYNCED_NAMES_LOGGED = 50;
+
+/** One clause of a sync's audit entry; empty when there is nothing to name. */
+function namesClause(heading: string, names: string[], limit = names.length): string {
+  if (names.length === 0) return '';
+  const extra = names.length > limit ? `, and ${names.length - limit} more` : '';
+  return ` ${heading}: ${names.slice(0, limit).join(', ')}${extra}.`;
+}
+
+function recordSyncFailure(req: Request, action: string, target: string, reason: string): void {
+  const actor = getAdminInfo(req);
+  store.recordPortalAdminLog({
+    adminUsername: actor.username,
+    authMethod: actor.authMethod,
+    action,
+    target,
+    details: `Sync from Salesforce Org failed and changed nothing: ${reason.slice(0, 500)}`,
+    ipAddress: actor.ip,
+  });
+}
+
+/** For failures before the route runs, such as a body the JSON parser refused. */
+export function recordObjectSyncFailure(req: Request, reason: string): void {
+  recordSyncFailure(req, 'SYNC_OBJECTS_FROM_ORG_FAILED', SYNC_OBJECTS_TARGET, reason);
+}
+
+function recordProfileSyncFailure(req: Request, reason: string): void {
+  recordSyncFailure(req, 'SYNC_PROFILES_FROM_ORG_FAILED', SYNC_PROFILES_TARGET, reason);
 }
 
 /**
@@ -449,34 +482,40 @@ adminRouter.post(
  * Applies the selected profile additions/updates and deletes only the removed profiles chosen by the admin.
  */
 adminRouter.post('/profiles/pull-apply', (req: Request, res: Response) => {
-  const { upserts, removeProfileIds, keptMissingProfileIds } = req.body || {};
-  if (!Array.isArray(upserts)) {
-    res.status(400).json({ error: 'upserts array is required.' });
+  const parsed = parseProfileSyncPayload(req.body);
+  if (!parsed.ok) {
+    recordProfileSyncFailure(req, parsed.error);
+    res.status(400).json({ error: parsed.error });
     return;
   }
 
-  const summary = store.applyProfilesSyncFromOrg({
-    upserts: upserts.map((u: any) => ({
-      id: String(u.id || ''),
-      name: String(u.name || ''),
-    })),
-    removeProfileIds: Array.isArray(removeProfileIds)
-      ? removeProfileIds.map(String)
-      : [],
-    keptMissingProfileIds: Array.isArray(keptMissingProfileIds)
-      ? keptMissingProfileIds.map(String)
-      : [],
-  });
-
   const actor = getAdminInfo(req);
-  store.recordPortalAdminLog({
-    adminUsername: actor.username,
-    authMethod: actor.authMethod,
-    action: 'SYNC_PROFILES_FROM_ORG',
-    target: 'Salesforce > Profiles',
-    details: `Synced Profiles from Salesforce Org (${summary.inserted} added, ${summary.updated} updated, ${summary.removed} removed, ${summary.keptMissing} missing profiles kept).`,
-    ipAddress: actor.ip,
-  });
+  let summary: ReturnType<typeof store.applyProfilesSyncFromOrg>;
+  try {
+    // The audit entry shares the transaction: an applied change can never go unlogged.
+    summary = runInTransaction(() => {
+      const applied = store.applyProfilesSyncFromOrg(parsed.value);
+      store.recordPortalAdminLog({
+        adminUsername: actor.username,
+        authMethod: actor.authMethod,
+        action: 'SYNC_PROFILES_FROM_ORG',
+        target: SYNC_PROFILES_TARGET,
+        details:
+          `Synced Profiles from Salesforce Org (${applied.inserted} added, ${applied.updated} updated, ${applied.removed} removed, ${applied.keptMissing} missing profiles kept).` +
+          namesClause('Synced', applied.affected.upserted, SYNCED_NAMES_LOGGED) +
+          namesClause('Removed', applied.affected.removed) +
+          namesClause('Kept as missing', applied.affected.keptMissing) +
+          namesClause('Access Groups that lost a Profile', applied.affected.groupsLosingMembers),
+        ipAddress: actor.ip,
+      });
+      return applied;
+    });
+  } catch (err: any) {
+    console.error('[admin] Profile sync apply failed:', err);
+    recordProfileSyncFailure(req, String(err?.message || err));
+    res.status(500).json({ error: 'The Profile sync failed, so nothing was changed. The reason is in the Portal Admin log.' });
+    return;
+  }
 
   res.json({
     summary,
@@ -879,34 +918,42 @@ adminRouter.post(
  * that the admin explicitly checked for removal.
  */
 adminRouter.post('/objects/pull-apply', (req: Request, res: Response) => {
-  const { pulledMetadata, removeObjectNames, removeFields } = req.body || {};
-  if (!Array.isArray(pulledMetadata)) {
-    res.status(400).json({ error: 'pulledMetadata array is required.' });
+  const parsed = parseObjectSyncPayload(req.body);
+  if (!parsed.ok) {
+    recordObjectSyncFailure(req, parsed.error);
+    res.status(400).json({ error: parsed.error });
     return;
   }
 
-  const summary = store.applyObjectsSyncFromOrg({
-    pulledMetadata,
-    removeObjectNames: Array.isArray(removeObjectNames)
-      ? removeObjectNames.map(String)
-      : [],
-    removeFields: Array.isArray(removeFields)
-      ? removeFields.map((f: any) => ({
-          objectName: String(f.objectName || ''),
-          fieldName: String(f.fieldName || ''),
-        }))
-      : [],
-  });
-
   const actor = getAdminInfo(req);
-  store.recordPortalAdminLog({
-    adminUsername: actor.username,
-    authMethod: actor.authMethod,
-    action: 'SYNC_OBJECTS_FROM_ORG',
-    target: 'Salesforce > Objects',
-    details: `Synced Objects from Salesforce Org (${summary.objectsUpserted} objects/${summary.fieldsUpserted} fields synced; ${summary.objectsRemoved} objects & ${summary.fieldsRemoved} fields removed; ${summary.objectsKeptMissing} objects & ${summary.fieldsKeptMissing} fields kept).`,
-    ipAddress: actor.ip,
-  });
+  let summary: ReturnType<typeof store.applyObjectsSyncFromOrg>;
+  try {
+    // The audit entry shares the transaction: an applied change can never go unlogged.
+    summary = runInTransaction(() => {
+      const applied = store.applyObjectsSyncFromOrg(parsed.value);
+      store.recordPortalAdminLog({
+        adminUsername: actor.username,
+        authMethod: actor.authMethod,
+        action: 'SYNC_OBJECTS_FROM_ORG',
+        target: SYNC_OBJECTS_TARGET,
+        // Only the routine list is capped: what was removed changes access and is bounded by local rows.
+        details:
+          `Synced Objects from Salesforce Org (${applied.objectsUpserted} objects/${applied.fieldsUpserted} fields synced; ${applied.objectsRemoved} objects & ${applied.fieldsRemoved} fields removed; ${applied.objectsKeptMissing} objects & ${applied.fieldsKeptMissing} fields kept).` +
+          namesClause('Synced', applied.affected.objectsSynced, SYNCED_NAMES_LOGGED) +
+          namesClause('Removed objects', applied.affected.objectsRemoved) +
+          namesClause('Removed fields', applied.affected.fieldsRemoved) +
+          namesClause('Kept as missing', [...applied.affected.objectsKeptMissing, ...applied.affected.fieldsKeptMissing]) +
+          namesClause('Access Groups that lost grants', applied.affected.groupsLosingGrants),
+        ipAddress: actor.ip,
+      });
+      return applied;
+    });
+  } catch (err: any) {
+    console.error('[admin] Object sync apply failed:', err);
+    recordObjectSyncFailure(req, String(err?.message || err));
+    res.status(500).json({ error: 'The Object sync failed, so nothing was changed. The reason is in the Portal Admin log.' });
+    return;
+  }
 
   res.json({
     summary,
