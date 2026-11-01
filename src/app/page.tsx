@@ -38,6 +38,10 @@ import {
 } from '@/components/views/FlyoutDrawer';
 import { CommandPalette } from '@/components/views/CommandPalette';
 import { profileSyncResultMessage } from '@/components/views/profileSyncReview';
+import {
+  ENTERPRISE_MATRIX_WARNING,
+  enterpriseMatrixAction,
+} from '@/components/views/enterpriseMatrix';
 
 type ActiveView =
   | 'dashboard'
@@ -154,6 +158,7 @@ export default function AdminPortalPage() {
   const [mcpStats, setMcpStats] = useState<McpRequestStats | null>(null);
   // Starts off so the burst button cannot show in production before the first overview loads.
   const [devToolsEnabled, setDevToolsEnabled] = useState(false);
+  const [seedConfirmOpen, setSeedConfirmOpen] = useState(false);
 
   const notify = useCallback((msg: string, isError = false) => {
     setToast({ msg, isError });
@@ -615,6 +620,9 @@ export default function AdminPortalPage() {
     await fetchWorkspace();
     notify('Loaded Reference Enterprise Access Matrix (5 Groups + Mappings)');
   };
+  const requestSeedEnterpriseMatrix = enterpriseMatrixAction(devToolsEnabled, () =>
+    setSeedConfirmOpen(true)
+  );
 
   const handleTestMcpCall = async (payload: {
     profileId: string;
@@ -1201,7 +1209,7 @@ export default function AdminPortalPage() {
               selectedFlyoutId={selectedFlyoutId}
               onNavigateTab={(next) => setView(next as ActiveView)}
               onOpenFlyout={(f) => setFlyout(f)}
-              onSeedEnterpriseMatrix={reportFailureAndStop(handleSeedEnterpriseMatrix)}
+              onSeedEnterpriseMatrix={requestSeedEnterpriseMatrix}
             />
           )}
 
@@ -1255,7 +1263,7 @@ export default function AdminPortalPage() {
               mappings={mappings}
               selectedFlyoutId={selectedFlyoutId}
               onOpenFlyout={(f) => setFlyout(f)}
-              onSeedEnterpriseMatrix={reportFailureAndStop(handleSeedEnterpriseMatrix)}
+              onSeedEnterpriseMatrix={requestSeedEnterpriseMatrix}
             />
           )}
 
@@ -1267,7 +1275,7 @@ export default function AdminPortalPage() {
               mappings={mappings}
               onToggleProfileGroup={reportFailureAndStop(handleToggleProfileGroup)}
               onOpenFlyout={(f) => setFlyout(f)}
-              onSeedEnterpriseMatrix={reportFailureAndStop(handleSeedEnterpriseMatrix)}
+              onSeedEnterpriseMatrix={requestSeedEnterpriseMatrix}
             />
           )}
 
@@ -1371,13 +1379,69 @@ export default function AdminPortalPage() {
         onClose={() => setCmdkOpen(false)}
         onNavigateView={(v) => setView(v as ActiveView)}
         onOpenFlyout={(f) => setFlyout(f)}
-        onSeedEnterpriseMatrix={reportFailureAndStop(handleSeedEnterpriseMatrix)}
+        onSeedEnterpriseMatrix={requestSeedEnterpriseMatrix}
         onToggleTheme={toggleTheme}
         theme={theme}
         profiles={profiles}
         objects={objects}
         groups={groups}
       />
+
+      {/* SAMPLE MATRIX CONFIRMATION */}
+      {seedConfirmOpen && (
+        <div className="cmdk-scrim" onClick={() => setSeedConfirmOpen(false)}>
+          <div
+            className="cmdk-box"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="seed-confirm-title"
+            aria-describedby="seed-confirm-body"
+            style={{ maxWidth: 480 }}
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') setSeedConfirmOpen(false);
+            }}
+          >
+            <div className="card-h">
+              <div className="card-t" id="seed-confirm-title">
+                Load the sample enterprise matrix?
+              </div>
+            </div>
+            <div className="card-b">
+              <p id="seed-confirm-body" style={{ fontSize: 12.5, color: 'var(--t2)' }}>
+                {ENTERPRISE_MATRIX_WARNING}
+              </p>
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'flex-end',
+                  gap: 8,
+                  marginTop: 12,
+                }}
+              >
+                <button
+                  type="button"
+                  className="btn"
+                  autoFocus
+                  onClick={() => setSeedConfirmOpen(false)}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="btn dng"
+                  onClick={() => {
+                    setSeedConfirmOpen(false);
+                    void reportFailureAndStop(handleSeedEnterpriseMatrix)();
+                  }}
+                >
+                  Replace mappings and load
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* TOAST BANNER */}
       {toast && (

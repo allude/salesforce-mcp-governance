@@ -14,7 +14,8 @@ interface CommandPaletteProps {
   onClose: () => void;
   onNavigateView: (view: string) => void;
   onOpenFlyout: (flyout: FlyoutState) => void;
-  onSeedEnterpriseMatrix: () => void;
+  /** Absent in production, where the server refuses sample data. */
+  onSeedEnterpriseMatrix?: () => void;
   onToggleTheme: () => void;
   theme: 'dark' | 'light';
   profiles: SalesforceProfile[];
@@ -148,13 +149,17 @@ export function CommandPalette({
         meta: 'XML folder or describeGlobal',
         action: () => onOpenFlyout({ type: 'sync' }),
       },
-      {
-        id: 'act-seed',
-        section: 'Quick Actions',
-        label: 'Load Reference Enterprise Governance Matrix',
-        meta: '5 standard groups + profile mappings',
-        action: () => onSeedEnterpriseMatrix(),
-      },
+      ...(onSeedEnterpriseMatrix
+        ? [
+            {
+              id: 'act-seed',
+              section: 'Quick Actions',
+              label: 'Load Reference Enterprise Governance Matrix',
+              meta: '5 standard groups + profile mappings',
+              action: () => onSeedEnterpriseMatrix(),
+            },
+          ]
+        : []),
       {
         id: 'act-theme',
         section: 'Quick Actions',
