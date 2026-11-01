@@ -168,3 +168,122 @@ describe('a sync whose names differ from the local row only by case', () => {
     assert.equal(objectNamed(objectName).enabled, true);
   });
 });
+
+describe('reading object metadata from Salesforce', () => {
+  const orgSession: SalesforceOrgTokenSession = {
+    authMode: 'jwt_bearer',
+    instanceUrl: 'https://acme.my.salesforce.com',
+    accessToken: 'test-token',
+    apiVersion: 'v62.0',
+    orgId: '00D000000000001',
+  } as SalesforceOrgTokenSession;
+  const OBJECT = 'Thing__c';
+
+  type Reply = { status: number; body?: unknown };
+  const json = (body: unknown): Reply => ({ status: 200, body });
+  const denied: Reply = { status: 403, body: [{ errorCode: 'REQUEST_LIMIT_EXCEEDED' }] };
+  const notFound: Reply = { status: 404, body: [{ errorCode: 'NOT_FOUND' }] };
+  const definition = json({ done: true, records: [{ QualifiedApiName: OBJECT, Label: 'Thing' }] });
+  const none = json({ done: true, records: [] });
+  const fieldRow = (name: string) => ({ QualifiedApiName: name, Label: name, DataType: 'Text' });
+
+  /** Stubs fetch with one reply per endpoint, chosen by what the URL asks for. */
+  function stubSalesforce(
+    t: { mock: { method: Function } },
+    replies: { describe: Reply; entity?: Reply; fields?: Reply | Reply[] }
+  ) {
+    const fieldReplies = Array.isArray(replies.fields) ? [...replies.fields] : null;
+    t.mock.method(globalThis, 'fetch', async (input: unknown) => {
+      const url = decodeURIComponent(String(input));
+      let reply: Reply | undefined;
+      if (url.includes('/describe')) reply = replies.describe;
+      else if (url.includes('FROM EntityDefinition')) reply = replies.entity;
+      else if (url.includes('FROM FieldDefinition') || url.includes('/query/next')) {
+        reply = fieldReplies ? fieldReplies.shift() : (replies.fields as Reply | undefined);
+      }
+      assert.ok(reply, `unexpected Salesforce call: ${url}`);
+      return new Response(JSON.stringify(reply.body ?? {}), { status: reply.status });
+    });
+  }
+  const read = () => fetchObjectsMetadataFromOrgSession(orgSession, [OBJECT]);
+
+  for (const status of [400, 401, 429, 500, 503]) {
+    test(`a ${status} from describe is an error, not a removed object`, async (t) => {
+      stubSalesforce(t, { describe: { status, body: [{ errorCode: 'X' }] } });
+      await assert.rejects(read(), new RegExp(`${OBJECT}.*${status}`));
+    });
+  }
+
+  test('a failed EntityDefinition query is an error, not a removed object', async (t) => {
+    stubSalesforce(t, { describe: notFound, entity: { status: 500 } });
+    await assert.rejects(read(), /EntityDefinition.*500/);
+  });
+
+  test('a failed FieldDefinition query is an error, not an object with no fields', async (t) => {
+    stubSalesforce(t, { describe: denied, entity: definition, fields: { status: 500 } });
+    await assert.rejects(read(), /FieldDefinition.*500/);
+  });
+
+  test('an object that comes back with no fields is an error', async (t) => {
+    stubSalesforce(t, { describe: json({ name: OBJECT, fields: [] }) });
+    await assert.rejects(read(), /no fields/);
+  });
+
+  test('a FieldDefinition query with no rows is an error', async (t) => {
+    stubSalesforce(t, { describe: notFound, entity: definition, fields: none });
+    await assert.rejects(read(), /no fields/);
+  });
+
+  test('a 403 with no visible definition is an error: rate limits are 403s too', async (t) => {
+    stubSalesforce(t, { describe: denied, entity: none });
+    await assert.rejects(read(), /describe returned 403/);
+  });
+
+  test('a 404 confirmed by an empty EntityDefinition query is a removed object', async (t) => {
+    stubSalesforce(t, { describe: notFound, entity: none });
+    const [result] = await read();
+    assert.equal(result.existsInOrg, false);
+  });
+
+  test('a user with no access to the object still gets its fields through the Tooling API', async (t) => {
+    stubSalesforce(t, {
+      describe: denied,
+      entity: definition,
+      fields: json({ done: true, records: [fieldRow('Id'), fieldRow('Secret__c')] }),
+    });
+    const [result] = await read();
+    assert.equal(result.existsInOrg, true);
+    assert.deepEqual(result.fields.map((f) => f.fieldName), ['Id', 'Secret__c']);
+  });
+
+  test('follows FieldDefinition result pages, so later fields are not reported as removed', async (t) => {
+    stubSalesforce(t, {
+      describe: notFound,
+      entity: definition,
+      fields: [
+        json({ done: false, nextRecordsUrl: '/services/data/v62.0/tooling/query/next-1', records: [fieldRow('Id')] }),
+        json({ done: true, records: [fieldRow('Secret__c')] }),
+      ],
+    });
+    const [result] = await read();
+    assert.deepEqual(result.fields.map((f) => f.fieldName), ['Id', 'Secret__c']);
+  });
+
+  test('a result page that cannot be followed is an error', async (t) => {
+    stubSalesforce(t, {
+      describe: notFound,
+      entity: definition,
+      fields: json({ done: false, nextRecordsUrl: 'https://evil.example/next', records: [fieldRow('Id')] }),
+    });
+    await assert.rejects(read(), /did not return all/);
+  });
+
+  test('a successful describe is returned as before', async (t) => {
+    stubSalesforce(t, {
+      describe: json({ name: OBJECT, label: 'Thing', custom: true, fields: [{ name: 'Id', label: 'Id', type: 'id' }] }),
+    });
+    const [result] = await read();
+    assert.equal(result.existsInOrg, true);
+    assert.deepEqual(result.fields.map((f) => f.fieldName), ['Id']);
+  });
+});

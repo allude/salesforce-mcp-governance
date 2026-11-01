@@ -707,6 +707,45 @@ function normalizeSfFieldType(rawType: string): string {
   return rawType.charAt(0).toUpperCase() + rawType.slice(1);
 }
 
+/** A failed metadata read, as an error. Never as "not found": an admin decides removals from that answer. */
+async function metadataReadError(res: Response, objectName: string, step: string): Promise<Error> {
+  const body = (await res.text().catch(() => '')).slice(0, 300);
+  return new Error(
+    `Could not read '${objectName}' from Salesforce: ${step} returned ${res.status}. Nothing was changed.${body ? ` ${body}` : ''}`
+  );
+}
+
+const MAX_TOOLING_QUERY_PAGES = 50;
+
+/** Runs a Tooling API query through every result page; a partial field list would look like removed fields. */
+async function fetchAllToolingRecords(
+  session: SalesforceOrgTokenSession,
+  soql: string,
+  objectName: string,
+  step: string
+): Promise<any[]> {
+  const records: any[] = [];
+  let path = `/services/data/${session.apiVersion}/tooling/query?q=${encodeURIComponent(soql)}`;
+  for (let page = 0; page < MAX_TOOLING_QUERY_PAGES; page++) {
+    const res = await fetch(`${session.instanceUrl}${path}`, {
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        Accept: 'application/json',
+      },
+    });
+    if (!res.ok) throw await metadataReadError(res, objectName, step);
+    const data = (await res.json()) as any;
+    records.push(...(Array.isArray(data.records) ? data.records : []));
+    if (data.done !== false) return records;
+    const next = String(data.nextRecordsUrl || '');
+    if (!next.startsWith('/services/data/')) break;
+    path = next;
+  }
+  throw new Error(
+    `Could not read '${objectName}' from Salesforce: ${step} did not return all of its results. Nothing was changed.`
+  );
+}
+
 /**
  * Fetches detailed Object & Field metadata for a list of object API names.
  * Uses Tooling API `FieldDefinition` + REST `/sobjects/{Name}/describe` so it works
@@ -760,17 +799,20 @@ export async function fetchObjectsMetadataFromOrgSession(
 
     if (descRes.ok) {
       const desc = (await descRes.json()) as any;
-      const fields = Array.isArray(desc.fields)
-        ? desc.fields.map((f: any) => ({
-            fieldName: String(f.name),
-            label: String(f.label || f.name),
-            fieldType: normalizeSfFieldType(String(f.type || 'Text')),
-            isCustom: Boolean(f.custom) || String(f.name).endsWith('__c'),
-            required:
-              String(f.name) === 'Id' ||
-              (!f.nillable && !f.defaultedOnCreate && Boolean(f.createable)),
-          }))
-        : [];
+      if (!Array.isArray(desc.fields) || desc.fields.length === 0) {
+        throw new Error(
+          `Could not read '${objName}' from Salesforce: describe returned no fields. Nothing was changed.`
+        );
+      }
+      const fields = desc.fields.map((f: any) => ({
+        fieldName: String(f.name),
+        label: String(f.label || f.name),
+        fieldType: normalizeSfFieldType(String(f.type || 'Text')),
+        isCustom: Boolean(f.custom) || String(f.name).endsWith('__c'),
+        required:
+          String(f.name) === 'Id' ||
+          (!f.nillable && !f.defaultedOnCreate && Boolean(f.createable)),
+      }));
       results.push({
         objectName: String(desc.name || objName),
         label: String(desc.label || objName),
@@ -781,54 +823,49 @@ export async function fetchObjectsMetadataFromOrgSession(
       continue;
     }
 
+    // Anything but "no such object" or "no access to it" (rate limit, expired token, outage) is a failure.
+    if (descRes.status !== 404 && descRes.status !== 403) {
+      throw await metadataReadError(descRes, objName, 'describe');
+    }
+
     // 2. Fallback: Query Tooling API EntityDefinition + FieldDefinition
     // (Works with `View Setup and Configuration` even when the Integration User has 0 CRUD on the object!)
     const edSoql = `SELECT QualifiedApiName, Label, IsCustomSetting FROM EntityDefinition WHERE QualifiedApiName = '${escapeSoqlString(objName)}' LIMIT 1`;
-    const edRes = await fetch(
-      `${session.instanceUrl}/services/data/${session.apiVersion}/tooling/query?q=${encodeURIComponent(edSoql)}`,
-      {
-        headers: {
-          Authorization: `Bearer ${session.accessToken}`,
-          Accept: 'application/json',
-        },
-      }
-    );
+    const edRecords = await fetchAllToolingRecords(session, edSoql, objName, 'the EntityDefinition query');
+    const edRecord = edRecords[0];
 
-    if (edRes.ok) {
-      const edData = (await edRes.json()) as any;
-      const edRecord = edData.records?.[0];
-      if (edRecord) {
-        const fdSoql = `SELECT QualifiedApiName, Label, DataType, IsNameField FROM FieldDefinition WHERE EntityDefinition.QualifiedApiName = '${escapeSoqlString(objName)}' ORDER BY QualifiedApiName ASC`;
-        const fdRes = await fetch(
-          `${session.instanceUrl}/services/data/${session.apiVersion}/tooling/query?q=${encodeURIComponent(fdSoql)}`,
-          {
-            headers: {
-              Authorization: `Bearer ${session.accessToken}`,
-              Accept: 'application/json',
-            },
-          }
+    if (edRecord) {
+      const fdSoql = `SELECT QualifiedApiName, Label, DataType, IsNameField FROM FieldDefinition WHERE EntityDefinition.QualifiedApiName = '${escapeSoqlString(objName)}' ORDER BY QualifiedApiName ASC`;
+      const fdRecords = await fetchAllToolingRecords(session, fdSoql, objName, 'the FieldDefinition query');
+      if (fdRecords.length === 0) {
+        throw new Error(
+          `Could not read '${objName}' from Salesforce: the FieldDefinition query returned no fields. Nothing was changed.`
         );
-        const fdData = fdRes.ok ? ((await fdRes.json()) as any) : { records: [] };
-        const fields = (fdData.records || []).map((f: any) => {
-          const fn = String(f.QualifiedApiName);
-          return {
-            fieldName: fn,
-            label: String(f.Label || fn),
-            fieldType: normalizeSfFieldType(String(f.DataType || 'Text')),
-            isCustom: fn.endsWith('__c'),
-            required: fn === 'Id' || Boolean(f.IsNameField),
-          };
-        });
-
-        results.push({
-          objectName: String(edRecord.QualifiedApiName || objName),
-          label: String(edRecord.Label || objName),
-          isCustom: String(edRecord.QualifiedApiName || objName).endsWith('__c'),
-          existsInOrg: true,
-          fields,
-        });
-        continue;
       }
+      const fields = fdRecords.map((f: any) => {
+        const fn = String(f.QualifiedApiName);
+        return {
+          fieldName: fn,
+          label: String(f.Label || fn),
+          fieldType: normalizeSfFieldType(String(f.DataType || 'Text')),
+          isCustom: fn.endsWith('__c'),
+          required: fn === 'Id' || Boolean(f.IsNameField),
+        };
+      });
+
+      results.push({
+        objectName: String(edRecord.QualifiedApiName || objName),
+        label: String(edRecord.Label || objName),
+        isCustom: String(edRecord.QualifiedApiName || objName).endsWith('__c'),
+        existsInOrg: true,
+        fields,
+      });
+      continue;
+    }
+
+    // A 403 with no visible definition means access was refused (a rate limit is also a 403), not that it is gone.
+    if (descRes.status === 403) {
+      throw await metadataReadError(descRes, objName, 'describe');
     }
 
     // Object was not found in Salesforce Org (deleted or removed)
