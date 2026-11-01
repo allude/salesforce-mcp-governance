@@ -165,6 +165,7 @@ export interface PortalOverviewPayload {
     totalMcpRequests: number;
     allowedMcpRequests: number;
     deniedMcpRequests: number;
+    erroredMcpRequests: number;
     totalProfiles: number;
     totalObjects: number;
     enabledObjects: number;

@@ -26,10 +26,15 @@ export function decryptSecret(ciphertext: string): string {
     throw new Error('Invalid encrypted secret format');
   }
   const [ivHex, tagHex, encHex] = parts;
+  if (!/^[0-9a-f]{24}$/i.test(ivHex) || !/^[0-9a-f]{32}$/i.test(tagHex) || !/^(?:[0-9a-f]{2})*$/i.test(encHex)) {
+    throw new Error('Invalid encrypted secret format');
+  }
+  // Pin the 128-bit tag length: older Node versions otherwise accept truncated (forgeable) tags.
   const decipher = crypto.createDecipheriv(
     'aes-256-gcm',
     KEY_BUFFER,
-    Buffer.from(ivHex, 'hex')
+    Buffer.from(ivHex, 'hex'),
+    { authTagLength: 16 }
   );
   decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
   const decrypted = Buffer.concat([

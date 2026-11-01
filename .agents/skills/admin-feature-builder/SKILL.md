@@ -26,7 +26,7 @@ Use this skill when adding or modifying configuration views, tables, importers, 
 - Export the entity interface and include it in `PortalOverviewPayload` if it is part of the main control plane state returned by `GET /api/admin/overview`.
 
 ### 3. Express Admin API Layer (`src/routes/adminRoutes.ts`)
-- All protected endpoints must sit below `adminRouter.use(requireAdminAuth);` so both the `HttpOnly` JWT session cookie (`sf_mcp_admin_session`) and `X-CSRF-Token` header are verified.
+- All protected endpoints must be registered after the `adminRouter.use(...)` that calls `requireAdminAuth` (it is async, so its rejection is passed to `next`), and wrapped in `asyncRoute(...)` so errors reach the JSON error handler. Together they ensure both the `HttpOnly` JWT session cookie (`sf_mcp_admin_session`) and `X-CSRF-Token` header are verified.
 - Extract the actor via `const actor = getAdminInfo(req);` and log the mutation:
   ```ts
   store.recordPortalAdminLog({

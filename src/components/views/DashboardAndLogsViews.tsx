@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Activity,
   ShieldCheck,
@@ -124,6 +124,8 @@ export function TrafficDashboardView({
           </div>
           <div className="mt-1 text-[11px] text-slate-500">
             Blocked by policy
+            {overview.stats.erroredMcpRequests > 0 &&
+              ` (+${overview.stats.erroredMcpRequests} Salesforce errors)`}
           </div>
         </Card>
 
@@ -777,6 +779,27 @@ export function PortalAuthSettingsView({
   const [adminGroup, setAdminGroup] = useState(
     overview.oktaSettings.adminGroup
   );
+  const [oktaIssuer, setOktaIssuer] = useState(overview.oktaSettings.issuer);
+  // Only send the issuer when the admin edited it, so changing the domain re-derives a default issuer
+  const [oktaIssuerEdited, setOktaIssuerEdited] = useState(false);
+  const storedIssuer = overview.oktaSettings.issuer;
+  useEffect(() => {
+    // Show what the server stored (e.g. a re-derived issuer after a domain change) unless being edited
+    if (!oktaIssuerEdited) setOktaIssuer(storedIssuer);
+  }, [storedIssuer, oktaIssuerEdited]);
+  const [oktaRedirectUri, setOktaRedirectUri] = useState(
+    overview.oktaSettings.redirectUri
+  );
+
+  // Salesforce Connection State
+  const [sfInstanceUrl, setSfInstanceUrl] = useState(overview.sfSettings.instanceUrl);
+  const [sfApiVersion, setSfApiVersion] = useState(overview.sfSettings.apiVersion);
+  const [sfExpectedOrgId, setSfExpectedOrgId] = useState(
+    overview.sfSettings.expectedOrgId
+  );
+  const [sfEnforceOrgIdLock, setSfEnforceOrgIdLock] = useState(
+    overview.sfSettings.enforceOrgIdLock
+  );
 
   // New Portal User State
   const [newUsername, setNewUsername] = useState('');
@@ -791,14 +814,42 @@ export function PortalAuthSettingsView({
         body: JSON.stringify({
           enabled: oktaEnabled,
           oktaDomain,
+          // Empty issuer means "derive https://<domain>/oauth2/default"; untouched means "keep or re-derive"
+          issuer: oktaIssuerEdited ? oktaIssuer.trim() : undefined,
           clientId,
           clientSecret: clientSecret.trim() || undefined,
+          // Empty redirect URI means "<BASE_URL>/auth/okta/callback"
+          redirectUri: oktaRedirectUri.trim(),
           adminGroup,
         }),
       });
       setClientSecret('');
+      setOktaIssuerEdited(false);
       await onRefresh();
       onShowToast('Saved Okta SSO configuration');
+    } catch (err: any) {
+      onShowToast(err.message, true);
+    }
+  };
+
+  const handleSaveSalesforceSettings = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (sfEnforceOrgIdLock && !sfExpectedOrgId.trim()) {
+      onShowToast('Enter the expected Org ID before enforcing the Org ID lock.', true);
+      return;
+    }
+    try {
+      await apiFetch('/api/admin/sf-settings', {
+        method: 'PUT',
+        body: JSON.stringify({
+          instanceUrl: sfInstanceUrl.trim(),
+          apiVersion: sfApiVersion.trim(),
+          expectedOrgId: sfExpectedOrgId.trim(),
+          enforceOrgIdLock: sfEnforceOrgIdLock,
+        }),
+      });
+      await onRefresh();
+      onShowToast('Saved Salesforce connection settings');
     } catch (err: any) {
       onShowToast(err.message, true);
     }
@@ -812,7 +863,8 @@ export function PortalAuthSettingsView({
         method: 'POST',
         body: JSON.stringify({
           username: newUsername.trim(),
-          displayName: newDisplayName.trim() || newUsername.trim(),
+          // Omitted when blank so updating an existing user's password keeps their display name
+          displayName: newDisplayName.trim() || undefined,
           password: newPassword,
         }),
       });
@@ -988,6 +1040,40 @@ export function PortalAuthSettingsView({
             />
           </div>
 
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div>
+              <label className="block text-xs font-semibold text-slate-700">
+                Issuer (optional)
+              </label>
+              <input
+                type="text"
+                value={oktaIssuer}
+                onChange={(e) => {
+                  setOktaIssuer(e.target.value);
+                  setOktaIssuerEdited(true);
+                }}
+                placeholder={
+                  oktaDomain.trim()
+                    ? `https://${oktaDomain.trim().replace(/^https?:\/\//, '')}/oauth2/default`
+                    : 'https://your-org.okta.com/oauth2/default'
+                }
+                className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-700">
+                Redirect URI (optional)
+              </label>
+              <input
+                type="text"
+                value={oktaRedirectUri}
+                onChange={(e) => setOktaRedirectUri(e.target.value)}
+                placeholder="<BASE_URL>/auth/okta/callback"
+                className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
+              />
+            </div>
+          </div>
+
           <div className="pt-2">
             <button
               type="submit"
@@ -995,6 +1081,76 @@ export function PortalAuthSettingsView({
             >
               <Save className="h-3.5 w-3.5" />
               Save Okta Configuration
+            </button>
+          </div>
+        </form>
+      </Card>
+
+      {/* Full width: Salesforce connection & Org ID lock */}
+      <Card className="p-5 lg:col-span-2">
+        <h3 className="text-sm font-bold text-slate-900">
+          Salesforce Connection & Org ID Lock
+        </h3>
+        <p className="mt-0.5 text-xs text-slate-500">
+          Where Copilot users&apos; tokens are verified, and (optionally) which single Salesforce org they must belong to.
+        </p>
+
+        <form onSubmit={handleSaveSalesforceSettings} className="mt-4 space-y-3">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <div className="sm:col-span-2">
+              <label className="block text-xs font-semibold text-slate-700">
+                Login / Instance URL
+              </label>
+              <input
+                type="text"
+                value={sfInstanceUrl}
+                onChange={(e) => setSfInstanceUrl(e.target.value)}
+                placeholder="https://login.salesforce.com or https://acme.my.salesforce.com"
+                className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-700">
+                API Version
+              </label>
+              <input
+                type="text"
+                value={sfApiVersion}
+                onChange={(e) => setSfApiVersion(e.target.value)}
+                placeholder="v62.0"
+                className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 items-end gap-3 sm:grid-cols-3">
+            <div className="sm:col-span-2">
+              <label className="block text-xs font-semibold text-slate-700">
+                Expected Org ID (00D...)
+              </label>
+              <input
+                type="text"
+                value={sfExpectedOrgId}
+                onChange={(e) => setSfExpectedOrgId(e.target.value)}
+                placeholder="00D5g000000AbCdEAF"
+                className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
+              />
+            </div>
+            <div className="flex items-center justify-between gap-3 rounded-lg border border-slate-200 px-3 py-2">
+              <span className="text-xs font-semibold text-slate-700">
+                Reject tokens from other orgs
+              </span>
+              <Switch checked={sfEnforceOrgIdLock} onCheckedChange={setSfEnforceOrgIdLock} />
+            </div>
+          </div>
+
+          <div className="pt-2">
+            <button
+              type="submit"
+              className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-1.5 text-xs font-semibold text-white hover:bg-indigo-700"
+            >
+              <Save className="h-3.5 w-3.5" />
+              Save Salesforce Settings
             </button>
           </div>
         </form>

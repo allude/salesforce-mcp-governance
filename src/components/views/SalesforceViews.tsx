@@ -444,8 +444,11 @@ export function SalesforceObjectsView({
       for (let i = 0; i < fileList.length; i++) {
         const f = fileList[i];
         const rel = (f as any).webkitRelativePath || f.name;
+        // Only object and field definitions are imported; skipping list views, layouts, record
+        // types etc. keeps the upload small.
         if (
-          f.name.endsWith('.xml') ||
+          f.name.endsWith('.object-meta.xml') ||
+          f.name.endsWith('.field-meta.xml') ||
           f.name.endsWith('.object') ||
           f.name.endsWith('.field')
         ) {

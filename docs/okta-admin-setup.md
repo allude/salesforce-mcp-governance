@@ -1,18 +1,18 @@
 # 🔑 Okta SSO & Admin Portal Configuration Guide
 
-The **Salesforce MCP Server** includes a built-in Web Administration Control Plane at `GET /` for managing **Salesforce Profile RBAC Policies**, syncing Profiles from your Salesforce Org, testing Profile policies in an interactive simulator, and configuring **Okta OpenID Connect (OIDC) Single Sign-On**.
+The **Admin Portal** is the Next.js app on `http://localhost:3000` (`src/app/`). It talks to the Express backend on `:3001` through the portal's proxy. Use it to register **Salesforce Profiles**, import **Objects & Fields**, build **Access Groups**, map Profiles to Groups, test policies in the simulator, read the audit logs, and configure **Okta OpenID Connect (OIDC) Single Sign-On**.
 
 ---
 
 ## 1. Initial Bootstrap Login (Before Okta SSO is Configured)
 
-When you first start the server (`npm run dev`), Okta SSO is not yet enabled, so you can sign in using the bootstrap credentials configured in `.env` (or `.env.example`):
+Start both services with `npm run dev`. On first start the backend seeds one portal user into the empty database from `ADMIN_BOOTSTRAP_USERNAME` / `ADMIN_BOOTSTRAP_PASSWORD`:
 
 * **URL:** `http://localhost:3000`
-* **Default Bootstrap Email:** `admin@company.com`
-* **Default Bootstrap Password:** `ChangeMeInProd!2026`
+* **Default username:** `admin`
+* **Default password:** `admin123`
 
-> **Production Note:** Always set a strong `APP_SECRET_KEY` (64 hex chars) and `ADMIN_BOOTSTRAP_PASSWORD` in `.env`, or disable local fallback login completely once Okta SSO is verified.
+> **Production note:** set `NODE_ENV=production`, a real `APP_SECRET_KEY` (64 hex characters, `openssl rand -hex 32`) and a strong `ADMIN_BOOTSTRAP_PASSWORD`. The backend refuses to start with a missing or publicly known `APP_SECRET_KEY`, or while any portal account uses a publicly known password (set `ADMIN_BOOTSTRAP_USERNAME` to that account and a strong `ADMIN_BOOTSTRAP_PASSWORD` to rotate it at startup). `npm start` runs the backend with `NODE_ENV=production`. The bootstrap values are only used when the database has no portal users; manage further users under **Settings > Portal Login & Okta SSO**.
 
 ---
 
@@ -38,54 +38,50 @@ When you first start the server (`npm run dev`), Okta SSO is not yet enabled, so
      http://localhost:3000
      ```
 5. **(Optional) Configure Okta Group Claim for Admin RBAC:**
-   * If you want only members of a specific Okta group (e.g., `MCP-Administrators`) to access the Admin Portal, go to **Sign On** tab &rarr; **OpenID Connect ID Token** &rarr; **Groups claim type** &rarr; **Filter**: `Matches regex` `.*` with claim name `groups`.
+   * The portal requires membership of an Okta group (default `MCP-Admins`). To make that work, go to **Sign On** tab &rarr; **OpenID Connect ID Token** &rarr; **Groups claim type** &rarr; **Filter**: `Matches regex` `.*` with claim name `groups`.
 6. Copy the **Client ID**, **Client Secret**, and your **Okta Issuer URL** (e.g., `https://your-company.okta.com/oauth2/default` or `https://your-company.okta.com`).
 
-### Step B: Enable Okta SSO in the MCP Admin Portal
-1. Open the MCP Admin Portal (`http://localhost:3000`) and go to tab **3. Okta SSO Admin Configuration**.
-2. Check **Enable Okta OIDC SSO for Admin Portal**.
+### Step B: Enable Okta SSO in the Admin Portal
+1. Open the Admin Portal (`http://localhost:3000`) and go to **Settings > Portal Login & Okta SSO**.
+2. Turn on **Okta SSO**.
 3. Enter:
-   * **Okta Issuer URL:** `https://<your-org>.okta.com/oauth2/default`
-   * **Okta OIDC Client ID:** `0oa...`
-   * **Okta OIDC Client Secret:** `<your-client-secret>` *(Encrypted at rest in SQLite using `AES-256-GCM`)*
-   * **Okta Redirect Callback URI:** `http://localhost:3000/auth/okta/callback`
-   * **Required Okta Group Claim (Optional):** e.g., `MCP-Administrators`
-4. Choose whether to keep **Allow Local Break-Glass Password Login alongside Okta SSO** checked while testing, or uncheck it to enforce **Strict Okta-Only Mode**.
-5. Click **Save Okta SSO Configuration**.
-6. Sign out—you will now see the **🔐 Sign in with Okta SSO (OIDC + PKCE)** button on the login screen.
+   * **Okta Domain:** `your-org.okta.com`.
+   * **Issuer (optional):** leave empty to use `https://<domain>/oauth2/default`; enter e.g. `https://your-org.okta.com` for the org authorization server. A custom issuer is kept across saves until you change the domain or clear the field.
+   * **Client ID:** `0oa...`
+   * **Client Secret:** `<your-client-secret>` *(encrypted at rest in SQLite with AES-256-GCM, never returned by the API)*
+   * **Required Okta Group Claim:** e.g. `MCP-Admins`. Users whose ID token `groups` claim lacks it are denied.
+   * **Redirect URI (optional):** leave empty to use `<BASE_URL>/auth/okta/callback`, which follows `BASE_URL` if it changes. It must match the URI registered in Okta.
+4. Save. Okta sign-in errors (for example a missing group) are shown on the login screen.
+5. Sign out. The login screen now offers **Sign In with Okta SSO** next to the username and password form.
+
+You can also pre-fill these settings from `OKTA_ISSUER`, `OKTA_CLIENT_ID`, `OKTA_CLIENT_SECRET`, `OKTA_REDIRECT_URI` and `OKTA_REQUIRED_GROUP` before the first start. SSO stays off until you enable it in the portal.
 
 ---
 
-## 3. Pulling All Profiles from Your Salesforce Org
+## 3. Registering Salesforce Profiles
 
-To configure which MCP actions are available per Salesforce Profile:
+Every Copilot user is matched to a Profile registered here by the `ProfileId` of their Salesforce user (15- and 18-character IDs match each other). If no registered ID matches, the user's Profile name is matched instead, so keep Profile names unique. Users whose Profile matches neither get no tools at all.
 
-1. In the Admin Portal, open tab **2. Sync Profiles from Salesforce Org**.
-2. Enter your **Salesforce Instance URL** (e.g., `https://yourcompany.my.salesforce.com`) and a valid **Salesforce Access Token** (you can grab one quickly from the Salesforce CLI via `sf org display --target-org <alias>`).
-3. Click **⚡ Sync Profiles from Live Salesforce Org**.
-4. The server queries your Salesforce Org REST API:
-   ```sql
-   SELECT Id, Name, UserType, PermissionsModifyAllData FROM Profile ORDER BY Name ASC
+1. Export your Profiles, for example with the Salesforce CLI:
+   ```bash
+   sf data query --query "SELECT Id, Name FROM Profile ORDER BY Name" --result-format csv --target-org <alias>
    ```
-5. Every Standard and Custom Profile in your Salesforce Org is imported into **1. Salesforce Profile RBAC Matrix**:
-   * Existing Profile configurations are preserved.
-   * Newly discovered Profiles default safely to **Read-Only** tools (`soql_query`, `sosl_search`, `describe_object`, `get_record`) unless `PermissionsModifyAllData` is true.
+2. In **Salesforce > Profiles**, click **Upload CSV File** or **Paste CSV**. The format is two columns, `id,name`; a header row is skipped and existing Profiles are updated. You can also add one Profile at a time.
+
+## 4. Importing Objects & Fields
+
+In **Salesforce > Objects**, either select your SFDX `objects/` folder in the browser (**Select SFDX objects/ Folder**) or enter a folder path on the server (**Sync from Local Path**). The importer reads `objects/<Obj>/<Obj>.object-meta.xml`, `objects/<Obj>/fields/*.field-meta.xml` and classic `objects/<Obj>.object` files; the object label comes from the object's own top-level `<label>`. Toggle Objects and individual Fields on or off; disabled ones are unavailable to every group. Re-importing keeps your toggles.
+
+Deleting an Object also removes it from every Access Group, so re-importing it later does not silently restore access; grant it again explicitly.
 
 ---
 
-## 4. Configuring Actions per Salesforce Profile
+## 5. Building Access Groups and the Profile Group Matrix
 
-In tab **1. Salesforce Profile RBAC Matrix**, for each Salesforce Profile you can configure:
-
-| Setting | Description |
-| :--- | :--- |
-| **Active Toggle** | Completely enables or disables MCP access for users with this Salesforce Profile. |
-| **SOQL Query (`soql_query`)** | Permits read-only `SELECT` queries. |
-| **SOSL Search (`sosl_search`)** | Permits `FIND {...}` multi-object text searches. |
-| **Describe (`describe_object`)** | Permits inspecting object fields and picklists. |
-| **Get Record (`get_record`)** | Permits fetching a single record by ID. |
-| **Create Record (`create_record`)** | Permits creating new records (`POST /sobjects/{sObject}`). |
-| **Update Record (`update_record`)** | Permits updating existing records (`PATCH /sobjects/{sObject}/{id}`). |
-| **Delete Record (`delete_record`)** | Permits deleting records (`DELETE /sobjects/{sObject}/{id}`). |
-| **Allowed sObjects** | Either `*` (all objects the user has Salesforce CRUD/FLS access to) or an explicit comma-separated allowlist such as `Account, Contact, Opportunity, Case`. |
-| **Max Rows** | Automatically caps `LIMIT` on any SOQL query executed by users with this Profile (1–2000). |
+1. In **Access Matrix > Groups**, create a group and choose:
+   * **MCP actions:** any of `list_enabled_objects`, `describe_object`, `soql_query`, `get_record`, `create_record`, `update_record`, `delete_record`.
+   * **Objects:** for each Object, `Read`, `Create`, `Update`, `Delete`, and the **allowed fields**. An Object row with no CRUD box ticked grants nothing, including its fields.
+2. In **Access Matrix > Profile Group Matrix**, assign groups to each Profile. A Profile's permissions are the union of its groups, limited to globally enabled Objects and Fields.
+3. Use the **policy simulator** on the Dashboard to check what a Profile can do with a given tool and object. The underlying API call (`POST /api/admin/test-mcp-access`) also returns a signed 15-minute `simulatorBearerToken` you can use against `/mcp`; calls made with it get simulated Salesforce data and never reach Salesforce.
+4. To lock the server to your org, open **Settings > Portal Login & Okta SSO > Salesforce Connection & Org ID Lock**, enter the expected Org ID (`00D...`) and turn on **Reject tokens from other orgs**. The same card sets the login/instance URL used to verify tokens (it must be inside `SALESFORCE_ALLOWED_DOMAINS`) and the API version.
+5. Watch **Logs > Copilot MCP Traffic (PII Stripped)** for every runtime decision (`ALLOWED`, `DENIED`, `ERROR`), and **Logs > Portal Admin Activity** for every admin change.
