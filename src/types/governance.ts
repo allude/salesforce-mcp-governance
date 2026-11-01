@@ -182,7 +182,10 @@ export interface SalesforceConnectionSettings {
   connectedOrgId: string;
   connectedUser: string;
   expectedOrgId: string;
+  /** Where MCP verifies user tokens and the authorization server it advertises. Not the sync connection's. */
   instanceUrl: string;
+  /** The instance the metadata sync connection last verified against. For display; '' when not connected. */
+  syncInstanceUrl: string;
   apiVersion: string;
   enforceOrgIdLock: boolean;
   sfdxObjectsFolderPath: string;

@@ -293,7 +293,7 @@ export function SalesforceOrgConnectionView({
                 </div>
                 <div className="mt-0.5 flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-[11px] text-emerald-800">
                   <span>Org ID: {sfSettings.connectedOrgId}</span>
-                  <span>Instance: {sfSettings.instanceUrl}</span>
+                  <span>Instance: {sfSettings.syncInstanceUrl}</span>
                   <span>User: {sfSettings.connectedUser}</span>
                   {sfSettings.lastConnectedAt && (
                     <span>

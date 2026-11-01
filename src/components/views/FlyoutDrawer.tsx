@@ -1376,7 +1376,7 @@ export function FlyoutDrawer({
                     </div>
                     <div style={{ fontSize: 11.5, color: 'var(--t3)' }}>
                       {sfSettings?.connectionStatus === 'connected'
-                        ? `Authenticated as ${sfSettings.connectedUser} (${sfSettings.instanceUrl})`
+                        ? `Authenticated as ${sfSettings.connectedUser} (${sfSettings.syncInstanceUrl})`
                         : 'Connect your Salesforce Org via OAuth 2.0 JWT Bearer to pull live SObjects.'}
                     </div>
                   </div>

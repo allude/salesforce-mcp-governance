@@ -591,7 +591,7 @@ export function TrafficDashboardView({
                   }}
                 >
                   {sfSettings?.connectionStatus === 'connected'
-                    ? `User: ${sfSettings.connectedUser} · ${sfSettings.instanceUrl}`
+                    ? `User: ${sfSettings.connectedUser} · ${sfSettings.syncInstanceUrl}`
                     : 'Configure OAuth 2.0 JWT Bearer to pull live Profiles & Objects'}
                 </div>
               </div>

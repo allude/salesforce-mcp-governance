@@ -1136,6 +1136,7 @@ describe('store: Salesforce connection settings', () => {
       connectedUser: '',
       expectedOrgId: '',
       instanceUrl: process.env.SALESFORCE_LOGIN_URL,
+      syncInstanceUrl: '',
       apiVersion: process.env.SALESFORCE_API_VERSION || 'v62.0',
       enforceOrgIdLock: false,
       sfdxObjectsFolderPath: '',

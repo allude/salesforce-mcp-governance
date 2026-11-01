@@ -26,6 +26,7 @@ import {
   validatePrivateKeyPem,
 } from '../salesforce/jwtConnection.js';
 import { salesforceIdKey } from '../salesforce/ids.js';
+import { SIMULATED_ORG_INSTANCE_URL } from '../salesforce/simulatedOrg.js';
 
 const dbDir = path.dirname(config.dbPath);
 if (!fs.existsSync(dbDir)) {
@@ -294,6 +295,7 @@ db.exec(`
     connected_user TEXT NOT NULL DEFAULT '',
     expected_org_id TEXT NOT NULL DEFAULT '',
     instance_url TEXT NOT NULL DEFAULT 'https://login.salesforce.com',
+    sync_instance_url TEXT NOT NULL DEFAULT '',
     api_version TEXT NOT NULL DEFAULT 'v62.0',
     enforce_org_id_lock INTEGER NOT NULL DEFAULT 0,
     sfdx_objects_folder_path TEXT NOT NULL DEFAULT '',
@@ -326,6 +328,24 @@ function runSchemaMigrations() {
   ensureColumnExists('sf_connection_settings', 'last_error', "TEXT NOT NULL DEFAULT ''");
   ensureColumnExists('sf_connection_settings', 'connected_org_id', "TEXT NOT NULL DEFAULT ''");
   ensureColumnExists('sf_connection_settings', 'connected_user', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('sf_connection_settings', 'sync_instance_url', "TEXT NOT NULL DEFAULT ''");
+  repairConnectInstanceUrls();
+}
+
+/**
+ * Connect used to write its host into instance_url, which MCP sends bearer tokens to. A connected row
+ * keeps showing that host as its sync instance. The simulated host is removed from instance_url
+ * because it is not a real Salesforce org. Any other value may have been the admin's, so it stays.
+ */
+export function repairConnectInstanceUrls() {
+  db.prepare(`
+    UPDATE sf_connection_settings SET sync_instance_url = instance_url
+    WHERE connection_status = 'connected' AND sync_instance_url = ''
+  `).run();
+  db.prepare(`
+    UPDATE sf_connection_settings SET instance_url = login_url
+    WHERE auth_mode = 'simulated' AND instance_url = ?
+  `).run(SIMULATED_ORG_INSTANCE_URL);
 }
 
 runSchemaMigrations();
@@ -1811,6 +1831,7 @@ export const store = {
       connectedUser: row.connected_user || '',
       expectedOrgId: row.expected_org_id || '',
       instanceUrl: row.instance_url || 'https://login.salesforce.com',
+      syncInstanceUrl: row.sync_instance_url || '',
       apiVersion: row.api_version || 'v62.0',
       enforceOrgIdLock: Boolean(row.enforce_org_id_lock),
       sfdxObjectsFolderPath: row.sfdx_objects_folder_path || '',
@@ -1880,6 +1901,7 @@ export const store = {
           connected_user = ?,
           expected_org_id = ?,
           instance_url = ?,
+          sync_instance_url = ?,
           api_version = ?,
           enforce_org_id_lock = ?,
           sfdx_objects_folder_path = ?,
@@ -1901,12 +1923,41 @@ export const store = {
       (input.connectedUser ?? current.connectedUser).trim(),
       (input.expectedOrgId ?? current.expectedOrgId).trim(),
       nextInstanceUrl,
+      (input.syncInstanceUrl ?? current.syncInstanceUrl).trim(),
       (input.apiVersion ?? current.apiVersion).trim(),
       (input.enforceOrgIdLock ?? current.enforceOrgIdLock) ? 1 : 0,
       (input.sfdxObjectsFolderPath ?? current.sfdxObjectsFolderPath).trim(),
       now
     );
     return this.getSalesforceSettings();
+  },
+
+  /**
+   * Saves a successful connect. Its host goes in sync_instance_url, never over a non-empty instance_url,
+   * which decides where MCP sends bearer tokens: a connect must not be able to redirect those. An empty
+   * instance_url would leave MCP with no host, so a real connect may set it. A simulated one may not.
+   */
+  saveVerifiedSalesforceConnection(
+    input: Partial<SalesforceConnectionSettings> & { privateKeyPem?: string },
+    session: { orgId: string; username: string; instanceUrl: string; authMode: 'jwt_bearer' | 'simulated' }
+  ): SalesforceConnectionSettings {
+    return runInTransaction(() => {
+      if (session.authMode !== 'simulated') {
+        db.prepare("UPDATE sf_connection_settings SET instance_url = ? WHERE id = 1 AND TRIM(instance_url) = ''").run(
+          session.instanceUrl
+        );
+      }
+      return this.updateSalesforceSettings({
+        ...input,
+        enabled: true,
+        connectionStatus: 'connected',
+        lastConnectedAt: new Date().toISOString(),
+        lastError: '',
+        connectedOrgId: session.orgId,
+        connectedUser: session.username,
+        syncInstanceUrl: session.instanceUrl,
+      });
+    });
   },
 
   // Legacy compatibility alias for adminAuth.ts

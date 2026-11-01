@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { config } from '../config.js';
 import { validateSalesforceInstanceUrl, escapeSoqlString } from './client.js';
+import { SIMULATED_ORG_INSTANCE_URL } from './simulatedOrg.js';
 
 export interface GeneratedCertBundle {
   privateKeyPem: string;
@@ -402,7 +403,7 @@ export async function connectToSalesforceOrgViaJwt(settings: {
       instanceUrl:
         settings.loginUrl && !settings.loginUrl.includes('login.salesforce.com')
           ? validateSalesforceInstanceUrl(settings.loginUrl)
-          : 'https://enterprise-org.my.salesforce.com',
+          : SIMULATED_ORG_INSTANCE_URL,
       orgId: simOrgId,
       username: settings.username?.trim() || 'mcp-metadata-sync@enterprise.my.salesforce.com',
       apiVersion,

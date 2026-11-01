@@ -1196,9 +1196,10 @@ adminRouter.post(
   asyncRoute(async (req: Request, res: Response) => {
     const actor = getAdminInfo(req);
     try {
-      // Save any provided settings first
+      // Save any provided settings first. instance_url is MCP's token host, which connect never sets.
       if (req.body && Object.keys(req.body).length > 0) {
-        store.updateSalesforceSettings(parseSalesforceSettingsInput(req.body));
+        const { instanceUrl: _mcpHost, ...input } = parseSalesforceSettingsInput(req.body);
+        store.updateSalesforceSettings(input);
       }
 
       const secrets = store.getSalesforceSettingsWithSecrets();
@@ -1214,15 +1215,7 @@ adminRouter.post(
         enforceOrgIdLock: secrets.enforceOrgIdLock,
       });
 
-      const updated = store.updateSalesforceSettings({
-        enabled: true,
-        connectionStatus: 'connected',
-        lastConnectedAt: new Date().toISOString(),
-        lastError: '',
-        connectedOrgId: session.orgId,
-        connectedUser: session.username,
-        instanceUrl: session.instanceUrl,
-      });
+      const updated = store.saveVerifiedSalesforceConnection({}, session);
 
       store.recordPortalAdminLog({
         adminUsername: actor.username,
