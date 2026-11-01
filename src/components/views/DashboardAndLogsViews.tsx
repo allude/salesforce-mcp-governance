@@ -1223,7 +1223,7 @@ export function PortalAdminLogsView({
 interface PortalAuthSettingsViewProps {
   oktaSettings: OktaConfig;
   portalUsers: PortalUser[];
-  onSaveOkta: (settings: Partial<OktaConfig> & { clientSecret?: string }) => Promise<void>;
+  onSaveOkta: (settings: Partial<OktaConfig> & { clientSecret?: string }) => Promise<OktaConfig>;
   onCreatePortalUser: (user: {
     username: string;
     displayName?: string;
@@ -1250,8 +1250,16 @@ export function PortalAuthSettingsView({
   const [newRole, setNewRole] = useState('Security Admin');
   const [busy, setBusy] = useState(false);
 
+  // The live poll delivers a new settings object every few seconds. Only a real change reaches the
+  // form, and never over unsaved edits.
+  const oktaBaseline = React.useRef(oktaSettings);
   React.useEffect(() => {
-    setOktaDraft(oktaSettings);
+    const baseline = oktaBaseline.current;
+    if (JSON.stringify(oktaSettings) === JSON.stringify(baseline)) return;
+    oktaBaseline.current = oktaSettings;
+    setOktaDraft((draft) =>
+      JSON.stringify(draft) === JSON.stringify(baseline) ? oktaSettings : draft
+    );
   }, [oktaSettings]);
 
   return (
@@ -1371,13 +1379,15 @@ export function PortalAuthSettingsView({
                 onClick={async () => {
                   setBusy(true);
                   try {
-                    await onSaveOkta({
+                    const saved = await onSaveOkta({
                       ...oktaDraft,
                       // Empty issuer means "derive https://<domain>/oauth2/default"; untouched means "keep or re-derive"
                       issuer: oktaIssuerEdited ? oktaDraft.issuer.trim() : undefined,
                       clientSecret: oktaClientSecret.trim() || undefined,
                       redirectUri: oktaDraft.redirectUri.trim(),
                     });
+                    oktaBaseline.current = saved;
+                    setOktaDraft(saved);
                     setOktaClientSecret('');
                     setOktaIssuerEdited(false);
                   } finally {

@@ -1276,6 +1276,7 @@ export default function AdminPortalPage() {
                 if (data.oktaSettings) setOktaSettings(data.oktaSettings);
                 await fetchWorkspace();
                 notify('Updated Okta OIDC SSO settings');
+                return data.oktaSettings;
               }}
               onCreatePortalUser={async (user) => {
                 const data = await apiFetch('/api/admin/portal-users', {
