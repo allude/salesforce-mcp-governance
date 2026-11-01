@@ -556,7 +556,8 @@ adminRouter.post('/objects', (req: Request, res: Response) => {
     saved = store.upsertObjectWithFields({
       objectName: store.resolveObjectName(String(objectName)),
       label: label ? String(label) : undefined,
-      fields: Array.isArray(fields) ? fields : undefined,
+      // The missing-in-org flag belongs to org sync, so a client cannot set or clear it here.
+      fields: Array.isArray(fields) ? fields.map(({ missingInOrg: _ignored, ...field }) => field) : undefined,
     });
   } catch (err: any) {
     res.status(400).json({ error: err?.message || 'Invalid object.' });

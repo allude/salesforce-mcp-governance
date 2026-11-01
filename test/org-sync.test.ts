@@ -62,6 +62,8 @@ function seedObjectWithGrant(allowedFields: string[]) {
 const allowedFieldsOf = (groupId: string) =>
   store.getGroups().find((g) => g.id === groupId)!.objectPermissions[0].allowedFields;
 const objectNamed = (objectName: string) => store.getObjects().find((o) => o.objectName === objectName)!;
+const fieldNamed = (objectName: string, fieldName: string) =>
+  objectNamed(objectName).fields.find((f) => f.fieldName === fieldName)!;
 
 describe('deleting a field', () => {
   test('revokes it from Access Groups, so a later sync that restores the field does not restore the grant', () => {
@@ -171,6 +173,124 @@ describe('a sync whose names differ from the local row only by case', () => {
     assert.equal(res.status, 200);
     const rows = store.getObjects().filter((o) => o.objectName.toLowerCase() === objectName.toLowerCase());
     assert.deepEqual(rows.map((o) => [o.objectName, o.enabled]), [[objectName, false]]);
+  });
+});
+
+describe('the missing-in-org flag outside org sync', () => {
+  /** An object present in the org, with a local Legacy__c field the sync flagged and kept. */
+  function seedFlaggedField() {
+    const objectName = newObjectName();
+    store.upsertObjectWithFields({ objectName, fields: [{ fieldName: 'Id' }, { fieldName: 'Legacy__c' }] });
+    syncFromOrg(objectName, ['Id']);
+    assert.equal(fieldNamed(objectName, 'Legacy__c').missingInOrg, true);
+    return objectName;
+  }
+
+  /** An object the sync flagged as gone from the org and kept. */
+  function seedFlaggedObject() {
+    const objectName = newObjectName();
+    store.upsertObjectWithFields({ objectName, fields: [{ fieldName: 'Id' }] });
+    store.applyObjectsSyncFromOrg({
+      pulledMetadata: [{ objectName, label: objectName, isCustom: true, existsInOrg: false, fields: [] }],
+      removeObjectNames: [],
+      removeFields: [],
+    });
+    assert.equal(objectNamed(objectName).missingInOrg, true);
+    return objectName;
+  }
+
+  const sfdxImportOf = (objectName: string, fieldNames: string[]) => [
+    {
+      objectName,
+      label: objectName,
+      isCustom: true,
+      sourcePath: 'force-app/main/default/objects',
+      fields: fieldNames.map(pulledField),
+    },
+  ];
+
+  const postObject = (body: Record<string, unknown>) =>
+    adminFetch(server.baseUrl, session, '/api/admin/objects', { method: 'POST', body });
+
+  test('an SFDX re-import keeps the flags while updating the rest of the row', () => {
+    const fieldObject = seedFlaggedField();
+    store.importObjectsFromParsedSfdx(sfdxImportOf(fieldObject, ['Id', 'Legacy__c']));
+    assert.equal(fieldNamed(fieldObject, 'Legacy__c').missingInOrg, true);
+    assert.equal(fieldNamed(fieldObject, 'Id').missingInOrg, false);
+    assert.equal(objectNamed(fieldObject).sourcePath, 'force-app/main/default/objects');
+
+    const flaggedObject = seedFlaggedObject();
+    store.importObjectsFromParsedSfdx(sfdxImportOf(flaggedObject, ['Id']));
+    assert.equal(objectNamed(flaggedObject).missingInOrg, true);
+  });
+
+  test('a manual object save keeps the flags', async () => {
+    const fieldObject = seedFlaggedField();
+    const saved = await postObject({ objectName: fieldObject, label: 'Renamed', fields: [{ fieldName: 'Legacy__c' }] });
+    assert.equal(saved.status, 200);
+    assert.equal(objectNamed(fieldObject).label, 'Renamed');
+    assert.equal(fieldNamed(fieldObject, 'Legacy__c').missingInOrg, true);
+
+    const flaggedObject = seedFlaggedObject();
+    assert.equal((await postObject({ objectName: flaggedObject, label: 'Renamed' })).status, 200);
+    assert.equal(objectNamed(flaggedObject).missingInOrg, true);
+  });
+
+  test('a manual object save cannot set or clear the flag from the request', async () => {
+    const objectName = seedFlaggedField();
+    const res = await postObject({
+      objectName,
+      fields: [
+        { fieldName: 'Legacy__c', missingInOrg: false },
+        { fieldName: 'Id', missingInOrg: true },
+      ],
+    });
+
+    assert.equal(res.status, 200);
+    assert.equal(fieldNamed(objectName, 'Legacy__c').missingInOrg, true);
+    assert.equal(fieldNamed(objectName, 'Id').missingInOrg, false);
+  });
+
+  test('a save in different casing keeps the flag of the existing row', () => {
+    const objectName = seedFlaggedField();
+    store.upsertObjectWithFields({ objectName, fields: [{ fieldName: 'LEGACY__C' }] });
+    assert.equal(fieldNamed(objectName, 'Legacy__c').missingInOrg, true);
+  });
+
+  test('new rows start unflagged', () => {
+    const objectName = newObjectName();
+    store.importObjectsFromParsedSfdx(sfdxImportOf(objectName, ['Id', 'Fresh__c']));
+    assert.equal(objectNamed(objectName).missingInOrg, false);
+    assert.ok(objectNamed(objectName).fields.every((f) => !f.missingInOrg));
+  });
+
+  test('keeping the flag leaves a manual enabled toggle alone, and an explicit one still applies', () => {
+    const objectName = seedFlaggedField();
+    store.toggleObjectField(objectName, 'Legacy__c', false);
+    store.importObjectsFromParsedSfdx(sfdxImportOf(objectName, ['Legacy__c']));
+    assert.equal(fieldNamed(objectName, 'Legacy__c').enabled, false);
+
+    store.upsertObjectWithFields({ objectName, fields: [{ fieldName: 'Legacy__c', enabled: true }] });
+    assert.equal(fieldNamed(objectName, 'Legacy__c').enabled, true);
+    assert.equal(fieldNamed(objectName, 'Legacy__c').missingInOrg, true);
+  });
+
+  test('org sync clears the flags when the field or object reappears', () => {
+    const fieldObject = seedFlaggedField();
+    store.importObjectsFromParsedSfdx(sfdxImportOf(fieldObject, ['Legacy__c']));
+    syncFromOrg(fieldObject, ['Id', 'Legacy__c']);
+    assert.equal(fieldNamed(fieldObject, 'Legacy__c').missingInOrg, false);
+
+    const flaggedObject = seedFlaggedObject();
+    syncFromOrg(flaggedObject, ['Id']);
+    assert.equal(objectNamed(flaggedObject).missingInOrg, false);
+  });
+
+  test('org sync flags a field again after it goes missing a second time', () => {
+    const objectName = seedFlaggedField();
+    syncFromOrg(objectName, ['Id', 'Legacy__c']);
+    syncFromOrg(objectName, ['Id']);
+    assert.equal(fieldNamed(objectName, 'Legacy__c').missingInOrg, true);
   });
 });
 

@@ -737,7 +737,13 @@ export const store = {
         ? Boolean(existing.enabled)
         : true;
     const sourcePath = input.sourcePath ?? existing?.source_path ?? 'manual';
-    const missingInOrg = input.missingInOrg ? 1 : 0;
+    // Only org sync passes this; a re-import or manual save must not clear what sync flagged.
+    const missingInOrg =
+      input.missingInOrg !== undefined
+        ? input.missingInOrg
+        : existing
+        ? Boolean(existing.missing_in_org)
+        : false;
 
     db.prepare(`
       INSERT INTO sf_objects (object_name, label, is_custom, enabled, source_path, missing_in_org, updated_at)
@@ -749,27 +755,34 @@ export const store = {
         source_path = excluded.source_path,
         missing_in_org = excluded.missing_in_org,
         updated_at = excluded.updated_at
-    `).run(objName, label, isCustom ? 1 : 0, enabled ? 1 : 0, sourcePath, missingInOrg, now);
+    `).run(objName, label, isCustom ? 1 : 0, enabled ? 1 : 0, sourcePath, missingInOrg ? 1 : 0, now);
 
     const fieldsToUpsert = input.fields || [
       { fieldName: 'Id', label: 'Record ID', fieldType: 'Id', isCustom: false, required: true },
       { fieldName: 'Name', label: 'Name', fieldType: 'Text', isCustom: false, required: false },
     ];
 
-    // An explicit `enabled` is applied; when it is omitted (e.g. an SFDX re-import) an existing
-    // field keeps the admin's manual toggle.
-    const fieldUpsertSql = (applyEnabled: boolean) => `
+    // An explicit `enabled` or `missingInOrg` is applied; when omitted (e.g. an SFDX re-import) an
+    // existing field keeps the admin's manual toggle and what org sync flagged.
+    const fieldUpsertSql = (applyEnabled: boolean, applyMissingInOrg: boolean) => `
       INSERT INTO sf_object_fields (object_name, field_name, label, field_type, is_custom, required, enabled, missing_in_org)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(object_name, field_name) DO UPDATE SET
         label = excluded.label,
         field_type = excluded.field_type,
         is_custom = excluded.is_custom,
-        required = excluded.required,
-        missing_in_org = excluded.missing_in_org${applyEnabled ? ',\n        enabled = excluded.enabled' : ''}
+        required = excluded.required${applyMissingInOrg ? ',\n        missing_in_org = excluded.missing_in_org' : ''}${applyEnabled ? ',\n        enabled = excluded.enabled' : ''}
     `;
-    const upsertFieldKeepEnabled = db.prepare(fieldUpsertSql(false));
-    const upsertFieldSetEnabled = db.prepare(fieldUpsertSql(true));
+    const fieldUpsertStatements = new Map<string, ReturnType<typeof db.prepare>>();
+    const fieldUpsertStatement = (applyEnabled: boolean, applyMissingInOrg: boolean) => {
+      const key = `${applyEnabled}:${applyMissingInOrg}`;
+      let statement = fieldUpsertStatements.get(key);
+      if (!statement) {
+        statement = db.prepare(fieldUpsertSql(applyEnabled, applyMissingInOrg));
+        fieldUpsertStatements.set(key, statement);
+      }
+      return statement;
+    };
 
     const existingFieldNames = (
       db.prepare('SELECT field_name FROM sf_object_fields WHERE object_name = ? ORDER BY field_name').all(objName) as Array<{
@@ -790,7 +803,7 @@ export const store = {
         : fieldNameByLower.get(requestedField.toLowerCase()) ?? requestedField;
       exactFieldNames.add(fieldName);
       if (!fieldNameByLower.has(fieldName.toLowerCase())) fieldNameByLower.set(fieldName.toLowerCase(), fieldName);
-      const stmt = f.enabled !== undefined ? upsertFieldSetEnabled : upsertFieldKeepEnabled;
+      const stmt = fieldUpsertStatement(f.enabled !== undefined, f.missingInOrg !== undefined);
       stmt.run(
         objName,
         fieldName,
