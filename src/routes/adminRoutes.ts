@@ -85,6 +85,47 @@ function parseSalesforceSettingsInput(body: Record<string, any>): SalesforceSett
   return input;
 }
 
+/** What a connect proves. The private key and certificate body are compared too, but never logged. */
+const VERIFIED_CONNECTION_FIELDS = [
+  'authMode',
+  'loginUrl',
+  'clientId',
+  'username',
+  'expectedOrgId',
+  'enforceOrgIdLock',
+  'certificatePem',
+  'certFingerprint',
+] as const;
+
+const NO_CONNECTED_ORG = {
+  enabled: false,
+  lastConnectedAt: null,
+  lastError: '',
+  connectedOrgId: '',
+  connectedUser: '',
+  syncInstanceUrl: '',
+} satisfies SalesforceSettingsInput;
+
+/**
+ * Saves settings outside a verified connect. A change to anything a connect proves ends the verified
+ * state, so nothing keeps reporting an org those settings were never tried against. A disconnected
+ * org has no such state to end and stays disconnected.
+ */
+function saveSalesforceSettings(input: SalesforceSettingsInput) {
+  return runInTransaction(() => {
+    const before = store.getSalesforceSettingsWithSecrets();
+    const saved = store.updateSalesforceSettings(input);
+    const after = store.getSalesforceSettingsWithSecrets();
+    const privateKeyReplaced = after.privateKeyPem !== before.privateKeyPem;
+    const changed = privateKeyReplaced || VERIFIED_CONNECTION_FIELDS.some((f) => after[f] !== before[f]);
+    const updated =
+      changed && before.connectionStatus !== 'disconnected'
+        ? store.updateSalesforceSettings({ ...NO_CONNECTED_ORG, connectionStatus: 'not_verified' })
+        : saved;
+    return { updated, privateKeyReplaced };
+  });
+}
+
 /**
  * Why a production Okta save must be refused, if it should be. The issuer's discovery and token
  * endpoints receive the client secret, and the redirect URI receives the authorization code.
@@ -424,7 +465,10 @@ adminRouter.delete('/profiles/:id', (req: Request, res: Response) => {
 
 async function getActiveSalesforceOrgSession(): Promise<SalesforceOrgTokenSession> {
   const sfSecrets = store.getSalesforceSettingsWithSecrets();
-  if (!sfSecrets.enabled && sfSecrets.connectionStatus !== 'connected') {
+  const active =
+    sfSecrets.connectionStatus === 'connected' ||
+    (sfSecrets.enabled && sfSecrets.connectionStatus !== 'not_verified');
+  if (!active) {
     throw new Error(
       'Salesforce Org connection is not active. Go to "Connect to Salesforce Org" to connect via JWT Bearer.'
     );
@@ -1131,7 +1175,7 @@ adminRouter.put('/sf-settings', (req: Request, res: Response) => {
 
   let updated;
   try {
-    updated = store.updateSalesforceSettings(input);
+    ({ updated } = saveSalesforceSettings(input));
   } catch (err: any) {
     // e.g. a private key that cannot be parsed
     res.status(400).json({ error: err?.message || 'Invalid Salesforce settings.' });
@@ -1159,7 +1203,7 @@ adminRouter.post('/sf-settings/generate-cert', (req: Request, res: Response) => 
     const bundle = generateSelfSignedCertificateBundle(
       commonName ? String(commonName) : 'Salesforce MCP Metadata Sync'
     );
-    const updated = store.updateSalesforceSettings({
+    const { updated } = saveSalesforceSettings({
       privateKeyPem: bundle.privateKeyPem,
       certificatePem: bundle.certificatePem,
       certFingerprint: bundle.fingerprintSha256,
@@ -1261,8 +1305,8 @@ adminRouter.post(
       // With a stored key that cannot be decrypted nothing was tried, so this is no verdict on the
       // submitted settings. They are saved for the retry once APP_SECRET_KEY is restored; the key stays.
       const unverifiable = stored.privateKeyUndecryptable && !replacesKey;
+      if (unverifiable) saveSalesforceSettings(input);
       const updated = store.updateSalesforceSettings({
-        ...(unverifiable ? input : {}),
         connectionStatus: 'error',
         lastError: errMsg,
       });
@@ -1281,11 +1325,7 @@ adminRouter.post(
  * Disconnects the active Salesforce Org metadata connection.
  */
 adminRouter.post('/sf-settings/disconnect', (req: Request, res: Response) => {
-  const updated = store.updateSalesforceSettings({
-    enabled: false,
-    connectionStatus: 'disconnected',
-    lastError: '',
-  });
+  const updated = store.updateSalesforceSettings({ ...NO_CONNECTED_ORG, connectionStatus: 'disconnected' });
 
   const actor = getAdminInfo(req);
   store.recordPortalAdminLog({

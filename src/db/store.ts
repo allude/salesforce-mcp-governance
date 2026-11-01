@@ -1822,7 +1822,9 @@ export const store = {
       certificatePem: row.certificate_pem || '',
       certFingerprint: row.cert_fingerprint || '',
       connectionStatus:
-        row.connection_status === 'connected' || row.connection_status === 'error'
+        row.connection_status === 'connected' ||
+        row.connection_status === 'error' ||
+        row.connection_status === 'not_verified'
           ? row.connection_status
           : 'disconnected',
       lastConnectedAt: row.last_connected_at || null,

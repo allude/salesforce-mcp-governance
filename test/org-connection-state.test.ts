@@ -331,3 +331,146 @@ describe('a connect that does not succeed', () => {
     assert.equal(store.getSalesforceSettings().connectedOrgId, '');
   });
 });
+
+describe('a connection whose settings changed', () => {
+  const connected = async () => {
+    answerTokenExchange(tokenGranted());
+    const res = await connect();
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(res.body.sfSettings.connectionStatus, 'connected');
+    assert.equal(res.body.sfSettings.connectedOrgId, ORG_ID);
+  };
+  const assertNotVerified = (settings: any) => {
+    assert.equal(settings.connectionStatus, 'not_verified');
+    assert.equal(settings.connectedOrgId, '');
+    assert.equal(settings.connectedUser, '');
+    assert.equal(settings.syncInstanceUrl, '');
+    assert.equal(settings.lastConnectedAt, null);
+    assert.equal(settings.lastError, '');
+    assert.equal(settings.enabled, false);
+  };
+
+  for (const [name, change] of Object.entries<() => Record<string, unknown>>({
+    'the private key': () => ({ privateKeyPem: generateSelfSignedCertificateBundle('Other').privateKeyPem }),
+    'the certificate': () => ({ certificatePem: generateSelfSignedCertificateBundle('Other').certificatePem }),
+    'the client ID': () => ({ clientId: '3MVG9_OTHER' }),
+    'the username': () => ({ username: 'other@example.com' }),
+    'the login URL': () => ({ loginUrl: 'https://test.salesforce.com' }),
+    'the auth mode': () => ({ authMode: 'simulated' }),
+    'the expected Org ID': () => ({ expectedOrgId: '00D000000000002AAA' }),
+    'the Org ID lock': () => ({ expectedOrgId: ORG_ID, enforceOrgIdLock: true }),
+  })) {
+    test(`saving a new value for ${name} ends the verified state`, async () => {
+      await connected();
+      const res = await route('', 'PUT', change());
+      assert.equal(res.status, 200, JSON.stringify(res.body));
+      assertNotVerified(res.body.sfSettings);
+      assertNotVerified(store.getSalesforceSettings());
+    });
+  }
+
+  test('turning the Org ID lock off ends the verified state', async () => {
+    store.updateSalesforceSettings({ expectedOrgId: ORG_ID, enforceOrgIdLock: true });
+    await connected();
+    assertNotVerified((await route('', 'PUT', { enforceOrgIdLock: false })).body.sfSettings);
+  });
+
+  test('generating a new key and certificate ends the verified state', async () => {
+    await connected();
+    const res = await route('/generate-cert', 'POST');
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assertNotVerified(res.body.sfSettings);
+  });
+
+  test('saving an earlier connection error ends it too: it was about the old settings', async () => {
+    answerTokenExchange(tokenRefused());
+    assert.equal((await connect()).status, 400);
+    assertNotVerified((await route('', 'PUT', { clientId: '3MVG9_OTHER' })).body.sfSettings);
+  });
+
+  test('resending the same values, or changing what a connect does not prove, keeps the connection', async () => {
+    await connected();
+    const s = store.getSalesforceSettings();
+    const same = await route('', 'PUT', {
+      authMode: s.authMode,
+      loginUrl: s.loginUrl,
+      clientId: ` ${s.clientId} `,
+      username: s.username,
+      expectedOrgId: s.expectedOrgId,
+      enforceOrgIdLock: s.enforceOrgIdLock,
+      certificatePem: s.certificatePem,
+      privateKeyPem: '',
+    });
+    assert.equal(same.body.sfSettings.connectionStatus, 'connected');
+    assert.equal(same.body.sfSettings.connectedOrgId, ORG_ID);
+
+    const reSent = await route('', 'PUT', { privateKeyPem: bundle.privateKeyPem });
+    assert.equal(reSent.body.sfSettings.connectionStatus, 'connected');
+
+    const other = await route('', 'PUT', { apiVersion: 'v60.0', sfdxObjectsFolderPath: '/tmp/x', instanceUrl: MCP_HOST });
+    assert.equal(other.body.sfSettings.connectionStatus, 'connected');
+    assert.equal(other.body.sfSettings.syncInstanceUrl, SYNC_HOST);
+  });
+
+  test('an org that was never connected stays disconnected', async () => {
+    const res = await route('', 'PUT', { clientId: '3MVG9_OTHER' });
+    assert.equal(res.body.sfSettings.connectionStatus, 'disconnected');
+  });
+
+  test('a save the store refuses changes nothing', async () => {
+    await connected();
+    assert.equal((await route('', 'PUT', { privateKeyPem: 'not a key', clientId: '3MVG9_OTHER' })).status, 400);
+    const after = store.getSalesforceSettings();
+    assert.equal(after.connectionStatus, 'connected');
+    assert.equal(after.clientId, '3MVG9_ORIGINAL');
+  });
+
+  test('org sync refuses until the changed settings are verified, without trying them', async () => {
+    await connected();
+    await route('', 'PUT', { clientId: '3MVG9_OTHER' });
+    let exchanged = false;
+    answerTokenExchange(() => {
+      exchanged = true;
+      return tokenGranted()();
+    });
+
+    const res = await adminFetch(server.baseUrl, session, '/api/admin/profiles/pull-preview', { method: 'POST', body: {} });
+
+    assert.match(res.body.error, /not active/);
+    assert.equal(exchanged, false);
+  });
+
+  test('a stray enabled flag does not make a not-verified connection usable', async () => {
+    await connected();
+    await route('', 'PUT', { clientId: '3MVG9_OTHER' });
+    store.updateSalesforceSettings({ enabled: true });
+
+    const res = await adminFetch(server.baseUrl, session, '/api/admin/profiles/pull-preview', { method: 'POST', body: {} });
+
+    assert.match(res.body.error, /not active/);
+  });
+
+  test('connecting again verifies the new settings', async () => {
+    await connected();
+    await route('', 'PUT', { clientId: '3MVG9_OTHER' });
+    await connected();
+    assert.equal(store.getSalesforceSettings().syncInstanceUrl, SYNC_HOST);
+  });
+
+  test('disconnect clears the connected fields and leaves the settings and MCP host', async () => {
+    await connected();
+    const res = await route('/disconnect', 'POST');
+
+    assert.equal(res.status, 200);
+    const after = res.body.sfSettings;
+    assert.equal(after.connectionStatus, 'disconnected');
+    assert.equal(after.connectedOrgId, '');
+    assert.equal(after.connectedUser, '');
+    assert.equal(after.syncInstanceUrl, '');
+    assert.equal(after.lastConnectedAt, null);
+    assert.equal(after.enabled, false);
+    assert.equal(after.instanceUrl, MCP_HOST);
+    assert.equal(after.clientId, '3MVG9_ORIGINAL');
+    assert.equal(after.hasPrivateKey, true);
+  });
+});

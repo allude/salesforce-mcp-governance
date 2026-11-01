@@ -176,7 +176,8 @@ export interface SalesforceConnectionSettings {
   hasPrivateKey: boolean;
   certificatePem: string;
   certFingerprint: string;
-  connectionStatus: 'connected' | 'disconnected' | 'error';
+  /** `not_verified`: the settings changed after the last connect or failed attempt, so neither result holds. */
+  connectionStatus: 'connected' | 'disconnected' | 'error' | 'not_verified';
   lastConnectedAt: string | null;
   lastError: string;
   connectedOrgId: string;
