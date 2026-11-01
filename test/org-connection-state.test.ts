@@ -474,3 +474,143 @@ describe('a connection whose settings changed', () => {
     assert.equal(after.hasPrivateKey, true);
   });
 });
+
+describe('the Portal Admin log of connection changes', () => {
+  const latest = (action: string) => {
+    const entry = store.getPortalAdminLogs(200).find((row) => row.action === action);
+    assert.ok(entry, `no ${action} entry`);
+    return entry.details;
+  };
+  const changesIn = (details: string): Record<string, { before: unknown; after: unknown }> =>
+    JSON.parse(details.match(/Changes: (\{.*?\})\. privateKeyReplaced: /)?.[1] ?? 'null');
+  const notSavedIn = (details: string): Record<string, { before: unknown; after: unknown }> =>
+    JSON.parse(details.match(/Not saved: (\{.*\})\. privateKeySubmitted: /)?.[1] ?? 'null');
+
+  /** The PEM body lines as well as its markers, so a re-encoded or partial copy is caught too. */
+  function assertNoSecrets(secrets: string[]) {
+    const logged = JSON.stringify(store.getPortalAdminLogs(500));
+    assert.ok(!logged.includes('PRIVATE KEY'));
+    assert.ok(!logged.includes('BEGIN CERTIFICATE'));
+    for (const secret of secrets) {
+      for (const line of secret.split('\n').filter((l) => l && !l.startsWith('-----'))) {
+        assert.ok(!logged.includes(line), 'a line of a PEM reached the log');
+      }
+    }
+  }
+
+  test('turning off the Org ID lock is identifiable', async () => {
+    store.updateSalesforceSettings({ expectedOrgId: ORG_ID, enforceOrgIdLock: true });
+
+    assert.equal((await route('', 'PUT', { enforceOrgIdLock: false })).status, 200);
+
+    const details = latest('UPDATE_SF_SETTINGS');
+    assert.deepEqual(changesIn(details).enforceOrgIdLock, { before: true, after: false });
+    assert.match(details, /privateKeyReplaced: false\./);
+  });
+
+  test('a save logs the before and after of each non-secret field it changes, and no others', async () => {
+    const other = generateSelfSignedCertificateBundle('Other');
+    const before = store.getSalesforceSettings();
+
+    const res = await route('', 'PUT', {
+      clientId: '3MVG9_NEW',
+      username: 'new@example.com',
+      loginUrl: 'https://test.salesforce.com',
+      instanceUrl: 'https://new-host.my.salesforce.com',
+      expectedOrgId: ORG_ID,
+      enforceOrgIdLock: true,
+      authMode: 'simulated',
+      certificatePem: other.certificatePem,
+      privateKeyPem: other.privateKeyPem,
+    });
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+
+    const details = latest('UPDATE_SF_SETTINGS');
+    assert.deepEqual(changesIn(details), {
+      authMode: { before: 'jwt_bearer', after: 'simulated' },
+      loginUrl: { before: before.loginUrl, after: 'https://test.salesforce.com' },
+      clientId: { before: '3MVG9_ORIGINAL', after: '3MVG9_NEW' },
+      username: { before: 'integration@example.com', after: 'new@example.com' },
+      expectedOrgId: { before: '', after: ORG_ID },
+      enforceOrgIdLock: { before: false, after: true },
+      instanceUrl: { before: MCP_HOST, after: 'https://new-host.my.salesforce.com' },
+      certFingerprint: { before: bundle.fingerprintSha256, after: other.fingerprintSha256 },
+    });
+    assert.match(details, /privateKeyReplaced: true\./);
+    assertNoSecrets([bundle.privateKeyPem, other.privateKeyPem, other.certificatePem]);
+  });
+
+  test('a save that ends a verified connection logs that too', async () => {
+    answerTokenExchange(tokenGranted());
+    await connect();
+    await route('', 'PUT', { clientId: '3MVG9_NEW' });
+
+    const changes = changesIn(latest('UPDATE_SF_SETTINGS'));
+    assert.deepEqual(changes.connectionStatus, { before: 'connected', after: 'not_verified' });
+    assert.deepEqual(changes.connectedOrgId, { before: ORG_ID, after: '' });
+    assert.deepEqual(changes.syncInstanceUrl, { before: SYNC_HOST, after: '' });
+  });
+
+  test('generate-cert logs the new fingerprint and the replaced key', async () => {
+    const res = await route('/generate-cert', 'POST');
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+
+    const details = latest('GENERATE_SF_JWT_CERT');
+    assert.deepEqual(changesIn(details).certFingerprint, {
+      before: bundle.fingerprintSha256,
+      after: res.body.fingerprintSha256,
+    });
+    assert.match(details, /privateKeyReplaced: true\./);
+    assertNoSecrets([store.getSalesforceSettingsWithSecrets().privateKeyPem, res.body.certificatePem]);
+  });
+
+  test('a successful connect logs what it saved, and no token', async () => {
+    const other = generateSelfSignedCertificateBundle('Other');
+    const token = `sync_tok_${uid()}`;
+    answerTokenExchange(() =>
+      Response.json({ access_token: token, instance_url: SYNC_HOST, id: `https://login.salesforce.com/id/${ORG_ID}/005000000000001AAA` })
+    );
+
+    const res = await connect({ clientId: '3MVG9_NEW', privateKeyPem: other.privateKeyPem, certificatePem: other.certificatePem });
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+
+    const details = latest('CONNECT_SALESFORCE_ORG');
+    const changes = changesIn(details);
+    assert.deepEqual(changes.clientId, { before: '3MVG9_ORIGINAL', after: '3MVG9_NEW' });
+    assert.deepEqual(changes.syncInstanceUrl, { before: '', after: SYNC_HOST });
+    assert.deepEqual(changes.certFingerprint, { before: bundle.fingerprintSha256, after: other.fingerprintSha256 });
+    assert.equal(changes.instanceUrl, undefined);
+    assert.match(details, /privateKeyReplaced: true\./);
+    assert.ok(!details.includes(token));
+    assertNoSecrets([other.privateKeyPem, other.certificatePem]);
+  });
+
+  test('a failed connect logs what changed and, apart, what was tried and not saved', async () => {
+    store.updateSalesforceSettings({ expectedOrgId: ORG_ID, enforceOrgIdLock: true });
+    const other = generateSelfSignedCertificateBundle('Other');
+    answerTokenExchange(tokenRefused());
+
+    const res = await connect({ enforceOrgIdLock: false, privateKeyPem: other.privateKeyPem, certificatePem: other.certificatePem });
+    assert.equal(res.status, 400);
+
+    const details = latest('CONNECT_SALESFORCE_ORG_FAILED');
+    assert.match(details, /invalid_grant/);
+    assert.deepEqual(changesIn(details), { connectionStatus: { before: 'disconnected', after: 'error' } });
+    assert.match(details, /privateKeyReplaced: false\./);
+    assert.deepEqual(notSavedIn(details), {
+      enforceOrgIdLock: { before: true, after: false },
+      certFingerprint: { before: bundle.fingerprintSha256, after: other.fingerprintSha256 },
+    });
+    assert.match(details, /privateKeySubmitted: true\./);
+    assertNoSecrets([other.privateKeyPem, other.certificatePem]);
+  });
+
+  test('a connect request that fails validation is logged with no changes', async () => {
+    const leaked = 'not-a-real-key-but-still-secret';
+    assert.equal((await connect({ privateKeyPem: leaked })).status, 400);
+
+    const details = latest('CONNECT_SALESFORCE_ORG_FAILED');
+    assert.deepEqual(changesIn(details), {});
+    assert.ok(!details.includes(leaked));
+  });
+});

@@ -15,6 +15,7 @@ import {
 import {
   generateSelfSignedCertificateBundle,
   connectToSalesforceOrgViaJwt,
+  inspectCertificatePem,
   validatePrivateKeyPem,
   fetchProfilesFromOrgSession,
   fetchOrgObjectsCatalog,
@@ -23,6 +24,7 @@ import {
 } from '../salesforce/jwtConnection.js';
 import { config } from '../config.js';
 import { parseObjectSyncPayload, parseProfileSyncPayload } from './orgSyncPayload.js';
+import type { SalesforceConnectionSettings } from '../types/governance.js';
 import {
   evaluateMcpToolCall,
   resolveEffectiveProfilePermissions,
@@ -106,6 +108,44 @@ const NO_CONNECTED_ORG = {
   syncInstanceUrl: '',
 } satisfies SalesforceSettingsInput;
 
+/** The settings an audit entry may show. An allowlist, so the key, certificate body and tokens stay out. */
+function auditableSettings(settings: Omit<SalesforceConnectionSettings, 'updatedAt'>) {
+  return {
+    authMode: settings.authMode,
+    loginUrl: settings.loginUrl,
+    clientId: settings.clientId,
+    username: settings.username,
+    expectedOrgId: settings.expectedOrgId,
+    enforceOrgIdLock: settings.enforceOrgIdLock,
+    instanceUrl: settings.instanceUrl,
+    syncInstanceUrl: settings.syncInstanceUrl,
+    apiVersion: settings.apiVersion,
+    sfdxObjectsFolderPath: settings.sfdxObjectsFolderPath,
+    certFingerprint: settings.certFingerprint,
+    connectionStatus: settings.connectionStatus,
+    connectedOrgId: settings.connectedOrgId,
+  };
+}
+
+function auditDiff(before: Omit<SalesforceConnectionSettings, 'updatedAt'>, after: typeof before): string {
+  const from = auditableSettings(before);
+  const to = auditableSettings(after);
+  const changed: Record<string, { before: unknown; after: unknown }> = {};
+  for (const field of Object.keys(from) as Array<keyof typeof from>) {
+    if (from[field] !== to[field]) changed[field] = { before: from[field], after: to[field] };
+  }
+  return JSON.stringify(changed);
+}
+
+/** How the settings changed, for a Portal Admin log entry. Values are JSON so a username cannot fake a line. */
+function auditChanges(
+  before: Omit<SalesforceConnectionSettings, 'updatedAt'>,
+  after: typeof before,
+  privateKeyReplaced: boolean
+): string {
+  return `Changes: ${auditDiff(before, after)}. privateKeyReplaced: ${privateKeyReplaced}.`;
+}
+
 /**
  * Saves settings outside a verified connect. A change to anything a connect proves ends the verified
  * state, so nothing keeps reporting an org those settings were never tried against. A disconnected
@@ -122,7 +162,7 @@ function saveSalesforceSettings(input: SalesforceSettingsInput) {
       changed && before.connectionStatus !== 'disconnected'
         ? store.updateSalesforceSettings({ ...NO_CONNECTED_ORG, connectionStatus: 'not_verified' })
         : saved;
-    return { updated, privateKeyReplaced };
+    return { before, updated, privateKeyReplaced };
   });
 }
 
@@ -1173,21 +1213,22 @@ adminRouter.put('/sf-settings', (req: Request, res: Response) => {
     return;
   }
 
-  let updated;
+  let saved;
   try {
-    ({ updated } = saveSalesforceSettings(input));
+    saved = saveSalesforceSettings(input);
   } catch (err: any) {
     // e.g. a private key that cannot be parsed
     res.status(400).json({ error: err?.message || 'Invalid Salesforce settings.' });
     return;
   }
+  const { updated } = saved;
   const actor = getAdminInfo(req);
   store.recordPortalAdminLog({
     adminUsername: actor.username,
     authMethod: actor.authMethod,
     action: 'UPDATE_SF_SETTINGS',
     target: 'Salesforce Org Connection',
-    details: `Updated Salesforce Org connection settings (Mode: ${updated.authMode}, Login URL: ${updated.loginUrl}, User: ${updated.username || 'Not set'}, OrgId: ${updated.expectedOrgId || 'Any'}, Instance: ${updated.instanceUrl}).`,
+    details: `Updated Salesforce Org connection settings (Mode: ${updated.authMode}, Login URL: ${updated.loginUrl}, User: ${updated.username || 'Not set'}, OrgId: ${updated.expectedOrgId || 'Any'}, Instance: ${updated.instanceUrl}). ${auditChanges(saved.before, updated, saved.privateKeyReplaced)}`,
     ipAddress: actor.ip,
   });
   res.json({ sfSettings: updated });
@@ -1203,7 +1244,7 @@ adminRouter.post('/sf-settings/generate-cert', (req: Request, res: Response) => 
     const bundle = generateSelfSignedCertificateBundle(
       commonName ? String(commonName) : 'Salesforce MCP Metadata Sync'
     );
-    const { updated } = saveSalesforceSettings({
+    const { before, updated, privateKeyReplaced } = saveSalesforceSettings({
       privateKeyPem: bundle.privateKeyPem,
       certificatePem: bundle.certificatePem,
       certFingerprint: bundle.fingerprintSha256,
@@ -1215,7 +1256,7 @@ adminRouter.post('/sf-settings/generate-cert', (req: Request, res: Response) => 
       authMethod: actor.authMethod,
       action: 'GENERATE_SF_JWT_CERT',
       target: 'Salesforce JWT Certificate',
-      details: `Generated new 2048-bit RSA Private Key & X.509 Certificate (SHA-256: ${bundle.fingerprintSha256.slice(0, 23)}...) for Salesforce Connected App.`,
+      details: `Generated new 2048-bit RSA Private Key & X.509 Certificate (SHA-256: ${bundle.fingerprintSha256.slice(0, 23)}...) for Salesforce Connected App. ${auditChanges(before, updated, privateKeyReplaced)}`,
       ipAddress: actor.ip,
     });
 
@@ -1241,13 +1282,13 @@ adminRouter.post(
   '/sf-settings/connect',
   asyncRoute(async (req: Request, res: Response) => {
     const actor = getAdminInfo(req);
-    const logFailure = (errMsg: string) =>
+    const logFailure = (errMsg: string, changes: string) =>
       store.recordPortalAdminLog({
         adminUsername: actor.username,
         authMethod: actor.authMethod,
         action: 'CONNECT_SALESFORCE_ORG_FAILED',
         target: 'Salesforce Org Connection',
-        details: `Salesforce JWT connection failed: ${errMsg}`,
+        details: `Salesforce JWT connection failed: ${errMsg} ${changes}`,
         ipAddress: actor.ip,
       });
 
@@ -1262,8 +1303,9 @@ adminRouter.post(
     } catch (err: any) {
       // A bad request says nothing about the org, so the connection status stays as it was.
       const errMsg = err?.message || 'Invalid Salesforce settings.';
-      logFailure(errMsg);
-      res.status(400).json({ error: errMsg, sfSettings: store.getSalesforceSettings() });
+      const current = store.getSalesforceSettings();
+      logFailure(errMsg, auditChanges(current, current, false));
+      res.status(400).json({ error: errMsg, sfSettings: current });
       return;
     }
 
@@ -1282,6 +1324,7 @@ adminRouter.post(
         throw new Error('Salesforce settings changed while connecting. Connect again to verify them.');
       }
       const updated = store.saveVerifiedSalesforceConnection(input, session);
+      const privateKeyReplaced = replacesKey && input.privateKeyPem !== stored.privateKeyPem;
 
       store.recordPortalAdminLog({
         adminUsername: actor.username,
@@ -1292,7 +1335,7 @@ adminRouter.post(
           session.authMode === 'simulated'
             ? 'Simulated JWT Org'
             : 'OAuth 2.0 JWT Bearer'
-        }.`,
+        }. ${auditChanges(stored, updated, privateKeyReplaced)}`,
         ipAddress: actor.ip,
       });
 
@@ -1310,7 +1353,23 @@ adminRouter.post(
         connectionStatus: 'error',
         lastError: errMsg,
       });
-      logFailure(errMsg);
+
+      // What the admin tried is part of the record, separately from what actually changed.
+      const attempted = unverifiable
+        ? '{}'
+        : auditDiff(stored, {
+            ...stored,
+            ...input,
+            clientId: (input.clientId ?? stored.clientId).trim(),
+            username: (input.username ?? stored.username).trim(),
+            certFingerprint:
+              (input.certificatePem && inspectCertificatePem(input.certificatePem.trim())?.fingerprintSha256) ||
+              stored.certFingerprint,
+          });
+      logFailure(
+        errMsg,
+        `${auditChanges(stored, updated, false)} Not saved: ${attempted}. privateKeySubmitted: ${replacesKey}.`
+      );
 
       res.status(400).json({
         error: errMsg,
