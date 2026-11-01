@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState, useEffect, useRef } from 'react';
+import { portalAuditResult } from './portalAudit';
 import type {
   SalesforceProfile,
   SalesforceObject,
@@ -1892,7 +1893,9 @@ export function FlyoutDrawer({
                   <dd className="mono">{flyout.data.ipAddress}</dd>
                   <dt>Result</dt>
                   <dd>
-                    <span className="tag ok">SUCCESS</span>
+                    <span className={`tag ${portalAuditResult(String(flyout.data.action)).tone}`}>
+                      {portalAuditResult(String(flyout.data.action)).label}
+                    </span>
                   </dd>
                 </dl>
               </div>
