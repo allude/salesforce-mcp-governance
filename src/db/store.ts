@@ -47,6 +47,24 @@ function runInTransaction<T>(fn: () => T): T {
 }
 
 let warnedUndecryptableOktaSecret = false;
+let warnedUndecryptablePrivateKey = false;
+
+/** Decrypts the stored JWT private key. A key that cannot be decrypted reads as empty and is flagged, never thrown. */
+function readStoredPrivateKey(privateKeyEnc: string): { privateKeyPem: string; undecryptable: boolean } {
+  try {
+    return { privateKeyPem: privateKeyEnc ? decryptSecret(privateKeyEnc) : '', undecryptable: false };
+  } catch {
+    // Usually APP_SECRET_KEY changed. Keep the ciphertext (updateSalesforceSettings never overwrites
+    // it unless a new key is entered) and tell the operator once.
+    if (!warnedUndecryptablePrivateKey) {
+      warnedUndecryptablePrivateKey = true;
+      console.warn(
+        '[store] The stored Salesforce JWT private key cannot be decrypted with the current APP_SECRET_KEY. Restore that key, or enter a new private key in Connect to Salesforce Org.'
+      );
+    }
+    return { privateKeyPem: '', undecryptable: true };
+  }
+}
 
 db.exec(`
   PRAGMA journal_mode = WAL;
@@ -1526,12 +1544,7 @@ export const store = {
 
   getSalesforceSettings(): SalesforceConnectionSettings & { privateKeyPem?: string } {
     const row = db.prepare('SELECT * FROM sf_connection_settings WHERE id = 1').get() as any;
-    let privateKeyPem = '';
-    try {
-      privateKeyPem = row.private_key_enc ? decryptSecret(row.private_key_enc) : '';
-    } catch {
-      privateKeyPem = '';
-    }
+    const { privateKeyPem } = readStoredPrivateKey(row.private_key_enc);
     return {
       enabled: Boolean(row.enabled),
       authMode: row.auth_mode === 'simulated' ? 'simulated' : 'jwt_bearer',
@@ -1558,31 +1571,37 @@ export const store = {
     };
   },
 
-  getSalesforceSettingsWithSecrets(): SalesforceConnectionSettings & { privateKeyPem: string } {
-    const row = db.prepare('SELECT * FROM sf_connection_settings WHERE id = 1').get() as any;
-    let privateKeyPem = '';
-    try {
-      privateKeyPem = row.private_key_enc ? decryptSecret(row.private_key_enc) : '';
-    } catch {
-      privateKeyPem = '';
-    }
+  getSalesforceSettingsWithSecrets(): SalesforceConnectionSettings & {
+    privateKeyPem: string;
+    privateKeyUndecryptable: boolean;
+  } {
+    const row = db.prepare('SELECT private_key_enc FROM sf_connection_settings WHERE id = 1').get() as {
+      private_key_enc: string;
+    };
+    const { privateKeyPem, undecryptable } = readStoredPrivateKey(row.private_key_enc);
     const base = this.getSalesforceSettings();
     return {
       ...base,
       privateKeyPem,
+      privateKeyUndecryptable: undecryptable,
     };
   },
 
   updateSalesforceSettings(
     input: Partial<SalesforceConnectionSettings> & { privateKeyPem?: string }
   ): SalesforceConnectionSettings {
-    const current = this.getSalesforceSettingsWithSecrets();
+    const current = this.getSalesforceSettings();
     const now = new Date().toISOString();
 
-    let nextPrivateKey = current.privateKeyPem;
-    if (input.privateKeyPem !== undefined && input.privateKeyPem.trim() !== '') {
-      nextPrivateKey = validatePrivateKeyPem(input.privateKeyPem);
-    }
+    const storedPrivateKeyEnc = (
+      db.prepare('SELECT private_key_enc FROM sf_connection_settings WHERE id = 1').get() as { private_key_enc: string }
+    ).private_key_enc;
+    // A blank key means "keep the stored one"; the stored ciphertext is kept as-is, even if it
+    // cannot be decrypted right now, so a key change never silently destroys it.
+    const nextPrivateKeyEnc =
+      input.privateKeyPem !== undefined && input.privateKeyPem.trim() !== ''
+        ? encryptSecret(validatePrivateKeyPem(input.privateKeyPem))
+        : storedPrivateKeyEnc;
 
     const nextCertPem =
       input.certificatePem !== undefined
@@ -1625,7 +1644,7 @@ export const store = {
       nextLoginUrl,
       (input.clientId ?? current.clientId).trim(),
       (input.username ?? current.username).trim(),
-      nextPrivateKey ? encryptSecret(nextPrivateKey) : '',
+      nextPrivateKeyEnc,
       nextCertPem,
       nextFingerprint,
       input.connectionStatus ?? current.connectionStatus,

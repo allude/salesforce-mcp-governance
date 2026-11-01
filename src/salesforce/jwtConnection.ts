@@ -355,6 +355,9 @@ const DEFAULT_SIMULATED_ORG: SimulatedOrgState = {
   ],
 };
 
+const UNDECRYPTABLE_PRIVATE_KEY_ERROR =
+  'The stored RSA Private Key cannot be decrypted with the current APP_SECRET_KEY. Restore that key, or enter a new private key.';
+
 /**
  * Authenticates against a Salesforce Org using OAuth 2.0 JWT Bearer Flow
  * (or Simulated Org mode when configured for local testing).
@@ -365,6 +368,8 @@ export async function connectToSalesforceOrgViaJwt(settings: {
   clientId: string;
   username: string;
   privateKeyPem: string;
+  /** A key is stored but could not be decrypted, so the error must not claim that none is set. */
+  privateKeyUndecryptable?: boolean;
   apiVersion: string;
   expectedOrgId?: string;
   enforceOrgIdLock?: boolean;
@@ -374,6 +379,9 @@ export async function connectToSalesforceOrgViaJwt(settings: {
   if (settings.authMode === 'simulated') {
     if (config.isProd) {
       throw new Error('Simulated Salesforce connections are not available in production.');
+    }
+    if (settings.privateKeyUndecryptable) {
+      throw new Error(UNDECRYPTABLE_PRIVATE_KEY_ERROR);
     }
     if (!settings.privateKeyPem) {
       throw new Error(
@@ -407,6 +415,9 @@ export async function connectToSalesforceOrgViaJwt(settings: {
   }
   if (!settings.username?.trim()) {
     throw new Error('Salesforce Integration Username is required.');
+  }
+  if (settings.privateKeyUndecryptable) {
+    throw new Error(UNDECRYPTABLE_PRIVATE_KEY_ERROR);
   }
   if (!settings.privateKeyPem?.trim()) {
     throw new Error('RSA Private Key PEM is required to sign the JWT assertion.');
