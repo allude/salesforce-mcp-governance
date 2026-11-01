@@ -852,11 +852,52 @@ export const store = {
     return this.getObjects().find((o) => o.objectName === objectName) || null;
   },
 
+  /**
+   * Deletes a field and revokes it from every Access Group, so a later sync that brings the field
+   * back does not silently restore access an admin removed. Returns null when there is no such field.
+   */
   deleteObjectField(objectName: string, fieldName: string): SalesforceObject | null {
-    db.prepare(
-      'DELETE FROM sf_object_fields WHERE object_name = ? AND field_name = ?'
-    ).run(objectName.trim(), fieldName.trim());
-    return this.getObjects().find((o) => o.objectName === objectName.trim()) || null;
+    const objName = objectName.trim();
+    const fldName = fieldName.trim();
+    const deleted = runInTransaction(() => {
+      const res = db
+        .prepare('DELETE FROM sf_object_fields WHERE object_name = ? AND field_name = ?')
+        .run(objName, fldName);
+      if (res.changes === 0) return false;
+      // Same rule as deleteObject: while a case variant still exists, the grants still refer to it.
+      const variantRemains = db
+        .prepare(
+          'SELECT 1 FROM sf_object_fields WHERE lower(object_name) = lower(?) AND lower(field_name) = lower(?) LIMIT 1'
+        )
+        .get(objName, fldName);
+      if (variantRemains) return true;
+
+      const now = new Date().toISOString();
+      const rows = db.prepare('SELECT id, object_permissions_json FROM access_groups').all() as Array<{
+        id: string;
+        object_permissions_json: string;
+      }>;
+      const updateGroup = db.prepare(
+        'UPDATE access_groups SET object_permissions_json = ?, updated_at = ? WHERE id = ?'
+      );
+      for (const row of rows) {
+        const perms = JSON.parse(row.object_permissions_json || '[]') as GroupObjectPermission[];
+        let changed = false;
+        const kept = perms.map((p) => {
+          if (String(p.objectName).toLowerCase() !== objName.toLowerCase()) return p;
+          const allowedFields = (p.allowedFields || []).filter(
+            (f) => String(f).toLowerCase() !== fldName.toLowerCase()
+          );
+          if (allowedFields.length === (p.allowedFields || []).length) return p;
+          changed = true;
+          return { ...p, allowedFields };
+        });
+        if (changed) updateGroup.run(JSON.stringify(kept), now, row.id);
+      }
+      return true;
+    });
+    if (!deleted) return null;
+    return this.getObjects().find((o) => o.objectName === objName) || null;
   },
 
   /**

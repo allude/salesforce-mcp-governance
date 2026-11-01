@@ -688,7 +688,7 @@ adminRouter.delete(
     const fieldName = String(req.params.fieldName);
     const updated = store.deleteObjectField(objectName, fieldName);
     if (!updated) {
-      res.status(404).json({ error: `Object '${objectName}' not found.` });
+      res.status(404).json({ error: `Field '${objectName}.${fieldName}' not found.` });
       return;
     }
 
