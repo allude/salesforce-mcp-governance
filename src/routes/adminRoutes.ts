@@ -15,6 +15,7 @@ import {
 import {
   generateSelfSignedCertificateBundle,
   connectToSalesforceOrgViaJwt,
+  validatePrivateKeyPem,
   fetchProfilesFromOrgSession,
   fetchOrgObjectsCatalog,
   fetchObjectsMetadataFromOrgSession,
@@ -1189,33 +1190,54 @@ adminRouter.post('/sf-settings/generate-cert', (req: Request, res: Response) => 
 
 /**
  * POST /api/admin/sf-settings/connect
- * Saves credentials and verifies OAuth 2.0 JWT Bearer connection against the Salesforce Org.
+ * Verifies the stored settings with any changes from the request over OAuth 2.0 JWT Bearer, and saves
+ * those changes only if that succeeds, so a failed attempt leaves a working key and settings in place.
  */
 adminRouter.post(
   '/sf-settings/connect',
   asyncRoute(async (req: Request, res: Response) => {
     const actor = getAdminInfo(req);
-    try {
-      // Save any provided settings first. instance_url is MCP's token host, which connect never sets.
-      if (req.body && Object.keys(req.body).length > 0) {
-        const { instanceUrl: _mcpHost, ...input } = parseSalesforceSettingsInput(req.body);
-        store.updateSalesforceSettings(input);
-      }
-
-      const secrets = store.getSalesforceSettingsWithSecrets();
-      const session = await connectToSalesforceOrgViaJwt({
-        authMode: secrets.authMode,
-        loginUrl: secrets.loginUrl,
-        clientId: secrets.clientId,
-        username: secrets.username,
-        privateKeyPem: secrets.privateKeyPem,
-        privateKeyUndecryptable: secrets.privateKeyUndecryptable,
-        apiVersion: secrets.apiVersion,
-        expectedOrgId: secrets.expectedOrgId,
-        enforceOrgIdLock: secrets.enforceOrgIdLock,
+    const logFailure = (errMsg: string) =>
+      store.recordPortalAdminLog({
+        adminUsername: actor.username,
+        authMethod: actor.authMethod,
+        action: 'CONNECT_SALESFORCE_ORG_FAILED',
+        target: 'Salesforce Org Connection',
+        details: `Salesforce JWT connection failed: ${errMsg}`,
+        ipAddress: actor.ip,
       });
 
-      const updated = store.saveVerifiedSalesforceConnection({}, session);
+    let input: SalesforceSettingsInput;
+    try {
+      // instance_url is MCP's token host, which connect never sets.
+      const { instanceUrl: _mcpHost, ...parsed } = parseSalesforceSettingsInput(req.body || {});
+      input = parsed;
+      if (input.privateKeyPem?.trim()) {
+        input.privateKeyPem = validatePrivateKeyPem(input.privateKeyPem);
+      }
+    } catch (err: any) {
+      // A bad request says nothing about the org, so the connection status stays as it was.
+      const errMsg = err?.message || 'Invalid Salesforce settings.';
+      logFailure(errMsg);
+      res.status(400).json({ error: errMsg, sfSettings: store.getSalesforceSettings() });
+      return;
+    }
+
+    const stored = store.getSalesforceSettingsWithSecrets();
+    const replacesKey = Boolean(input.privateKeyPem?.trim());
+    try {
+      const session = await connectToSalesforceOrgViaJwt({
+        ...stored,
+        ...input,
+        privateKeyPem: replacesKey ? (input.privateKeyPem as string) : stored.privateKeyPem,
+        privateKeyUndecryptable: replacesKey ? false : stored.privateKeyUndecryptable,
+      });
+
+      // A save made during the exchange was not what got verified.
+      if (store.getSalesforceSettings().updatedAt !== stored.updatedAt) {
+        throw new Error('Salesforce settings changed while connecting. Connect again to verify them.');
+      }
+      const updated = store.saveVerifiedSalesforceConnection(input, session);
 
       store.recordPortalAdminLog({
         adminUsername: actor.username,
@@ -1236,19 +1258,15 @@ adminRouter.post(
       });
     } catch (err: any) {
       const errMsg = err.message || 'Failed to connect to Salesforce Org.';
+      // With a stored key that cannot be decrypted nothing was tried, so this is no verdict on the
+      // submitted settings. They are saved for the retry once APP_SECRET_KEY is restored; the key stays.
+      const unverifiable = stored.privateKeyUndecryptable && !replacesKey;
       const updated = store.updateSalesforceSettings({
+        ...(unverifiable ? input : {}),
         connectionStatus: 'error',
         lastError: errMsg,
       });
-
-      store.recordPortalAdminLog({
-        adminUsername: actor.username,
-        authMethod: actor.authMethod,
-        action: 'CONNECT_SALESFORCE_ORG_FAILED',
-        target: 'Salesforce Org Connection',
-        details: `Salesforce JWT connection failed: ${errMsg}`,
-        ipAddress: actor.ip,
-      });
+      logFailure(errMsg);
 
       res.status(400).json({
         error: errMsg,

@@ -5,6 +5,7 @@ import { after, afterEach, before, beforeEach, describe, test } from 'node:test'
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import { config } from '../src/config.js';
 import { repairConnectInstanceUrls, store } from '../src/db/store.js';
 import { generateSelfSignedCertificateBundle } from '../src/salesforce/jwtConnection.js';
 import { SIMULATED_ORG_INSTANCE_URL } from '../src/salesforce/simulatedOrg.js';
@@ -193,5 +194,140 @@ describe('the instance URL MCP uses to verify tokens', () => {
     repairConnectInstanceUrls();
 
     assert.equal(rawInstanceUrl(), SIMULATED_ORG_INSTANCE_URL);
+  });
+});
+
+describe('a connect that does not succeed', () => {
+  const newKey = () => generateSelfSignedCertificateBundle('Replacement').privateKeyPem;
+  const changes = () => ({
+    clientId: '3MVG9_CANDIDATE',
+    username: 'candidate@example.com',
+    loginUrl: 'https://test.salesforce.com',
+    expectedOrgId: '00D000000000002AAA',
+    enforceOrgIdLock: true,
+    apiVersion: 'v61.0',
+    privateKeyPem: newKey(),
+    certificatePem: generateSelfSignedCertificateBundle('Replacement').certificatePem,
+  });
+  const stored = () => {
+    const { connectionStatus, lastError, updatedAt, ...rest } = store.getSalesforceSettingsWithSecrets();
+    return rest;
+  };
+
+  test('tries the submitted settings and key, not the stored ones', async () => {
+    let assertion = '';
+    globalThis.fetch = (async (input: any, init?: RequestInit) => {
+      const url = new URL(typeof input === 'string' ? input : input.url ?? input.href);
+      if (url.pathname !== '/services/oauth2/token') return sfFetch(input, init);
+      assertion = new URLSearchParams(String(init?.body)).get('assertion') || '';
+      return tokenRefused()();
+    }) as typeof fetch;
+    const candidate = changes();
+
+    await connect(candidate);
+
+    const [header, payload, signature] = assertion.split('.');
+    const claims = JSON.parse(Buffer.from(payload, 'base64url').toString());
+    assert.equal(claims.iss, candidate.clientId);
+    assert.equal(claims.sub, candidate.username);
+    assert.equal(claims.aud, candidate.loginUrl);
+    const verifier = crypto.createVerify('RSA-SHA256').update(`${header}.${payload}`);
+    assert.ok(verifier.verify(crypto.createPublicKey(candidate.privateKeyPem), signature, 'base64url'));
+  });
+
+  test('keeps the old key and settings, and records only the error', async () => {
+    answerTokenExchange(tokenGranted());
+    assert.equal((await connect()).status, 200);
+    const connected = stored();
+
+    answerTokenExchange(tokenRefused());
+    const res = await connect(changes());
+
+    assert.equal(res.status, 400);
+    assert.match(res.body.error, /invalid_grant/);
+    assert.deepEqual(stored(), connected);
+    const after = store.getSalesforceSettings();
+    assert.equal(after.connectionStatus, 'error');
+    assert.match(after.lastError, /invalid_grant/);
+  });
+
+  test('an Org ID lock the org does not match saves nothing', async () => {
+    const before = stored();
+    answerTokenExchange(tokenGranted(SYNC_HOST, '00D000000000009AAA'));
+
+    const res = await connect({ expectedOrgId: '00D000000000002AAA', enforceOrgIdLock: true });
+
+    assert.equal(res.status, 400);
+    assert.match(res.body.error, /Org ID Lock Mismatch/);
+    assert.deepEqual(stored(), before);
+  });
+
+  test('a success saves the submitted settings and key', async () => {
+    const candidate = { ...changes(), expectedOrgId: ORG_ID };
+    answerTokenExchange(tokenGranted());
+
+    const res = await connect(candidate);
+
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    const after = store.getSalesforceSettingsWithSecrets();
+    assert.equal(after.connectionStatus, 'connected');
+    assert.equal(after.clientId, candidate.clientId);
+    assert.equal(after.username, candidate.username);
+    assert.equal(after.loginUrl, candidate.loginUrl);
+    assert.equal(after.enforceOrgIdLock, true);
+    assert.equal(after.apiVersion, 'v61.0');
+    assert.equal(after.privateKeyPem.trim(), candidate.privateKeyPem.trim());
+  });
+
+  for (const [name, body] of Object.entries({
+    'a malformed Org ID': { expectedOrgId: 'nope', clientId: '3MVG9_CANDIDATE' },
+    'a disallowed login URL': { loginUrl: 'https://evil.example.com', clientId: '3MVG9_CANDIDATE' },
+    'an unparseable private key': { privateKeyPem: 'not a key', clientId: '3MVG9_CANDIDATE' },
+    'a lock with no Org ID': { enforceOrgIdLock: true, clientId: '3MVG9_CANDIDATE' },
+  })) {
+    test(`${name} is a 400 that leaves the connection status and settings alone`, async () => {
+      answerTokenExchange(tokenGranted());
+      assert.equal((await connect()).status, 200);
+      const before = store.getSalesforceSettingsWithSecrets();
+      sf.reset();
+
+      const res = await connect(body);
+
+      assert.equal(res.status, 400);
+      assert.equal(res.body.sfSettings.connectionStatus, 'connected');
+      assert.deepEqual(store.getSalesforceSettingsWithSecrets(), before);
+      assert.deepEqual(sf.calls, []);
+    });
+  }
+
+  test('production still refuses simulated mode, without touching the connection', async () => {
+    answerTokenExchange(tokenGranted());
+    assert.equal((await connect()).status, 200);
+    const mutable = config as { isProd: boolean };
+    mutable.isProd = true;
+    try {
+      const res = await connect({ authMode: 'simulated' });
+      assert.equal(res.status, 400);
+      assert.match(res.body.error, /not available in production/);
+    } finally {
+      mutable.isProd = false;
+    }
+    const after = store.getSalesforceSettings();
+    assert.equal(after.authMode, 'jwt_bearer');
+    assert.equal(after.connectionStatus, 'connected');
+  });
+
+  test('settings saved during the token exchange are not reported as verified', async () => {
+    answerTokenExchange(() => {
+      store.updateSalesforceSettings({ username: 'changed-meanwhile@example.com' });
+      return tokenGranted()();
+    });
+
+    const res = await connect();
+
+    assert.equal(res.status, 400);
+    assert.match(res.body.error, /changed while connecting/);
+    assert.equal(store.getSalesforceSettings().connectionStatus, 'error');
+    assert.equal(store.getSalesforceSettings().connectedOrgId, '');
   });
 });
