@@ -5,6 +5,7 @@ import {
   requireAdminAuth,
   issueAdminSessionCookie,
   clearAdminSessionCookie,
+  isHttpsUrl,
   verifyAdminSessionFromRequest,
 } from '../security/adminAuth.js';
 import {
@@ -176,18 +177,30 @@ function saveSalesforceSettings(input: SalesforceSettingsInput) {
 /**
  * Why a production Okta save must be refused, if it should be. The issuer's discovery and token
  * endpoints receive the client secret, and the redirect URI receives the authorization code.
- * A blank value is allowed: it means the https issuer derived from the domain, or the default URI.
+ * A blank result is allowed: it means the default redirect URI, or an issuer not configured yet.
+ * The result is judged after merging with the stored row, so `{enabled: true}` cannot switch on a
+ * stored http issuer. A result left disabled may keep a bad stored value, so that an admin can still
+ * turn Okta off (the portal resends the stored redirect URI), but it cannot introduce a new one.
  */
 function insecureOktaUrlError(body: Record<string, unknown>): string | null {
-  const urls: Array<[string, unknown]> = [
+  const submitted: Array<[string, unknown]> = [
     ['Okta Issuer', body.issuer],
     ['Okta Redirect URI', body.redirectUri],
   ];
-  for (const [label, value] of urls) {
-    if (value === undefined || value === null) continue;
-    const url = typeof value === 'string' ? value.trim() : null;
-    if (url === '') continue;
-    if (url === null || !/^https:\/\//i.test(url) || !URL.canParse(url)) {
+  for (const [label, value] of submitted) {
+    if (value !== undefined && value !== null && typeof value !== 'string') {
+      return `${label} must be an https:// URL in production.`;
+    }
+  }
+  const stored = store.getOktaConfig();
+  const next = store.resolveOktaSave(body);
+  const results: Array<[string, string, string]> = [
+    ['Okta Issuer', next.issuer, stored.issuer],
+    ['Okta Redirect URI', next.redirectUri, stored.redirectUri],
+  ];
+  for (const [label, url, storedUrl] of results) {
+    if (!url || isHttpsUrl(url)) continue;
+    if (next.enabled || url !== storedUrl) {
       return `${label} must be an https:// URL in production.`;
     }
   }

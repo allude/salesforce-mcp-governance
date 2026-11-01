@@ -671,6 +671,17 @@ function planProfileForms(forms: SalesforceProfile[], groupIdsOf: (profileId: st
   return { conflict: distinctSets.size > 1 && granted.length > 0, union, granted };
 }
 
+/** What an Okta settings save may change. An omitted field keeps the stored value. */
+export interface OktaConfigInput {
+  enabled?: boolean;
+  oktaDomain?: string;
+  issuer?: string;
+  clientId?: string;
+  clientSecret?: string;
+  redirectUri?: string;
+  adminGroup?: string;
+}
+
 export const store = {
   // ============================================================================
   // 1. PORTAL USERS & AUTHENTICATION
@@ -1956,15 +1967,34 @@ export const store = {
     };
   },
 
-  updateOktaConfig(input: {
-    enabled?: boolean;
-    oktaDomain?: string;
-    issuer?: string;
-    clientId?: string;
-    clientSecret?: string;
-    redirectUri?: string;
-    adminGroup?: string;
-  }): OktaSsoSettings {
+  /**
+   * The values a save of `input` would store. The production https gate reads this, so it judges
+   * the same result the save writes, including values kept from the stored row.
+   */
+  resolveOktaSave(input: OktaConfigInput) {
+    const current = this.getOktaConfig();
+    const oktaDomain = (input.oktaDomain ?? current.oktaDomain).trim();
+    const derivedIssuer = oktaDomain
+      ? `https://${oktaDomain.replace(/^https?:\/\//, '').replace(/\/+$/, '')}/oauth2/default`
+      : '';
+    const domainChanged = oktaDomain !== current.oktaDomain;
+    // An explicit issuer wins; an empty one means "derive from the domain". Otherwise keep a custom
+    // issuer (e.g. the Okta org authorization server) across saves that do not change the domain.
+    const requestedIssuer = input.issuer?.trim();
+    const issuer = requestedIssuer
+      ? requestedIssuer
+      : input.issuer !== undefined || domainChanged || !current.issuer
+      ? derivedIssuer
+      : current.issuer;
+    return {
+      enabled: Boolean(input.enabled ?? current.enabled),
+      oktaDomain,
+      issuer,
+      redirectUri: (input.redirectUri ?? current.redirectUri).trim(),
+    };
+  },
+
+  updateOktaConfig(input: OktaConfigInput): OktaSsoSettings {
     const current = this.getOktaConfig();
     const storedSecretEnc = (
       db.prepare('SELECT client_secret_enc FROM okta_config WHERE id = 1').get() as { client_secret_enc: string }
@@ -1975,19 +2005,7 @@ export const store = {
       input.clientSecret !== undefined && input.clientSecret !== ''
         ? encryptSecret(input.clientSecret)
         : storedSecretEnc;
-    const nextDomain = (input.oktaDomain ?? current.oktaDomain).trim();
-    const derivedIssuer = nextDomain
-      ? `https://${nextDomain.replace(/^https?:\/\//, '').replace(/\/+$/, '')}/oauth2/default`
-      : '';
-    const domainChanged = nextDomain !== current.oktaDomain;
-    // An explicit issuer wins; an empty one means "derive from the domain". Otherwise keep a custom
-    // issuer (e.g. the Okta org authorization server) across saves that do not change the domain.
-    const requestedIssuer = input.issuer?.trim();
-    const nextIssuer = requestedIssuer
-      ? requestedIssuer
-      : input.issuer !== undefined || domainChanged || !current.issuer
-      ? derivedIssuer
-      : current.issuer;
+    const next = this.resolveOktaSave(input);
     const now = new Date().toISOString();
 
     db.prepare(`
@@ -1996,12 +2014,12 @@ export const store = {
           client_secret_enc = ?, redirect_uri = ?, admin_group = ?, updated_at = ?
       WHERE id = 1
     `).run(
-      (input.enabled ?? current.enabled) ? 1 : 0,
-      nextDomain,
-      nextIssuer,
+      next.enabled ? 1 : 0,
+      next.oktaDomain,
+      next.issuer,
       (input.clientId ?? current.clientId).trim(),
       nextSecretEnc,
-      (input.redirectUri ?? current.redirectUri).trim(),
+      next.redirectUri,
       (input.adminGroup ?? current.adminGroup).trim(),
       now
     );

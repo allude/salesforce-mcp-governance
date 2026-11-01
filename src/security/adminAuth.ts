@@ -116,6 +116,14 @@ export async function requireAdminAuth(
   next();
 }
 
+/** Whether a URL is parseable and https. Okta's issuer and redirect URI carry secrets, so production requires it. */
+export function isHttpsUrl(url: string): boolean {
+  return /^https:\/\//i.test(url) && URL.canParse(url);
+}
+
+/** A stored row can predate the settings check, or come from OKTA_ISSUER, so sign-in checks the issuer itself. */
+const INSECURE_ISSUER_DETAILS = 'The configured Okta issuer is not an https:// URL, so production refused the sign-in.';
+
 /**
  * Initiates the Okta OIDC Authorization Code Flow with PKCE (`/auth/okta/login`).
  */
@@ -125,6 +133,10 @@ export async function handleOktaLoginRedirect(req: Request, res: Response): Prom
     res.status(400).send(
       'Okta SSO is not enabled or configured yet. Sign in with bootstrap credentials to configure Okta first.'
     );
+    return;
+  }
+  if (config.isProd && !isHttpsUrl(okta.issuer)) {
+    redirectWithAuthError(res, 'sso_failed', req.ip || '127.0.0.1', INSECURE_ISSUER_DETAILS);
     return;
   }
 
@@ -257,6 +269,10 @@ export async function handleOktaCallback(req: Request, res: Response): Promise<v
   }
 
   const okta = store.getOktaConfig();
+  if (config.isProd && !isHttpsUrl(okta.issuer)) {
+    redirectWithAuthError(res, 'sso_failed', clientIp, INSECURE_ISSUER_DETAILS);
+    return;
+  }
   const issuer = okta.issuer.replace(/\/+$/, '');
   const redirectUri = okta.redirectUri || `${config.baseUrl}/auth/okta/callback`;
 
