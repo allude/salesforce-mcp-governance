@@ -33,17 +33,128 @@ if (!fs.existsSync(dbDir)) {
 
 const db = new DatabaseSync(config.dbPath);
 
-/** Runs `fn` atomically: either every statement in it commits or none does. */
-function runInTransaction<T>(fn: () => T): T {
+let transactionDepth = 0;
+let transactionDoomed = false;
+
+/**
+ * Runs `fn` atomically: either every statement in it commits or none does. A nested call joins the
+ * open transaction. Its failure dooms the whole transaction, even if an outer step catches the error,
+ * so a half-applied inner step can never commit. `fn` must be synchronous.
+ */
+export function runInTransaction<T>(fn: () => T): T {
+  if (transactionDepth > 0) {
+    transactionDepth++;
+    try {
+      return fn();
+    } catch (err) {
+      transactionDoomed = true;
+      throw err;
+    } finally {
+      transactionDepth--;
+    }
+  }
+
   db.exec('BEGIN IMMEDIATE');
+  transactionDepth = 1;
+  transactionDoomed = false;
   try {
     const result = fn();
+    if (transactionDoomed) {
+      throw new Error('Transaction rolled back: a nested step failed.');
+    }
     db.exec('COMMIT');
     return result;
   } catch (err) {
     db.exec('ROLLBACK');
     throw err;
+  } finally {
+    transactionDepth = 0;
+    transactionDoomed = false;
   }
+}
+
+/**
+ * Deletes a field and revokes it from every Access Group, reporting which groups lost it.
+ * While a case variant still exists the grants still refer to it and stay.
+ */
+function deleteFieldAndRevokeGrants(objName: string, fldName: string): { deleted: boolean; revokedGroups: string[] } {
+  return runInTransaction(() => {
+    const res = db
+      .prepare('DELETE FROM sf_object_fields WHERE object_name = ? AND field_name = ?')
+      .run(objName, fldName);
+    if (res.changes === 0) return { deleted: false, revokedGroups: [] };
+    const variantRemains = db
+      .prepare(
+        'SELECT 1 FROM sf_object_fields WHERE lower(object_name) = lower(?) AND lower(field_name) = lower(?) LIMIT 1'
+      )
+      .get(objName, fldName);
+    if (variantRemains) return { deleted: true, revokedGroups: [] };
+
+    const now = new Date().toISOString();
+    const rows = db.prepare('SELECT id, name, object_permissions_json FROM access_groups').all() as Array<{
+      id: string;
+      name: string;
+      object_permissions_json: string;
+    }>;
+    const updateGroup = db.prepare(
+      'UPDATE access_groups SET object_permissions_json = ?, updated_at = ? WHERE id = ?'
+    );
+    const revokedGroups: string[] = [];
+    for (const row of rows) {
+      const perms = JSON.parse(row.object_permissions_json || '[]') as GroupObjectPermission[];
+      let changed = false;
+      const kept = perms.map((p) => {
+        if (String(p.objectName).toLowerCase() !== objName.toLowerCase()) return p;
+        const allowedFields = (p.allowedFields || []).filter(
+          (f) => String(f).toLowerCase() !== fldName.toLowerCase()
+        );
+        if (allowedFields.length === (p.allowedFields || []).length) return p;
+        changed = true;
+        return { ...p, allowedFields };
+      });
+      if (changed) {
+        updateGroup.run(JSON.stringify(kept), now, row.id);
+        revokedGroups.push(row.name);
+      }
+    }
+    return { deleted: true, revokedGroups };
+  });
+}
+
+/**
+ * Deletes an Object and its fields and revokes it from every Access Group, reporting which groups
+ * lost it. Grants match objects case-insensitively; while a case variant (e.g. 'Account' after
+ * deleting a stray 'account') still exists, the grants still refer to it and must stay.
+ */
+function deleteObjectAndRevokeGrants(objectName: string): { deleted: boolean; revokedGroups: string[] } {
+  return runInTransaction(() => {
+    const res = db.prepare('DELETE FROM sf_objects WHERE object_name = ?').run(objectName);
+    if (res.changes === 0) return { deleted: false, revokedGroups: [] };
+    const variantRemains = db
+      .prepare('SELECT 1 FROM sf_objects WHERE lower(object_name) = lower(?) LIMIT 1')
+      .get(objectName);
+    if (variantRemains) return { deleted: true, revokedGroups: [] };
+
+    const now = new Date().toISOString();
+    const rows = db.prepare('SELECT id, name, object_permissions_json FROM access_groups').all() as Array<{
+      id: string;
+      name: string;
+      object_permissions_json: string;
+    }>;
+    const updateGroup = db.prepare(
+      'UPDATE access_groups SET object_permissions_json = ?, updated_at = ? WHERE id = ?'
+    );
+    const revokedGroups: string[] = [];
+    for (const row of rows) {
+      const perms = JSON.parse(row.object_permissions_json || '[]') as GroupObjectPermission[];
+      const kept = perms.filter((p) => String(p.objectName).toLowerCase() !== objectName.toLowerCase());
+      if (kept.length !== perms.length) {
+        updateGroup.run(JSON.stringify(kept), now, row.id);
+        revokedGroups.push(row.name);
+      }
+    }
+    return { deleted: true, revokedGroups };
+  });
 }
 
 let warnedUndecryptableOktaSecret = false;
@@ -597,44 +708,86 @@ export const store = {
     };
   },
 
+  /**
+   * Applies a Profile sync in one transaction: any failure leaves the database untouched. An id in
+   * `upserts` is present in the org, so a remove or keep-as-missing entry for it is ignored.
+   */
   applyProfilesSyncFromOrg(input: {
     upserts: Array<{ id: string; name: string }>;
     removeProfileIds: string[];
     keptMissingProfileIds?: string[];
-  }): { inserted: number; updated: number; removed: number; keptMissing: number; total: number } {
-    let inserted = 0;
-    let updated = 0;
-    let removed = 0;
-    let keptMissing = 0;
-
-    for (const p of input.upserts) {
-      if (!p.id || !p.name) continue;
-      const res = this.upsertProfile(p.id, p.name, false);
-      if (res.action === 'inserted') inserted++;
-      else updated++;
-    }
-
-    for (const remId of input.removeProfileIds || []) {
-      if (this.deleteProfile(remId)) {
-        removed++;
-      }
-    }
-
-    for (const keptId of input.keptMissingProfileIds || []) {
-      const existing = this.getProfileById(keptId);
-      if (existing) {
-        db.prepare('UPDATE sf_profiles SET missing_in_org = 1 WHERE id = ?').run(keptId.trim());
-        keptMissing++;
-      }
-    }
-
-    return {
-      inserted,
-      updated,
-      removed,
-      keptMissing,
-      total: this.getProfiles().length,
+  }): {
+    inserted: number;
+    updated: number;
+    removed: number;
+    keptMissing: number;
+    total: number;
+    affected: {
+      upserted: string[];
+      removed: string[];
+      keptMissing: string[];
+      groupsLosingMembers: string[];
     };
+  } {
+    return runInTransaction(() => {
+      let inserted = 0;
+      let updated = 0;
+      const affected = {
+        upserted: [] as string[],
+        removed: [] as string[],
+        keptMissing: [] as string[],
+        groupsLosingMembers: [] as string[],
+      };
+      const presentInOrg = new Set<string>();
+
+      for (const p of input.upserts) {
+        if (!p.id || !p.name) continue;
+        presentInOrg.add(p.id.trim());
+        const res = this.upsertProfile(p.id, p.name, false);
+        if (res.action === 'inserted') inserted++;
+        else updated++;
+        affected.upserted.push(res.profile.name);
+      }
+
+      const lostGroups = new Set<string>();
+      const groupNamesOfProfile = db.prepare(`
+        SELECT g.name AS name FROM profile_group_memberships m
+        JOIN access_groups g ON g.id = m.group_id
+        WHERE m.profile_id = ?
+      `);
+      for (const remId of input.removeProfileIds || []) {
+        const id = remId.trim();
+        if (presentInOrg.has(id)) continue;
+        const existing = this.getProfileById(id);
+        if (!existing) continue;
+        for (const row of groupNamesOfProfile.all(id) as Array<{ name: string }>) {
+          lostGroups.add(row.name);
+        }
+        if (this.deleteProfile(id)) {
+          affected.removed.push(existing.name);
+        }
+      }
+      affected.groupsLosingMembers = Array.from(lostGroups);
+
+      for (const keptId of input.keptMissingProfileIds || []) {
+        const id = keptId.trim();
+        if (presentInOrg.has(id)) continue;
+        const existing = this.getProfileById(id);
+        if (existing) {
+          db.prepare('UPDATE sf_profiles SET missing_in_org = 1 WHERE id = ?').run(id);
+          affected.keptMissing.push(existing.name);
+        }
+      }
+
+      return {
+        inserted,
+        updated,
+        removed: affected.removed.length,
+        keptMissing: affected.keptMissing.length,
+        total: this.getProfiles().length,
+        affected,
+      };
+    });
   },
 
   // ============================================================================
@@ -921,44 +1074,7 @@ export const store = {
   deleteObjectField(objectName: string, fieldName: string): SalesforceObject | null {
     const objName = objectName.trim();
     const fldName = fieldName.trim();
-    const deleted = runInTransaction(() => {
-      const res = db
-        .prepare('DELETE FROM sf_object_fields WHERE object_name = ? AND field_name = ?')
-        .run(objName, fldName);
-      if (res.changes === 0) return false;
-      // Same rule as deleteObject: while a case variant still exists, the grants still refer to it.
-      const variantRemains = db
-        .prepare(
-          'SELECT 1 FROM sf_object_fields WHERE lower(object_name) = lower(?) AND lower(field_name) = lower(?) LIMIT 1'
-        )
-        .get(objName, fldName);
-      if (variantRemains) return true;
-
-      const now = new Date().toISOString();
-      const rows = db.prepare('SELECT id, object_permissions_json FROM access_groups').all() as Array<{
-        id: string;
-        object_permissions_json: string;
-      }>;
-      const updateGroup = db.prepare(
-        'UPDATE access_groups SET object_permissions_json = ?, updated_at = ? WHERE id = ?'
-      );
-      for (const row of rows) {
-        const perms = JSON.parse(row.object_permissions_json || '[]') as GroupObjectPermission[];
-        let changed = false;
-        const kept = perms.map((p) => {
-          if (String(p.objectName).toLowerCase() !== objName.toLowerCase()) return p;
-          const allowedFields = (p.allowedFields || []).filter(
-            (f) => String(f).toLowerCase() !== fldName.toLowerCase()
-          );
-          if (allowedFields.length === (p.allowedFields || []).length) return p;
-          changed = true;
-          return { ...p, allowedFields };
-        });
-        if (changed) updateGroup.run(JSON.stringify(kept), now, row.id);
-      }
-      return true;
-    });
-    if (!deleted) return null;
+    if (!deleteFieldAndRevokeGrants(objName, fldName).deleted) return null;
     return this.getObjects().find((o) => o.objectName === objName) || null;
   },
 
@@ -967,33 +1083,7 @@ export const store = {
    * object later (e.g. an SFDX re-sync) does not silently restore access an admin removed.
    */
   deleteObject(objectName: string): boolean {
-    return runInTransaction(() => {
-      const res = db.prepare('DELETE FROM sf_objects WHERE object_name = ?').run(objectName);
-      if (res.changes === 0) return false;
-      // Grants match objects case-insensitively; while a case variant (e.g. 'Account' after deleting a
-      // stray 'account') still exists, the grants still refer to it and must stay.
-      const variantRemains = db
-        .prepare('SELECT 1 FROM sf_objects WHERE lower(object_name) = lower(?) LIMIT 1')
-        .get(objectName);
-      if (variantRemains) return true;
-
-      const now = new Date().toISOString();
-      const rows = db.prepare('SELECT id, object_permissions_json FROM access_groups').all() as Array<{
-        id: string;
-        object_permissions_json: string;
-      }>;
-      const updateGroup = db.prepare(
-        'UPDATE access_groups SET object_permissions_json = ?, updated_at = ? WHERE id = ?'
-      );
-      for (const row of rows) {
-        const perms = JSON.parse(row.object_permissions_json || '[]') as GroupObjectPermission[];
-        const kept = perms.filter((p) => String(p.objectName).toLowerCase() !== objectName.toLowerCase());
-        if (kept.length !== perms.length) {
-          updateGroup.run(JSON.stringify(kept), now, row.id);
-        }
-      }
-      return true;
-    });
+    return deleteObjectAndRevokeGrants(objectName).deleted;
   },
 
   /**
@@ -1103,11 +1193,24 @@ export const store = {
   },
 
   /**
-   * Applies the Object & Field sync from Salesforce Org, deleting ONLY the objects/fields
-   * the user explicitly chose to remove, and marking kept removed items with `missing_in_org = 1`.
+   * Applies the Object & Field sync from Salesforce Org in one transaction, so any failure leaves the
+   * database untouched. Deletes ONLY the objects/fields the user explicitly chose to remove and the
+   * pull reports as gone, and marks kept removed items with `missing_in_org = 1`.
    */
   applyObjectsSyncFromOrg(input: {
-    pulledMetadata: PulledOrgObjectMetadata[];
+    pulledMetadata: Array<{
+      objectName: string;
+      label?: string;
+      isCustom?: boolean;
+      existsInOrg: boolean;
+      fields: Array<{
+        fieldName: string;
+        label?: string;
+        fieldType?: string;
+        isCustom?: boolean;
+        required?: boolean;
+      }>;
+    }>;
     removeObjectNames: string[];
     removeFields: Array<{ objectName: string; fieldName: string }>;
   }): {
@@ -1117,6 +1220,14 @@ export const store = {
     fieldsRemoved: number;
     objectsKeptMissing: number;
     fieldsKeptMissing: number;
+    affected: {
+      objectsSynced: string[];
+      objectsRemoved: string[];
+      fieldsRemoved: string[];
+      objectsKeptMissing: string[];
+      fieldsKeptMissing: string[];
+      groupsLosingGrants: string[];
+    };
   } {
     const removeObjSet = new Set(
       (input.removeObjectNames || []).map((n) => n.toLowerCase())
@@ -1126,83 +1237,108 @@ export const store = {
         (f) => `${f.objectName.toLowerCase()}.${f.fieldName.toLowerCase()}`
       )
     );
-
-    let objectsUpserted = 0;
-    let fieldsUpserted = 0;
-    let objectsRemoved = 0;
-    let fieldsRemoved = 0;
-    let objectsKeptMissing = 0;
-    let fieldsKeptMissing = 0;
-
-    const existingObjects = this.getObjects();
-    const existingObjMap = new Map(
-      existingObjects.map((o) => [o.objectName.toLowerCase(), o])
-    );
-
+    // Across every entry for a name: a field any of them reports is present, whatever the others say.
+    const reportedFields = new Map<string, Set<string>>();
     for (const pulled of input.pulledMetadata) {
-      const localObj = existingObjMap.get(pulled.objectName.toLowerCase());
-
-      if (!pulled.existsInOrg) {
-        if (localObj) {
-          if (removeObjSet.has(localObj.objectName.toLowerCase())) {
-            if (this.deleteObject(localObj.objectName)) {
-              objectsRemoved++;
-            }
-          } else {
-            db.prepare(
-              'UPDATE sf_objects SET missing_in_org = 1, updated_at = ? WHERE object_name = ?'
-            ).run(new Date().toISOString(), localObj.objectName);
-            objectsKeptMissing++;
-          }
-        }
-        continue;
-      }
-
-      // Upsert the object and all present org fields (setting missing_in_org = 0)
-      this.upsertObjectWithFields({
-        objectName: this.resolveObjectName(pulled.objectName),
-        label: pulled.label,
-        isCustom: pulled.isCustom,
-        sourcePath: 'salesforce-org-jwt',
-        missingInOrg: false,
-        fields: pulled.fields.map((f) => ({
-          ...f,
-          missingInOrg: false,
-        })),
-      });
-      objectsUpserted++;
-      fieldsUpserted += pulled.fields.length;
-
-      // Handle local fields on this object that were NOT in the Salesforce Org
-      if (localObj) {
-        const orgFieldSet = new Set(
-          pulled.fields.map((f) => f.fieldName.toLowerCase())
-        );
-        for (const lf of localObj.fields) {
-          if (!orgFieldSet.has(lf.fieldName.toLowerCase())) {
-            const key = `${localObj.objectName.toLowerCase()}.${lf.fieldName.toLowerCase()}`;
-            if (removeFieldSet.has(key)) {
-              this.deleteObjectField(localObj.objectName, lf.fieldName);
-              fieldsRemoved++;
-            } else {
-              db.prepare(
-                'UPDATE sf_object_fields SET missing_in_org = 1 WHERE object_name = ? AND field_name = ?'
-              ).run(localObj.objectName, lf.fieldName);
-              fieldsKeptMissing++;
-            }
-          }
-        }
-      }
+      const key = pulled.objectName.toLowerCase();
+      const names = reportedFields.get(key) || new Set<string>();
+      for (const f of pulled.fields) names.add(f.fieldName.toLowerCase());
+      reportedFields.set(key, names);
     }
 
-    return {
-      objectsUpserted,
-      fieldsUpserted,
-      objectsRemoved,
-      fieldsRemoved,
-      objectsKeptMissing,
-      fieldsKeptMissing,
-    };
+    return runInTransaction(() => {
+      let fieldsUpserted = 0;
+      const lostGrants = new Set<string>();
+      const affected = {
+        objectsSynced: [] as string[],
+        objectsRemoved: [] as string[],
+        fieldsRemoved: [] as string[],
+        objectsKeptMissing: [] as string[],
+        fieldsKeptMissing: [] as string[],
+        groupsLosingGrants: [] as string[],
+      };
+
+      const existingObjects = this.getObjects();
+      const existingObjMap = new Map(
+        existingObjects.map((o) => [o.objectName.toLowerCase(), o])
+      );
+
+      for (const pulled of input.pulledMetadata) {
+        const localObj = existingObjMap.get(pulled.objectName.toLowerCase());
+
+        if (!pulled.existsInOrg) {
+          if (localObj) {
+            if (removeObjSet.has(localObj.objectName.toLowerCase())) {
+              const result = deleteObjectAndRevokeGrants(localObj.objectName);
+              if (result.deleted) {
+                affected.objectsRemoved.push(localObj.objectName);
+                result.revokedGroups.forEach((g) => lostGrants.add(g));
+              }
+            } else {
+              db.prepare(
+                'UPDATE sf_objects SET missing_in_org = 1, updated_at = ? WHERE object_name = ?'
+              ).run(new Date().toISOString(), localObj.objectName);
+              affected.objectsKeptMissing.push(localObj.objectName);
+            }
+          }
+          continue;
+        }
+
+        // Upsert the object and all present org fields (setting missing_in_org = 0). Named one by one
+        // so `enabled` stays the admin's: nothing in a pull may decide what is exposed.
+        const syncedObject = this.upsertObjectWithFields({
+          objectName: this.resolveObjectName(pulled.objectName),
+          label: pulled.label,
+          isCustom: pulled.isCustom,
+          sourcePath: 'salesforce-org-jwt',
+          missingInOrg: false,
+          fields: pulled.fields.map((f) => ({
+            fieldName: f.fieldName,
+            label: f.label,
+            fieldType: f.fieldType,
+            isCustom: f.isCustom,
+            required: f.required,
+            missingInOrg: false,
+          })),
+        });
+        affected.objectsSynced.push(syncedObject.objectName);
+        fieldsUpserted += pulled.fields.length;
+
+        // Handle local fields on this object that were NOT in the Salesforce Org
+        if (localObj) {
+          const orgFieldSet = reportedFields.get(pulled.objectName.toLowerCase())!;
+          for (const lf of localObj.fields) {
+            if (!orgFieldSet.has(lf.fieldName.toLowerCase())) {
+              const key = `${localObj.objectName.toLowerCase()}.${lf.fieldName.toLowerCase()}`;
+              const qualifiedName = `${localObj.objectName}.${lf.fieldName}`;
+              if (removeFieldSet.has(key)) {
+                const result = deleteFieldAndRevokeGrants(localObj.objectName, lf.fieldName);
+                if (result.deleted) {
+                  affected.fieldsRemoved.push(qualifiedName);
+                  result.revokedGroups.forEach((g) => lostGrants.add(g));
+                }
+              } else {
+                db.prepare(
+                  'UPDATE sf_object_fields SET missing_in_org = 1 WHERE object_name = ? AND field_name = ?'
+                ).run(localObj.objectName, lf.fieldName);
+                affected.fieldsKeptMissing.push(qualifiedName);
+              }
+            }
+          }
+        }
+      }
+      affected.groupsLosingGrants = Array.from(lostGrants);
+
+      return {
+        objectsUpserted: affected.objectsSynced.length,
+        fieldsUpserted,
+        objectsRemoved: affected.objectsRemoved.length,
+        fieldsRemoved: affected.fieldsRemoved.length,
+        objectsKeptMissing: affected.objectsKeptMissing.length,
+        fieldsKeptMissing: affected.fieldsKeptMissing.length,
+        affected,
+      };
+    });
   },
 
   // ============================================================================
