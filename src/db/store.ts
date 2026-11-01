@@ -1587,6 +1587,7 @@ export const store = {
     }));
   },
 
+  /** Totals for the dashboard KPIs: real traffic only, so the simulator cannot inflate them. */
   getCopilotMcpLogStats(): { total: number; allowed: number; denied: number; errors: number } {
     const row = db
       .prepare(
@@ -1594,7 +1595,8 @@ export const store = {
                 COALESCE(SUM(CASE WHEN status = 'ALLOWED' THEN 1 ELSE 0 END), 0) AS allowed,
                 COALESCE(SUM(CASE WHEN status = 'DENIED' THEN 1 ELSE 0 END), 0) AS denied,
                 COALESCE(SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END), 0) AS errors
-         FROM mcp_copilot_logs`
+         FROM mcp_copilot_logs
+         WHERE simulated = 0`
       )
       .get() as { total: number; allowed: number; denied: number; errors: number };
     return { total: row.total, allowed: row.allowed, denied: row.denied, errors: row.errors };

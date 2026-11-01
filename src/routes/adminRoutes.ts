@@ -374,7 +374,7 @@ adminRouter.get('/overview', (_req: Request, res: Response) => {
   const sfSettings = store.getSalesforceSettings();
   const portalUsers = store.getPortalUsers();
 
-  // Totals cover every logged call; the log lists themselves are the latest 150 rows.
+  // Totals cover every real logged call; the log lists themselves are the latest 150 rows.
   const mcpStats = store.getCopilotMcpLogStats();
 
   res.json({

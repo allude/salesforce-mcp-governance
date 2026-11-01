@@ -14,6 +14,7 @@ import type {
 } from '@/types/governance';
 import { MCP_TOOL_CATALOG, formatShortTime } from '@/components/ui/primitives';
 import type { FlyoutState } from './FlyoutDrawer';
+import { realTraffic } from './simulatedTraffic';
 
 // ============================================================================
 // 1. DASHBOARD VIEW
@@ -59,29 +60,31 @@ export function TrafficDashboardView({
     return found ? found.groupIds : [];
   };
 
+  const realLogs = useMemo(() => realTraffic(copilotLogs), [copilotLogs]);
+
   // KPI metrics
   // Totals come from the server: copilotLogs holds only the latest rows. The latency and user
   // figures below are computed from those rows and labelled as such.
-  const totalCalls = mcpStats?.totalMcpRequests ?? copilotLogs.length;
+  const totalCalls = mcpStats?.totalMcpRequests ?? realLogs.length;
   const allowedCalls =
     mcpStats?.allowedMcpRequests ??
-    copilotLogs.filter((l) => l.status === 'ALLOWED').length;
+    realLogs.filter((l) => l.status === 'ALLOWED').length;
   const deniedCalls =
     mcpStats?.deniedMcpRequests ??
-    copilotLogs.filter((l) => l.status === 'DENIED').length;
+    realLogs.filter((l) => l.status === 'DENIED').length;
   const errorCalls =
     mcpStats?.erroredMcpRequests ??
-    copilotLogs.filter((l) => l.status === 'ERROR').length;
+    realLogs.filter((l) => l.status === 'ERROR').length;
   const successRate = totalCalls
     ? ((allowedCalls / totalCalls) * 100).toFixed(1)
     : '100.0';
 
   const sortedLatencies = useMemo(
     () =>
-      copilotLogs
+      realLogs
         .map((l) => l.latencyMs || 0)
         .sort((a, b) => a - b),
-    [copilotLogs]
+    [realLogs]
   );
   const p95Latency = sortedLatencies.length
     ? sortedLatencies[Math.floor(sortedLatencies.length * 0.95)]
@@ -93,12 +96,12 @@ export function TrafficDashboardView({
     : 0;
 
   const uniqueUsers = useMemo(
-    () => new Set(copilotLogs.map((l) => l.sfUsername)).size,
-    [copilotLogs]
+    () => new Set(realLogs.map((l) => l.sfUsername)).size,
+    [realLogs]
   );
   const uniqueProfilesInLogs = useMemo(
-    () => new Set(copilotLogs.map((l) => l.profileId)).size,
-    [copilotLogs]
+    () => new Set(realLogs.map((l) => l.profileId)).size,
+    [realLogs]
   );
 
   // Stacked bar chart buckets (24 bars)
@@ -114,10 +117,10 @@ export function TrafficDashboardView({
       return { lbl, ok: 0, warn: 0, err: 0 };
     });
 
-    if (copilotLogs.length === 0) return result;
+    if (realLogs.length === 0) return result;
 
     // Distribute real logs across buckets (by timestamp hash/hour so chart is informative & deterministic)
-    copilotLogs.forEach((log, i) => {
+    realLogs.forEach((log, i) => {
       const d = new Date(log.timestamp);
       const bucketIdx = !Number.isNaN(d.getTime())
         ? range === '24h'
@@ -132,7 +135,7 @@ export function TrafficDashboardView({
     });
 
     return result;
-  }, [copilotLogs, range]);
+  }, [realLogs, range]);
 
   const maxBucket = Math.max(
     1,
@@ -142,13 +145,13 @@ export function TrafficDashboardView({
   // Top tools
   const topTools = useMemo(() => {
     const counts: Record<string, number> = {};
-    copilotLogs.forEach((l) => {
+    realLogs.forEach((l) => {
       counts[l.toolName] = (counts[l.toolName] || 0) + 1;
     });
     return Object.entries(counts)
       .sort((a, b) => b[1] - a[1])
       .slice(0, 6);
-  }, [copilotLogs]);
+  }, [realLogs]);
   const maxToolCount = Math.max(1, ...topTools.map((t) => t[1]));
 
   // Top users
@@ -157,7 +160,7 @@ export function TrafficDashboardView({
       string,
       { user: string; profile: string; n: number; denied: number }
     > = {};
-    copilotLogs.forEach((l) => {
+    realLogs.forEach((l) => {
       if (!map[l.sfUsername]) {
         map[l.sfUsername] = {
           user: l.sfUsername,
@@ -172,7 +175,7 @@ export function TrafficDashboardView({
     return Object.values(map)
       .sort((a, b) => b.n - a.n)
       .slice(0, 5);
-  }, [copilotLogs]);
+  }, [realLogs]);
   const maxUserCount = Math.max(1, ...topUsers.map((u) => u.n));
 
   // Governance health / Needs attention
@@ -188,7 +191,7 @@ export function TrafficDashboardView({
   const destructiveGroups = groups.filter((g) =>
     g.allowedActions?.includes('delete_record')
   );
-  const recentDenials = copilotLogs
+  const recentDenials = realLogs
     .filter((l) => l.status === 'DENIED')
     .slice(0, 5);
 
@@ -292,7 +295,7 @@ export function TrafficDashboardView({
           </div>
           <div className="k-val">{p95Latency}</div>
           <div className="k-sub">
-            <span>avg {avgLatency} ms · latest {copilotLogs.length} calls</span>
+            <span>avg {avgLatency} ms · latest {realLogs.length} calls</span>
           </div>
         </div>
 
@@ -305,7 +308,7 @@ export function TrafficDashboardView({
           <div className="k-sub">
             <span>
               across {uniqueProfilesInLogs} profiles in the latest{' '}
-              {copilotLogs.length} calls
+              {realLogs.length} calls
             </span>
           </div>
         </div>
@@ -821,11 +824,11 @@ export function CopilotMcpLogsView({
 
   const exportCsv = () => {
     const header =
-      'Id,Timestamp,User,ProfileId,ProfileName,Tool,TargetObject,Status,LatencyMs\n';
+      'Id,Timestamp,User,ProfileId,ProfileName,Tool,TargetObject,Status,LatencyMs,Simulated\n';
     const body = rows
       .map(
         (r) =>
-          `"${r.id}","${r.timestamp}","${r.sfUsername}","${r.profileId}","${r.profileName}","${r.toolName}","${r.targetObject}","${r.status}",${r.latencyMs}`
+          `"${r.id}","${r.timestamp}","${r.sfUsername}","${r.profileId}","${r.profileName}","${r.toolName}","${r.targetObject}","${r.status}",${r.latencyMs},${r.simulated ? 'true' : 'false'}`
       )
       .join('\n');
     const blob = new Blob([header + body], { type: 'text/csv;charset=utf-8;' });
@@ -976,7 +979,15 @@ export function CopilotMcpLogsView({
                     <td className="mono" style={{ color: 'var(--t2)' }}>
                       {formatShortTime(r.timestamp)}
                     </td>
-                    <td>{r.sfUsername}</td>
+                    <td>
+                      {r.sfUsername}
+                      {r.simulated && (
+                        <>
+                          {' '}
+                          <span className="tag warn">SIMULATED</span>
+                        </>
+                      )}
+                    </td>
                     <td>
                       <div>{r.profileName}</div>
                       <div

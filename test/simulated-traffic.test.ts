@@ -9,6 +9,7 @@ import { createSimulatorToken, resolveSalesforceUserFromToken } from '../src/sal
 import { startTestServer, loginAsAdmin, adminFetch, mcpRequest, type AdminSession, type TestServer } from './helpers/server.js';
 import { installSalesforceMock } from './helpers/salesforceMock.js';
 import { TEST_ADMIN } from './helpers/env.js';
+import { realTraffic } from '../src/components/views/simulatedTraffic.js';
 
 const tag = () => crypto.randomBytes(4).toString('hex');
 const newProfileId = () => `00e${crypto.randomBytes(6).toString('hex')}`.slice(0, 15);
@@ -207,5 +208,55 @@ describe('recordCopilotMcpLog', () => {
     const byId = new Map(rowsFor(profileId).map((r) => [r.id, r]));
     assert.equal(byId.get(real.id)?.simulated, undefined);
     assert.equal(byId.get(simulated.id)?.simulated, true);
+  });
+});
+
+describe('dashboard figures', () => {
+  test('simulator calls leave the overview KPIs unchanged while their rows still list', async () => {
+    const { profileId, objectName } = seedProfile();
+    const stats = async () => (await adminFetch(server.baseUrl, session, '/api/admin/overview')).body;
+    const before = (await stats()).stats;
+
+    await simulate({ profileId, toolName: 'soql_query', targetObject: objectName });
+    await simulate({ profileId, toolName: 'delete_record', targetObject: objectName });
+    const token = createSimulatorToken({ profileId, profileName: 'X' });
+    await mcpRequest(server.baseUrl, token, 'tools/call', { name: 'soql_query', arguments: { objectName, fields: ['Id'] } });
+
+    const overview = await stats();
+    assert.equal(overview.stats.totalMcpRequests, before.totalMcpRequests);
+    assert.equal(overview.stats.allowedMcpRequests, before.allowedMcpRequests);
+    assert.equal(overview.stats.deniedMcpRequests, before.deniedMcpRequests);
+    assert.equal(overview.stats.erroredMcpRequests, before.erroredMcpRequests);
+    assert.equal(overview.copilotLogs.filter((r: any) => r.profileId === profileId).length, 3);
+  });
+
+  test('real calls still count', () => {
+    const before = store.getCopilotMcpLogStats();
+    const row = {
+      sfUsername: 'real@acme.com',
+      profileId: newProfileId(),
+      profileName: 'P',
+      matchedGroups: [],
+      toolName: 'soql_query',
+      targetObject: 'Account',
+      latencyMs: 1,
+      rawRequestPayload: {},
+      rawResponseSummary: {},
+    };
+    store.recordCopilotMcpLog({ ...row, status: 'ALLOWED' });
+    store.recordCopilotMcpLog({ ...row, status: 'ERROR' });
+    store.recordCopilotMcpLog({ ...row, status: 'DENIED', simulated: true });
+
+    assert.deepEqual(store.getCopilotMcpLogStats(), {
+      total: before.total + 2,
+      allowed: before.allowed + 1,
+      denied: before.denied,
+      errors: before.errors + 1,
+    });
+  });
+
+  test('realTraffic drops simulated rows and keeps the order of the rest', () => {
+    const logs = [{ id: 'a' }, { id: 'b', simulated: true }, { id: 'c' }];
+    assert.deepEqual(realTraffic(logs).map((l) => l.id), ['a', 'c']);
   });
 });

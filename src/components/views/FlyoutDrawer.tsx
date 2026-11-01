@@ -1799,7 +1799,15 @@ export function FlyoutDrawer({
                   <dt>Timestamp</dt>
                   <dd className="mono">{flyout.data.timestamp}</dd>
                   <dt>User</dt>
-                  <dd>{flyout.data.sfUsername}</dd>
+                  <dd>
+                    {flyout.data.sfUsername}
+                    {flyout.data.simulated && (
+                      <>
+                        {' '}
+                        <span className="tag warn">SIMULATED</span>
+                      </>
+                    )}
+                  </dd>
                   <dt>Salesforce profile</dt>
                   <dd>
                     {flyout.data.profileName}{' '}
