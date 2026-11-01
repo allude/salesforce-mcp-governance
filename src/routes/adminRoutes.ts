@@ -25,6 +25,7 @@ import {
 import { config } from '../config.js';
 import { parseObjectSyncPayload, parseProfileSyncPayload } from './orgSyncPayload.js';
 import { isSalesforceId } from '../salesforce/ids.js';
+import { SIMULATED_ORG_INSTANCE_URL } from '../salesforce/simulatedOrg.js';
 import { AVAILABLE_MCP_ACTIONS, unknownMcpActionIds } from '../types/governance.js';
 import type { SalesforceConnectionSettings } from '../types/governance.js';
 import {
@@ -44,6 +45,10 @@ function parseSalesforceSettingsInput(body: Record<string, any>): SalesforceSett
   const input: SalesforceSettingsInput = {};
   if (body.instanceUrl !== undefined) {
     input.instanceUrl = validateSalesforceInstanceUrl(String(body.instanceUrl));
+    if (input.instanceUrl === SIMULATED_ORG_INSTANCE_URL) {
+      // MCP sends real bearer tokens to this host, and the simulated one is not a real org.
+      throw new Error('The simulated org host cannot be used as the Salesforce instance URL.');
+    }
   }
   if (body.loginUrl !== undefined) {
     // The signed JWT assertion is posted here, so it passes the same allowlist as instance URLs.

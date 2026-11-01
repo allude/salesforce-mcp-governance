@@ -153,6 +153,19 @@ describe('the instance URL MCP uses to verify tokens', () => {
     assert.equal(rawInstanceUrl(), MCP_HOST);
   });
 
+  for (const written of [SIMULATED_ORG_INSTANCE_URL, 'https://ENTERPRISE-ORG.my.salesforce.com/path']) {
+    test(`a save or connect naming ${written} as the MCP host is refused`, async () => {
+      const saved = await route('', 'PUT', { instanceUrl: written });
+      assert.equal(saved.status, 400);
+      assert.match(saved.body.error, /simulated org host/);
+      assert.equal(rawInstanceUrl(), MCP_HOST);
+
+      const connected = await connect({ instanceUrl: written });
+      assert.equal(connected.status, 400);
+      assert.equal(rawInstanceUrl(), MCP_HOST);
+    });
+  }
+
   test('a real connect initialises an empty MCP host', async () => {
     setRawInstanceUrl('');
     answerTokenExchange(tokenGranted());
