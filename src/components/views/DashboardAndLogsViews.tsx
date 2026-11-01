@@ -18,7 +18,15 @@ import type { FlyoutState } from './FlyoutDrawer';
 // ============================================================================
 // 1. DASHBOARD VIEW
 // ============================================================================
+export interface McpRequestStats {
+  totalMcpRequests: number;
+  allowedMcpRequests: number;
+  deniedMcpRequests: number;
+  erroredMcpRequests: number;
+}
+
 interface TrafficDashboardProps {
+  mcpStats?: McpRequestStats | null;
   copilotLogs: CopilotMcpLogEntry[];
   portalLogs: PortalAdminLogEntry[];
   profiles: SalesforceProfile[];
@@ -34,6 +42,7 @@ interface TrafficDashboardProps {
 
 export function TrafficDashboardView({
   copilotLogs,
+  mcpStats,
   profiles,
   objects,
   groups,
@@ -51,13 +60,18 @@ export function TrafficDashboardView({
   };
 
   // KPI metrics
-  const totalCalls = copilotLogs.length;
-  const allowedCalls = copilotLogs.filter((l) => l.status === 'ALLOWED').length;
-  const deniedCalls = copilotLogs.filter((l) => l.status === 'DENIED').length;
+  // Totals come from the server: copilotLogs holds only the latest rows. The latency and user
+  // figures below are computed from those rows and labelled as such.
+  const totalCalls = mcpStats?.totalMcpRequests ?? copilotLogs.length;
+  const allowedCalls =
+    mcpStats?.allowedMcpRequests ??
+    copilotLogs.filter((l) => l.status === 'ALLOWED').length;
+  const deniedCalls =
+    mcpStats?.deniedMcpRequests ??
+    copilotLogs.filter((l) => l.status === 'DENIED').length;
   const errorCalls =
-    totalCalls - allowedCalls - deniedCalls > 0
-      ? totalCalls - allowedCalls - deniedCalls
-      : 0;
+    mcpStats?.erroredMcpRequests ??
+    copilotLogs.filter((l) => l.status === 'ERROR').length;
   const successRate = totalCalls
     ? ((allowedCalls / totalCalls) * 100).toFixed(1)
     : '100.0';
@@ -231,7 +245,7 @@ export function TrafficDashboardView({
         <div className="kpi">
           <div className="k-lbl">
             <span>MCP requests</span>
-            <span className="mono">{range.toUpperCase()}</span>
+            <span className="mono">ALL TIME</span>
           </div>
           <div className="k-val">{totalCalls}</div>
           <div className="k-sub">
@@ -278,7 +292,7 @@ export function TrafficDashboardView({
           </div>
           <div className="k-val">{p95Latency}</div>
           <div className="k-sub">
-            <span>avg {avgLatency} ms · Salesforce REST</span>
+            <span>avg {avgLatency} ms · latest {copilotLogs.length} calls</span>
           </div>
         </div>
 
@@ -290,8 +304,8 @@ export function TrafficDashboardView({
           <div className="k-val">{uniqueUsers}</div>
           <div className="k-sub">
             <span>
-              across {uniqueProfilesInLogs} active profiles ({profiles.length}{' '}
-              total)
+              across {uniqueProfilesInLogs} profiles in the latest{' '}
+              {copilotLogs.length} calls
             </span>
           </div>
         </div>

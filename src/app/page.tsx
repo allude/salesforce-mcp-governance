@@ -18,6 +18,7 @@ import type {
 } from '@/types/governance';
 import {
   TrafficDashboardView,
+  type McpRequestStats,
   CopilotMcpLogsView,
   PortalAdminLogsView,
   PortalAuthSettingsView,
@@ -149,6 +150,7 @@ export default function AdminPortalPage() {
   const [sfSettings, setSfSettings] =
     useState<SalesforceConnectionSettings | null>(null);
   const [portalUsers, setPortalUsers] = useState<PortalUserSummary[]>([]);
+  const [mcpStats, setMcpStats] = useState<McpRequestStats | null>(null);
 
   const notify = useCallback((msg: string, isError = false) => {
     setToast({ msg, isError });
@@ -255,6 +257,7 @@ export default function AdminPortalPage() {
       setGroups(data.groups || []);
       setMappings(data.profileGroupMappings || []);
       setCopilotLogs(data.copilotLogs || []);
+      setMcpStats(data.stats || null);
       setPortalLogs(data.portalLogs || []);
       if (data.oktaSettings) setOktaSettings(data.oktaSettings);
       if (data.sfSettings) setSfSettings(data.sfSettings);
@@ -1025,7 +1028,7 @@ export default function AdminPortalPage() {
                 </svg>
                 MCP traffic
               </span>
-              <span className="ct">{copilotLogs.length}</span>
+              <span className="ct">{mcpStats?.totalMcpRequests ?? copilotLogs.length}</span>
             </button>
             <button
               type="button"
@@ -1186,6 +1189,7 @@ export default function AdminPortalPage() {
           {view === 'dashboard' && (
             <TrafficDashboardView
               copilotLogs={copilotLogs}
+              mcpStats={mcpStats}
               portalLogs={portalLogs}
               profiles={profiles}
               objects={objects}
