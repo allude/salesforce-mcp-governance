@@ -237,6 +237,9 @@ function parseCsvLine(line: string): string[] {
   return cols.map((c) => c.trim().replace(/^'(.*)'$/, '$1'));
 }
 
+/** The apostrophe csvExport's csvCell puts before a formula character. Any other is part of the name. */
+const NEUTRALISING_APOSTROPHE = /^'(?=[=+\-@\t\r\n])/;
+
 const ID_HEADERS = new Set(['id', 'profileid', 'profile_id', 'profile id']);
 const NAME_HEADERS = new Set(['name', 'profilename', 'profile_name', 'profile name']);
 
@@ -269,7 +272,7 @@ export function parseProfilesCsv(csvText: string): Array<{ id: string; name: str
       }
     }
     const id = cols[idCol];
-    const name = cols[nameCol];
+    const name = cols[nameCol]?.replace(NEUTRALISING_APOSTROPHE, '');
     if (id && name) rows.push({ id, name });
   });
   return rows;

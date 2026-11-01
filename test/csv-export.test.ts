@@ -5,6 +5,7 @@ import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { CopilotMcpLogEntry, PortalAdminLogEntry } from '../src/types/governance.js';
 import { buildCsv, csvCell, portalAuditCsv, profilesCsv, trafficLogCsv } from '../src/components/views/csvExport.js';
+import { parseProfilesCsv } from '../src/db/importers.js';
 
 /** RFC 4180 reader, so the tests assert what a spreadsheet would see rather than the raw text. */
 function parseCsv(text: string): string[][] {
@@ -169,5 +170,35 @@ describe('exports', () => {
 
   test('every row of a multi-row export stays separate', () => {
     assert.equal(parseCsv(portalAuditCsv([auditRow, auditRow, auditRow])).length, 4);
+  });
+});
+
+describe('re-importing a profiles export', () => {
+  const roundTrip = (name: string) =>
+    parseProfilesCsv(profilesCsv([{ id: '00e000000000001', name, updatedAt: '2026-11-01' }]));
+
+  // A line feed is left out: parseProfilesCsv splits lines before reading quotes, so such a name never reaches a cell.
+  for (const name of ['=Ops', '+Ops', '-Ops', '@Ops', '\tOps', '\rOps']) {
+    test(`${JSON.stringify(name)} comes back without the apostrophe the export added`, () => {
+      assert.ok(profilesCsv([{ id: 'x', name, updatedAt: '' }]).includes(`"'${name}"`), 'control: the export neutralised it');
+      assert.deepEqual(roundTrip(name), [{ id: '00e000000000001', name }]);
+    });
+  }
+
+  test('a second export and import still gives the same name', () => {
+    const [first] = roundTrip('-Ops');
+    assert.deepEqual(roundTrip(first.name), [{ id: '00e000000000001', name: '-Ops' }]);
+  });
+
+  for (const name of ['System Administrator', "'Support", "''-Ops", "O'Brien Team", "'"]) {
+    test(`${JSON.stringify(name)} keeps its apostrophes, since the export added none`, () => {
+      assert.deepEqual(roundTrip(name), [{ id: '00e000000000001', name }]);
+    });
+  }
+
+  test('a CRLF file with the apostrophe in a quoted cell parses the same way', () => {
+    assert.deepEqual(parseProfilesCsv('ProfileId,ProfileName\r\n00e000000000001,"\'-Ops"\r\n'), [
+      { id: '00e000000000001', name: '-Ops' },
+    ]);
   });
 });
