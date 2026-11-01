@@ -1,5 +1,5 @@
 import { AVAILABLE_MCP_ACTIONS } from '@/types/governance';
-import type { McpActionId, McpActionType } from '@/types/governance';
+import type { AccessGroup, McpActionId, McpActionType } from '@/types/governance';
 
 /** What a new group starts with: discovery and read tools, never anything that writes. */
 export const DEFAULT_NEW_GROUP_ACTIONS: readonly McpActionId[] = [
@@ -16,6 +16,17 @@ export function newAccessGroupDraft() {
     allowedActions: [...DEFAULT_NEW_GROUP_ACTIONS] as McpActionType[],
     objectPermissions: [],
   };
+}
+
+/**
+ * The stored group behind a drawer, or null for a draft that has not been saved. Delete and profile
+ * assignment need a real group ID, so they must not fall back to the draft's data.
+ */
+export function savedAccessGroup(
+  groups: readonly AccessGroup[],
+  id: string | undefined
+): AccessGroup | null {
+  return (id && groups.find((group) => group.id === id)) || null;
 }
 
 /**

@@ -10,6 +10,7 @@ import { AVAILABLE_MCP_ACTIONS, unknownMcpActionIds } from '../src/types/governa
 import {
   DEFAULT_NEW_GROUP_ACTIONS,
   newAccessGroupDraft,
+  savedAccessGroup,
   splitMcpActions,
 } from '../src/components/views/accessGroupDraft.js';
 import {
@@ -138,6 +139,23 @@ describe('stored groups naming IDs that are not tools', () => {
     const res = await postGroup({ ...stale, allowedActions: splitMcpActions(stale.allowedActions).known });
     assert.equal(res.status, 200, JSON.stringify(res.body));
     assert.deepEqual(res.body.group.allowedActions, ['list_enabled_objects', 'get_record']);
+  });
+});
+
+describe('controls that need a saved group', () => {
+  const saved = { id: 'grp-1', name: 'Saved', description: '', allowedActions: [], objectPermissions: [], updatedAt: '' };
+
+  test('a new group draft has no saved group, whatever its name', () => {
+    assert.equal(savedAccessGroup([saved], undefined), null);
+    assert.equal(savedAccessGroup([{ ...saved, name: 'New Access Group' }], undefined), null);
+  });
+
+  test('a group deleted while its drawer is open no longer counts as saved', () => {
+    assert.equal(savedAccessGroup([], saved.id), null);
+  });
+
+  test('a group in the saved list is found, from the list and not the stale drawer data', () => {
+    assert.equal(savedAccessGroup([saved], saved.id), saved);
   });
 });
 

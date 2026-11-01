@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { portalAuditResult } from './portalAudit';
 import { DEFAULT_SIMULATED_USERNAME, trafficBurstCalls } from './simulatedTraffic';
-import { splitMcpActions } from './accessGroupDraft';
+import { savedAccessGroup, splitMcpActions } from './accessGroupDraft';
 import type {
   SalesforceProfile,
   SalesforceObject,
@@ -239,9 +239,7 @@ export function FlyoutDrawer({
       : null;
 
   const liveGroup: AccessGroup | null =
-    flyout.type === 'group'
-      ? groups.find((g) => g.id === flyout.data?.id) || flyout.data
-      : null;
+    flyout.type === 'group' ? savedAccessGroup(groups, flyout.data?.id) : null;
 
   const computeEffectiveAccess = (profileId: string) => {
     const gIds = getProfileGroupIds(profileId);
