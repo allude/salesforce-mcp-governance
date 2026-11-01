@@ -152,6 +152,8 @@ export default function AdminPortalPage() {
     useState<SalesforceConnectionSettings | null>(null);
   const [portalUsers, setPortalUsers] = useState<PortalUserSummary[]>([]);
   const [mcpStats, setMcpStats] = useState<McpRequestStats | null>(null);
+  // Starts off so the burst button cannot show in production before the first overview loads.
+  const [devToolsEnabled, setDevToolsEnabled] = useState(false);
 
   const notify = useCallback((msg: string, isError = false) => {
     setToast({ msg, isError });
@@ -259,6 +261,7 @@ export default function AdminPortalPage() {
       setMappings(data.profileGroupMappings || []);
       setCopilotLogs(data.copilotLogs || []);
       setMcpStats(data.stats || null);
+      setDevToolsEnabled(data.devToolsEnabled === true);
       setPortalLogs(data.portalLogs || []);
       if (data.oktaSettings) setOktaSettings(data.oktaSettings);
       if (data.sfSettings) setSfSettings(data.sfSettings);
@@ -1341,6 +1344,7 @@ export default function AdminPortalPage() {
         groups={groups}
         mappings={mappings}
         sfSettings={sfSettings}
+        devToolsEnabled={devToolsEnabled}
         onUpsertProfile={reportFailure(handleUpsertProfile)}
         onDeleteProfile={reportFailure(handleDeleteProfile)}
         onImportCsv={reportFailure(handleImportCsv)}

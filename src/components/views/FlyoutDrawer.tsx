@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { portalAuditResult } from './portalAudit';
+import { DEFAULT_SIMULATED_USERNAME, trafficBurstCalls } from './simulatedTraffic';
 import type {
   SalesforceProfile,
   SalesforceObject,
@@ -67,6 +68,8 @@ interface FlyoutDrawerProps {
     objectPermissions: GroupObjectPermission[];
   }) => Promise<AccessGroup | void>;
   onDeleteGroup: (groupId: string) => Promise<void>;
+  /** From the server: false in production, where the traffic burst is hidden. */
+  devToolsEnabled: boolean;
   onTestMcpCall: (payload: {
     profileId: string;
     toolName: string;
@@ -110,6 +113,7 @@ export function FlyoutDrawer({
   onTestMcpCall,
   onRefreshWorkspace,
   notify,
+  devToolsEnabled,
 }: FlyoutDrawerProps) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -155,7 +159,7 @@ export function FlyoutDrawer({
 
   // Simulator drawer state
   const [simProfileId, setSimProfileId] = useState('');
-  const [simUsername, setSimUsername] = useState('Jordan Lee');
+  const [simUsername, setSimUsername] = useState(DEFAULT_SIMULATED_USERNAME);
   const [simTool, setSimTool] = useState<McpActionType>('soql_query');
   const [simObject, setSimObject] = useState('Opportunity');
   const [simResult, setSimResult] = useState<any>(null);
@@ -522,50 +526,7 @@ export function FlyoutDrawer({
   const handleRunBurst = async () => {
     setBusy(true);
     try {
-      const sampleCalls: Array<{
-        profileId: string;
-        username: string;
-        toolName: McpActionType;
-        targetObject: string;
-      }> = [
-        {
-          profileId: profiles[0]?.id || '00e5g000001A9xLAAS',
-          username: 'Jordan Lee',
-          toolName: 'soql_query',
-          targetObject: 'Opportunity',
-        },
-        {
-          profileId: profiles[1]?.id || profiles[0]?.id || '00e5g000001B2k9AAC',
-          username: 'Maya Patel',
-          toolName: 'update_record',
-          targetObject: 'Account',
-        },
-        {
-          profileId: profiles[2]?.id || profiles[0]?.id || '00e5g000001D8pRAAU',
-          username: 'Devon Brooks',
-          toolName: 'get_record',
-          targetObject: 'Case',
-        },
-        {
-          profileId: profiles[1]?.id || profiles[0]?.id || '00e5g000001B2k9AAC',
-          username: 'Hannah Kim',
-          toolName: 'delete_record',
-          targetObject: 'Account',
-        },
-        {
-          profileId: profiles[3]?.id || profiles[0]?.id || '00e5g000001C4mQAAQ',
-          username: 'Carlos Reyes',
-          toolName: 'describe_object',
-          targetObject: 'Opportunity',
-        },
-        {
-          profileId:
-            profiles[profiles.length - 1]?.id || '00e5g000001J0yVAAS',
-          username: 'Priya Nair',
-          toolName: 'soql_query',
-          targetObject: 'Contact',
-        },
-      ];
+      const sampleCalls = trafficBurstCalls(profiles.map((p) => p.id));
       let lastRes = null;
       for (const call of sampleCalls) {
         lastRes = await onTestMcpCall(call);
@@ -1950,8 +1911,11 @@ export function FlyoutDrawer({
                     className="inp"
                     value={simUsername}
                     onChange={(e) => setSimUsername(e.target.value)}
-                    placeholder="Jordan Lee"
+                    placeholder={DEFAULT_SIMULATED_USERNAME}
                   />
+                  <div style={{ fontSize: 11, color: 'var(--t3)', marginTop: 4 }}>
+                    Logged as simulated:&lt;name&gt; and tagged SIMULATED.
+                  </div>
                 </div>
                 <div
                   style={{
@@ -2016,14 +1980,16 @@ export function FlyoutDrawer({
                   >
                     Run MCP Policy Check
                   </button>
-                  <button
-                    type="button"
-                    className="btn"
-                    disabled={busy}
-                    onClick={handleRunBurst}
-                  >
-                    Run 6-Event Traffic Burst
-                  </button>
+                  {devToolsEnabled && (
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={busy}
+                      onClick={handleRunBurst}
+                    >
+                      Run 6-Event Traffic Burst
+                    </button>
+                  )}
                 </div>
               </div>
 

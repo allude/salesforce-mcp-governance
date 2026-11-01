@@ -118,8 +118,8 @@ export function CommandPalette({
       {
         id: 'act-sim',
         section: 'Quick Actions',
-        label: 'Open Live MCP Policy Simulator & Traffic Burst',
-        meta: 'Test RBAC & generate traffic',
+        label: 'Open Live MCP Policy Simulator',
+        meta: 'Test RBAC policies',
         action: () => onOpenFlyout({ type: 'simulator' }),
       },
       {

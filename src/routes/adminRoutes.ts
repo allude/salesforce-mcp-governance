@@ -394,6 +394,7 @@ adminRouter.get('/overview', (_req: Request, res: Response) => {
     profileGroupMappings,
     copilotLogs,
     portalLogs,
+    devToolsEnabled: !config.isProd,
     oktaSettings: {
       enabled: okta.enabled,
       oktaDomain: okta.oktaDomain,

@@ -4,12 +4,13 @@ import './helpers/env.js';
 import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import { config } from '../src/config.js';
 import { store } from '../src/db/store.js';
 import { createSimulatorToken, resolveSalesforceUserFromToken } from '../src/salesforce/client.js';
 import { startTestServer, loginAsAdmin, adminFetch, mcpRequest, type AdminSession, type TestServer } from './helpers/server.js';
 import { installSalesforceMock } from './helpers/salesforceMock.js';
 import { TEST_ADMIN } from './helpers/env.js';
-import { realTraffic } from '../src/components/views/simulatedTraffic.js';
+import { DEFAULT_SIMULATED_USERNAME, realTraffic, trafficBurstCalls } from '../src/components/views/simulatedTraffic.js';
 
 const tag = () => crypto.randomBytes(4).toString('hex');
 const newProfileId = () => `00e${crypto.randomBytes(6).toString('hex')}`.slice(0, 15);
@@ -258,5 +259,45 @@ describe('dashboard figures', () => {
   test('realTraffic drops simulated rows and keeps the order of the rest', () => {
     const logs = [{ id: 'a' }, { id: 'b', simulated: true }, { id: 'c' }];
     assert.deepEqual(realTraffic(logs).map((l) => l.id), ['a', 'c']);
+  });
+});
+
+describe('traffic burst', () => {
+  test('uses only obviously synthetic names', () => {
+    const calls = trafficBurstCalls(['00e000000000001', '00e000000000002']);
+    assert.equal(calls.length, 6);
+    for (const call of calls) assert.match(call.username, /^test-user-\d+$/);
+    assert.equal(new Set(calls.map((c) => c.username)).size, 6);
+  });
+
+  test('uses the given Profiles, and reuses the first when there are too few', () => {
+    const calls = trafficBurstCalls(['00eA', '00eB']);
+    assert.deepEqual(calls.map((c) => c.profileId), ['00eA', '00eB', '00eA', '00eB', '00eA', '00eB']);
+  });
+
+  test("the form's default name matches the server's", async () => {
+    const profileId = newProfileId();
+    const res = await simulate({ profileId, toolName: 'list_enabled_objects' });
+    assert.equal(res.status, 200);
+    assert.equal(rowsFor(profileId)[0].sfUsername, `simulated:${DEFAULT_SIMULATED_USERNAME}`);
+  });
+});
+
+describe('devToolsEnabled', () => {
+  test('overview reports it from the server config outside production', async () => {
+    const res = await adminFetch(server.baseUrl, session, '/api/admin/overview');
+    assert.equal(res.body.devToolsEnabled, true);
+  });
+
+  test('overview reports it off in production', async () => {
+    const mutable = config as { isProd: boolean };
+    mutable.isProd = true;
+    try {
+      const res = await adminFetch(server.baseUrl, session, '/api/admin/overview');
+      assert.equal(res.status, 200);
+      assert.equal(res.body.devToolsEnabled, false);
+    } finally {
+      mutable.isProd = false;
+    }
   });
 });
