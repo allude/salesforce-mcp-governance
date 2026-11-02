@@ -422,6 +422,36 @@ describe('/mcp end to end', () => {
     assert.equal((await mcpRequest(server.baseUrl, token, 'tools/list', {}, client)).status, 200);
   });
 
+  test('copies of one junk token that waited at the gate are refused without asking Salesforce again', async () => {
+    const mockedFetch = globalThis.fetch;
+    const release: Array<() => void> = [];
+    globalThis.fetch = (async (input: any, init?: any) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (/salesforce\.com$/.test(url.hostname)) await new Promise<void>((r) => release.push(r));
+      return mockedFetch(input, init);
+    }) as typeof fetch;
+    try {
+      const token = `junk_${crypto.randomBytes(8).toString('hex')}`;
+      const rowsBefore = rejectedRows();
+      // 8 copies take the gate's slots and 12 wait behind them.
+      const pending = Array.from({ length: 20 }, (_, i) =>
+        mcpRequest(server.baseUrl, token, 'tools/list', {}, { 'X-Forwarded-For': `198.19.2.${i + 1}` })
+      );
+      while (verificationGateStats().queued < 12) await new Promise((r) => setTimeout(r, 5));
+
+      const drain = setInterval(() => release.splice(0).forEach((r) => r()), 2);
+      const statuses = (await Promise.all(pending)).map((res) => res.status);
+      clearInterval(drain);
+
+      assert.deepEqual([...new Set(statuses)], [401]);
+      assert.equal(sf.calls.length, 8, 'only the copies already running asked Salesforce');
+      assert.equal(rejectedRows() - rowsBefore, 20, 'every copy is still logged');
+    } finally {
+      globalThis.fetch = mockedFetch;
+      release.splice(0).forEach((r) => r());
+    }
+  });
+
   test('when verification is at capacity a caller gets 503 with Retry-After, and no log row', async () => {
     // Slow every Salesforce answer so the 8 slots and 100 queue places fill.
     const mockedFetch = globalThis.fetch;

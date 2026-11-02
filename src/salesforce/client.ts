@@ -267,18 +267,20 @@ export async function resolveSalesforceUserFromToken(
   assertNotSimulatedOrgHost(fallbackInstanceUrl, 'Salesforce instance URL');
 
   const rejectionKey = `${tokenHash}|${baseLoginUrl}`;
-  if (wasRecentlyRejected(rejectionKey)) {
-    throw new Error('Salesforce token verification failed (HTTP 401)');
-  }
+  const refuseIfRecentlyRejected = () => {
+    if (wasRecentlyRejected(rejectionKey)) throw new Error('Salesforce token verification failed (HTTP 401)');
+  };
+  refuseIfRecentlyRejected();
 
   return verificationGate.run(wasHashRecentlyVerified(tokenHash), async () => {
-    // Another request with this token may have finished verifying while this one waited.
+    // Another request with this token may have finished verifying, or been rejected, while this one waited.
     const verifiedMeanwhile = identityCache.get(tokenHash);
     if (verifiedMeanwhile && verifiedMeanwhile.expiresAt > Date.now()) {
       enforceOrgIdLock(verifiedMeanwhile.user.organizationId);
       rememberVerifiedToken(tokenHash);
       return { ...verifiedMeanwhile.user, accessToken: bearerToken };
     }
+    refuseIfRecentlyRejected();
     return verifyWithSalesforce(bearerToken, tokenHash, rejectionKey, baseLoginUrl, fallbackInstanceUrl, sfSettings.apiVersion);
   });
 }
