@@ -377,6 +377,12 @@ describe('/mcp end to end', () => {
       ['HTTP 429', async () => new Response('slow down', { status: 429 })],
       ['a timeout', async () => { throw new DOMException('The operation was aborted due to timeout', 'TimeoutError'); }],
       ['a network failure', async () => { throw new TypeError('fetch failed'); }],
+      ['a connection lost mid-body', async () => new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"user_id":'));
+          controller.error(new TypeError('terminated'));
+        },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })],
     ];
     for (const [name, failure] of failures) {
       const client = freshClient();

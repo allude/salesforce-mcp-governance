@@ -69,13 +69,16 @@ async function fetchForVerification(url: string, headers: Record<string, string>
   }
 }
 
-/** Reads a JSON body; the verification timeout also covers the body, and that is not a verdict either. */
+/**
+ * Reads a JSON body. A body that arrived but is not JSON is Salesforce's answer; a timeout or a
+ * connection lost while reading it is not a verdict either.
+ */
 async function readVerificationJson(res: Response): Promise<any> {
   try {
     return await res.json();
   } catch (err) {
-    if (isAbort(err)) throw new SalesforceUnavailableError('timed out');
-    throw err;
+    if (err instanceof SyntaxError) throw err;
+    throw new SalesforceUnavailableError(isAbort(err) ? 'timed out' : 'not reachable');
   }
 }
 
