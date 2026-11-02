@@ -1,4 +1,4 @@
-import { testTmpDir } from './helpers/env.js';
+import './helpers/env.js';
 // Covers what bounds the cost of junk /mcp bearer tokens without refusing valid ones:
 // src/mcp/bearer.ts (one token parser for the limiters and the handler), src/security/clientIp.ts
 // (IPv6 /64 keys, and when req.ip tells clients apart), src/security/failureWindow.ts,
@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import type { Request } from 'express';
 import { store, UNVERIFIED_CALLER_USERNAME } from '../src/db/store.js';
 import { isPlausibleBearerToken, parseBearerToken } from '../src/mcp/bearer.js';
-import { clientIpsAreDistinguishable, rateLimitIpKey } from '../src/security/clientIp.js';
+import { clientIpIsForwarded, rateLimitIpKey } from '../src/security/clientIp.js';
 import { createFailureWindow } from '../src/security/failureWindow.js';
 import { createVerificationGate, VerificationBusyError } from '../src/salesforce/verificationGate.js';
 import { verificationGateStats } from '../src/salesforce/client.js';
@@ -73,21 +73,27 @@ describe('rateLimitIpKey', () => {
   });
 });
 
-describe('clientIpsAreDistinguishable', () => {
-  const from = (remoteAddress: string) => ({ socket: { remoteAddress } }) as unknown as Request;
+describe('clientIpIsForwarded', () => {
+  // req.ip is what Express resolved: the socket address unless a trusted proxy named the client.
+  const req = (remoteAddress: string, ip: string = remoteAddress) => ({ ip, socket: { remoteAddress } }) as unknown as Request;
 
-  test('behind an untrusted proxy on loopback every caller looks the same, so per-IP limits are off', () => {
-    for (const address of ['127.0.0.1', '::1', '::ffff:127.0.0.1']) {
-      assert.equal(clientIpsAreDistinguishable(from(address), false), false, address);
-      assert.equal(clientIpsAreDistinguishable(from(address), 0), false, address);
+  test('a connection whose address is req.ip may be a shared proxy, so per-IP limits are off', () => {
+    // The portal proxy on loopback, on another container or host (MCP_BACKEND_URL), or a
+    // TRUST_PROXY that does not cover the connecting hop: req.ip stays the socket address.
+    for (const address of ['127.0.0.1', '::1', '::ffff:127.0.0.1', '172.18.0.3', '::ffff:10.0.0.5', '2001:db8::7']) {
+      assert.equal(clientIpIsForwarded(req(address)), false, address);
     }
+    assert.equal(clientIpIsForwarded(req('::ffff:172.18.0.3', '172.18.0.3')), false, 'mapped form of the same address');
+    assert.equal(clientIpIsForwarded(req('2001:db8::7', '2001:db8::99')), false, 'same /64 as the proxy');
   });
 
-  test('a direct connection, or a configured trusted proxy, tells clients apart', () => {
-    assert.equal(clientIpsAreDistinguishable(from('203.0.113.9'), false), true);
-    assert.equal(clientIpsAreDistinguishable(from('127.0.0.1'), 'loopback'), true);
-    assert.equal(clientIpsAreDistinguishable(from('127.0.0.1'), 1), true);
-    assert.equal(clientIpsAreDistinguishable(from('127.0.0.1'), true), true);
+  test('a client address supplied by a trusted proxy tells clients apart', () => {
+    assert.equal(clientIpIsForwarded(req('127.0.0.1', '203.0.113.9')), true);
+    assert.equal(clientIpIsForwarded(req('172.18.0.3', '2001:db8:1::5')), true);
+  });
+
+  test('a missing address is never treated as a client', () => {
+    assert.equal(clientIpIsForwarded({ socket: {} } as unknown as Request), false);
   });
 });
 
@@ -209,7 +215,7 @@ describe('/mcp behind the portal proxy with TRUST_PROXY off', () => {
     `;
     const output = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], {
       cwd: repoRoot,
-      env: { ...process.env, TRUST_PROXY: 'false', DB_PATH: path.join(testTmpDir, `shared-ip-${crypto.randomUUID()}.sqlite`) },
+      env: { ...process.env, TRUST_PROXY: 'false' },
       stdio: 'pipe',
     }).toString();
     const result = JSON.parse(output.trim().split('\n').pop()!);
@@ -238,6 +244,21 @@ describe('/mcp end to end', () => {
   const freshClient = () => ({ 'X-Forwarded-For': `192.0.2.${++ipCounter}` });
   const rejectedRows = () =>
     store.getCopilotMcpLogs(5000).filter((row) => row.sfUsername === UNVERIFIED_CALLER_USERNAME).length;
+
+  test('with a trusted proxy that names no client, a flood from the proxy address never locks out a new valid token', async () => {
+    // No X-Forwarded-For: req.ip is the loopback socket address, shared by everyone behind it.
+    const statuses = [];
+    for (let i = 0; i < 40; i++) {
+      statuses.push((await mcpRequest(server.baseUrl, `junk_unnamed_${i}`, 'tools/list')).status);
+    }
+    sf.addUser('unnamed_fresh_token', {
+      userId: '005000000000998AAA', organizationId: '00D000000000001AAA', username: 'unnamed@acme.example',
+      profileId: '00e000000000998AAA', profileName: 'Unnamed',
+    });
+
+    assert.deepEqual([...new Set(statuses)], [401], 'every junk token is checked and refused, none answered 429');
+    assert.equal((await mcpRequest(server.baseUrl, 'unnamed_fresh_token', 'tools/list')).status, 200);
+  });
 
   test('repeating a junk token reaches Salesforce once, and every attempt is still refused and logged', async () => {
     const client = freshClient();

@@ -29,16 +29,16 @@ function expandIPv6(address: string): string[] {
   return [...headGroups, ...Array(missing).fill('0'), ...tailGroups].map((group) => group.replace(/^0+(?=.)/, ''));
 }
 
-const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
-
 /**
- * Whether req.ip tells clients apart. Behind the portal's Next.js proxy with TRUST_PROXY off, every
- * request arrives from loopback, so req.ip is the same for everyone; a per-IP limit there would be
- * one limit shared by all callers, which anyone could use up. That only holds when the proxy is
- * not trusted and the connection itself comes from loopback.
+ * Whether req.ip names the client rather than whatever connected to this server. That holds only
+ * when a trusted proxy supplied the address (X-Forwarded-For under TRUST_PROXY), so req.ip differs
+ * from the socket address. Otherwise the connection may be the portal's Next.js proxy, on loopback
+ * or on another host or container (MCP_BACKEND_URL), and every caller would share its address; a
+ * per-IP limit there would be one limit shared by all callers, which anyone could use up. A
+ * TRUST_PROXY that does not cover the connecting hop leaves req.ip equal to the socket address, so
+ * that counts as shared too.
  */
-export function clientIpsAreDistinguishable(req: Request, trustProxy: boolean | number | string): boolean {
-  const trusted = trustProxy !== false && trustProxy !== 0;
-  if (trusted) return true;
-  return !LOOPBACK.has(req.socket?.remoteAddress || '');
+export function clientIpIsForwarded(req: Request): boolean {
+  const ip = rateLimitIpKey(req.ip);
+  return ip !== '' && ip !== rateLimitIpKey(req.socket?.remoteAddress);
 }

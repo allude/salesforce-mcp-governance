@@ -16,7 +16,7 @@ import {
 } from './security/adminAuth.js';
 import { adminRouter, recordObjectSyncFailure } from './routes/adminRoutes.js';
 import { hashToken } from './security/crypto.js';
-import { clientIpsAreDistinguishable, rateLimitIpKey } from './security/clientIp.js';
+import { clientIpIsForwarded, rateLimitIpKey } from './security/clientIp.js';
 import { createFailureWindow } from './security/failureWindow.js';
 import { parseBearerToken } from './mcp/bearer.js';
 
@@ -150,8 +150,8 @@ const mcpLimiter = rateLimit({
 
 // mcpLimiter gives every token its own bucket, so a client sending a new junk token each time was
 // never limited by it. Rejected tokens are also counted per client IP, 30 a minute, but only where
-// req.ip tells clients apart (TRUST_PROXY set, or direct connections). Behind the portal proxy
-// without TRUST_PROXY every caller has the same IP, so that count would be one limit anyone could
+// a trusted proxy named the client (clientIpIsForwarded). Otherwise req.ip is whatever connected,
+// usually the portal proxy that every caller shares, so that count would be one limit anyone could
 // use up and lock out every new sign-in; there the cost is bounded instead by the rejected-token
 // cache and the verification gate in salesforce/client.ts. A request is counted only once it has
 // been answered 401, and a token that verified within the last hour is never refused here.
@@ -160,7 +160,7 @@ const rejectedTokenWindow = createFailureWindow({ windowMs: 60 * 1000, max: REJE
 
 function mcpRejectedTokenLimiter(req: Request, res: Response, next: NextFunction): void {
   const token = parseBearerToken(req.headers.authorization);
-  if (!token || wasTokenRecentlyVerified(token) || !clientIpsAreDistinguishable(req, config.trustProxy)) {
+  if (!token || wasTokenRecentlyVerified(token) || !clientIpIsForwarded(req)) {
     next();
     return;
   }
