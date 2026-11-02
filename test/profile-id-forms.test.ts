@@ -311,6 +311,19 @@ describe('Profile ID forms outside org sync', () => {
         assert.deepEqual(groupsOf(id), [group.id]);
       });
 
+      test('the exact ID of a stored row is refused and renames nothing', async (t) => {
+        const id = newId15();
+        const group = mapped(t, id, 'Sales');
+
+        const res = await create(id, 'Renamed by New Profile');
+
+        assert.equal(res.status, 409);
+        assert.match(res.body.error, new RegExp(`stored as ${id} \\("Sales"\\)`));
+        assert.deepEqual(rowsOf(id).map((p) => [p.id, p.name]), [[id, 'Sales']]);
+        assert.deepEqual(groupsOf(id), [group.id]);
+        assert.equal(auditedFor(id), false);
+      });
+
       test('with both forms stored it names the row in force, even for an exact ID', async (t) => {
         const id = newId15();
         storedTwice(t, [{ id, name: 'A in force' }, { id: to18(id), name: 'B other' }]);

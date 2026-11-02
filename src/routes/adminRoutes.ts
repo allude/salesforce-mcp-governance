@@ -503,11 +503,12 @@ adminRouter.post('/profiles', (req: Request, res: Response) => {
   }
 
   // Only the New Profile form sets `creating`: someone pasting an ID there means a new Profile, so
-  // finding it stored under another form is news to them, not a save to apply over the stored row.
+  // finding it stored in any form, the exact one included, is news to them, not a rename to apply
+  // over the stored row.
   if (creating === true) {
     const cleanId = String(id).trim();
     const forms = store.getProfiles().filter((p) => salesforceIdsMatch(p.id, cleanId));
-    if (forms.some((p) => p.id !== cleanId)) {
+    if (forms.length > 0) {
       res.status(409).json({
         error: `This Profile is already stored as ${forms[0].id} ("${forms[0].name}"). Open that row to edit it.`,
       });
