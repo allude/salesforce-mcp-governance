@@ -113,7 +113,12 @@ describe('generating a certificate and key', () => {
 });
 
 describe('mcpTokenHostWarning', () => {
-  const connected = { connectionStatus: 'connected', loginUrl: 'https://test.salesforce.com', instanceUrl: 'https://login.salesforce.com' } as const;
+  const connected = {
+    connectionStatus: 'connected',
+    authMode: 'jwt_bearer',
+    loginUrl: 'https://test.salesforce.com',
+    instanceUrl: 'https://login.salesforce.com',
+  } as const;
 
   test('warns when a connection logs in through a sandbox and MCP verifies at production login', () => {
     assert.match(mcpTokenHostWarning(connected) ?? '', /login\.salesforce\.com/);
@@ -132,6 +137,14 @@ describe('mcpTokenHostWarning', () => {
     assert.equal(mcpTokenHostWarning({ ...connected, loginUrl: 'https://login.salesforce.com' }), null);
     assert.equal(mcpTokenHostWarning({ ...connected, loginUrl: 'https://acme.my.salesforce.com' }), null);
     assert.equal(mcpTokenHostWarning({ ...connected, instanceUrl: 'https://acme--uat.sandbox.my.salesforce.com' }), null);
+  });
+
+  test('stays quiet for a simulated connection, which never moves the host off production login', () => {
+    assert.equal(mcpTokenHostWarning({ ...connected, authMode: 'simulated' }), null);
+    assert.equal(
+      mcpTokenHostWarning({ ...connected, authMode: 'simulated', loginUrl: 'https://acme--uat.sandbox.my.salesforce.com' }),
+      null
+    );
   });
 
   test('a value that is not a URL does not throw', () => {

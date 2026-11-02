@@ -121,9 +121,11 @@ function isSandboxLoginHost(host: string): boolean {
 
 /** A connection that logs in through a sandbox while MCP verifies user tokens at production login. */
 export function mcpTokenHostWarning(
-  settings: Pick<SalesforceConnectionSettings, 'connectionStatus' | 'loginUrl' | 'instanceUrl'>
+  settings: Pick<SalesforceConnectionSettings, 'connectionStatus' | 'authMode' | 'loginUrl' | 'instanceUrl'>
 ): string | null {
   if (settings.connectionStatus !== 'connected') return null;
+  // A simulated connect never writes the instance URL, so its advice to reconnect could not clear this.
+  if (settings.authMode === 'simulated') return null;
   if (!isSandboxLoginHost(hostnameOf(settings.loginUrl))) return null;
   if (hostnameOf(settings.instanceUrl) !== 'login.salesforce.com') return null;
   return 'This connection logs in through a sandbox, but MCP verifies user tokens at login.salesforce.com, so sandbox users may be refused. Set the MCP token host to the sandbox My Domain URL, or Connect & Verify again to use the connected host.';
