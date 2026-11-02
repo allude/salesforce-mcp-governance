@@ -45,6 +45,39 @@ const RECENTLY_REJECTED_TTL_MS = 5 * 60 * 1000;
 const VERIFICATION_TIMEOUT_MS = 10 * 1000;
 const verificationGate = createVerificationGate({ maxConcurrent: 8, maxQueued: 100, maxWaitMs: 10 * 1000 });
 
+/**
+ * Salesforce could not give a verdict on the token: it timed out, could not be reached, or answered
+ * 5xx or 429. Not a verdict on the token, so a token that verified before keeps its exemption and
+ * the caller is told to retry rather than that its token is invalid.
+ */
+export class SalesforceUnavailableError extends Error {
+  constructor(detail: string) {
+    super(`Salesforce could not verify the token right now (${detail}); try again shortly`);
+    this.name = 'SalesforceUnavailableError';
+  }
+}
+
+const isAbort = (err: unknown) => err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError');
+
+/** fetch with the verification timeout; a timeout or network failure is SalesforceUnavailableError. */
+async function fetchForVerification(url: string, headers: Record<string, string>): Promise<Response> {
+  try {
+    return await fetch(url, { headers, signal: AbortSignal.timeout(VERIFICATION_TIMEOUT_MS) });
+  } catch (err) {
+    throw new SalesforceUnavailableError(isAbort(err) ? 'timed out' : 'not reachable');
+  }
+}
+
+/** Reads a JSON body; the verification timeout also covers the body, and that is not a verdict either. */
+async function readVerificationJson(res: Response): Promise<any> {
+  try {
+    return await res.json();
+  } catch (err) {
+    if (isAbort(err)) throw new SalesforceUnavailableError('timed out');
+    throw err;
+  }
+}
+
 const SIMULATOR_TOKEN_PREFIX = 'sf_sim_';
 const SIMULATOR_TOKEN_TTL_SECONDS = 15 * 60;
 const SIMULATED_IDENTITY_PREFIX = 'simulated:';
@@ -259,22 +292,21 @@ async function verifyWithSalesforce(
   storedApiVersion: string
 ): Promise<VerifiedSalesforceUser> {
   // 2. Call Salesforce OIDC /services/oauth2/userinfo to verify token & get user_id + custom_domain
-  const userInfoRes = await fetch(`${baseLoginUrl}/services/oauth2/userinfo`, {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${bearerToken}`,
-      Accept: 'application/json',
-    },
-    signal: AbortSignal.timeout(VERIFICATION_TIMEOUT_MS),
+  const userInfoRes = await fetchForVerification(`${baseLoginUrl}/services/oauth2/userinfo`, {
+    Authorization: `Bearer ${bearerToken}`,
+    Accept: 'application/json',
   });
 
   if (!userInfoRes.ok) {
-    // Only a 401 says the token itself is invalid; other statuses may be passing faults.
+    // Only a 401 says the token itself is invalid; 5xx and 429 are passing faults, not verdicts.
+    if (userInfoRes.status >= 500 || userInfoRes.status === 429) {
+      throw new SalesforceUnavailableError(`HTTP ${userInfoRes.status}`);
+    }
     if (userInfoRes.status === 401) rememberRejectedToken(rejectionKey);
     throw new Error(`Salesforce token verification failed (HTTP ${userInfoRes.status})`);
   }
 
-  const userInfo = (await userInfoRes.json()) as any;
+  const userInfo = await readVerificationJson(userInfoRes);
   const userId: string = userInfo.user_id;
   const orgId: string = userInfo.organization_id;
   if (typeof userId !== 'string' || !userId || typeof orgId !== 'string' || !orgId) {
@@ -296,14 +328,11 @@ async function verifyWithSalesforce(
   // 3. Query the User's ProfileId and Profile.Name via Salesforce REST API
   const apiVersion = storedApiVersion || config.salesforce.apiVersion;
   const soql = `SELECT Id, Username, Name, Email, ProfileId, Profile.Name FROM User WHERE Id = '${escapeSoqlString(userId)}' LIMIT 1`;
-  const queryRes = await fetch(
+  const queryRes = await fetchForVerification(
     `${instanceUrl}/services/data/${apiVersion}/query?q=${encodeURIComponent(soql)}`,
     {
-      headers: {
-        Authorization: `Bearer ${bearerToken}`,
-        Accept: 'application/json',
-      },
-      signal: AbortSignal.timeout(VERIFICATION_TIMEOUT_MS),
+      Authorization: `Bearer ${bearerToken}`,
+      Accept: 'application/json',
     }
   );
 
@@ -313,7 +342,7 @@ async function verifyWithSalesforce(
   let profileName = '';
 
   if (queryRes.ok) {
-    const queryData = (await queryRes.json()) as any;
+    const queryData = await readVerificationJson(queryRes);
     const userRecord = queryData.records?.[0];
     if (userRecord) {
       profileId = String(userRecord.ProfileId || '');

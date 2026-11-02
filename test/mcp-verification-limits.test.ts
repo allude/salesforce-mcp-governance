@@ -17,7 +17,7 @@ import { isPlausibleBearerToken, parseBearerToken } from '../src/mcp/bearer.js';
 import { clientIpIsForwarded, rateLimitIpKey } from '../src/security/clientIp.js';
 import { createFailureWindow } from '../src/security/failureWindow.js';
 import { createVerificationGate, VerificationBusyError } from '../src/salesforce/verificationGate.js';
-import { verificationGateStats } from '../src/salesforce/client.js';
+import { verificationGateStats, wasTokenRecentlyVerified } from '../src/salesforce/client.js';
 import { installSalesforceMock, type SalesforceMock } from './helpers/salesforceMock.js';
 import { mcpRequest, startTestServer, type TestServer } from './helpers/server.js';
 
@@ -345,6 +345,81 @@ describe('/mcp end to end', () => {
     } finally {
       store.updateSalesforceSettings({ enforceOrgIdLock: false, expectedOrgId: '' });
     }
+  });
+
+  /** Makes every Salesforce request fail with `failure` until the returned restore is called. */
+  function failSalesforce(failure: () => Promise<Response>): () => void {
+    const mockedFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: any, init?: any) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (/salesforce\.com$/.test(url.hostname)) return failure();
+      return mockedFetch(input, init);
+    }) as typeof fetch;
+    return () => {
+      globalThis.fetch = mockedFetch;
+    };
+  }
+
+  test('when Salesforce cannot answer, the caller gets 503 with Retry-After, and the token is not remembered as rejected', async () => {
+    const failures: Array<[string, () => Promise<Response>]> = [
+      ['HTTP 503', async () => new Response('down', { status: 503 })],
+      ['HTTP 429', async () => new Response('slow down', { status: 429 })],
+      ['a timeout', async () => { throw new DOMException('The operation was aborted due to timeout', 'TimeoutError'); }],
+      ['a network failure', async () => { throw new TypeError('fetch failed'); }],
+    ];
+    for (const [name, failure] of failures) {
+      const client = freshClient();
+      const token = `valid_${crypto.randomBytes(8).toString('hex')}`;
+      sf.addUser(token, {
+        userId: '005000000000887AAA', organizationId: '00D000000000001AAA', username: 'outage@acme.example',
+        profileId: '00e000000000887AAA', profileName: 'Outage Test',
+      });
+      const rowsBefore = rejectedRows();
+      const restore = failSalesforce(failure);
+      let res;
+      try {
+        res = await mcpRequest(server.baseUrl, token, 'tools/list', {}, client);
+      } finally {
+        restore();
+      }
+      assert.equal(res.status, 503, name);
+      assert.equal(res.headers.get('retry-after'), '5', name);
+      assert.equal(res.headers.get('www-authenticate'), null, `${name}: the client is not told its token is invalid`);
+      assert.equal(rejectedRows() - rowsBefore, 1, `${name}: the attempt is still logged`);
+      assert.equal((await mcpRequest(server.baseUrl, token, 'tools/list', {}, client)).status, 200, `${name}: once Salesforce answers, the token gets in`);
+    }
+  });
+
+  test('a Salesforce outage keeps a verified token exempt, while unverified tokens still count towards the limit', async () => {
+    const client = freshClient();
+    const token = `valid_${crypto.randomBytes(8).toString('hex')}`;
+    sf.addUser(token, {
+      userId: '005000000000886AAA', organizationId: '00D000000000001AAA', username: 'exempt@acme.example',
+      profileId: '00e000000000886AAA', profileName: 'Exempt Test',
+    });
+    assert.equal((await mcpRequest(server.baseUrl, token, 'tools/list', {}, client)).status, 200);
+
+    // Past the 2-minute identity cache, so the next call asks Salesforce again.
+    const realNow = Date.now;
+    Date.now = () => realNow() + 3 * 60 * 1000;
+    const restore = failSalesforce(async () => new Response('down', { status: 503 }));
+    try {
+      assert.equal((await mcpRequest(server.baseUrl, token, 'tools/list', {}, client)).status, 503);
+      assert.equal(wasTokenRecentlyVerified(token), true, 'no verdict, so the exemption stays');
+
+      const junk: number[] = [];
+      for (let i = 0; i < 31; i++) {
+        junk.push((await mcpRequest(server.baseUrl, `junk_outage_${i}`, 'tools/list', {}, client)).status);
+      }
+      assert.deepEqual(junk.slice(0, 30), Array(30).fill(503));
+      assert.equal(junk[30], 429, 'tokens that never verified are counted');
+
+      assert.equal((await mcpRequest(server.baseUrl, token, 'tools/list', {}, client)).status, 503, 'the exempt token still reaches Salesforce');
+    } finally {
+      restore();
+      Date.now = realNow;
+    }
+    assert.equal((await mcpRequest(server.baseUrl, token, 'tools/list', {}, client)).status, 200);
   });
 
   test('when verification is at capacity a caller gets 503 with Retry-After, and no log row', async () => {

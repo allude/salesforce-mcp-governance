@@ -154,7 +154,8 @@ const mcpLimiter = rateLimit({
 // usually the portal proxy that every caller shares, so that count would be one limit anyone could
 // use up and lock out every new sign-in; there the cost is bounded instead by the rejected-token
 // cache and the verification gate in salesforce/client.ts. A request is counted only once it has
-// been answered 401, and a token that verified within the last hour is never refused here.
+// been answered and its token did not verify, and a token that verified within the last hour is
+// never refused here.
 const REJECTED_TOKEN_LIMIT = 30;
 const rejectedTokenWindow = createFailureWindow({ windowMs: 60 * 1000, max: REJECTED_TOKEN_LIMIT, maxKeys: 10_000 });
 
@@ -176,7 +177,8 @@ function mcpRejectedTokenLimiter(req: Request, res: Response, next: NextFunction
     return;
   }
   res.on('finish', () => {
-    if (res.statusCode === 401) rejectedTokenWindow.record(key);
+    // Set by the /mcp handler when the token did not verify (401, or 503 when Salesforce gave no verdict).
+    if (res.locals.tokenNotVerified === true) rejectedTokenWindow.record(key);
   });
   next();
 }
