@@ -1,4 +1,4 @@
-import type { CopilotMcpLogEntry, PortalAdminLogEntry } from '@/types/governance';
+import type { CopilotMcpLogEntry, PortalAdminLogEntry, PortalOverviewPayload } from '@/types/governance';
 
 /** Rows asked for by each click of "Load older". */
 export const LOG_HISTORY_PAGE_ROWS = 200;
@@ -144,4 +144,75 @@ export function auditRowMatches(row: PortalAdminLogEntry, filters: AuditFilters)
       row.target.toLowerCase().includes(q) ||
       row.details.toLowerCase().includes(q))
   );
+}
+
+/** The MCP log user for a rejected bearer token; matches UNVERIFIED_CALLER_USERNAME in the store. */
+export const REJECTED_TOKEN_USERNAME = 'unverified_caller';
+/** The audit action written per policy simulation; matches SIMULATE_MCP_CALL_ACTION in the store. */
+export const SIMULATION_ACTION = 'SIMULATE_MCP_CALL';
+
+/** How many rows of each kind the /overview log lists hold at most. */
+export type OverviewLogCaps = PortalOverviewPayload['logCaps'];
+
+/** The caps /overview has used since they were split by kind, for a response that does not send them. */
+export const DEFAULT_OVERVIEW_LOG_CAPS: OverviewLogCaps = {
+  copilotLogs: { calls: 150, simulated: 50, rejected: 50 },
+  portalLogs: { events: 150, simulations: 50 },
+};
+
+export interface LogKind<T> {
+  noun: string;
+  cap: number;
+  matches: (row: T) => boolean;
+}
+
+export function trafficLogKinds(caps: OverviewLogCaps['copilotLogs']): Array<LogKind<CopilotMcpLogEntry>> {
+  const rejected = (r: CopilotMcpLogEntry) => !r.simulated && r.sfUsername === REJECTED_TOKEN_USERNAME;
+  return [
+    { noun: 'calls', cap: caps.calls, matches: (r) => !r.simulated && !rejected(r) },
+    { noun: 'simulated', cap: caps.simulated, matches: (r) => r.simulated === true },
+    { noun: 'rejected', cap: caps.rejected, matches: rejected },
+  ];
+}
+
+export function auditLogKinds(caps: OverviewLogCaps['portalLogs']): Array<LogKind<PortalAdminLogEntry>> {
+  return [
+    { noun: 'events', cap: caps.events, matches: (r) => r.action !== SIMULATION_ACTION },
+    { noun: 'simulations', cap: caps.simulations, matches: (r) => r.action === SIMULATION_ACTION },
+  ];
+}
+
+function utcSeconds(iso: string): string {
+  return `${iso.slice(0, 19).replace('T', ' ')} UTC`;
+}
+
+/**
+ * What a Logs view holds, for its toolbar. The /overview list caps each kind on its own, so older
+ * rows of one kind can be missing between shown rows of another; naming the latest rows held keeps
+ * a reader from taking those gaps for a quiet period. A kind with fewer rows than its cap is held
+ * in full.
+ */
+export function describeHeldLogs<T extends { seq?: number; timestamp: string }>(input: {
+  overview: T[];
+  older: T[];
+  cursor: number | null | undefined;
+  kinds: Array<LogKind<T>>;
+}): string {
+  const { overview, older, cursor, kinds } = input;
+  if (cursor === null) return 'the whole log';
+
+  const oldestLoaded = older.length > 0 ? older[older.length - 1] : undefined;
+  if (cursor !== undefined && oldestLoaded) {
+    // Loaded pages run unbroken from the newest row, so only /overview rows older than them have gaps.
+    const outside = overview.filter((row) => (row.seq ?? 0) < (oldestLoaded.seq ?? 0)).length;
+    const since = `every event since ${utcSeconds(oldestLoaded.timestamp)}`;
+    return outside > 0 ? `${since} + ${outside} older from the latest-row lists` : since;
+  }
+
+  const parts = kinds.flatMap((kind) => {
+    const count = overview.filter(kind.matches).length;
+    if (count === 0) return [];
+    return [count >= kind.cap ? `latest ${kind.cap} ${kind.noun}` : `all ${count} ${kind.noun}`];
+  });
+  return parts.length > 0 ? parts.join(' + ') : 'no events';
 }

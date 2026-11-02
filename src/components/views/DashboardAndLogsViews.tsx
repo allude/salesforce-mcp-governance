@@ -17,17 +17,21 @@ import type { FlyoutState } from './FlyoutDrawer';
 import { realTraffic } from './simulatedTraffic';
 import { portalAuditCsv, trafficLogCsv } from './csvExport';
 import {
+  auditLogKinds,
   auditRouteQuery,
   auditRowMatches,
+  describeHeldLogs,
   exportFileName,
   exportTruncatedMessage,
   mergeNewestFirst,
   readAllRows,
   readOlderRows,
+  trafficLogKinds,
   trafficRouteQuery,
   trafficRowMatches,
   type LogPage,
   type LogQuery,
+  type OverviewLogCaps,
 } from './logHistory';
 import { trafficBuckets, trafficChartSubtitle, type TrafficRange } from './trafficChart';
 
@@ -824,7 +828,7 @@ function useOlderLogRows<T extends { id: string; seq?: number }>(
     setCursor(undefined);
   };
 
-  return { held, cursor, loading, loadOlder, reset };
+  return { held, older, cursor, loading, loadOlder, reset };
 }
 
 /** Exports every matching row through the paged route, up to the export limit, and says when it was cut. */
@@ -884,6 +888,7 @@ interface CopilotMcpLogsViewProps {
   objects: SalesforceObjectConfig[];
   selectedFlyoutId?: string;
   initialSearch?: string;
+  caps: OverviewLogCaps['copilotLogs'];
   fetchLogPage: FetchLogPage<CopilotMcpLogEntry>;
   onNotify: (msg: string, isError?: boolean) => void;
   onClearLogs: () => Promise<void>;
@@ -895,6 +900,7 @@ export function CopilotMcpLogsView({
   objects,
   selectedFlyoutId,
   initialSearch = '',
+  caps,
   fetchLogPage,
   onNotify,
   onClearLogs,
@@ -925,10 +931,26 @@ export function CopilotMcpLogsView({
   const exportCsv = () =>
     exportRows(trafficRouteQuery(filters), (r) => trafficRowMatches(r, filters), trafficLogCsv, 'mcp-traffic-log');
 
+  // Clearing empties only this view until the next refresh, which the toolbar must not call an empty log.
+  const [cleared, setCleared] = useState(false);
+  React.useEffect(() => {
+    if (logs.length > 0) setCleared(false);
+  }, [logs]);
+
   const clearLogs = async () => {
     history.reset();
+    setCleared(true);
     await onClearLogs();
   };
+
+  const heldText = cleared
+    ? 'view cleared until the next refresh'
+    : describeHeldLogs({
+        overview: logs,
+        older: history.older,
+        cursor: history.cursor,
+        kinds: trafficLogKinds(caps),
+      });
 
   return (
     <div>
@@ -1029,6 +1051,9 @@ export function CopilotMcpLogsView({
             </span>
             <span className="mono" style={{ color: 'var(--t3)' }}>
               {rows.length} of {history.held.length} events
+            </span>
+            <span className="mono" style={{ color: 'var(--t3)' }} title="What this view holds">
+              ({heldText})
             </span>
           </div>
         </div>
@@ -1151,6 +1176,7 @@ export function CopilotMcpLogsView({
 interface PortalAdminLogsViewProps {
   logs: PortalAdminLogEntry[];
   selectedFlyoutId?: string;
+  caps: OverviewLogCaps['portalLogs'];
   fetchLogPage: FetchLogPage<PortalAdminLogEntry>;
   onNotify: (msg: string, isError?: boolean) => void;
   onOpenFlyout: (flyout: FlyoutState) => void;
@@ -1159,6 +1185,7 @@ interface PortalAdminLogsViewProps {
 export function PortalAdminLogsView({
   logs,
   selectedFlyoutId,
+  caps,
   fetchLogPage,
   onNotify,
   onOpenFlyout,
@@ -1187,6 +1214,13 @@ export function PortalAdminLogsView({
 
   const exportCsv = () =>
     exportRows(auditRouteQuery(filters), (r) => auditRowMatches(r, filters), portalAuditCsv, 'portal-audit-log');
+
+  const heldText = describeHeldLogs({
+    overview: logs,
+    older: history.older,
+    cursor: history.cursor,
+    kinds: auditLogKinds(caps),
+  });
 
   return (
     <div>
@@ -1258,7 +1292,10 @@ export function PortalAdminLogsView({
           </div>
           <div className="tbar-r">
             <span className="mono" style={{ color: 'var(--t3)' }}>
-              {rows.length} events
+              {rows.length} of {history.held.length} events
+            </span>
+            <span className="mono" style={{ color: 'var(--t3)' }} title="What this view holds">
+              ({heldText})
             </span>
           </div>
         </div>

@@ -304,6 +304,11 @@ export interface PortalOverviewPayload {
   serverTime: string;
   copilotLogs: CopilotMcpLogRecord[];
   portalLogs: PortalAdminLogRecord[];
+  /** The most rows of each kind the two log lists hold. */
+  logCaps: {
+    copilotLogs: { calls: number; simulated: number; rejected: number };
+    portalLogs: { events: number; simulations: number };
+  };
   oktaSettings: OktaSsoSettings;
   sfSettings: SalesforceConnectionSettings;
   portalUsers: PortalUserSummary[];

@@ -40,7 +40,7 @@ import { CommandPalette } from '@/components/views/CommandPalette';
 import { profileSyncResultMessage } from '@/components/views/profileSyncReview';
 import { mcpActivityStatus } from '@/components/views/mcpActivity';
 import { estimateClockOffsetMs } from '@/components/views/trafficChart';
-import { logPageUrl } from '@/components/views/logHistory';
+import { DEFAULT_OVERVIEW_LOG_CAPS, logPageUrl, type OverviewLogCaps } from '@/components/views/logHistory';
 import {
   ENTERPRISE_MATRIX_WARNING,
   enterpriseMatrixAction,
@@ -145,6 +145,7 @@ export default function AdminPortalPage() {
   const [mappings, setMappings] = useState<ProfileGroupMapping[]>([]);
   const [copilotLogs, setCopilotLogs] = useState<CopilotMcpLogRecord[]>([]);
   const [portalLogs, setPortalLogs] = useState<PortalAdminLogRecord[]>([]);
+  const [logCaps, setLogCaps] = useState<OverviewLogCaps>(DEFAULT_OVERVIEW_LOG_CAPS);
   const [oktaSettings, setOktaSettings] = useState<OktaSsoSettings>({
     enabled: false,
     oktaDomain: '',
@@ -278,6 +279,7 @@ export default function AdminPortalPage() {
       setMcpStats(data.stats || null);
       setDevToolsEnabled(data.devToolsEnabled === true);
       setPortalLogs(data.portalLogs || []);
+      if (data.logCaps) setLogCaps(data.logCaps);
       if (data.oktaSettings) setOktaSettings(data.oktaSettings);
       if (data.sfSettings) setSfSettings(data.sfSettings);
       if (data.portalUsers) setPortalUsers(data.portalUsers);
@@ -1317,6 +1319,7 @@ export default function AdminPortalPage() {
               objects={objects}
               selectedFlyoutId={selectedFlyoutId}
               initialSearch={trafficSearchFilter}
+              caps={logCaps.copilotLogs}
               fetchLogPage={(query) => apiFetch(logPageUrl('/api/admin/mcp-logs', query))}
               onNotify={notify}
               onClearLogs={async () => {
@@ -1331,6 +1334,7 @@ export default function AdminPortalPage() {
             <PortalAdminLogsView
               logs={portalLogs}
               selectedFlyoutId={selectedFlyoutId}
+              caps={logCaps.portalLogs}
               fetchLogPage={(query) => apiFetch(logPageUrl('/api/admin/portal-logs', query))}
               onNotify={notify}
               onOpenFlyout={(f) => setFlyout(f)}

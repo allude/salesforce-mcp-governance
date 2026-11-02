@@ -428,6 +428,15 @@ adminRouter.get('/overview', (_req: Request, res: Response) => {
     profileGroupMappings,
     copilotLogs,
     portalLogs,
+    // The Logs views state these, so rows a cap left out are not read as missing activity.
+    logCaps: {
+      copilotLogs: {
+        calls: OVERVIEW_LOG_ROWS,
+        simulated: OVERVIEW_SIMULATED_LOG_ROWS,
+        rejected: OVERVIEW_REJECTED_LOG_ROWS,
+      },
+      portalLogs: { events: OVERVIEW_LOG_ROWS, simulations: OVERVIEW_SIMULATED_LOG_ROWS },
+    },
     devToolsEnabled: !config.isProd,
     oktaSettings: {
       enabled: okta.enabled,

@@ -8,6 +8,7 @@ import { startTestServer, loginAsAdmin, adminFetch, type AdminSession, type Test
 import { realTraffic } from '../src/components/views/simulatedTraffic.js';
 import { trafficChartSubtitle } from '../src/components/views/trafficChart.js';
 import { trafficLogCsv } from '../src/components/views/csvExport.js';
+import { auditLogKinds, describeHeldLogs, trafficLogKinds } from '../src/components/views/logHistory.js';
 
 let server: TestServer;
 let session: AdminSession;
@@ -136,6 +137,15 @@ describe('MCP rows in /overview', () => {
       'capping the list must not remove rows'
     );
   });
+
+  test('sends its caps, so the Logs view can say which rows it holds', async () => {
+    const { copilotLogs, logCaps } = await overview();
+    assert.deepEqual(logCaps.copilotLogs, { calls: 150, simulated: 50, rejected: 50 });
+    assert.equal(
+      describeHeldLogs({ overview: copilotLogs, older: [], cursor: undefined, kinds: trafficLogKinds(logCaps.copilotLogs) }),
+      'latest 150 calls + latest 50 simulated + latest 50 rejected'
+    );
+  });
 });
 
 describe('Portal rows in /overview', () => {
@@ -160,6 +170,15 @@ describe('Portal rows in /overview', () => {
     const { portalLogs } = await overview();
     assert.equal(portalLogs[0].id, newest.id);
     assert.equal(portalLogs.filter((l: any) => l.action !== 'SIMULATE_MCP_CALL').length, 150);
+  });
+
+  test('sends its caps, so the Logs view can say which rows it holds', async () => {
+    const { portalLogs, logCaps } = await overview();
+    assert.deepEqual(logCaps.portalLogs, { events: 150, simulations: 50 });
+    assert.equal(
+      describeHeldLogs({ overview: portalLogs, older: [], cursor: undefined, kinds: auditLogKinds(logCaps.portalLogs) }),
+      'latest 150 events + latest 50 simulations'
+    );
   });
 });
 
