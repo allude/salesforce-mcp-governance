@@ -26,7 +26,7 @@ import {
   validatePrivateKeyPem,
 } from '../salesforce/jwtConnection.js';
 import { salesforceIdKey, salesforceIdsMatch } from '../salesforce/ids.js';
-import { isUninitialisedMcpTokenHost, SIMULATED_ORG_ID, SIMULATED_ORG_INSTANCE_URL } from '../salesforce/simulatedOrg.js';
+import { isSimulatedOrgHost, isUninitialisedMcpTokenHost, SIMULATED_ORG_ID } from '../salesforce/simulatedOrg.js';
 
 const dbDir = path.dirname(config.dbPath);
 if (!fs.existsSync(dbDir)) {
@@ -403,12 +403,15 @@ export function repairConnectInstanceUrls() {
     UPDATE sf_connection_settings SET sync_instance_url = instance_url
     WHERE connection_status = 'connected' AND sync_instance_url = ''
   `).run();
-  db.prepare(`
-    UPDATE sf_connection_settings
-    SET instance_url = CASE WHEN login_url = :host THEN 'https://login.salesforce.com' ELSE login_url END
-    WHERE instance_url = :host
-      AND (auth_mode = 'simulated' OR TRIM(connected_org_id) = '' OR connected_org_id = :orgId)
-  `).run({ host: SIMULATED_ORG_INSTANCE_URL, orgId: SIMULATED_ORG_ID });
+  // Matched in code by hostname, as an exact SQL match missed the host with a port, other case or trailing dot.
+  const row = db
+    .prepare('SELECT instance_url, login_url, auth_mode, connected_org_id FROM sf_connection_settings WHERE id = 1')
+    .get() as { instance_url: string; login_url: string; auth_mode: string; connected_org_id: string } | undefined;
+  if (!row || !isSimulatedOrgHost(row.instance_url)) return;
+  const connectedOrgId = row.connected_org_id.trim();
+  if (row.auth_mode !== 'simulated' && connectedOrgId !== '' && connectedOrgId !== SIMULATED_ORG_ID) return;
+  const replacement = isSimulatedOrgHost(row.login_url) ? 'https://login.salesforce.com' : row.login_url;
+  db.prepare('UPDATE sf_connection_settings SET instance_url = ? WHERE id = 1').run(replacement);
 }
 
 runSchemaMigrations();
@@ -2280,7 +2283,7 @@ export const store = {
         .get() as { instance_url: string };
       if (
         session.authMode !== 'simulated' &&
-        session.instanceUrl !== SIMULATED_ORG_INSTANCE_URL &&
+        !isSimulatedOrgHost(session.instanceUrl) &&
         isUninitialisedMcpTokenHost(currentHost)
       ) {
         db.prepare('UPDATE sf_connection_settings SET instance_url = ? WHERE id = 1').run(session.instanceUrl);

@@ -8,7 +8,12 @@ import { DatabaseSync } from 'node:sqlite';
 import { config } from '../src/config.js';
 import { repairConnectInstanceUrls, store } from '../src/db/store.js';
 import { generateSelfSignedCertificateBundle } from '../src/salesforce/jwtConnection.js';
-import { isUninitialisedMcpTokenHost, SIMULATED_ORG_ID, SIMULATED_ORG_INSTANCE_URL } from '../src/salesforce/simulatedOrg.js';
+import {
+  isSimulatedOrgHost,
+  isUninitialisedMcpTokenHost,
+  SIMULATED_ORG_ID,
+  SIMULATED_ORG_INSTANCE_URL,
+} from '../src/salesforce/simulatedOrg.js';
 import { installSalesforceMock, type SalesforceMock } from './helpers/salesforceMock.js';
 import {
   adminFetch,
@@ -23,6 +28,12 @@ const MCP_HOST = 'https://mcp-host.my.salesforce.com';
 const SYNC_HOST = 'https://sync-host.my.salesforce.com';
 const ORG_ID = '00D000000000001AAA';
 const uid = () => crypto.randomBytes(4).toString('hex');
+/** The simulated host written so that an exact string match misses it. */
+const SIMULATED_HOST_VARIANTS = [
+  'https://enterprise-org.my.salesforce.com:8443',
+  'https://ENTERPRISE-ORG.My.Salesforce.com',
+  'https://enterprise-org.my.salesforce.com.',
+];
 
 let server: TestServer;
 let session: AdminSession;
@@ -217,12 +228,20 @@ describe('the instance URL MCP uses to verify tokens', () => {
     assert.equal(rawInstanceUrl(), 'https://login.salesforce.com');
   });
 
-  test('a real connect that reports the simulated host does not adopt it', async () => {
-    setRawInstanceUrl('https://login.salesforce.com');
-    answerTokenExchange(tokenGranted(SIMULATED_ORG_INSTANCE_URL));
-    assert.equal((await connect()).status, 200);
-    assert.equal(rawInstanceUrl(), 'https://login.salesforce.com');
-  });
+  for (const reported of [SIMULATED_ORG_INSTANCE_URL, ...SIMULATED_HOST_VARIANTS]) {
+    test(`a real connect that reports ${reported} is refused and adopts it nowhere`, async () => {
+      setRawInstanceUrl('https://login.salesforce.com');
+      answerTokenExchange(tokenGranted(reported));
+      const res = await connect();
+
+      assert.equal(res.status, 400, JSON.stringify(res.body));
+      assert.equal(rawInstanceUrl(), 'https://login.salesforce.com');
+      const settings = store.getSalesforceSettings();
+      assert.equal(settings.syncInstanceUrl, '');
+      assert.notEqual(settings.connectionStatus, 'connected');
+      assert.ok(!sf.calls.some((call) => isSimulatedOrgHost(call.url.href)), 'the access token was not sent there');
+    });
+  }
 
   test('a simulated connect does not initialise a generic login host', async () => {
     setRawInstanceUrl('https://login.salesforce.com');
@@ -325,6 +344,69 @@ describe('the instance URL MCP uses to verify tokens', () => {
   test('upgrading leaves any other MCP host alone on a row with no connection evidence', () => {
     repairConnectInstanceUrls();
     assert.equal(rawInstanceUrl(), MCP_HOST);
+  });
+});
+
+describe('the simulated host however it is written', () => {
+  for (const written of SIMULATED_HOST_VARIANTS) {
+    test(`${written} is refused as the MCP host and as the login URL`, async () => {
+      const asInstance = await route('', 'PUT', { instanceUrl: written });
+      assert.equal(asInstance.status, 400, JSON.stringify(asInstance.body));
+      assert.equal(rawInstanceUrl(), MCP_HOST);
+
+      const asLogin = await route('', 'PUT', { loginUrl: written });
+      assert.equal(asLogin.status, 400, JSON.stringify(asLogin.body));
+      assert.equal(store.getSalesforceSettings().loginUrl, 'https://login.salesforce.com');
+
+      const connected = await connect({ loginUrl: written });
+      assert.equal(connected.status, 400, JSON.stringify(connected.body));
+      assert.equal(store.getSalesforceSettings().loginUrl, 'https://login.salesforce.com');
+    });
+
+    test(`a real connect never posts the JWT assertion to a stored login URL of ${written}`, async () => {
+      store.updateSalesforceSettings({ loginUrl: written });
+      let exchanges = 0;
+      answerTokenExchange(() => {
+        exchanges += 1;
+        return tokenGranted()();
+      });
+
+      const res = await connect();
+      assert.equal(res.status, 400, JSON.stringify(res.body));
+      assert.equal(exchanges, 0);
+      assert.equal(rawInstanceUrl(), MCP_HOST);
+    });
+
+    test(`upgrading removes ${written} from the MCP host and from the value it falls back to`, () => {
+      store.updateSalesforceSettings({ authMode: 'jwt_bearer', loginUrl: written, connectedOrgId: '' });
+      setRawInstanceUrl(written);
+
+      repairConnectInstanceUrls();
+
+      assert.equal(rawInstanceUrl(), 'https://login.salesforce.com');
+    });
+  }
+
+  test('a simulated connect still works in development', async () => {
+    const res = await connect({ authMode: 'simulated' });
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(res.body.sfSettings.connectionStatus, 'connected');
+    assert.equal(res.body.sfSettings.syncInstanceUrl, SIMULATED_ORG_INSTANCE_URL);
+    assert.equal(rawInstanceUrl(), MCP_HOST);
+  });
+});
+
+describe('isSimulatedOrgHost', () => {
+  test('matches the simulated hostname with any port, case, path or trailing dot', () => {
+    for (const url of [SIMULATED_ORG_INSTANCE_URL, ...SIMULATED_HOST_VARIANTS, ' https://enterprise-org.my.salesforce.com:443/x ', 'https://enterprise-org.my.salesforce.com../']) {
+      assert.equal(isSimulatedOrgHost(url), true, url);
+    }
+  });
+
+  test('does not match other hosts or values that are not URLs', () => {
+    for (const url of [MCP_HOST, 'https://enterprise-org.my.salesforce.com.evil.example', 'https://x.enterprise-org.my.salesforce.com', 'enterprise-org.my.salesforce.com', '', 'not a url']) {
+      assert.equal(isSimulatedOrgHost(url), false, url);
+    }
   });
 });
 

@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { config } from '../config.js';
 import { validateSalesforceInstanceUrl, escapeSoqlString } from './client.js';
-import { SIMULATED_ORG_ID, SIMULATED_ORG_INSTANCE_URL } from './simulatedOrg.js';
+import { assertNotSimulatedOrgHost, SIMULATED_ORG_ID, SIMULATED_ORG_INSTANCE_URL } from './simulatedOrg.js';
 
 export interface GeneratedCertBundle {
   privateKeyPem: string;
@@ -432,6 +432,8 @@ export async function connectToSalesforceOrgViaJwt(settings: {
   const cleanLoginUrl = validateSalesforceInstanceUrl(
     settings.loginUrl || 'https://login.salesforce.com'
   );
+  // A database saved before the settings check may still hold it, and the signed assertion goes here.
+  assertNotSimulatedOrgHost(cleanLoginUrl, 'Salesforce login URL');
   const assertion = createSalesforceJwtAssertion({
     clientId: settings.clientId,
     username: settings.username,
@@ -473,6 +475,8 @@ export async function connectToSalesforceOrgViaJwt(settings: {
   const instanceUrl = validateSalesforceInstanceUrl(
     tokenData.instance_url || cleanLoginUrl
   );
+  // The access token would go there next, and the host would become sync_instance_url or instance_url.
+  assertNotSimulatedOrgHost(instanceUrl, 'instance URL of a live connection');
   const accessToken: string = tokenData.access_token;
 
   // Extract Org ID from id URL (`https://login.salesforce.com/id/00D.../005...`) or userinfo

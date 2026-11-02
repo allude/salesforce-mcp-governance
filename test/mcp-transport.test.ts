@@ -621,6 +621,26 @@ test('SSRF guard: an X-Salesforce-Instance-Url outside Salesforce is refused wit
   assert.deepEqual(h.sf.nonSalesforceCalls, []);
 });
 
+test('an X-Salesforce-Instance-Url naming the simulated org host, however written, is refused before the token is sent', async (t) => {
+  const h = await startHarness(t);
+  const simulatedHints = [
+    'https://enterprise-org.my.salesforce.com',
+    'https://enterprise-org.my.salesforce.com:8443',
+    'https://ENTERPRISE-ORG.My.Salesforce.com',
+    'https://enterprise-org.my.salesforce.com.',
+  ];
+
+  for (const hint of simulatedHints) {
+    await t.test(hint, async () => {
+      const token = addSalesforceUser(h.sf);
+      const res = await rpc(h, token, 'tools/list', {}, { 'X-Salesforce-Instance-Url': hint });
+      assert.equal(res.status, 401, JSON.stringify(res.body));
+      assert.ok(challengeOf(res).includes('error="invalid_token"'), challengeOf(res));
+      assert.deepEqual(callsBearing(h.sf, token), [], 'the token was not sent anywhere');
+    });
+  }
+});
+
 test('SSRF guard: a Salesforce-domain X-Salesforce-Instance-Url is honoured for the userinfo call', async (t) => {
   const h = await startHarness(t);
   const seeded = seedProfile(t, ['list_enabled_objects']);

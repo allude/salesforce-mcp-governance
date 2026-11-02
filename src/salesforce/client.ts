@@ -3,6 +3,7 @@ import { config } from '../config.js';
 import { store } from '../db/store.js';
 import { hashToken, timingSafeStringEqual } from '../security/crypto.js';
 import { salesforceIdsMatch } from './ids.js';
+import { assertNotSimulatedOrgHost } from './simulatedOrg.js';
 
 export interface VerifiedSalesforceUser {
   userId: string;
@@ -134,6 +135,9 @@ export async function resolveSalesforceUserFromToken(
   if (bearerToken.startsWith(SIMULATOR_TOKEN_PREFIX)) {
     return verifySimulatorToken(bearerToken);
   }
+
+  // The caller's real token goes to the hint on a cache miss, and the allowlist alone admits the simulated host.
+  if (instanceUrlHint) assertNotSimulatedOrgHost(instanceUrlHint, 'Salesforce instance URL');
 
   const tokenHash = hashToken(bearerToken);
   const cached = identityCache.get(tokenHash);
