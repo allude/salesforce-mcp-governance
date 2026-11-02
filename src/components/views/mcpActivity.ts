@@ -18,7 +18,8 @@ function timeAgo(ageMs: number): string {
 
 /**
  * The header's only claim about MCP traffic: when the last real call happened. `lastCallAt` is
- * undefined until the server has answered, and null once it has said there are none.
+ * undefined until the server has answered, and null once it has said there are none. `now` should be
+ * on the server's clock, which stamps the call, or a skewed browser clock misstates its age.
  */
 export function mcpActivityStatus(lastCallAt: string | null | undefined, now: number): McpActivityStatus {
   if (lastCallAt === null) return { label: 'No MCP calls yet', tone: 'off' };

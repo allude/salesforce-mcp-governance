@@ -3,9 +3,11 @@ import './helpers/env.js';
 // by a rejected token, and must not be hidden when simulator rows fill the capped log list.
 import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { store } from '../src/db/store.js';
 import { startTestServer, loginAsAdmin, adminFetch, mcpRequest, type AdminSession, type TestServer } from './helpers/server.js';
 import { mcpActivityStatus } from '../src/components/views/mcpActivity.js';
+import { estimateClockOffsetMs } from '../src/components/views/trafficChart.js';
 
 const NOW = Date.parse('2026-11-01T12:00:00.000Z');
 const MIN = 60_000;
@@ -47,6 +49,36 @@ describe('mcpActivityStatus', () => {
 
   test('a time ahead of the browser clock reads as just now', () => {
     assert.deepEqual(mcpActivityStatus(ago(-5 * MIN), NOW), { label: 'Last MCP call just now', tone: 'ok' });
+  });
+
+  describe('with a skewed browser clock, read on the server clock as the chart is', () => {
+    // The server stamps calls on its clock; the page measures the browser's skew from /overview.
+    const onServerClock = (browserNow: number) => browserNow + estimateClockOffsetMs(new Date(NOW).toISOString(), browserNow, browserNow);
+
+    test('a browser 3 h fast still reads a call 1 s old as just now', () => {
+      const browserNow = NOW + 3 * HOUR;
+      assert.equal(mcpActivityStatus(ago(1000), browserNow).label, 'Last MCP call 3 h ago');
+      assert.deepEqual(mcpActivityStatus(ago(1000), onServerClock(browserNow)), { label: 'Last MCP call just now', tone: 'ok' });
+    });
+
+    test('a browser 3 h slow does not read a call 2 h old as just now', () => {
+      const browserNow = NOW - 3 * HOUR;
+      assert.equal(mcpActivityStatus(ago(2 * HOUR), browserNow).label, 'Last MCP call just now');
+      assert.equal(mcpActivityStatus(ago(2 * HOUR), onServerClock(browserNow)).label, 'Last MCP call 2 h ago');
+    });
+
+    test('a browser more than a day fast keeps the dot active after a live call', () => {
+      const browserNow = NOW + 25 * HOUR;
+      assert.equal(mcpActivityStatus(ago(1000), browserNow).tone, 'off');
+      assert.equal(mcpActivityStatus(ago(1000), onServerClock(browserNow)).tone, 'ok');
+    });
+
+    test('the header passes the server-clock reading, the same one the chart uses', () => {
+      const page = fs.readFileSync(new URL('../src/app/page.tsx', import.meta.url), 'utf8');
+      const call = page.match(/mcpActivityStatus\(([^;]*)\);/);
+      assert.ok(call, 'page.tsx calls mcpActivityStatus');
+      assert.match(call[1], /,\s*clockNow \+ clockOffsetMs\s*$/);
+    });
   });
 });
 

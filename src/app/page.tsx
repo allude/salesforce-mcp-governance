@@ -916,7 +916,8 @@ export default function AdminPortalPage() {
     return found && found.groupIds.length > 0;
   }).length;
   const meta = VIEW_META[view] || VIEW_META.dashboard;
-  const mcpActivity = mcpActivityStatus(mcpStats ? mcpStats.lastMcpCallAt : undefined, clockNow);
+  // Read on the server's clock, which stamps the call, so the pill agrees with the chart under skew.
+  const mcpActivity = mcpActivityStatus(mcpStats ? mcpStats.lastMcpCallAt : undefined, clockNow + clockOffsetMs);
   const selectedFlyoutId =
     flyout?.data?.id || flyout?.data?.objectName || undefined;
   const displayUser = session.displayName || session.name || session.username;
