@@ -358,12 +358,12 @@ describe('/mcp end to end', () => {
     }
   });
 
-  /** Makes every Salesforce request fail with `failure` until the returned restore is called. */
-  function failSalesforce(failure: () => Promise<Response>): () => void {
+  /** Makes Salesforce requests to matching hosts fail with `failure` until the returned restore is called. */
+  function failSalesforce(failure: () => Promise<Response>, hosts = /salesforce\.com$/): () => void {
     const mockedFetch = globalThis.fetch;
     globalThis.fetch = (async (input: any, init?: any) => {
       const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
-      if (/salesforce\.com$/.test(url.hostname)) return failure();
+      if (hosts.test(url.hostname)) return failure();
       return mockedFetch(input, init);
     }) as typeof fetch;
     return () => {
@@ -431,6 +431,33 @@ describe('/mcp end to end', () => {
       Date.now = realNow;
     }
     assert.equal((await mcpRequest(server.baseUrl, token, 'tools/list', {}, client)).status, 200);
+  });
+
+  test('no verdict from a hinted host that never vouched for the token ends its exemption', async () => {
+    const client = freshClient();
+    const token = `valid_${crypto.randomBytes(8).toString('hex')}`;
+    sf.addUser(token, {
+      userId: '005000000000885AAA', organizationId: '00D000000000001AAA', username: 'hinted@acme.example',
+      profileId: '00e000000000885AAA', profileName: 'Hinted Test',
+    });
+    assert.equal((await mcpRequest(server.baseUrl, token, 'tools/list', {}, client)).status, 200);
+
+    const realNow = Date.now;
+    Date.now = () => realNow() + 3 * 60 * 1000;
+    // Only the host the caller names never answers; the one that vouched for the token is fine.
+    const restore = failSalesforce(async () => { throw new TypeError('fetch failed'); }, /^unreachable\.my\.salesforce\.com$/);
+    try {
+      const hinted = await mcpRequest(server.baseUrl, token, 'tools/list', {}, {
+        ...client,
+        'X-Salesforce-Instance-Url': 'https://unreachable.my.salesforce.com',
+      });
+      assert.equal(hinted.status, 503);
+      assert.equal(wasTokenRecentlyVerified(token), false, 'a caller-chosen outage does not keep the exemption');
+    } finally {
+      restore();
+      Date.now = realNow;
+    }
+    assert.equal((await mcpRequest(server.baseUrl, token, 'tools/list', {}, client)).status, 200, 'the token itself still works');
   });
 
   test('copies of one junk token that waited at the gate are refused without asking Salesforce again', async () => {

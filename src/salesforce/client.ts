@@ -35,6 +35,7 @@ const CACHE_MAX_ENTRIES = 5000;
 // failed-attempt limiter reads this, so a caller whose token already proved valid keeps working
 // while someone floods the same client IP with bad tokens. It never skips verification itself.
 const recentlyVerifiedTokens = new Map<string, number>();
+const recentlyVerifiedAtHost = new Map<string, number>();
 const RECENTLY_VERIFIED_TTL_MS = 60 * 60 * 1000;
 
 // Tokens Salesforce answered 401 for, keyed by token hash and the host asked, so repeating a junk
@@ -188,11 +189,19 @@ const isLive = (entries: Map<string, number>, key: string) => {
   return expiresAt !== undefined && expiresAt > Date.now();
 };
 
-function rememberVerifiedToken(tokenHash: string): void {
+/**
+ * Remembers that a token verified; with `hostKey` (token hash and login host), also where Salesforce
+ * vouched for it. Only a failure at that host keeps the exemption when Salesforce gives no verdict,
+ * so a caller cannot keep it by pointing the instance-URL hint at a host that never answers.
+ */
+function rememberVerifiedToken(tokenHash: string, hostKey?: string): void {
   rememberUntil(recentlyVerifiedTokens, tokenHash, RECENTLY_VERIFIED_TTL_MS);
+  if (hostKey) rememberUntil(recentlyVerifiedAtHost, hostKey, RECENTLY_VERIFIED_TTL_MS);
 }
 
 const wasHashRecentlyVerified = (tokenHash: string) => isLive(recentlyVerifiedTokens, tokenHash);
+const wasVerifiedAtHost = (tokenHash: string, hostKey: string) =>
+  wasHashRecentlyVerified(tokenHash) && isLive(recentlyVerifiedAtHost, hostKey);
 
 function rememberRejectedToken(rejectionKey: string): void {
   rememberUntil(recentlyRejectedTokens, rejectionKey, RECENTLY_REJECTED_TTL_MS);
@@ -272,7 +281,8 @@ export async function resolveSalesforceUserFromToken(
   };
   refuseIfRecentlyRejected();
 
-  return verificationGate.run(wasHashRecentlyVerified(tokenHash), async () => {
+  // Priority only for a token Salesforce vouched for at this same host.
+  return verificationGate.run(wasVerifiedAtHost(tokenHash, rejectionKey), async () => {
     // Another request with this token may have finished verifying, or been rejected, while this one waited.
     const verifiedMeanwhile = identityCache.get(tokenHash);
     if (verifiedMeanwhile && verifiedMeanwhile.expiresAt > Date.now()) {
@@ -281,7 +291,15 @@ export async function resolveSalesforceUserFromToken(
       return { ...verifiedMeanwhile.user, accessToken: bearerToken };
     }
     refuseIfRecentlyRejected();
-    return verifyWithSalesforce(bearerToken, tokenHash, rejectionKey, baseLoginUrl, fallbackInstanceUrl, sfSettings.apiVersion);
+    try {
+      return await verifyWithSalesforce(bearerToken, tokenHash, rejectionKey, baseLoginUrl, fallbackInstanceUrl, sfSettings.apiVersion);
+    } catch (err) {
+      // No verdict from a host that never vouched for this token: the exemption ends, as for a rejection.
+      if (err instanceof SalesforceUnavailableError && !wasVerifiedAtHost(tokenHash, rejectionKey)) {
+        recentlyVerifiedTokens.delete(tokenHash);
+      }
+      throw err;
+    }
   });
 }
 
@@ -367,7 +385,7 @@ async function verifyWithSalesforce(
     user: verifiedUser,
     expiresAt: Date.now() + CACHE_TTL_MS,
   });
-  rememberVerifiedToken(tokenHash);
+  rememberVerifiedToken(tokenHash, rejectionKey);
 
   return {
     ...verifiedUser,
