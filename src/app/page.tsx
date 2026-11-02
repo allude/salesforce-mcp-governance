@@ -40,6 +40,7 @@ import { CommandPalette } from '@/components/views/CommandPalette';
 import { profileSyncResultMessage } from '@/components/views/profileSyncReview';
 import { mcpActivityStatus } from '@/components/views/mcpActivity';
 import { useModalDialog } from '@/components/views/useModalDialog';
+import { isCommandPaletteShortcut } from '@/components/views/shortcuts';
 import { estimateClockOffsetMs } from '@/components/views/trafficChart';
 import { DEFAULT_OVERVIEW_LOG_CAPS, logPageUrl, type OverviewLogCaps } from '@/components/views/logHistory';
 import {
@@ -225,10 +226,11 @@ export default function AdminPortalPage() {
     });
   }, []);
 
-  // Global Cmd+K / Ctrl+K shortcut
+  // Global Cmd+K / Ctrl+K shortcut. An open modal dialog (useModalDialog) stops the chord in its
+  // capture-phase listener, so it never reaches this one.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+      if (isCommandPaletteShortcut(e)) {
         e.preventDefault();
         setCmdkOpen((o) => !o);
       }

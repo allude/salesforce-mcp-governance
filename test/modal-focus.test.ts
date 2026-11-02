@@ -5,7 +5,13 @@ import './helpers/env.js';
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { MODAL_FOCUSABLE_SELECTOR, canReturnFocusTo, modalKeyAction } from '../src/components/views/modalFocus.js';
+import {
+  MODAL_FOCUSABLE_SELECTOR,
+  canReturnFocusTo,
+  modalFocusinAction,
+  modalKeyAction,
+} from '../src/components/views/modalFocus.js';
+import { isCommandPaletteShortcut } from '../src/components/views/shortcuts.js';
 
 // Both dialogs hold Cancel then Confirm.
 const CANCEL = 0;
@@ -47,6 +53,100 @@ describe('modalKeyAction', () => {
     for (const key of ['Enter', ' ', 'a', 'ArrowDown']) {
       assert.equal(modalKeyAction(key, false, 2, CANCEL), null, key);
     }
+  });
+});
+
+describe('page-wide shortcuts while a dialog is open', () => {
+  // Cmd+K used to fall through to the page's window listener: the command palette opened behind the
+  // dialog, took focus out of it, ran commands on Enter, and stayed open after Escape closed the
+  // dialog first.
+  test('Cmd+K and Ctrl+K are blocked from the page wherever focus is', () => {
+    for (const active of [CANCEL, CONFIRM, -1]) {
+      assert.deepEqual(modalKeyAction('k', false, 2, active, { metaKey: true }), { kind: 'block' }, `meta ${active}`);
+      assert.deepEqual(modalKeyAction('k', false, 2, active, { ctrlKey: true }), { kind: 'block' }, `ctrl ${active}`);
+    }
+  });
+
+  test('the chord is blocked with Shift held too, as the page listener would still open the palette', () => {
+    assert.deepEqual(modalKeyAction('K', true, 2, CANCEL, { metaKey: true }), { kind: 'block' });
+    assert.deepEqual(modalKeyAction('K', true, 2, CANCEL, { ctrlKey: true }), { kind: 'block' });
+  });
+
+  test('a dialog with no controls still blocks the chord', () => {
+    assert.deepEqual(modalKeyAction('k', false, 0, -1, { metaKey: true }), { kind: 'block' });
+  });
+
+  test('a plain k, and other Cmd/Ctrl chords, are left to the focused control and the browser', () => {
+    assert.equal(modalKeyAction('k', false, 2, CANCEL), null);
+    assert.equal(modalKeyAction('k', false, 2, CANCEL, { metaKey: false, ctrlKey: false }), null);
+    assert.equal(modalKeyAction('c', false, 2, CANCEL, { metaKey: true }), null);
+    assert.equal(modalKeyAction('Enter', false, 2, CONFIRM, { ctrlKey: true }), null);
+  });
+
+  test('Escape and Tab keep their meaning with Ctrl held', () => {
+    assert.deepEqual(modalKeyAction('Escape', false, 2, CANCEL, { ctrlKey: true }), { kind: 'close' });
+    assert.deepEqual(modalKeyAction('Tab', false, 2, CONFIRM, { ctrlKey: true }), { kind: 'focus', index: CANCEL });
+  });
+
+  test('the dialog blocks exactly what opens the command palette', () => {
+    const chords = [
+      { key: 'k', metaKey: true },
+      { key: 'k', ctrlKey: true },
+      { key: 'K', metaKey: true },
+      { key: 'k' },
+      { key: 'j', metaKey: true },
+      { key: 'Escape', ctrlKey: true },
+    ];
+    for (const chord of chords) {
+      const blocked = modalKeyAction(chord.key, false, 2, CANCEL, chord)?.kind === 'block';
+      assert.equal(blocked, isCommandPaletteShortcut(chord), JSON.stringify(chord));
+    }
+  });
+
+  test('the page and the dialog share one test for the palette shortcut', () => {
+    const page = fs.readFileSync(new URL('../src/app/page.tsx', import.meta.url), 'utf8');
+    const hook = fs.readFileSync(new URL('../src/components/views/useModalDialog.ts', import.meta.url), 'utf8');
+    assert.match(page, /if \(isCommandPaletteShortcut\(e\)\)/);
+    assert.doesNotMatch(page, /e\.key\.toLowerCase\(\) === 'k'/);
+    // The hook must pass the modifiers, or the chord reaches modalKeyAction as a plain k.
+    assert.match(hook, /metaKey: e\.metaKey, ctrlKey: e\.ctrlKey/);
+  });
+});
+
+describe('isCommandPaletteShortcut', () => {
+  test('Cmd+K on macOS and Ctrl+K elsewhere, in either case', () => {
+    assert.equal(isCommandPaletteShortcut({ key: 'k', metaKey: true }), true);
+    assert.equal(isCommandPaletteShortcut({ key: 'k', ctrlKey: true }), true);
+    assert.equal(isCommandPaletteShortcut({ key: 'K', ctrlKey: true }), true);
+  });
+
+  test('a k typed without Cmd or Ctrl, or another key with them, is not the shortcut', () => {
+    assert.equal(isCommandPaletteShortcut({ key: 'k' }), false);
+    assert.equal(isCommandPaletteShortcut({ key: 'k', metaKey: false, ctrlKey: false }), false);
+    assert.equal(isCommandPaletteShortcut({ key: 'l', metaKey: true }), false);
+    assert.equal(isCommandPaletteShortcut({ key: 'Escape', ctrlKey: true }), false);
+  });
+});
+
+describe('modalFocusinAction', () => {
+  test('focus arriving behind the open dialog is pulled back in', () => {
+    assert.equal(modalFocusinAction(false, false), 'reclaim');
+  });
+
+  test('focus moving between the dialog controls is tracked, not fought', () => {
+    assert.equal(modalFocusinAction(true, false), 'track');
+  });
+
+  test('focus handed back to the opener on close is let out of the dialog', () => {
+    assert.equal(modalFocusinAction(false, true), 'allow');
+    assert.equal(modalFocusinAction(true, true), 'allow');
+  });
+
+  test('the hook guards focusin and lets the opener take focus back on close', () => {
+    const hook = fs.readFileSync(new URL('../src/components/views/useModalDialog.ts', import.meta.url), 'utf8');
+    assert.match(hook, /addEventListener\('focusin', onFocusIn, true\)/);
+    assert.match(hook, /removeEventListener\('focusin', onFocusIn, true\)/);
+    assert.match(hook, /releasingRef\.current = true;\s*try \{\s*opener\.focus\(\);/);
   });
 });
 

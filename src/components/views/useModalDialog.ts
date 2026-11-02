@@ -1,19 +1,27 @@
 'use client';
 
 import { useCallback, useLayoutEffect, useRef } from 'react';
-import { MODAL_FOCUSABLE_SELECTOR, canReturnFocusTo, modalKeyAction } from './modalFocus';
+import {
+  MODAL_FOCUSABLE_SELECTOR,
+  canReturnFocusTo,
+  modalFocusinAction,
+  modalKeyAction,
+} from './modalFocus';
 
 /**
  * Focus handling for an aria-modal confirmation dialog: focus starts on `initialFocusRef` (Cancel),
- * Tab and Shift+Tab stay inside `dialogRef`, Escape closes from anywhere on the page, and focus goes
- * back to the control that opened it. Answer the dialog through `close`, which hands focus back
- * before the caller's action can disable or remove that control.
+ * Tab and Shift+Tab stay inside `dialogRef`, Escape closes from anywhere on the page, page-wide
+ * shortcuts such as Cmd/Ctrl+K never reach the page behind, focus moved outside by script is pulled
+ * back in, and focus goes back to the control that opened it. Answer the dialog through `close`,
+ * which hands focus back before the caller's action can disable or remove that control.
  */
 export function useModalDialog(open: boolean, onClose: () => void) {
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const initialFocusRef = useRef<HTMLButtonElement | null>(null);
   const openerRef = useRef<HTMLElement | null>(null);
   const onCloseRef = useRef(onClose);
+  // Set while focus goes back to the opener, so the focusin guard lets it leave the dialog.
+  const releasingRef = useRef(false);
 
   useLayoutEffect(() => {
     onCloseRef.current = onClose;
@@ -22,7 +30,13 @@ export function useModalDialog(open: boolean, onClose: () => void) {
   const returnFocus = useCallback(() => {
     const opener = openerRef.current;
     openerRef.current = null;
-    if (opener && canReturnFocusTo(opener)) opener.focus();
+    if (!opener || !canReturnFocusTo(opener)) return;
+    releasingRef.current = true;
+    try {
+      opener.focus();
+    } finally {
+      releasingRef.current = false;
+    }
   }, []);
 
   const close = useCallback(() => {
@@ -36,9 +50,13 @@ export function useModalDialog(open: boolean, onClose: () => void) {
     const active = document.activeElement;
     openerRef.current = active instanceof HTMLElement && active !== document.body ? active : null;
     (initialFocusRef.current ?? box)?.focus();
+    const initiallyFocused = document.activeElement;
+    let lastInside: HTMLElement | null =
+      box && initiallyFocused instanceof HTMLElement && box.contains(initiallyFocused) ? initiallyFocused : null;
 
     // Capture phase on document, so Escape still works after a click dropped focus to body, and
-    // listeners behind the dialog (such as the drawer's Escape) never see these keys.
+    // listeners behind the dialog (such as the drawer's Escape and the page's Cmd/Ctrl+K on window)
+    // never see these keys.
     const onKey = (e: KeyboardEvent) => {
       if (!box) return;
       const focusables = Array.from(box.querySelectorAll<HTMLElement>(MODAL_FOCUSABLE_SELECTOR));
@@ -47,17 +65,39 @@ export function useModalDialog(open: boolean, onClose: () => void) {
         e.key,
         e.shiftKey,
         focusables.length,
-        current instanceof HTMLElement ? focusables.indexOf(current) : -1
+        current instanceof HTMLElement ? focusables.indexOf(current) : -1,
+        { metaKey: e.metaKey, ctrlKey: e.ctrlKey }
       );
       if (!action) return;
       e.preventDefault();
       e.stopPropagation();
       if (action.kind === 'close') close();
-      else (action.index < 0 ? box : focusables[action.index]).focus();
+      else if (action.kind === 'focus') (action.index < 0 ? box : focusables[action.index]).focus();
+    };
+
+    // Whatever still moves focus behind the dialog (a script's focus(), an autoFocus control
+    // mounting) is undone: focus returns to the control in the dialog that last held it.
+    const onFocusIn = (e: FocusEvent) => {
+      if (!box) return;
+      const target = e.target;
+      const inDialog = target instanceof Node && box.contains(target);
+      const action = modalFocusinAction(inDialog, releasingRef.current);
+      if (action === 'track') {
+        if (target instanceof HTMLElement) lastInside = target;
+      } else if (action === 'reclaim') {
+        // A control disabled since it was focused cannot take focus; fall back to Cancel, then the box.
+        for (const el of [lastInside, initialFocusRef.current, box]) {
+          if (!el || !box.contains(el)) continue;
+          el.focus();
+          if (document.activeElement === el) break;
+        }
+      }
     };
     document.addEventListener('keydown', onKey, true);
+    document.addEventListener('focusin', onFocusIn, true);
     return () => {
       document.removeEventListener('keydown', onKey, true);
+      document.removeEventListener('focusin', onFocusIn, true);
       // Closed without `close` (or unmounted): only reclaim focus the dialog was holding.
       const now = document.activeElement;
       if (!now || now === document.body || box?.contains(now)) returnFocus();
