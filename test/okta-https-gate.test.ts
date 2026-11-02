@@ -1,7 +1,8 @@
 import './helpers/env.js';
 // In production the Okta issuer and redirect URI must be https whatever put them there: the settings
-// route judges the merged result of a save, and sign-in refuses an http issuer already stored, because
-// a row can predate the route check or be seeded from OKTA_ISSUER.
+// route judges the merged result of a save, and sign-in refuses an http issuer or redirect URI already
+// stored, because a row can predate the route check or be seeded from OKTA_ISSUER / OKTA_REDIRECT_URI.
+// A blank redirect URI means the BASE_URL default, so that default is judged in its place.
 import { after, afterEach, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -51,6 +52,37 @@ async function asProduction<T>(fn: () => Promise<T>): Promise<T> {
     return await fn();
   } finally {
     mutable.isProd = false;
+  }
+}
+
+/** Runs `fn` with an https BASE_URL; the test environment's is http, as a local portal's is. */
+async function withHttpsBaseUrl<T>(fn: () => Promise<T>): Promise<T> {
+  const mutable = config as { baseUrl: string };
+  const original = mutable.baseUrl;
+  mutable.baseUrl = 'https://portal.example.com';
+  try {
+    return await fn();
+  } finally {
+    mutable.baseUrl = original;
+  }
+}
+
+/**
+ * Runs `fn` with the https issuer's discovery answered locally with a failure, counting what reaches
+ * it, since that issuer is not reachable from a test and a refused sign-in must send it nothing.
+ */
+async function withStubbedHttpsIssuer<T>(fn: (reached: () => number) => Promise<T>): Promise<T> {
+  const realFetch = globalThis.fetch;
+  let count = 0;
+  globalThis.fetch = (async (input: any, init?: RequestInit) => {
+    if (!String(input).startsWith(HTTPS_ISSUER)) return realFetch(input, init);
+    count += 1;
+    return new Response('', { status: 503 });
+  }) as typeof fetch;
+  try {
+    return await fn(() => count);
+  } finally {
+    globalThis.fetch = realFetch;
   }
 }
 
@@ -105,11 +137,11 @@ describe('saving Okta settings in production', () => {
     assert.equal(store.getOktaConfig().enabled, true);
   });
 
-  test('blank values that derive https from the domain are accepted when enabling', async () => {
+  test('blank values that derive https from the domain and BASE_URL are accepted when enabling', async () => {
     store.updateOktaConfig({ clientId: 'client', issuer: HTTP_ISSUER, redirectUri: HTTP_REDIRECT });
 
-    const res = await asProduction(() =>
-      putOkta({ enabled: true, oktaDomain: 'acme.okta.com', issuer: '', redirectUri: '' })
+    const res = await withHttpsBaseUrl(() =>
+      asProduction(() => putOkta({ enabled: true, oktaDomain: 'acme.okta.com', issuer: '', redirectUri: '' }))
     );
 
     assert.equal(res.status, 200, JSON.stringify(res.body));
@@ -117,8 +149,38 @@ describe('saving Okta settings in production', () => {
     assert.equal(res.body.oktaSettings.redirectUri, '');
   });
 
+  test('enabling with a blank redirect URI is refused when its BASE_URL default is http', async () => {
+    store.updateOktaConfig({ clientId: 'client', issuer: HTTPS_ISSUER, redirectUri: '' });
+    const before = store.getOktaConfig();
+
+    const res = await asProduction(() => putOkta({ enabled: true }));
+
+    assert.equal(res.status, 400);
+    assert.match(res.body.error, /BASE_URL/);
+    assert.match(res.body.error, /must be an https:\/\/ URL in production/);
+    assert.deepEqual(store.getOktaConfig(), before);
+  });
+
+  test('clearing the redirect URI of an enabled row is refused when the BASE_URL default is http', async () => {
+    store.updateOktaConfig({ enabled: true, clientId: 'client', issuer: HTTPS_ISSUER, redirectUri: HTTPS_REDIRECT });
+
+    const res = await asProduction(() => putOkta({ redirectUri: '' }));
+
+    assert.equal(res.status, 400);
+    assert.equal(store.getOktaConfig().redirectUri, HTTPS_REDIRECT);
+  });
+
+  test('a disabled row may keep a blank redirect URI whatever BASE_URL is', async () => {
+    store.updateOktaConfig({ enabled: true, clientId: 'client', issuer: HTTPS_ISSUER, redirectUri: '' });
+
+    const res = await asProduction(() => putOkta({ enabled: false }));
+
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(res.body.oktaSettings.enabled, false);
+  });
+
   test('changing the domain replaces a stored http issuer, so the result is judged, not the old value', async () => {
-    store.updateOktaConfig({ clientId: 'client', oktaDomain: 'old.okta.com', issuer: HTTP_ISSUER });
+    store.updateOktaConfig({ clientId: 'client', oktaDomain: 'old.okta.com', issuer: HTTP_ISSUER, redirectUri: HTTPS_REDIRECT });
 
     const res = await asProduction(() => putOkta({ enabled: true, oktaDomain: 'acme.okta.com' }));
 
@@ -144,12 +206,13 @@ describe('signing in with Okta in production', () => {
     return store.getPortalAdminLogs(500).filter((row) => !seen.has(row.id));
   }
 
-  function assertRefused(res: Response, rows: Awaited<ReturnType<typeof newLogRows>>) {
+  function assertRefused(res: Response, rows: Awaited<ReturnType<typeof newLogRows>>, reason = /issuer/) {
     assert.equal(res.status, 302);
     assert.equal(res.headers.get('location'), '/?auth_error=sso_failed');
     assert.equal(rows.length, 1);
     assert.equal(rows[0].action, 'OKTA_LOGIN_FAILED');
     assert.match(rows[0].details, /not an https:\/\/ URL/);
+    assert.match(rows[0].details, reason);
   }
 
   const login = () => fetch(`${server.baseUrl}/auth/okta/login`, { redirect: 'manual' });
@@ -197,18 +260,73 @@ describe('signing in with Okta in production', () => {
     assert.equal(fakeIssuerRequests, reached, 'neither discovery nor the token endpoint is called');
   });
 
-  test('control: login with an https issuer still redirects to Okta', async () => {
-    store.updateOktaConfig({ enabled: true, clientId: 'client', issuer: HTTPS_ISSUER });
-    const realFetch = globalThis.fetch;
+  for (const [name, setup] of Object.entries({
+    'a stored http redirect URI': { redirectUri: HTTP_REDIRECT, reason: /configured Okta redirect URI/ },
+    'a blank redirect URI whose BASE_URL default is http': { redirectUri: '', reason: /BASE_URL/ },
+  })) {
+    test(`login with ${name} is refused with an audit row, before reaching the issuer`, async () => {
+      store.updateOktaConfig({ enabled: true, clientId: 'client', issuer: HTTPS_ISSUER, redirectUri: setup.redirectUri });
+      let res!: Response;
+
+      const rows = await withStubbedHttpsIssuer(async (reached) => {
+        const rows = await newLogRows(async () => {
+          res = await asProduction(login);
+        });
+        assert.equal(reached(), 0);
+        return rows;
+      });
+
+      assertRefused(res, rows, setup.reason);
+      assert.ok(!res.headers.getSetCookie().some((c) => c.startsWith('sf_mcp_oidc_flow=')), 'no login is started');
+    });
+
+    test(`callback with ${name} is refused with an audit row, before any code exchange`, async () => {
+      store.updateOktaConfig({
+        enabled: true,
+        clientId: 'client',
+        clientSecret: 'okta-test-secret',
+        issuer: HTTPS_ISSUER,
+        redirectUri: setup.redirectUri,
+      });
+      let res!: Response;
+
+      const rows = await withStubbedHttpsIssuer(async (reached) => {
+        const { cookie, state } = await startedLogin();
+        const before = reached();
+        const rows = await newLogRows(async () => {
+          res = await asProduction(() =>
+            fetch(`${server.baseUrl}/auth/okta/callback?${new URLSearchParams({ code: 'code-1', state })}`, {
+              redirect: 'manual',
+              headers: { Cookie: cookie },
+            })
+          );
+        });
+        assert.equal(reached(), before, 'neither discovery nor the token endpoint is called');
+        return rows;
+      });
+
+      assertRefused(res, rows, setup.reason);
+    });
+  }
+
+  test('control: login with an https issuer and redirect URI still redirects to Okta', async () => {
+    store.updateOktaConfig({ enabled: true, clientId: 'client', issuer: HTTPS_ISSUER, redirectUri: HTTPS_REDIRECT });
     // Discovery is best-effort, so answering it with a failure keeps this test off the network.
-    globalThis.fetch = (async (input: any, init?: RequestInit) =>
-      String(input).startsWith(HTTPS_ISSUER) ? new Response('', { status: 503 }) : realFetch(input, init)) as typeof fetch;
-    try {
-      const res = await asProduction(login);
-      assert.equal(res.status, 302);
-      assert.match(res.headers.get('location') || '', /^https:\/\/acme\.okta\.com\/oauth2\/default\/v1\/authorize\?/);
-    } finally {
-      globalThis.fetch = realFetch;
-    }
+    const res = await withStubbedHttpsIssuer(() => asProduction(login));
+
+    assert.equal(res.status, 302);
+    const location = res.headers.get('location') || '';
+    assert.match(location, /^https:\/\/acme\.okta\.com\/oauth2\/default\/v1\/authorize\?/);
+    assert.equal(new URL(location).searchParams.get('redirect_uri'), HTTPS_REDIRECT);
+  });
+
+  test('control: a blank redirect URI is accepted when BASE_URL is https', async () => {
+    store.updateOktaConfig({ enabled: true, clientId: 'client', issuer: HTTPS_ISSUER, redirectUri: '' });
+
+    const res = await withStubbedHttpsIssuer(() => withHttpsBaseUrl(() => asProduction(login)));
+
+    assert.equal(res.status, 302);
+    const redirectUri = new URL(res.headers.get('location') || '').searchParams.get('redirect_uri');
+    assert.equal(redirectUri, 'https://portal.example.com/auth/okta/callback');
   });
 });

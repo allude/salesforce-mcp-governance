@@ -6,6 +6,7 @@ import {
   issueAdminSessionCookie,
   clearAdminSessionCookie,
   isHttpsUrl,
+  effectiveOktaRedirectUri,
   verifyAdminSessionFromRequest,
 } from '../security/adminAuth.js';
 import {
@@ -177,7 +178,8 @@ function saveSalesforceSettings(input: SalesforceSettingsInput) {
 /**
  * Why a production Okta save must be refused, if it should be. The issuer's discovery and token
  * endpoints receive the client secret, and the redirect URI receives the authorization code.
- * A blank result is allowed: it means the default redirect URI, or an issuer not configured yet.
+ * A blank issuer is allowed, as one not configured yet. A blank redirect URI means the BASE_URL
+ * default, which sign-in also refuses when it is http, so an enabled result is judged by that default.
  * The result is judged after merging with the stored row, so `{enabled: true}` cannot switch on a
  * stored http issuer. A result left disabled may keep a bad stored value, so that an admin can still
  * turn Okta off (the portal resends the stored redirect URI), but it cannot introduce a new one.
@@ -203,6 +205,9 @@ function insecureOktaUrlError(body: Record<string, unknown>): string | null {
     if (next.enabled || url !== storedUrl) {
       return `${label} must be an https:// URL in production.`;
     }
+  }
+  if (next.enabled && !next.redirectUri && !isHttpsUrl(effectiveOktaRedirectUri(''))) {
+    return 'Okta Redirect URI is blank, so it defaults to one under BASE_URL, and that must be an https:// URL in production. Enter an https:// redirect URI or set an https BASE_URL.';
   }
   return null;
 }

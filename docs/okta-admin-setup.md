@@ -50,7 +50,7 @@ Start both services with `npm run dev`. On first start the backend seeds one por
    * **Client ID:** `0oa...`
    * **Client Secret:** `<your-client-secret>` *(encrypted at rest in SQLite with AES-256-GCM, never returned by the API)*
    * **Required Okta Group Claim:** e.g. `MCP-Admins`. Users whose ID token `groups` claim lacks it are denied.
-   * **Redirect URI (optional):** leave empty to use `<BASE_URL>/auth/okta/callback`, which follows `BASE_URL` if it changes. It must match the URI registered in Okta.
+   * **Redirect URI (optional):** leave empty to use `<BASE_URL>/auth/okta/callback`, which follows `BASE_URL` if it changes. It must match the URI registered in Okta. In production the issuer and this URI (or, when it is empty, the `BASE_URL` default) must be `https://`: saving and sign-in are refused otherwise.
 4. Save. Okta sign-in errors (for example a missing group) are shown on the login screen.
 5. Sign out. The login screen now offers **Sign In with Okta SSO** next to the username and password form.
 

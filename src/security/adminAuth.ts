@@ -121,8 +121,28 @@ export function isHttpsUrl(url: string): boolean {
   return /^https:\/\//i.test(url) && URL.canParse(url);
 }
 
-/** A stored row can predate the settings check, or come from OKTA_ISSUER, so sign-in checks the issuer itself. */
-const INSECURE_ISSUER_DETAILS = 'The configured Okta issuer is not an https:// URL, so production refused the sign-in.';
+/** Where Okta sends the authorization code: the stored redirect URI, or the default under BASE_URL. */
+export function effectiveOktaRedirectUri(storedRedirectUri: string): string {
+  return storedRedirectUri || `${config.baseUrl}/auth/okta/callback`;
+}
+
+/**
+ * Why production refuses an Okta sign-in, if it does. A stored row can predate the settings check, or
+ * come from OKTA_ISSUER / OKTA_REDIRECT_URI, and a blank redirect URI follows BASE_URL, so sign-in
+ * checks the issuer and the effective redirect URI itself.
+ */
+function insecureOktaSignInDetails(okta: { issuer: string; redirectUri: string }): string | null {
+  if (!config.isProd) return null;
+  if (!isHttpsUrl(okta.issuer)) {
+    return 'The configured Okta issuer is not an https:// URL, so production refused the sign-in.';
+  }
+  if (!isHttpsUrl(effectiveOktaRedirectUri(okta.redirectUri))) {
+    return okta.redirectUri
+      ? 'The configured Okta redirect URI is not an https:// URL, so production refused the sign-in.'
+      : 'The Okta redirect URI is blank and its BASE_URL default is not an https:// URL, so production refused the sign-in.';
+  }
+  return null;
+}
 
 /**
  * Initiates the Okta OIDC Authorization Code Flow with PKCE (`/auth/okta/login`).
@@ -135,8 +155,9 @@ export async function handleOktaLoginRedirect(req: Request, res: Response): Prom
     );
     return;
   }
-  if (config.isProd && !isHttpsUrl(okta.issuer)) {
-    redirectWithAuthError(res, 'sso_failed', req.ip || '127.0.0.1', INSECURE_ISSUER_DETAILS);
+  const insecure = insecureOktaSignInDetails(okta);
+  if (insecure) {
+    redirectWithAuthError(res, 'sso_failed', req.ip || '127.0.0.1', insecure);
     return;
   }
 
@@ -175,7 +196,7 @@ export async function handleOktaLoginRedirect(req: Request, res: Response): Prom
     // Fallback to standard /v1/authorize
   }
 
-  const redirectUri = okta.redirectUri || `${config.baseUrl}/auth/okta/callback`;
+  const redirectUri = effectiveOktaRedirectUri(okta.redirectUri);
   const authUrl = new URL(authorizeEndpoint);
   authUrl.searchParams.set('client_id', okta.clientId);
   authUrl.searchParams.set('response_type', 'code');
@@ -269,12 +290,13 @@ export async function handleOktaCallback(req: Request, res: Response): Promise<v
   }
 
   const okta = store.getOktaConfig();
-  if (config.isProd && !isHttpsUrl(okta.issuer)) {
-    redirectWithAuthError(res, 'sso_failed', clientIp, INSECURE_ISSUER_DETAILS);
+  const insecure = insecureOktaSignInDetails(okta);
+  if (insecure) {
+    redirectWithAuthError(res, 'sso_failed', clientIp, insecure);
     return;
   }
   const issuer = okta.issuer.replace(/\/+$/, '');
-  const redirectUri = okta.redirectUri || `${config.baseUrl}/auth/okta/callback`;
+  const redirectUri = effectiveOktaRedirectUri(okta.redirectUri);
 
   try {
     // 1. Discover Okta token_endpoint and jwks_uri
