@@ -58,6 +58,47 @@ export async function readOlderRows<T extends { id: string }>(
   }
 }
 
+/** The newest write-order seq among `rows`, or 0 when there are none. */
+export function newestSeq(rows: Array<{ seq?: number }>): number {
+  return rows.reduce((newest, row) => Math.max(newest, row.seq ?? 0), 0);
+}
+
+/**
+ * The rows "Load older" has read beside the /overview list. `cursor` is undefined before the first
+ * page and null once the oldest row has been read. `loadedTop` is the newest seq the loaded pages
+ * cover, recorded when the first page is read (0 for a log that was empty then): the pages run
+ * unbroken from that row down to the cursor, and only /overview rows can stand in for newer ones.
+ */
+export interface OlderRowsState<T> {
+  older: T[];
+  cursor: number | null | undefined;
+  loadedTop: number | undefined;
+}
+
+export function emptyOlderRows<T>(): OlderRowsState<T> {
+  return { older: [], cursor: undefined, loadedTop: undefined };
+}
+
+/**
+ * The state after one "Load older": the next pages older than the cursor that add a row the view
+ * does not hold. From an empty state this reads down from the newest row of the log and records it.
+ */
+export async function loadOlderRows<T extends { id: string; seq?: number }>(
+  readPage: ReadLogPage<T>,
+  state: OlderRowsState<T>,
+  overview: T[],
+  pageRows = LOG_HISTORY_PAGE_ROWS
+): Promise<OlderRowsState<T>> {
+  if (state.cursor === null) return state;
+  const held = new Set([...overview, ...state.older].map((row) => row.id));
+  const page = await readOlderRows(readPage, state.cursor, held, pageRows);
+  return {
+    older: mergeNewestFirst(state.older, page.rows),
+    cursor: page.nextBefore,
+    loadedTop: state.cursor === undefined ? newestSeq(page.rows) : state.loadedTop,
+  };
+}
+
 /**
  * Every row the route returns, newest first, up to `max`. `truncated` says older matching rows
  * exist that were left out, so the export can say so.
@@ -187,18 +228,48 @@ function utcSeconds(iso: string): string {
 }
 
 /**
+ * The kinds whose rows have a gap above the loaded pages. Live refreshes replace the /overview list,
+ * which keeps only the newest `cap` rows of each kind: once more than that many arrive after the
+ * pages were loaded, the list's oldest row of that kind is newer than `loadedTop`, and the rows in
+ * between are in neither the list nor the pages. A kind under its cap is held in full, so has none.
+ */
+export function heldLogGaps<T extends { seq?: number }>(input: {
+  overview: T[];
+  loadedTop: number | undefined;
+  kinds: Array<LogKind<T>>;
+}): string[] {
+  const { overview, loadedTop, kinds } = input;
+  if (loadedTop === undefined) return [];
+  return kinds.flatMap((kind) => {
+    const rows = overview.filter(kind.matches);
+    if (rows.length === 0 || rows.length < kind.cap) return [];
+    const oldest = rows.reduce((min, row) => Math.min(min, row.seq ?? 0), Infinity);
+    return oldest > loadedTop ? [kind.noun] : [];
+  });
+}
+
+/**
  * What a Logs view holds, for its toolbar. The /overview list caps each kind on its own, so older
  * rows of one kind can be missing between shown rows of another; naming the latest rows held keeps
  * a reader from taking those gaps for a quiet period. A kind with fewer rows than its cap is held
- * in full.
+ * in full. `loadedTop` is the newest seq the loaded pages covered when they were first read; rows
+ * that have since passed out of the /overview list leave a gap the text must name.
  */
 export function describeHeldLogs<T extends { seq?: number; timestamp: string }>(input: {
   overview: T[];
   older: T[];
   cursor: number | null | undefined;
   kinds: Array<LogKind<T>>;
+  loadedTop?: number;
 }): string {
   const { overview, older, cursor, kinds } = input;
+  if (cursor !== undefined) {
+    const gaps = heldLogGaps({ overview, loadedTop: input.loadedTop, kinds });
+    if (gaps.length > 0) {
+      const after = older.length > 0 ? ` after ${utcSeconds(older[0].timestamp)}` : ' since older rows were loaded';
+      return `gap: some ${gaps.join(' + ')}${after} are not held; reload to fill it`;
+    }
+  }
   if (cursor === null) return 'the whole log';
 
   const oldestLoaded = older.length > 0 ? older[older.length - 1] : undefined;

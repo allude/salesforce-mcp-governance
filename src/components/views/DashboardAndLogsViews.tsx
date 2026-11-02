@@ -23,14 +23,17 @@ import {
   describeHeldLogs,
   exportFileName,
   exportTruncatedMessage,
+  emptyOlderRows,
+  heldLogGaps,
+  loadOlderRows,
   mergeNewestFirst,
   readAllRows,
-  readOlderRows,
   trafficLogKinds,
   trafficRouteQuery,
   trafficRowMatches,
   type LogPage,
   type LogQuery,
+  type OlderRowsState,
   type OverviewLogCaps,
 } from './logHistory';
 import { trafficBuckets, trafficChartSubtitle, type TrafficRange } from './trafficChart';
@@ -793,29 +796,27 @@ function downloadCsv(csv: string, fileName: string) {
 
 /**
  * Older rows read through a paged log route, held beside the capped /overview list. `cursor` is
- * undefined before the first page and null once the oldest row has been read.
+ * undefined before the first page and null once the oldest row has been read. `reload` drops the
+ * loaded pages and reads down from the newest row again, which closes a gap live refreshes opened.
  */
 function useOlderLogRows<T extends { id: string; seq?: number }>(
   logs: T[],
   fetchPage: FetchLogPage<T>,
   onNotify: (msg: string, isError?: boolean) => void
 ) {
-  const [older, setOlder] = useState<T[]>([]);
-  const [cursor, setCursor] = useState<number | null | undefined>(undefined);
+  const [state, setState] = useState<OlderRowsState<T>>(emptyOlderRows);
   const [loading, setLoading] = useState(false);
-  const held = useMemo(() => mergeNewestFirst(logs, older), [logs, older]);
+  // Bumped by reset and each read, so a page that lands after a reset or reload does not bring back what they dropped.
+  const generation = React.useRef(0);
+  const held = useMemo(() => mergeNewestFirst(logs, state.older), [logs, state.older]);
 
-  const loadOlder = async () => {
-    if (loading || cursor === null) return;
+  const read = async (from: OlderRowsState<T>) => {
+    if (loading || from.cursor === null) return;
+    const run = ++generation.current;
     setLoading(true);
     try {
-      const page = await readOlderRows(
-        (before, limit) => fetchPage({ before, limit }),
-        cursor,
-        new Set(held.map((row) => row.id))
-      );
-      setOlder((prev) => mergeNewestFirst(prev, page.rows));
-      setCursor(page.nextBefore);
+      const next = await loadOlderRows((before, limit) => fetchPage({ before, limit }), from, logs);
+      if (run === generation.current) setState(next);
     } catch (err) {
       onNotify(`Could not load older rows: ${err instanceof Error ? err.message : String(err)}`, true);
     } finally {
@@ -823,12 +824,50 @@ function useOlderLogRows<T extends { id: string; seq?: number }>(
     }
   };
 
+  const loadOlder = () => read(state);
+  const reload = () => read(emptyOlderRows<T>());
+
   const reset = () => {
-    setOlder([]);
-    setCursor(undefined);
+    generation.current += 1;
+    setState(emptyOlderRows<T>());
   };
 
-  return { held, older, cursor, loading, loadOlder, reset };
+  return {
+    held,
+    older: state.older,
+    cursor: state.cursor,
+    loadedTop: state.loadedTop,
+    loading,
+    loadOlder,
+    reload,
+    reset,
+  };
+}
+
+/** The toolbar's account of the rows held, with a Reload button when live refreshes opened a gap. */
+function HeldLogsNote({
+  text,
+  gap,
+  loading,
+  onReload,
+}: {
+  text: string;
+  gap: boolean;
+  loading: boolean;
+  onReload: () => void;
+}) {
+  return (
+    <>
+      <span className="mono" style={{ color: 'var(--t3)' }} title="What this view holds">
+        ({text})
+      </span>
+      {gap && (
+        <button type="button" className="btn sm" disabled={loading} onClick={onReload}>
+          {loading ? 'Loading…' : 'Reload'}
+        </button>
+      )}
+    </>
+  );
 }
 
 /** Exports every matching row through the paged route, up to the export limit, and says when it was cut. */
@@ -943,13 +982,16 @@ export function CopilotMcpLogsView({
     await onClearLogs();
   };
 
+  const kinds = trafficLogKinds(caps);
+  const gap = !cleared && heldLogGaps({ overview: logs, loadedTop: history.loadedTop, kinds }).length > 0;
   const heldText = cleared
     ? 'view cleared until the next refresh'
     : describeHeldLogs({
         overview: logs,
         older: history.older,
         cursor: history.cursor,
-        kinds: trafficLogKinds(caps),
+        kinds,
+        loadedTop: history.loadedTop,
       });
 
   return (
@@ -1052,9 +1094,7 @@ export function CopilotMcpLogsView({
             <span className="mono" style={{ color: 'var(--t3)' }}>
               {rows.length} of {history.held.length} events
             </span>
-            <span className="mono" style={{ color: 'var(--t3)' }} title="What this view holds">
-              ({heldText})
-            </span>
+            <HeldLogsNote text={heldText} gap={gap} loading={history.loading} onReload={history.reload} />
           </div>
         </div>
 
@@ -1215,11 +1255,14 @@ export function PortalAdminLogsView({
   const exportCsv = () =>
     exportRows(auditRouteQuery(filters), (r) => auditRowMatches(r, filters), portalAuditCsv, 'portal-audit-log');
 
+  const kinds = auditLogKinds(caps);
+  const gap = heldLogGaps({ overview: logs, loadedTop: history.loadedTop, kinds }).length > 0;
   const heldText = describeHeldLogs({
     overview: logs,
     older: history.older,
     cursor: history.cursor,
-    kinds: auditLogKinds(caps),
+    kinds,
+    loadedTop: history.loadedTop,
   });
 
   return (
@@ -1294,9 +1337,7 @@ export function PortalAdminLogsView({
             <span className="mono" style={{ color: 'var(--t3)' }}>
               {rows.length} of {history.held.length} events
             </span>
-            <span className="mono" style={{ color: 'var(--t3)' }} title="What this view holds">
-              ({heldText})
-            </span>
+            <HeldLogsNote text={heldText} gap={gap} loading={history.loading} onReload={history.reload} />
           </div>
         </div>
 

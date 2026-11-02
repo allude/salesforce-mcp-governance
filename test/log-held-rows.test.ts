@@ -12,7 +12,12 @@ import {
   SIMULATION_ACTION,
   auditLogKinds,
   describeHeldLogs,
+  emptyOlderRows,
+  heldLogGaps,
+  loadOlderRows,
+  mergeNewestFirst,
   trafficLogKinds,
+  type ReadLogPage,
 } from '../src/components/views/logHistory.js';
 import { SIMULATE_MCP_CALL_ACTION, UNVERIFIED_CALLER_USERNAME } from '../src/db/store.js';
 import type { CopilotMcpLogEntry, PortalAdminLogEntry } from '../src/types/governance.js';
@@ -106,6 +111,79 @@ describe('describeHeldLogs', () => {
   test('the portal markers match what the store writes', () => {
     assert.equal(REJECTED_TOKEN_USERNAME, UNVERIFIED_CALLER_USERNAME);
     assert.equal(SIMULATION_ACTION, SIMULATE_MCP_CALL_ACTION);
+  });
+});
+
+describe('gaps live refreshes open above the loaded pages', () => {
+  /** The whole log, newest first, paged as the routes page it. */
+  const routeOver = <T extends { seq?: number }>(log: () => T[]): ReadLogPage<T> => async (before, limit) => {
+    const older = log().filter((r) => before === undefined || (r.seq ?? 0) < before);
+    const page = older.slice(0, limit);
+    return { rows: page, nextBefore: older.length > limit ? (page[page.length - 1].seq ?? 0) : null };
+  };
+  const overviewOf = (log: CopilotMcpLogEntry[]) =>
+    mcpKinds.flatMap((kind) => log.filter(kind.matches).slice(0, kind.cap));
+  const since = (row: { timestamp: string }) => `${row.timestamp.slice(0, 19).replace('T', ' ')} UTC`;
+
+  test('the first Load older records the newest row the pages cover', async () => {
+    let log = newestFirst(times(1000, () => call('real')));
+    const state = await loadOlderRows(routeOver(() => log), emptyOlderRows<CopilotMcpLogEntry>(), overviewOf(log));
+    assert.equal(state.loadedTop, log[0].seq);
+    const next = await loadOlderRows(routeOver(() => log), state, overviewOf(log));
+    assert.equal(next.loadedTop, log[0].seq, 'later pages keep the recorded point');
+    log = [];
+    assert.equal((await loadOlderRows(routeOver(() => log), emptyOlderRows<CopilotMcpLogEntry>(), [])).loadedTop, 0);
+  });
+
+  test('more new calls than the list cap drop the "every event since" claim and name the gap', async () => {
+    let log = newestFirst(times(1000, () => call('real')));
+    const state = await loadOlderRows(routeOver(() => log), emptyOlderRows<CopilotMcpLogEntry>(), overviewOf(log));
+    const oldest = state.older[state.older.length - 1];
+    assert.equal(
+      describeHeldLogs({ overview: overviewOf(log), ...state, kinds: mcpKinds }),
+      `every event since ${since(oldest)}`
+    );
+
+    // 300 calls arrive; the refreshed list holds only the newest 150, so 150 are in neither list.
+    log = newestFirst([...log, ...times(300, () => call('real'))]);
+    const overview = overviewOf(log);
+    const held = new Set(mergeNewestFirst(overview, state.older).map((r) => r.id));
+    assert.equal(log.filter((r) => !held.has(r.id) && (r.seq ?? 0) > (oldest.seq ?? 0)).length, 150);
+    assert.deepEqual(heldLogGaps({ overview, loadedTop: state.loadedTop, kinds: mcpKinds }), ['calls']);
+    const text = describeHeldLogs({ overview, ...state, kinds: mcpKinds });
+    assert.ok(!text.includes('every event since'), text);
+    assert.equal(text, `gap: some calls after ${since(state.older[0])} are not held; reload to fill it`);
+
+    // Reload reads down from the newest row again and the gap is gone.
+    const reloaded = await loadOlderRows(routeOver(() => log), emptyOlderRows<CopilotMcpLogEntry>(), overview);
+    assert.equal(reloaded.loadedTop, log[0].seq);
+    assert.deepEqual(heldLogGaps({ overview, loadedTop: reloaded.loadedTop, kinds: mcpKinds }), []);
+    assert.match(describeHeldLogs({ overview, ...reloaded, kinds: mcpKinds }), /^every event since /);
+  });
+
+  test('fewer new rows than the cap leave no gap', async () => {
+    let log = newestFirst(times(1000, () => call('real')));
+    const state = await loadOlderRows(routeOver(() => log), emptyOlderRows<CopilotMcpLogEntry>(), overviewOf(log));
+    log = newestFirst([...log, ...times(149, () => call('real')), ...times(49, () => call('simulated'))]);
+    assert.deepEqual(heldLogGaps({ overview: overviewOf(log), loadedTop: state.loadedTop, kinds: mcpKinds }), []);
+    assert.match(describeHeldLogs({ overview: overviewOf(log), ...state, kinds: mcpKinds }), /^every event since /);
+  });
+
+  test('a burst of one capped kind is named on its own, also once the whole log was read', async () => {
+    let log = newestFirst(times(30, () => call('real')));
+    const state = await loadOlderRows(routeOver(() => log), emptyOlderRows<CopilotMcpLogEntry>(), overviewOf(log));
+    assert.equal(state.cursor, null);
+    assert.equal(describeHeldLogs({ overview: overviewOf(log), ...state, kinds: mcpKinds }), 'the whole log');
+
+    log = newestFirst([...log, ...times(51, () => call('rejected')), ...times(51, () => call('simulated'))]);
+    const text = describeHeldLogs({ overview: overviewOf(log), ...state, kinds: mcpKinds });
+    assert.equal(text, `gap: some simulated + rejected after ${since(state.older[0])} are not held; reload to fill it`);
+  });
+
+  test('before any Load older, the latest-row text is unchanged', () => {
+    const overview = newestFirst(times(150, () => call('real')));
+    assert.deepEqual(heldLogGaps({ overview, loadedTop: undefined, kinds: mcpKinds }), []);
+    assert.equal(describeHeldLogs({ overview, older: [], cursor: undefined, kinds: mcpKinds }), 'latest 150 calls');
   });
 });
 
