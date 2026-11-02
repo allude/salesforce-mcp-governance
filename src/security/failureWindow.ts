@@ -41,6 +41,8 @@ export function createFailureWindow(options: { windowMs: number; max: number; ma
           windows.delete(oldest);
         }
       }
+      // Delete first so a key whose old window expired moves to the end and is not taken for the oldest.
+      windows.delete(key);
       windows.set(key, { count: 1, resetAt: now + options.windowMs });
     },
   };

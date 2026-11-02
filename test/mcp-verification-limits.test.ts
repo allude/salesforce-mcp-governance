@@ -119,6 +119,17 @@ describe('createFailureWindow', () => {
     assert.ok(window.retryAfterSeconds('b', 0) > 0);
     assert.ok(window.retryAfterSeconds('c', 0) > 0);
   });
+
+  test('a key that starts a new window counts as the newest, so eviction drops older windows first', () => {
+    const window = createFailureWindow({ windowMs: 60_000, max: 1, maxKeys: 3 });
+    window.record('a', 0);
+    window.record('b', 10_000);
+    window.record('a', 65_000); // a's first window has ended; this starts a new one.
+    window.record('c', 66_000);
+    window.record('d', 67_000); // Full, nothing expired: the oldest live window (b) goes.
+    assert.ok(window.retryAfterSeconds('a', 67_000) > 0, 'the client blocked most recently stays blocked');
+    assert.equal(window.retryAfterSeconds('b', 67_000), 0);
+  });
 });
 
 describe('createVerificationGate', () => {
