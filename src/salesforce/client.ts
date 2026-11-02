@@ -29,6 +29,12 @@ const identityCache = new Map<string, CachedIdentity>();
 const CACHE_TTL_MS = 120 * 1000;
 const CACHE_MAX_ENTRIES = 5000;
 
+// Hashes of tokens that passed verification in the last hour, with their expiry. Only the /mcp
+// failed-attempt limiter reads this, so a caller whose token already proved valid keeps working
+// while someone floods the same client IP with bad tokens. It never skips verification itself.
+const recentlyVerifiedTokens = new Map<string, number>();
+const RECENTLY_VERIFIED_TTL_MS = 60 * 60 * 1000;
+
 const SIMULATOR_TOKEN_PREFIX = 'sf_sim_';
 const SIMULATOR_TOKEN_TTL_SECONDS = 15 * 60;
 const SIMULATED_IDENTITY_PREFIX = 'simulated:';
@@ -116,6 +122,30 @@ function cacheIdentity(tokenHash: string, entry: CachedIdentity): void {
   identityCache.set(tokenHash, entry);
 }
 
+function rememberVerifiedToken(tokenHash: string): void {
+  const now = Date.now();
+  if (!recentlyVerifiedTokens.has(tokenHash) && recentlyVerifiedTokens.size >= CACHE_MAX_ENTRIES) {
+    for (const [key, expiresAt] of recentlyVerifiedTokens) {
+      if (expiresAt <= now) recentlyVerifiedTokens.delete(key);
+    }
+    while (recentlyVerifiedTokens.size >= CACHE_MAX_ENTRIES) {
+      const oldest = recentlyVerifiedTokens.keys().next().value;
+      if (oldest === undefined) break;
+      recentlyVerifiedTokens.delete(oldest);
+    }
+  }
+  // Delete first so a refreshed entry moves to the end and is evicted last.
+  recentlyVerifiedTokens.delete(tokenHash);
+  recentlyVerifiedTokens.set(tokenHash, now + RECENTLY_VERIFIED_TTL_MS);
+}
+
+/** True when this exact bearer token passed verification within the last hour. */
+export function wasTokenRecentlyVerified(bearerToken: string): boolean {
+  if (!bearerToken) return false;
+  const expiresAt = recentlyVerifiedTokens.get(hashToken(bearerToken));
+  return expiresAt !== undefined && expiresAt > Date.now();
+}
+
 /**
  * Validates a Salesforce OAuth 2.0 Bearer token and resolves the user's exact
  * Salesforce Profile ID and Profile Name.
@@ -133,7 +163,9 @@ export async function resolveSalesforceUserFromToken(
 
   // 1. Check if this is an Admin Simulator token for testing RBAC policies locally
   if (bearerToken.startsWith(SIMULATOR_TOKEN_PREFIX)) {
-    return verifySimulatorToken(bearerToken);
+    const simulatedUser = verifySimulatorToken(bearerToken);
+    rememberVerifiedToken(hashToken(bearerToken));
+    return simulatedUser;
   }
 
   // The caller's real token goes to the hint on a cache miss, and the allowlist alone admits the simulated host.
@@ -143,6 +175,7 @@ export async function resolveSalesforceUserFromToken(
   const cached = identityCache.get(tokenHash);
   if (cached && cached.expiresAt > Date.now()) {
     enforceOrgIdLock(cached.user.organizationId);
+    rememberVerifiedToken(tokenHash);
     return { ...cached.user, accessToken: bearerToken };
   }
 
@@ -231,6 +264,7 @@ export async function resolveSalesforceUserFromToken(
     user: verifiedUser,
     expiresAt: Date.now() + CACHE_TTL_MS,
   });
+  rememberVerifiedToken(tokenHash);
 
   return {
     ...verifiedUser,

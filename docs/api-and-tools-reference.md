@@ -27,7 +27,7 @@ Stateless Model Context Protocol endpoint used by Microsoft Copilot Studio and o
 * **`401 Unauthorized` (invalid, expired, wrong-org or forged token):** `WWW-Authenticate: Bearer error="invalid_token", error_description="...", resource_metadata="..."`. The attempt is written to the Copilot MCP log as `unverified_caller` / `DENIED`.
 * **`400`:** a body that is not valid JSON gets the JSON-RPC parse error `-32700`.
 * **CORS:** any origin, never with credentials. `WWW-Authenticate` and `Mcp-Session-Id` are exposed.
-* **Rate limit:** 120 requests per minute per bearer token (requests without a token: per client IP).
+* **Rate limit:** 120 requests per minute per bearer token (requests without a token: per client IP). Rejected tokens are also limited to 30 per minute per client IP; after that, tokens that have not verified within the last hour get `429` with `Retry-After` until the window ends, without reaching Salesforce. Without `TRUST_PROXY` behind a load balancer, every caller shares one client IP, so a flood can delay new sign-ins (not callers already verified) for up to a minute at a time.
 
 **Simulator tokens.** `POST /api/admin/test-mcp-access` returns a `simulatorBearerToken` (`sf_sim_<payload>.<signature>`). It is HMAC-signed with a key derived from `APP_SECRET_KEY`, expires after 15 minutes, and lets an admin exercise `/mcp` as a given Profile. Calls made with it get simulated Salesforce responses and never reach Salesforce, and are logged with `simulated: true` under the name `simulated:<name>`. Each simulation also writes a `SIMULATE_MCP_CALL` portal admin log row naming the admin. Unsigned, tampered or expired simulator tokens get `401`.
 

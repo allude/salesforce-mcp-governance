@@ -8,7 +8,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { config } from './config.js';
 import { handleMcpStreamableHttpRequest } from './mcp/streamableHttp.js';
-import { salesforceAuthorizationBase } from './salesforce/client.js';
+import { salesforceAuthorizationBase, wasTokenRecentlyVerified } from './salesforce/client.js';
 import {
   handleOktaLoginRedirect,
   handleOktaCallback,
@@ -132,15 +132,44 @@ const adminApiLimiter = rateLimit({
   message: { error: 'Too many requests, please slow down.' },
 });
 
+function bearerTokenOf(req: Request): string {
+  const auth = req.headers.authorization;
+  return typeof auth === 'string' && /^bearer\s+/i.test(auth) ? auth.replace(/^bearer\s+/i, '').trim() : '';
+}
+
 const mcpLimiter = rateLimit({
   windowMs: 1 * 60 * 1000,
   max: 120,
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req: Request) => {
-    const auth = req.headers.authorization;
-    const token = typeof auth === 'string' && /^bearer\s+/i.test(auth) ? auth.replace(/^bearer\s+/i, '').trim() : '';
+    const token = bearerTokenOf(req);
     return token ? `token:${hashToken(token)}` : `ip:${req.ip}`;
+  },
+});
+
+// mcpLimiter gives every token its own bucket, so a client sending a new junk token each time was
+// never limited, and each one cost a Salesforce userinfo call and a log row. Rejected tokens are
+// therefore also counted per client IP; only 401 answers count. Requests with no token are left to
+// mcpLimiter's IP bucket (they reach no one), and a token that verified within the last hour is
+// exempt, so a flood from a shared IP cannot lock out callers already signed in. Behind the portal
+// proxy without TRUST_PROXY every caller shares one IP, so a flood can still delay new tokens.
+const mcpFailedTokenLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req: Request) => `failed-token-ip:${req.ip}`,
+  skip: (req: Request) => {
+    const token = bearerTokenOf(req);
+    return !token || wasTokenRecentlyVerified(token);
+  },
+  skipSuccessfulRequests: true,
+  requestWasSuccessful: (_req: Request, res: Response) => res.statusCode !== 401,
+  message: {
+    jsonrpc: '2.0',
+    error: { code: -32001, message: 'Too many rejected tokens from this client, please try again later.' },
+    id: null,
   },
 });
 
@@ -166,7 +195,7 @@ app.get('/healthz', (_req, res) => {
 });
 
 // 4. Streamable HTTP MCP Endpoint (POST, GET, DELETE /mcp; mcpCors above answers OPTIONS preflights)
-app.all('/mcp', mcpLimiter, (req: Request, res: Response, next: NextFunction) => {
+app.all('/mcp', mcpLimiter, mcpFailedTokenLimiter, (req: Request, res: Response, next: NextFunction) => {
   handleMcpStreamableHttpRequest(req, res).catch(next);
 });
 
