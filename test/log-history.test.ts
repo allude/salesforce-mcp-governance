@@ -5,6 +5,10 @@ import assert from 'node:assert/strict';
 import {
   auditRouteQuery,
   auditRowMatches,
+  LOG_EXPORT_MAX_ROWS,
+  LOG_EXPORT_MAX_SCANNED_ROWS,
+  LOG_EXPORT_PAGE_ROWS,
+  exportCutMessage,
   exportFileName,
   exportTruncatedMessage,
   logPageUrl,
@@ -105,6 +109,70 @@ describe('export naming and notice', () => {
       'portal-audit-log-2026-11-02-newest-10000-rows.csv'
     );
     assert.match(exportTruncatedMessage(), /newest 10,000 matching rows/);
+  });
+});
+
+describe('export with a search the route cannot apply', () => {
+  test('counts the limit after the search, so rare matches past the newest 10,000 rows are kept', async () => {
+    // 50,000 rows; 12 match, spread down to the oldest rows.
+    const log = pagedLog(50_000);
+    const matches = new Set(Array.from({ length: 12 }, (_, i) => i * 4000 + 7));
+    const keep = (r: Row) => matches.has(r.seq);
+    const read = await readAllRows(log.read, LOG_EXPORT_MAX_ROWS, LOG_EXPORT_PAGE_ROWS, { keep });
+    assert.equal(read.rows.length, 12);
+    assert.deepEqual(read.rows.map((r) => r.seq), [...matches].sort((a, b) => b - a));
+    assert.equal(read.scanned, 50_000);
+    assert.equal(read.cut, null);
+    assert.equal(read.truncated, false);
+    assert.equal(exportFileName('mcp-traffic-log', '2026-11-02', read.cut), 'mcp-traffic-log-2026-11-02.csv');
+  });
+
+  test('stops at the most kept rows, newest first, and says the match limit cut it', async () => {
+    const log = pagedLog(1000);
+    const read = await readAllRows(log.read, 30, 100, { keep: (r) => r.seq % 2 === 0 });
+    assert.equal(read.rows.length, 30);
+    assert.equal(read.rows[0].seq, 1000);
+    assert.equal(read.rows[29].seq, 942);
+    assert.deepEqual(read.cut, { by: 'matches', matched: 30, scanned: 60 });
+    assert.equal(read.truncated, true);
+    assert.equal(exportFileName('portal-audit-log', '2026-11-02', read.cut, 30), 'portal-audit-log-2026-11-02-newest-30-rows.csv');
+    assert.equal(
+      exportCutMessage({ by: 'matches', matched: 10_000, scanned: 61_234 }),
+      'Export stopped at the newest 10,000 matching rows, the most one file holds; older rows were not checked.'
+    );
+  });
+
+  test('a rare search stops at the scan bound and says how many rows matched in what it read', async () => {
+    const log = pagedLog(1000);
+    const read = await readAllRows(log.read, 30, 100, { keep: (r) => r.seq % 97 === 0, maxScanned: 450 });
+    assert.deepEqual(read.rows.map((r) => r.seq), [970, 873, 776, 679, 582]);
+    assert.deepEqual(read.cut, { by: 'scan', matched: 5, scanned: 450 });
+    assert.ok(log.calls.every((c) => c.limit <= 100));
+    assert.equal(log.calls.reduce((n, c) => n + c.limit, 0), 450, 'never asks for rows past the scan bound');
+    assert.equal(
+      exportFileName('mcp-traffic-log', '2026-11-02', read.cut),
+      'mcp-traffic-log-2026-11-02-5-matching-in-newest-450-rows.csv'
+    );
+    assert.equal(
+      exportCutMessage({ by: 'scan', matched: 12, scanned: 100_000 }),
+      'Export stopped after checking the newest 100,000 rows, the most one export reads: 12 rows matched; older rows were not checked.'
+    );
+    assert.match(exportCutMessage({ by: 'scan', matched: 1, scanned: 100_000 }), /: 1 row matched;/);
+  });
+
+  test('a log that ends at the scan bound or the match limit is not called cut', async () => {
+    const all = await readAllRows(pagedLog(450).read, 30, 100, { keep: (r) => r.seq % 97 === 0, maxScanned: 450 });
+    assert.equal(all.cut, null);
+    const exact = await readAllRows(pagedLog(60).read, 30, 100, { keep: (r) => r.seq % 2 === 0 });
+    assert.equal(exact.rows.length, 30);
+    assert.equal(exact.cut, null);
+  });
+
+  test('the scan bound defaults to 100,000 rows', async () => {
+    assert.equal(LOG_EXPORT_MAX_SCANNED_ROWS, 100_000);
+    const log = pagedLog(100_001);
+    const read = await readAllRows(log.read, undefined, undefined, { keep: () => false });
+    assert.deepEqual(read.cut, { by: 'scan', matched: 0, scanned: 100_000 });
   });
 });
 

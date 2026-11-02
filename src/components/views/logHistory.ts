@@ -6,6 +6,8 @@ export const LOG_HISTORY_PAGE_ROWS = 200;
 export const LOG_EXPORT_MAX_ROWS = 10_000;
 /** The largest page the log routes serve. */
 export const LOG_EXPORT_PAGE_ROWS = 1000;
+/** The most rows one export reads while looking for matches, so a rare search cannot read forever. */
+export const LOG_EXPORT_MAX_SCANNED_ROWS = 100_000;
 
 export interface LogPage<T> {
   rows: T[];
@@ -100,34 +102,95 @@ export async function loadOlderRows<T extends { id: string; seq?: number }>(
 }
 
 /**
- * Every row the route returns, newest first, up to `max`. `truncated` says older matching rows
- * exist that were left out, so the export can say so.
+ * Why an export stopped before the start of the log, or null when it read all of it. `matches`: it
+ * kept `matched` rows, the most one export holds, and older rows were not checked. `scan`: it read
+ * `scanned` rows without reaching that many matches, and older rows were not checked.
+ */
+export type ExportCut =
+  | null
+  | { by: 'matches'; matched: number; scanned: number }
+  | { by: 'scan'; matched: number; scanned: number };
+
+export interface ExportRead<T> {
+  rows: T[];
+  scanned: number;
+  truncated: boolean;
+  cut: ExportCut;
+}
+
+/**
+ * Every row the route returns that `keep` accepts, newest first, up to `max` kept rows. The route
+ * cannot apply the free-text search, so each page is filtered as it arrives and the limit counts
+ * the rows kept; `maxScanned` bounds the rows read, so a search that matches rarely cannot read a
+ * huge log to its start. `cut` says which limit stopped it, so the export can say exactly that.
  */
 export async function readAllRows<T>(
   readPage: ReadLogPage<T>,
   max = LOG_EXPORT_MAX_ROWS,
-  pageRows = LOG_EXPORT_PAGE_ROWS
-): Promise<{ rows: T[]; truncated: boolean }> {
+  pageRows = LOG_EXPORT_PAGE_ROWS,
+  options: { keep?: (row: T) => boolean; maxScanned?: number } = {}
+): Promise<ExportRead<T>> {
+  const { keep, maxScanned = LOG_EXPORT_MAX_SCANNED_ROWS } = options;
   const rows: T[] = [];
+  let scanned = 0;
+  const stop = (by: 'matches' | 'scan'): ExportRead<T> => ({
+    rows,
+    scanned,
+    truncated: true,
+    cut: { by, matched: rows.length, scanned },
+  });
   let before: number | undefined;
   for (;;) {
-    const page = await readPage(before, Math.min(pageRows, max - rows.length));
-    rows.push(...page.rows.slice(0, max - rows.length));
+    // Unfiltered, every row read is kept, so ask only for the rows still needed.
+    const want = keep ? Math.min(pageRows, maxScanned - scanned) : Math.min(pageRows, max - rows.length);
+    const page = await readPage(before, want);
+    for (const row of page.rows) {
+      if (scanned >= maxScanned) return stop('scan');
+      const kept = !keep || keep(row);
+      if (kept && rows.length >= max) return stop('matches');
+      scanned += 1;
+      if (kept) rows.push(row);
+    }
     // A cursor that does not move would loop forever; treat it as the end of the log.
     const advanced = page.nextBefore !== null && (before === undefined || page.nextBefore < before);
-    if (!advanced) return { rows, truncated: false };
-    if (rows.length >= max) return { rows, truncated: true };
+    if (!advanced) return { rows, scanned, truncated: false, cut: null };
+    if (rows.length >= max) return stop('matches');
+    if (scanned >= maxScanned) return stop('scan');
     before = page.nextBefore as number;
   }
 }
 
-/** The export's file name, marked when the row limit cut it short so the file says so on its own. */
-export function exportFileName(base: string, date: string, truncated: boolean, max = LOG_EXPORT_MAX_ROWS): string {
-  return truncated ? `${base}-${date}-newest-${max}-rows.csv` : `${base}-${date}.csv`;
+/** The legacy `true` means the match limit cut an export at `max` rows. */
+function normalizeCut(cut: ExportCut | boolean, max: number): ExportCut {
+  if (cut === true) return { by: 'matches', matched: max, scanned: max };
+  return cut === false ? null : cut;
+}
+
+/** The export's file name, marked when a limit cut it short so the file says so on its own. */
+export function exportFileName(
+  base: string,
+  date: string,
+  cut: ExportCut | boolean,
+  max = LOG_EXPORT_MAX_ROWS
+): string {
+  const c = normalizeCut(cut, max);
+  if (!c) return `${base}-${date}.csv`;
+  if (c.by === 'matches') return `${base}-${date}-newest-${c.matched}-rows.csv`;
+  return `${base}-${date}-${c.matched}-matching-in-newest-${c.scanned}-rows.csv`;
+}
+
+/** The notice for a cut export: how many rows matched, and which limit stopped it. */
+export function exportCutMessage(cut: Exclude<ExportCut, null>): string {
+  const n = (count: number) => count.toLocaleString('en-US');
+  if (cut.by === 'matches') {
+    return `Export stopped at the newest ${n(cut.matched)} matching rows, the most one file holds; older rows were not checked.`;
+  }
+  const matched = cut.matched === 1 ? '1 row matched' : `${n(cut.matched)} rows matched`;
+  return `Export stopped after checking the newest ${n(cut.scanned)} rows, the most one export reads: ${matched}; older rows were not checked.`;
 }
 
 export function exportTruncatedMessage(max = LOG_EXPORT_MAX_ROWS): string {
-  return `Export stopped at the newest ${max.toLocaleString('en-US')} matching rows; older rows are not in the file.`;
+  return exportCutMessage({ by: 'matches', matched: max, scanned: max });
 }
 
 export interface TrafficFilters {

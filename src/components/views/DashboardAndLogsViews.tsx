@@ -21,8 +21,10 @@ import {
   auditRouteQuery,
   auditRowMatches,
   describeHeldLogs,
+  LOG_EXPORT_MAX_ROWS,
+  LOG_EXPORT_PAGE_ROWS,
+  exportCutMessage,
   exportFileName,
-  exportTruncatedMessage,
   emptyOlderRows,
   heldLogGaps,
   loadOlderRows,
@@ -885,12 +887,16 @@ function useLogExport<T>(
     if (exporting) return;
     setExporting(true);
     try {
-      const { rows, truncated } = await readAllRows((before, limit) =>
-        fetchPage({ ...routeQuery, before, limit })
+      // The route cannot apply the free-text search, so the limits count rows after `keep`.
+      const { rows, cut } = await readAllRows(
+        (before, limit) => fetchPage({ ...routeQuery, before, limit }),
+        LOG_EXPORT_MAX_ROWS,
+        LOG_EXPORT_PAGE_ROWS,
+        { keep }
       );
       const date = new Date().toISOString().slice(0, 10);
-      downloadCsv(toCsv(rows.filter(keep)), exportFileName(fileBase, date, truncated));
-      if (truncated) onNotify(exportTruncatedMessage());
+      downloadCsv(toCsv(rows), exportFileName(fileBase, date, cut));
+      if (cut) onNotify(exportCutMessage(cut));
     } catch (err) {
       onNotify(`Export failed: ${err instanceof Error ? err.message : String(err)}`, true);
     } finally {
