@@ -1321,6 +1321,16 @@ pre.code {
   font-size: 12.5px;
 }
 
+/* "Load older" row under a paged log table */
+.tbl-more {
+  display: flex;
+  justify-content: center;
+  padding: 10px 14px;
+  border-top: 1px solid var(--bd);
+  color: var(--t3);
+  font-size: 12px;
+}
+
 /* Command Palette (Cmd+K) */
 .cmdk-scrim {
   position: fixed;

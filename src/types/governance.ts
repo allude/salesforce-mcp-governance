@@ -152,6 +152,7 @@ export interface CopilotMcpLogRecord {
   sanitizedRequestPayload: string; // JSON with PII / record values stripped
   sanitizedResponseSummary: string; // JSON with record values stripped
   simulated?: true; // Present only on rows from the policy simulator, never on real traffic
+  seq?: number; // Write order (SQLite rowid) on rows from the Admin API log lists; the paging cursor
 }
 
 export interface PortalAdminLogRecord {
@@ -163,6 +164,7 @@ export interface PortalAdminLogRecord {
   target: string;
   details: string;
   ipAddress: string;
+  seq?: number; // Write order (SQLite rowid) on rows from the Admin API log lists; the paging cursor
 }
 
 export interface OktaSsoSettings {

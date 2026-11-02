@@ -40,6 +40,7 @@ import { CommandPalette } from '@/components/views/CommandPalette';
 import { profileSyncResultMessage } from '@/components/views/profileSyncReview';
 import { mcpActivityStatus } from '@/components/views/mcpActivity';
 import { estimateClockOffsetMs } from '@/components/views/trafficChart';
+import { logPageUrl } from '@/components/views/logHistory';
 import {
   ENTERPRISE_MATRIX_WARNING,
   enterpriseMatrixAction,
@@ -1316,6 +1317,8 @@ export default function AdminPortalPage() {
               objects={objects}
               selectedFlyoutId={selectedFlyoutId}
               initialSearch={trafficSearchFilter}
+              fetchLogPage={(query) => apiFetch(logPageUrl('/api/admin/mcp-logs', query))}
+              onNotify={notify}
               onClearLogs={async () => {
                 setCopilotLogs([]);
                 notify('Cleared view buffer');
@@ -1328,6 +1331,8 @@ export default function AdminPortalPage() {
             <PortalAdminLogsView
               logs={portalLogs}
               selectedFlyoutId={selectedFlyoutId}
+              fetchLogPage={(query) => apiFetch(logPageUrl('/api/admin/portal-logs', query))}
+              onNotify={notify}
               onOpenFlyout={(f) => setFlyout(f)}
             />
           )}

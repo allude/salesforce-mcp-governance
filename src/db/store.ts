@@ -553,6 +553,60 @@ function toPortalAdminLogRecord(r: any): PortalAdminLogRecord {
   };
 }
 
+/** Keeps the rowid a log query selected as `seq`, the order rows were written in and the paging cursor. */
+function withSeq<T>(toRecord: (r: any) => T): (r: any) => T & { seq: number } {
+  return (r) => ({ ...toRecord(r), seq: Number(r.seq) });
+}
+
+export interface LogPageCursor {
+  /** Only rows written before this `seq`; omitted for the newest page. */
+  before?: number;
+  limit: number;
+}
+
+export interface CopilotMcpLogPageQuery extends LogPageCursor {
+  status?: 'ALLOWED' | 'DENIED' | 'ERROR';
+  simulated?: boolean;
+  toolName?: string;
+  targetObject?: string;
+}
+
+export interface PortalAdminLogPageQuery extends LogPageCursor {
+  action?: string;
+  authMethod?: 'password' | 'okta_sso';
+}
+
+export interface LogPage<T> {
+  rows: Array<T & { seq: number }>;
+  /** The `before` cursor for the next older page, or null when no older matching row exists. */
+  nextBefore: number | null;
+}
+
+/** Reads one more row than asked for, so the caller learns whether an older page exists. */
+function readLogPage<T>(
+  table: 'mcp_copilot_logs' | 'portal_admin_logs',
+  where: string[],
+  params: Record<string, string | number>,
+  cursor: LogPageCursor,
+  toRecord: (r: any) => T
+): LogPage<T> {
+  const conditions = [...where];
+  const bound: Record<string, string | number> = { ...params, limit: cursor.limit + 1 };
+  if (cursor.before !== undefined) {
+    conditions.push('rowid < :before');
+    bound.before = cursor.before;
+  }
+  const filter = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const rows = db
+    .prepare(`SELECT rowid AS seq, * FROM ${table} ${filter} ORDER BY rowid DESC LIMIT :limit`)
+    .all(bound) as any[];
+  const page = rows.slice(0, cursor.limit).map(withSeq(toRecord));
+  return {
+    rows: page,
+    nextBefore: rows.length > cursor.limit ? page[page.length - 1].seq : null,
+  };
+}
+
 /**
  * Strips all sensitive data values from a payload while preserving keys, field names, and structure
  * so Copilot MCP logs never store raw customer PII or record values.
@@ -1783,7 +1837,30 @@ export const store = {
          ORDER BY seq DESC`
       )
       .all({ unverified: UNVERIFIED_CALLER_USERNAME, realLimit, simulatedLimit, rejectedLimit }) as any[];
-    return rows.map(toCopilotMcpLogRecord);
+    return rows.map(withSeq(toCopilotMcpLogRecord));
+  },
+
+  /**
+   * One page of the whole MCP log, newest first, for reading past the /overview caps. Pass the
+   * previous page's `nextBefore` as `before`; it is null once the oldest matching row is returned.
+   */
+  getCopilotMcpLogPage(query: CopilotMcpLogPageQuery): LogPage<CopilotMcpLogRecord> {
+    const where: string[] = [];
+    const params: Record<string, string | number> = {};
+    if (query.status !== undefined) {
+      where.push('status = :status');
+      params.status = query.status;
+    }
+    if (query.simulated !== undefined) where.push(query.simulated ? 'simulated <> 0' : 'simulated = 0');
+    if (query.toolName !== undefined) {
+      where.push('tool_name = :toolName');
+      params.toolName = query.toolName;
+    }
+    if (query.targetObject !== undefined) {
+      where.push('target_object = :targetObject');
+      params.targetObject = query.targetObject;
+    }
+    return readLogPage('mcp_copilot_logs', where, params, query, toCopilotMcpLogRecord);
   },
 
   /** Totals for the dashboard KPIs: real traffic only, so the simulator cannot inflate them. */
@@ -1907,7 +1984,22 @@ export const store = {
          ORDER BY seq DESC`
       )
       .all({ action: SIMULATE_MCP_CALL_ACTION, otherLimit, simulationLimit }) as any[];
-    return rows.map(toPortalAdminLogRecord);
+    return rows.map(withSeq(toPortalAdminLogRecord));
+  },
+
+  /** One page of the whole portal audit log, newest first; paged like getCopilotMcpLogPage. */
+  getPortalAdminLogPage(query: PortalAdminLogPageQuery): LogPage<PortalAdminLogRecord> {
+    const where: string[] = [];
+    const params: Record<string, string | number> = {};
+    if (query.action !== undefined) {
+      where.push('action = :action');
+      params.action = query.action;
+    }
+    if (query.authMethod !== undefined) {
+      where.push('auth_method = :authMethod');
+      params.authMethod = query.authMethod;
+    }
+    return readLogPage('portal_admin_logs', where, params, query, toPortalAdminLogRecord);
   },
 
   recordPortalAdminLog(input: {

@@ -1,0 +1,147 @@
+import type { CopilotMcpLogEntry, PortalAdminLogEntry } from '@/types/governance';
+
+/** Rows asked for by each click of "Load older". */
+export const LOG_HISTORY_PAGE_ROWS = 200;
+/** The most rows one CSV export reads, so an export of a huge log stays a bounded download. */
+export const LOG_EXPORT_MAX_ROWS = 10_000;
+/** The largest page the log routes serve. */
+export const LOG_EXPORT_PAGE_ROWS = 1000;
+
+export interface LogPage<T> {
+  rows: T[];
+  nextBefore: number | null;
+}
+
+/** Reads one page older than `before` (the newest page when undefined), at most `limit` rows. */
+export type ReadLogPage<T> = (before: number | undefined, limit: number) => Promise<LogPage<T>>;
+
+export type LogQuery = Record<string, string | number | undefined>;
+
+/** The route plus its query string, leaving out unset parameters. */
+export function logPageUrl(path: string, query: LogQuery): string {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined && value !== '') params.set(key, String(value));
+  }
+  const qs = params.toString();
+  return qs ? `${path}?${qs}` : path;
+}
+
+/** One list, newest first by write order, each row once; later lists win for a repeated id. */
+export function mergeNewestFirst<T extends { id: string; seq?: number }>(...lists: T[][]): T[] {
+  const byId = new Map<string, T>();
+  for (const list of lists) for (const row of list) byId.set(row.id, row);
+  return Array.from(byId.values()).sort((a, b) => (b.seq ?? 0) - (a.seq ?? 0));
+}
+
+/**
+ * Reads pages older than `cursor` until one adds a row the view does not hold yet, or the log ends.
+ * The first contiguous pages can be wholly inside the capped /overview lists, and a click that shows
+ * nothing new would look broken. Those lists hold a few hundred rows, so this stops within a few pages.
+ */
+export async function readOlderRows<T extends { id: string }>(
+  readPage: ReadLogPage<T>,
+  cursor: number | undefined,
+  held: ReadonlySet<string>,
+  pageRows = LOG_HISTORY_PAGE_ROWS
+): Promise<LogPage<T>> {
+  const rows: T[] = [];
+  let before = cursor;
+  for (;;) {
+    const page = await readPage(before, pageRows);
+    rows.push(...page.rows);
+    const advanced = page.nextBefore !== null && (before === undefined || page.nextBefore < before);
+    if (!advanced || page.rows.some((row) => !held.has(row.id))) {
+      return { rows, nextBefore: advanced ? page.nextBefore : null };
+    }
+    before = page.nextBefore as number;
+  }
+}
+
+/**
+ * Every row the route returns, newest first, up to `max`. `truncated` says older matching rows
+ * exist that were left out, so the export can say so.
+ */
+export async function readAllRows<T>(
+  readPage: ReadLogPage<T>,
+  max = LOG_EXPORT_MAX_ROWS,
+  pageRows = LOG_EXPORT_PAGE_ROWS
+): Promise<{ rows: T[]; truncated: boolean }> {
+  const rows: T[] = [];
+  let before: number | undefined;
+  for (;;) {
+    const page = await readPage(before, Math.min(pageRows, max - rows.length));
+    rows.push(...page.rows.slice(0, max - rows.length));
+    // A cursor that does not move would loop forever; treat it as the end of the log.
+    const advanced = page.nextBefore !== null && (before === undefined || page.nextBefore < before);
+    if (!advanced) return { rows, truncated: false };
+    if (rows.length >= max) return { rows, truncated: true };
+    before = page.nextBefore as number;
+  }
+}
+
+/** The export's file name, marked when the row limit cut it short so the file says so on its own. */
+export function exportFileName(base: string, date: string, truncated: boolean, max = LOG_EXPORT_MAX_ROWS): string {
+  return truncated ? `${base}-${date}-newest-${max}-rows.csv` : `${base}-${date}.csv`;
+}
+
+export function exportTruncatedMessage(max = LOG_EXPORT_MAX_ROWS): string {
+  return `Export stopped at the newest ${max.toLocaleString('en-US')} matching rows; older rows are not in the file.`;
+}
+
+export interface TrafficFilters {
+  status: 'all' | 'ALLOWED' | 'DENIED' | 'ERROR';
+  tool: string;
+  object: string;
+  search: string;
+}
+
+/** Filters the route applies itself; the free-text search is applied to the rows it returns. */
+export function trafficRouteQuery(filters: TrafficFilters): LogQuery {
+  return {
+    status: filters.status === 'all' ? undefined : filters.status,
+    tool: filters.tool === 'all' ? undefined : filters.tool,
+    object: filters.object === 'all' ? undefined : filters.object,
+  };
+}
+
+export function trafficRowMatches(row: CopilotMcpLogEntry, filters: TrafficFilters): boolean {
+  const q = filters.search.toLowerCase();
+  return (
+    (filters.status === 'all' || row.status === filters.status) &&
+    (filters.tool === 'all' || row.toolName === filters.tool) &&
+    (filters.object === 'all' || row.targetObject === filters.object) &&
+    (!q ||
+      row.sfUsername.toLowerCase().includes(q) ||
+      row.profileName.toLowerCase().includes(q) ||
+      row.toolName.toLowerCase().includes(q) ||
+      row.targetObject.toLowerCase().includes(q) ||
+      row.profileId.toLowerCase().includes(q))
+  );
+}
+
+export interface AuditFilters {
+  method: 'all' | 'okta_sso' | 'password';
+  action: string;
+  search: string;
+}
+
+export function auditRouteQuery(filters: AuditFilters): LogQuery {
+  return {
+    authMethod: filters.method === 'all' ? undefined : filters.method,
+    action: filters.action === 'all' ? undefined : filters.action,
+  };
+}
+
+export function auditRowMatches(row: PortalAdminLogEntry, filters: AuditFilters): boolean {
+  const q = filters.search.toLowerCase();
+  return (
+    (filters.method === 'all' || row.authMethod === filters.method) &&
+    (filters.action === 'all' || row.action === filters.action) &&
+    (!q ||
+      row.adminUsername.toLowerCase().includes(q) ||
+      row.action.toLowerCase().includes(q) ||
+      row.target.toLowerCase().includes(q) ||
+      row.details.toLowerCase().includes(q))
+  );
+}

@@ -25,6 +25,7 @@ import {
 } from '../salesforce/jwtConnection.js';
 import { config } from '../config.js';
 import { parseObjectSyncPayload, parseProfileSyncPayload } from './orgSyncPayload.js';
+import { LogPageQueryError, parseMcpLogPageQuery, parsePortalLogPageQuery } from './logPageQuery.js';
 import { isSalesforceId, salesforceIdsMatch } from '../salesforce/ids.js';
 import { SIMULATED_ORG_INSTANCE_URL } from '../salesforce/simulatedOrg.js';
 import { AVAILABLE_MCP_ACTIONS, unknownMcpActionIds } from '../types/governance.js';
@@ -441,6 +442,36 @@ adminRouter.get('/overview', (_req: Request, res: Response) => {
     sfSettings,
     portalUsers,
   });
+});
+
+/** Answers a malformed paging query with 400 and anything else as the page itself. */
+function sendLogPage<T>(res: Response, read: () => T) {
+  let page: T;
+  try {
+    page = read();
+  } catch (err) {
+    if (!(err instanceof LogPageQueryError)) throw err;
+    res.status(400).json({ error: err.message });
+    return;
+  }
+  res.json(page);
+}
+
+/**
+ * GET /api/admin/mcp-logs?before=&limit=&status=&simulated=&tool=&object=
+ * Pages back through the whole Copilot MCP log, newest first, so rows past the /overview caps stay
+ * reachable. Read-only.
+ */
+adminRouter.get('/mcp-logs', (req: Request, res: Response) => {
+  sendLogPage(res, () => store.getCopilotMcpLogPage(parseMcpLogPageQuery(req.query)));
+});
+
+/**
+ * GET /api/admin/portal-logs?before=&limit=&action=&authMethod=
+ * Pages back through the whole portal audit log, newest first. Read-only.
+ */
+adminRouter.get('/portal-logs', (req: Request, res: Response) => {
+  sendLogPage(res, () => store.getPortalAdminLogPage(parsePortalLogPageQuery(req.query)));
 });
 
 // ============================================================================

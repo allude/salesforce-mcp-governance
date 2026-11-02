@@ -16,6 +16,19 @@ import { MCP_TOOL_CATALOG, formatShortTime } from '@/components/ui/primitives';
 import type { FlyoutState } from './FlyoutDrawer';
 import { realTraffic } from './simulatedTraffic';
 import { portalAuditCsv, trafficLogCsv } from './csvExport';
+import {
+  auditRouteQuery,
+  auditRowMatches,
+  exportFileName,
+  exportTruncatedMessage,
+  mergeNewestFirst,
+  readAllRows,
+  readOlderRows,
+  trafficRouteQuery,
+  trafficRowMatches,
+  type LogPage,
+  type LogQuery,
+} from './logHistory';
 import { trafficBuckets, trafficChartSubtitle, type TrafficRange } from './trafficChart';
 
 // ============================================================================
@@ -760,11 +773,119 @@ export function TrafficDashboardView({
 // ============================================================================
 // 2. COPILOT MCP TRAFFIC LOG VIEW
 // ============================================================================
+
+/** Reads one page of a paged log route; the views pass the filters and cursor as the query. */
+export type FetchLogPage<T> = (query: LogQuery) => Promise<LogPage<T>>;
+
+function downloadCsv(csv: string, fileName: string) {
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/**
+ * Older rows read through a paged log route, held beside the capped /overview list. `cursor` is
+ * undefined before the first page and null once the oldest row has been read.
+ */
+function useOlderLogRows<T extends { id: string; seq?: number }>(
+  logs: T[],
+  fetchPage: FetchLogPage<T>,
+  onNotify: (msg: string, isError?: boolean) => void
+) {
+  const [older, setOlder] = useState<T[]>([]);
+  const [cursor, setCursor] = useState<number | null | undefined>(undefined);
+  const [loading, setLoading] = useState(false);
+  const held = useMemo(() => mergeNewestFirst(logs, older), [logs, older]);
+
+  const loadOlder = async () => {
+    if (loading || cursor === null) return;
+    setLoading(true);
+    try {
+      const page = await readOlderRows(
+        (before, limit) => fetchPage({ before, limit }),
+        cursor,
+        new Set(held.map((row) => row.id))
+      );
+      setOlder((prev) => mergeNewestFirst(prev, page.rows));
+      setCursor(page.nextBefore);
+    } catch (err) {
+      onNotify(`Could not load older rows: ${err instanceof Error ? err.message : String(err)}`, true);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const reset = () => {
+    setOlder([]);
+    setCursor(undefined);
+  };
+
+  return { held, cursor, loading, loadOlder, reset };
+}
+
+/** Exports every matching row through the paged route, up to the export limit, and says when it was cut. */
+function useLogExport<T>(
+  fetchPage: FetchLogPage<T>,
+  onNotify: (msg: string, isError?: boolean) => void
+) {
+  const [exporting, setExporting] = useState(false);
+  const exportRows = async (
+    routeQuery: LogQuery,
+    keep: (row: T) => boolean,
+    toCsv: (rows: T[]) => string,
+    fileBase: string
+  ) => {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      const { rows, truncated } = await readAllRows((before, limit) =>
+        fetchPage({ ...routeQuery, before, limit })
+      );
+      const date = new Date().toISOString().slice(0, 10);
+      downloadCsv(toCsv(rows.filter(keep)), exportFileName(fileBase, date, truncated));
+      if (truncated) onNotify(exportTruncatedMessage());
+    } catch (err) {
+      onNotify(`Export failed: ${err instanceof Error ? err.message : String(err)}`, true);
+    } finally {
+      setExporting(false);
+    }
+  };
+  return { exporting, exportRows };
+}
+
+function LoadOlderFooter({
+  cursor,
+  loading,
+  onLoad,
+}: {
+  cursor: number | null | undefined;
+  loading: boolean;
+  onLoad: () => void;
+}) {
+  return (
+    <div className="tbl-more">
+      {cursor === null ? (
+        <span>Start of the log reached.</span>
+      ) : (
+        <button type="button" className="btn sm" disabled={loading} onClick={onLoad}>
+          {loading ? 'Loading…' : 'Load older'}
+        </button>
+      )}
+    </div>
+  );
+}
+
 interface CopilotMcpLogsViewProps {
   logs: CopilotMcpLogEntry[];
   objects: SalesforceObjectConfig[];
   selectedFlyoutId?: string;
   initialSearch?: string;
+  fetchLogPage: FetchLogPage<CopilotMcpLogEntry>;
+  onNotify: (msg: string, isError?: boolean) => void;
   onClearLogs: () => Promise<void>;
   onOpenFlyout: (flyout: FlyoutState) => void;
 }
@@ -774,6 +895,8 @@ export function CopilotMcpLogsView({
   objects,
   selectedFlyoutId,
   initialSearch = '',
+  fetchLogPage,
+  onNotify,
   onClearLogs,
   onOpenFlyout,
 }: CopilotMcpLogsViewProps) {
@@ -783,34 +906,28 @@ export function CopilotMcpLogsView({
   >('all');
   const [toolFilter, setToolFilter] = useState('all');
   const [objFilter, setObjFilter] = useState('all');
+  const history = useOlderLogRows(logs, fetchLogPage, onNotify);
+  const { exporting, exportRows } = useLogExport(fetchLogPage, onNotify);
 
   React.useEffect(() => {
     if (initialSearch) setQ(initialSearch);
   }, [initialSearch]);
 
-  const rows = useMemo(() => {
-    return logs.filter(
-      (r) =>
-        (statusFilter === 'all' || r.status === statusFilter) &&
-        (toolFilter === 'all' || r.toolName === toolFilter) &&
-        (objFilter === 'all' || r.targetObject === objFilter) &&
-        (!q ||
-          r.sfUsername.toLowerCase().includes(q.toLowerCase()) ||
-          r.profileName.toLowerCase().includes(q.toLowerCase()) ||
-          r.toolName.toLowerCase().includes(q.toLowerCase()) ||
-          r.targetObject.toLowerCase().includes(q.toLowerCase()) ||
-          r.profileId.toLowerCase().includes(q.toLowerCase()))
-    );
-  }, [logs, statusFilter, toolFilter, objFilter, q]);
+  const filters = useMemo(
+    () => ({ status: statusFilter, tool: toolFilter, object: objFilter, search: q }),
+    [statusFilter, toolFilter, objFilter, q]
+  );
+  const rows = useMemo(
+    () => history.held.filter((r) => trafficRowMatches(r, filters)),
+    [history.held, filters]
+  );
 
-  const exportCsv = () => {
-    const blob = new Blob([trafficLogCsv(rows)], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `mcp-traffic-log-${new Date().toISOString().slice(0, 10)}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+  const exportCsv = () =>
+    exportRows(trafficRouteQuery(filters), (r) => trafficRowMatches(r, filters), trafficLogCsv, 'mcp-traffic-log');
+
+  const clearLogs = async () => {
+    history.reset();
+    await onClearLogs();
   };
 
   return (
@@ -831,11 +948,11 @@ export function CopilotMcpLogsView({
           >
             Simulate MCP call
           </button>
-          <button type="button" className="btn" onClick={exportCsv}>
-            Export CSV
+          <button type="button" className="btn" onClick={exportCsv} disabled={exporting}>
+            {exporting ? 'Exporting…' : 'Export CSV'}
           </button>
-          {logs.length > 0 && (
-            <button type="button" className="btn dng" onClick={onClearLogs}>
+          {history.held.length > 0 && (
+            <button type="button" className="btn dng" onClick={clearLogs}>
               Clear log
             </button>
           )}
@@ -911,7 +1028,7 @@ export function CopilotMcpLogsView({
               <span className="dot ok" /> PII redaction active
             </span>
             <span className="mono" style={{ color: 'var(--t3)' }}>
-              {rows.length} of {logs.length} events
+              {rows.length} of {history.held.length} events
             </span>
           </div>
         </div>
@@ -1022,6 +1139,7 @@ export function CopilotMcpLogsView({
             </tbody>
           </table>
         </div>
+        <LoadOlderFooter cursor={history.cursor} loading={history.loading} onLoad={history.loadOlder} />
       </div>
     </div>
   );
@@ -1033,12 +1151,16 @@ export function CopilotMcpLogsView({
 interface PortalAdminLogsViewProps {
   logs: PortalAdminLogEntry[];
   selectedFlyoutId?: string;
+  fetchLogPage: FetchLogPage<PortalAdminLogEntry>;
+  onNotify: (msg: string, isError?: boolean) => void;
   onOpenFlyout: (flyout: FlyoutState) => void;
 }
 
 export function PortalAdminLogsView({
   logs,
   selectedFlyoutId,
+  fetchLogPage,
+  onNotify,
   onOpenFlyout,
 }: PortalAdminLogsViewProps) {
   const [q, setQ] = useState('');
@@ -1046,34 +1168,25 @@ export function PortalAdminLogsView({
     'all'
   );
   const [actionFilter, setActionFilter] = useState('all');
+  const history = useOlderLogRows(logs, fetchLogPage, onNotify);
+  const { exporting, exportRows } = useLogExport(fetchLogPage, onNotify);
 
   const uniqueActions = useMemo(
-    () => Array.from(new Set(logs.map((l) => l.action))),
-    [logs]
+    () => Array.from(new Set(history.held.map((l) => l.action))),
+    [history.held]
   );
 
-  const rows = useMemo(() => {
-    return logs.filter(
-      (r) =>
-        (method === 'all' || r.authMethod === method) &&
-        (actionFilter === 'all' || r.action === actionFilter) &&
-        (!q ||
-          r.adminUsername.toLowerCase().includes(q.toLowerCase()) ||
-          r.action.toLowerCase().includes(q.toLowerCase()) ||
-          r.target.toLowerCase().includes(q.toLowerCase()) ||
-          r.details.toLowerCase().includes(q.toLowerCase()))
-    );
-  }, [logs, method, actionFilter, q]);
+  const filters = useMemo(
+    () => ({ method, action: actionFilter, search: q }),
+    [method, actionFilter, q]
+  );
+  const rows = useMemo(
+    () => history.held.filter((r) => auditRowMatches(r, filters)),
+    [history.held, filters]
+  );
 
-  const exportCsv = () => {
-    const blob = new Blob([portalAuditCsv(rows)], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `portal-audit-log-${new Date().toISOString().slice(0, 10)}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
+  const exportCsv = () =>
+    exportRows(auditRouteQuery(filters), (r) => auditRowMatches(r, filters), portalAuditCsv, 'portal-audit-log');
 
   return (
     <div>
@@ -1086,8 +1199,8 @@ export function PortalAdminLogsView({
           </p>
         </div>
         <div className="ph-act">
-          <button type="button" className="btn" onClick={exportCsv}>
-            Export CSV
+          <button type="button" className="btn" onClick={exportCsv} disabled={exporting}>
+            {exporting ? 'Exporting…' : 'Export CSV'}
           </button>
         </div>
       </div>
@@ -1206,6 +1319,7 @@ export function PortalAdminLogsView({
             </tbody>
           </table>
         </div>
+        <LoadOlderFooter cursor={history.cursor} loading={history.loading} onLoad={history.loadOlder} />
       </div>
     </div>
   );
