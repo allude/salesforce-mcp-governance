@@ -25,6 +25,7 @@ import {
   LOG_EXPORT_PAGE_ROWS,
   exportCutMessage,
   exportFileName,
+  clearedOlderRows,
   emptyOlderRows,
   heldLogGaps,
   loadOlderRows,
@@ -808,9 +809,14 @@ function useOlderLogRows<T extends { id: string; seq?: number }>(
 ) {
   const [state, setState] = useState<OlderRowsState<T>>(emptyOlderRows);
   const [loading, setLoading] = useState(false);
-  // Bumped by reset and each read, so a page that lands after a reset or reload does not bring back what they dropped.
+  // Bumped by clear and each read, so a page that lands after a clear or reload does not bring back what they dropped.
   const generation = React.useRef(0);
   const held = useMemo(() => mergeNewestFirst(logs, state.older), [logs, state.older]);
+
+  // A refresh that brings rows back refills a cleared view.
+  React.useEffect(() => {
+    if (logs.length > 0) setState((prev) => (prev.cleared ? { ...prev, cleared: false } : prev));
+  }, [logs]);
 
   const read = async (from: OlderRowsState<T>) => {
     if (loading || from.cursor === null) return;
@@ -818,7 +824,8 @@ function useOlderLogRows<T extends { id: string; seq?: number }>(
     setLoading(true);
     try {
       const next = await loadOlderRows((before, limit) => fetchPage({ before, limit }), from, logs);
-      if (run === generation.current) setState(next);
+      // A refresh may have refilled the view while the pages were read.
+      if (run === generation.current) setState((prev) => ({ ...next, cleared: prev.cleared && next.cleared }));
     } catch (err) {
       onNotify(`Could not load older rows: ${err instanceof Error ? err.message : String(err)}`, true);
     } finally {
@@ -829,9 +836,10 @@ function useOlderLogRows<T extends { id: string; seq?: number }>(
   const loadOlder = () => read(state);
   const reload = () => read(emptyOlderRows<T>());
 
-  const reset = () => {
+  /** Clear log: drops the loaded pages, and the view is called cleared until rows come back. */
+  const clear = () => {
     generation.current += 1;
-    setState(emptyOlderRows<T>());
+    setState(clearedOlderRows<T>());
   };
 
   return {
@@ -839,10 +847,11 @@ function useOlderLogRows<T extends { id: string; seq?: number }>(
     older: state.older,
     cursor: state.cursor,
     loadedTop: state.loadedTop,
+    cleared: state.cleared,
     loading,
     loadOlder,
     reload,
-    reset,
+    clear,
   };
 }
 
@@ -976,19 +985,15 @@ export function CopilotMcpLogsView({
   const exportCsv = () =>
     exportRows(trafficRouteQuery(filters), (r) => trafficRowMatches(r, filters), trafficLogCsv, 'mcp-traffic-log');
 
-  // Clearing empties only this view until the next refresh, which the toolbar must not call an empty log.
-  const [cleared, setCleared] = useState(false);
-  React.useEffect(() => {
-    if (logs.length > 0) setCleared(false);
-  }, [logs]);
-
+  // Clearing empties only this view until the next refresh or Load older refills it, which the
+  // toolbar must not call an empty log.
   const clearLogs = async () => {
-    history.reset();
-    setCleared(true);
+    history.clear();
     await onClearLogs();
   };
 
   const kinds = trafficLogKinds(caps);
+  const cleared = history.cleared;
   const gap = !cleared && heldLogGaps({ overview: logs, loadedTop: history.loadedTop, kinds }).length > 0;
   const heldText = cleared
     ? 'view cleared until the next refresh'
