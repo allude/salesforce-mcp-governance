@@ -108,6 +108,11 @@ export function validateSalesforceInstanceUrl(rawUrl: string): string {
   if (parsed.username || parsed.password) {
     throw new Error('Salesforce instance URL must not contain credentials');
   }
+  // Salesforce serves on 443 only (which URL parsing drops); another port on an allowed host could
+  // only hang or reach something that is not Salesforce.
+  if (parsed.port) {
+    throw new Error('Salesforce instance URL must not name a port other than 443');
+  }
 
   const host = parsed.hostname.toLowerCase();
   // URL parsing keeps characters such as `"` and `%` in hosts; the origin is later written into

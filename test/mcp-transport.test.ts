@@ -614,6 +614,9 @@ test('SSRF guard: an X-Salesforce-Instance-Url outside Salesforce is refused wit
     'https://evil.example.com',
     'https://login.salesforce.com.evil.com',
     'https://user:pass@acme.my.salesforce.com',
+    // An allowed host on another port could only hang until the timeout, or reach something else.
+    'https://login.salesforce.com:1',
+    'https://acme.my.salesforce.com:8443',
   ];
 
   for (const hint of hostileHints) {
