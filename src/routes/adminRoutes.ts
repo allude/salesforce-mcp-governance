@@ -380,10 +380,12 @@ adminRouter.use((req: Request, res: Response, next: NextFunction) => {
   requireAdminAuth(req, res, next).catch(next);
 });
 
-// Each list holds up to this many rows of ordinary traffic, plus its own smaller allowance of simulated
-// rows, merged newest first. Simulated rows are told apart by `simulated` or the SIMULATE_MCP_CALL action.
+// Each list holds up to this many rows of ordinary traffic, plus its own smaller allowances of simulated
+// rows and (MCP only) rejected-token rows, merged newest first. Simulated rows are told apart by
+// `simulated` or the SIMULATE_MCP_CALL action, rejected tokens by the unverified_caller user.
 const OVERVIEW_LOG_ROWS = 150;
 const OVERVIEW_SIMULATED_LOG_ROWS = 50;
+const OVERVIEW_REJECTED_LOG_ROWS = 50;
 
 /**
  * GET /api/admin/overview
@@ -393,7 +395,11 @@ adminRouter.get('/overview', (_req: Request, res: Response) => {
   const objects = store.getObjects();
   const groups = store.getGroups();
   const profileGroupMappings = store.getProfileGroupMappings();
-  const copilotLogs = store.getCopilotMcpLogsCappedByKind(OVERVIEW_LOG_ROWS, OVERVIEW_SIMULATED_LOG_ROWS);
+  const copilotLogs = store.getCopilotMcpLogsCappedByKind(
+    OVERVIEW_LOG_ROWS,
+    OVERVIEW_SIMULATED_LOG_ROWS,
+    OVERVIEW_REJECTED_LOG_ROWS
+  );
   const portalLogs = store.getPortalAdminLogsCappedByKind(OVERVIEW_LOG_ROWS, OVERVIEW_SIMULATED_LOG_ROWS);
   const okta = store.getOktaConfig();
   const sfSettings = store.getSalesforceSettings();

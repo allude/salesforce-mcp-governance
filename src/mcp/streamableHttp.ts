@@ -3,7 +3,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { resolveSalesforceUserFromToken, salesforceAuthorizationBase } from '../salesforce/client.js';
 import { createUserScopedMcpServer } from './server.js';
 import { config } from '../config.js';
-import { store } from '../db/store.js';
+import { store, UNVERIFIED_CALLER_USERNAME } from '../db/store.js';
 
 /** Keeps reflected error text header-safe: printable ASCII only, no quotes or backslashes. */
 export function toHeaderSafe(text: string): string {
@@ -45,7 +45,7 @@ export async function handleMcpStreamableHttpRequest(
     );
   } catch (err: any) {
     store.recordCopilotMcpLog({
-      sfUsername: 'unverified_caller',
+      sfUsername: UNVERIFIED_CALLER_USERNAME,
       profileId: 'unverified',
       profileName: 'Unverified Token',
       matchedGroups: [],

@@ -519,6 +519,9 @@ initializeSystemSingletons();
 /** The portal admin log action written once per policy simulation. */
 export const SIMULATE_MCP_CALL_ACTION = 'SIMULATE_MCP_CALL';
 
+/** The MCP log user for a bearer token that failed verification, so the caller is unknown. */
+export const UNVERIFIED_CALLER_USERNAME = 'unverified_caller';
+
 function toCopilotMcpLogRecord(r: any): CopilotMcpLogRecord {
   return {
     id: r.id,
@@ -1753,22 +1756,33 @@ export const store = {
   },
 
   /**
-   * Newest first, with real and simulated rows capped separately so a run of simulator calls cannot
-   * push real calls out of what the portal can see. Every row stays in the table.
+   * Newest first, with verified calls, simulated calls and rejected tokens capped separately, so
+   * neither simulator runs nor junk bearer tokens (which anyone can send) can push verified calls out
+   * of what the portal can see. Every row stays in the table.
    */
-  getCopilotMcpLogsCappedByKind(realLimit: number, simulatedLimit: number): CopilotMcpLogRecord[] {
+  getCopilotMcpLogsCappedByKind(
+    realLimit: number,
+    simulatedLimit: number,
+    rejectedLimit: number
+  ): CopilotMcpLogRecord[] {
     const rows = db
       .prepare(
         `SELECT * FROM (
-           SELECT rowid AS seq, * FROM mcp_copilot_logs WHERE simulated = 0 ORDER BY rowid DESC LIMIT ?
+           SELECT rowid AS seq, * FROM mcp_copilot_logs
+           WHERE simulated = 0 AND sf_username <> :unverified ORDER BY rowid DESC LIMIT :realLimit
          )
          UNION ALL
          SELECT * FROM (
-           SELECT rowid AS seq, * FROM mcp_copilot_logs WHERE simulated <> 0 ORDER BY rowid DESC LIMIT ?
+           SELECT rowid AS seq, * FROM mcp_copilot_logs WHERE simulated <> 0 ORDER BY rowid DESC LIMIT :simulatedLimit
+         )
+         UNION ALL
+         SELECT * FROM (
+           SELECT rowid AS seq, * FROM mcp_copilot_logs
+           WHERE simulated = 0 AND sf_username = :unverified ORDER BY rowid DESC LIMIT :rejectedLimit
          )
          ORDER BY seq DESC`
       )
-      .all(realLimit, simulatedLimit) as any[];
+      .all({ unverified: UNVERIFIED_CALLER_USERNAME, realLimit, simulatedLimit, rejectedLimit }) as any[];
     return rows.map(toCopilotMcpLogRecord);
   },
 
@@ -1796,10 +1810,10 @@ export const store = {
     const row = db
       .prepare(
         `SELECT timestamp FROM mcp_copilot_logs
-         WHERE simulated = 0 AND sf_username <> 'unverified_caller'
+         WHERE simulated = 0 AND sf_username <> ?
          ORDER BY rowid DESC LIMIT 1`
       )
-      .get() as { timestamp: string } | undefined;
+      .get(UNVERIFIED_CALLER_USERNAME) as { timestamp: string } | undefined;
     return row?.timestamp ?? null;
   },
 

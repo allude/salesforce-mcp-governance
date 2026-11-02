@@ -3,7 +3,7 @@ import './helpers/env.js';
 // portal shows, while every row stays stored. This file's fresh database makes the counts exact.
 import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { store } from '../src/db/store.js';
+import { store, UNVERIFIED_CALLER_USERNAME } from '../src/db/store.js';
 import { startTestServer, loginAsAdmin, adminFetch, type AdminSession, type TestServer } from './helpers/server.js';
 import { realTraffic } from '../src/components/views/simulatedTraffic.js';
 import { trafficChartSubtitle } from '../src/components/views/trafficChart.js';
@@ -36,6 +36,21 @@ const logCall = (sfUsername: string, status: 'ALLOWED' | 'DENIED', simulated: bo
     rawRequestPayload: {},
     rawResponseSummary: {},
     simulated,
+  });
+
+// The same fields /mcp writes when a bearer token fails verification.
+const logRejectedToken = () =>
+  store.recordCopilotMcpLog({
+    sfUsername: UNVERIFIED_CALLER_USERNAME,
+    profileId: 'unverified',
+    profileName: 'Unverified Token',
+    matchedGroups: [],
+    toolName: 'mcp_authenticate',
+    targetObject: '*',
+    status: 'DENIED',
+    latencyMs: 1,
+    rawRequestPayload: { method: 'tools/list' },
+    rawResponseSummary: { error: 'Token validation failed' },
   });
 
 const logAudit = (action: string) =>
@@ -97,6 +112,28 @@ describe('MCP rows in /overview', () => {
         ['DENIED', false],
         ['ALLOWED', true],
       ]
+    );
+  });
+
+  test('a verified call survives a flood of rejected-token rows, which have their own smaller cap', async () => {
+    const verified = logCall('real.user@acme.com', 'DENIED', false);
+    const rejected = Array.from({ length: 151 }, () => logRejectedToken());
+
+    const { copilotLogs } = await overview();
+    assert.ok(copilotLogs.some((r: any) => r.id === verified.id), 'expected the verified call to stay visible');
+    assert.ok(trafficLogCsv(copilotLogs).includes(verified.id));
+
+    const shownRejected = copilotLogs.filter((r: any) => r.sfUsername === UNVERIFIED_CALLER_USERNAME);
+    assert.deepEqual(
+      shownRejected.map((r: any) => r.id),
+      rejected.slice(-50).reverse().map((r) => r.id),
+      'the newest 50 rejected-token rows are kept, newest first'
+    );
+    assert.equal(copilotLogs.filter((r: any) => !r.simulated && r.sfUsername !== UNVERIFIED_CALLER_USERNAME).length, 150);
+    assert.equal(
+      store.getCopilotMcpLogs(1_000_000).filter((r) => r.sfUsername === UNVERIFIED_CALLER_USERNAME).length,
+      151,
+      'capping the list must not remove rows'
     );
   });
 });
