@@ -63,7 +63,15 @@ function rpc(
   params: Record<string, unknown> = {},
   headers: Record<string, string> = {}
 ) {
-  return mcpRequest(h.server.baseUrl, token, method, params, { 'X-Forwarded-For': CLIENT_IP, ...headers });
+  return mcpRequest(h.server.baseUrl, token, method, params, { 'X-Forwarded-For': nextClientIp(), ...headers });
+}
+
+// /mcp also limits rejected tokens to 30 a minute per client IP, and this file sends far more than
+// that on purpose, so each rpc() call comes from its own address and no test inherits another's count.
+let clientIpCounter = 0;
+function nextClientIp(): string {
+  clientIpCounter += 1;
+  return `198.18.${(clientIpCounter >> 8) & 255}.${clientIpCounter & 255}`;
 }
 
 function toolNames(body: any): string[] {

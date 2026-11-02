@@ -1,6 +1,8 @@
 import { Request, Response } from 'express';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { resolveSalesforceUserFromToken, salesforceAuthorizationBase } from '../salesforce/client.js';
+import { forgetVerifiedToken, resolveSalesforceUserFromToken, salesforceAuthorizationBase } from '../salesforce/client.js';
+import { VerificationBusyError } from '../salesforce/verificationGate.js';
+import { parseBearerToken } from './bearer.js';
 import { createUserScopedMcpServer } from './server.js';
 import { config } from '../config.js';
 import { store, UNVERIFIED_CALLER_USERNAME } from '../db/store.js';
@@ -14,8 +16,8 @@ export async function handleMcpStreamableHttpRequest(
   req: Request,
   res: Response
 ): Promise<void> {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.toLowerCase().startsWith('bearer ')) {
+  const bearerToken = parseBearerToken(req.headers.authorization);
+  if (!bearerToken) {
     const authUrl = salesforceAuthorizationBase();
     res.setHeader(
       'WWW-Authenticate',
@@ -32,7 +34,6 @@ export async function handleMcpStreamableHttpRequest(
     return;
   }
 
-  const bearerToken = authHeader.slice(7).trim();
   const instanceUrlHint = req.headers['x-salesforce-instance-url'] as
     | string
     | undefined;
@@ -44,6 +45,13 @@ export async function handleMcpStreamableHttpRequest(
       instanceUrlHint
     );
   } catch (err: any) {
+    // Capacity, not a verdict on the token: no log row, and the client keeps its token and retries.
+    if (err instanceof VerificationBusyError) {
+      res.setHeader('Retry-After', '5');
+      res.status(503).json({ jsonrpc: '2.0', error: { code: -32000, message: err.message }, id: null });
+      return;
+    }
+    forgetVerifiedToken(bearerToken);
     store.recordCopilotMcpLog({
       sfUsername: UNVERIFIED_CALLER_USERNAME,
       profileId: 'unverified',

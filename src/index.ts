@@ -16,6 +16,9 @@ import {
 } from './security/adminAuth.js';
 import { adminRouter, recordObjectSyncFailure } from './routes/adminRoutes.js';
 import { hashToken } from './security/crypto.js';
+import { clientIpsAreDistinguishable, rateLimitIpKey } from './security/clientIp.js';
+import { createFailureWindow } from './security/failureWindow.js';
+import { parseBearerToken } from './mcp/bearer.js';
 
 export const app = express();
 
@@ -90,6 +93,7 @@ const authLimiter = rateLimit({
   max: 60,
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: (req: Request) => rateLimitIpKey(req.ip),
   message: { error: 'Too many authentication attempts, please try again later.' },
 });
 
@@ -100,6 +104,7 @@ const loginLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   skipSuccessfulRequests: true,
+  keyGenerator: (req: Request) => rateLimitIpKey(req.ip),
   message: { error: 'Too many authentication attempts, please try again later.' },
 });
 
@@ -127,15 +132,10 @@ const adminApiLimiter = rateLimit({
   legacyHeaders: false,
   keyGenerator: (req: Request) => {
     const session = req.cookies?.sf_mcp_admin_session;
-    return typeof session === 'string' && session ? `session:${hashToken(session)}` : `ip:${req.ip}`;
+    return typeof session === 'string' && session ? `session:${hashToken(session)}` : `ip:${rateLimitIpKey(req.ip)}`;
   },
   message: { error: 'Too many requests, please slow down.' },
 });
-
-function bearerTokenOf(req: Request): string {
-  const auth = req.headers.authorization;
-  return typeof auth === 'string' && /^bearer\s+/i.test(auth) ? auth.replace(/^bearer\s+/i, '').trim() : '';
-}
 
 const mcpLimiter = rateLimit({
   windowMs: 1 * 60 * 1000,
@@ -143,35 +143,43 @@ const mcpLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req: Request) => {
-    const token = bearerTokenOf(req);
-    return token ? `token:${hashToken(token)}` : `ip:${req.ip}`;
+    const token = parseBearerToken(req.headers.authorization);
+    return token ? `token:${hashToken(token)}` : `ip:${rateLimitIpKey(req.ip)}`;
   },
 });
 
 // mcpLimiter gives every token its own bucket, so a client sending a new junk token each time was
-// never limited, and each one cost a Salesforce userinfo call and a log row. Rejected tokens are
-// therefore also counted per client IP; only 401 answers count. Requests with no token are left to
-// mcpLimiter's IP bucket (they reach no one), and a token that verified within the last hour is
-// exempt, so a flood from a shared IP cannot lock out callers already signed in. Behind the portal
-// proxy without TRUST_PROXY every caller shares one IP, so a flood can still delay new tokens.
-const mcpFailedTokenLimiter = rateLimit({
-  windowMs: 1 * 60 * 1000,
-  max: 30,
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req: Request) => `failed-token-ip:${req.ip}`,
-  skip: (req: Request) => {
-    const token = bearerTokenOf(req);
-    return !token || wasTokenRecentlyVerified(token);
-  },
-  skipSuccessfulRequests: true,
-  requestWasSuccessful: (_req: Request, res: Response) => res.statusCode !== 401,
-  message: {
-    jsonrpc: '2.0',
-    error: { code: -32001, message: 'Too many rejected tokens from this client, please try again later.' },
-    id: null,
-  },
-});
+// never limited by it. Rejected tokens are also counted per client IP, 30 a minute, but only where
+// req.ip tells clients apart (TRUST_PROXY set, or direct connections). Behind the portal proxy
+// without TRUST_PROXY every caller has the same IP, so that count would be one limit anyone could
+// use up and lock out every new sign-in; there the cost is bounded instead by the rejected-token
+// cache and the verification gate in salesforce/client.ts. A request is counted only once it has
+// been answered 401, and a token that verified within the last hour is never refused here.
+const REJECTED_TOKEN_LIMIT = 30;
+const rejectedTokenWindow = createFailureWindow({ windowMs: 60 * 1000, max: REJECTED_TOKEN_LIMIT, maxKeys: 10_000 });
+
+function mcpRejectedTokenLimiter(req: Request, res: Response, next: NextFunction): void {
+  const token = parseBearerToken(req.headers.authorization);
+  if (!token || wasTokenRecentlyVerified(token) || !clientIpsAreDistinguishable(req, config.trustProxy)) {
+    next();
+    return;
+  }
+  const key = rateLimitIpKey(req.ip);
+  const retryAfter = rejectedTokenWindow.retryAfterSeconds(key);
+  if (retryAfter > 0) {
+    res.setHeader('Retry-After', String(retryAfter));
+    res.status(429).json({
+      jsonrpc: '2.0',
+      error: { code: -32001, message: 'Too many rejected tokens from this client, please try again later.' },
+      id: null,
+    });
+    return;
+  }
+  res.on('finish', () => {
+    if (res.statusCode === 401) rejectedTokenWindow.record(key);
+  });
+  next();
+}
 
 // 3. RFC 9728 OAuth 2.0 Protected Resource Metadata (For MCP OAuth Discovery & Copilot Studio)
 app.get('/.well-known/oauth-protected-resource', (_req, res) => {
@@ -195,7 +203,7 @@ app.get('/healthz', (_req, res) => {
 });
 
 // 4. Streamable HTTP MCP Endpoint (POST, GET, DELETE /mcp; mcpCors above answers OPTIONS preflights)
-app.all('/mcp', mcpLimiter, mcpFailedTokenLimiter, (req: Request, res: Response, next: NextFunction) => {
+app.all('/mcp', mcpLimiter, mcpRejectedTokenLimiter, (req: Request, res: Response, next: NextFunction) => {
   handleMcpStreamableHttpRequest(req, res).catch(next);
 });
 

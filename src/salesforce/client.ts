@@ -4,6 +4,8 @@ import { store } from '../db/store.js';
 import { hashToken, timingSafeStringEqual } from '../security/crypto.js';
 import { salesforceIdsMatch } from './ids.js';
 import { assertNotSimulatedOrgHost } from './simulatedOrg.js';
+import { createVerificationGate } from './verificationGate.js';
+import { isPlausibleBearerToken } from '../mcp/bearer.js';
 
 export interface VerifiedSalesforceUser {
   userId: string;
@@ -34,6 +36,14 @@ const CACHE_MAX_ENTRIES = 5000;
 // while someone floods the same client IP with bad tokens. It never skips verification itself.
 const recentlyVerifiedTokens = new Map<string, number>();
 const RECENTLY_VERIFIED_TTL_MS = 60 * 60 * 1000;
+
+// Tokens Salesforce answered 401 for, keyed by token hash and the host asked, so repeating a junk
+// token costs nothing. Only a definite 401 is remembered; a 5xx or a timeout may pass.
+const recentlyRejectedTokens = new Map<string, number>();
+const RECENTLY_REJECTED_TTL_MS = 5 * 60 * 1000;
+
+const VERIFICATION_TIMEOUT_MS = 10 * 1000;
+const verificationGate = createVerificationGate({ maxConcurrent: 8, maxQueued: 100, maxWaitMs: 10 * 1000 });
 
 const SIMULATOR_TOKEN_PREFIX = 'sf_sim_';
 const SIMULATOR_TOKEN_TTL_SECONDS = 15 * 60;
@@ -122,28 +132,57 @@ function cacheIdentity(tokenHash: string, entry: CachedIdentity): void {
   identityCache.set(tokenHash, entry);
 }
 
-function rememberVerifiedToken(tokenHash: string): void {
+/** Sets `key` to expire after `ttlMs`, evicting expired and then oldest entries at the size cap. */
+function rememberUntil(entries: Map<string, number>, key: string, ttlMs: number): void {
   const now = Date.now();
-  if (!recentlyVerifiedTokens.has(tokenHash) && recentlyVerifiedTokens.size >= CACHE_MAX_ENTRIES) {
-    for (const [key, expiresAt] of recentlyVerifiedTokens) {
-      if (expiresAt <= now) recentlyVerifiedTokens.delete(key);
+  if (!entries.has(key) && entries.size >= CACHE_MAX_ENTRIES) {
+    for (const [k, expiresAt] of entries) {
+      if (expiresAt <= now) entries.delete(k);
     }
-    while (recentlyVerifiedTokens.size >= CACHE_MAX_ENTRIES) {
-      const oldest = recentlyVerifiedTokens.keys().next().value;
+    while (entries.size >= CACHE_MAX_ENTRIES) {
+      const oldest = entries.keys().next().value;
       if (oldest === undefined) break;
-      recentlyVerifiedTokens.delete(oldest);
+      entries.delete(oldest);
     }
   }
   // Delete first so a refreshed entry moves to the end and is evicted last.
-  recentlyVerifiedTokens.delete(tokenHash);
-  recentlyVerifiedTokens.set(tokenHash, now + RECENTLY_VERIFIED_TTL_MS);
+  entries.delete(key);
+  entries.set(key, now + ttlMs);
 }
+
+const isLive = (entries: Map<string, number>, key: string) => {
+  const expiresAt = entries.get(key);
+  return expiresAt !== undefined && expiresAt > Date.now();
+};
+
+function rememberVerifiedToken(tokenHash: string): void {
+  rememberUntil(recentlyVerifiedTokens, tokenHash, RECENTLY_VERIFIED_TTL_MS);
+}
+
+const wasHashRecentlyVerified = (tokenHash: string) => isLive(recentlyVerifiedTokens, tokenHash);
+
+function rememberRejectedToken(rejectionKey: string): void {
+  rememberUntil(recentlyRejectedTokens, rejectionKey, RECENTLY_REJECTED_TTL_MS);
+}
+
+const wasRecentlyRejected = (rejectionKey: string) => isLive(recentlyRejectedTokens, rejectionKey);
 
 /** True when this exact bearer token passed verification within the last hour. */
 export function wasTokenRecentlyVerified(bearerToken: string): boolean {
-  if (!bearerToken) return false;
-  const expiresAt = recentlyVerifiedTokens.get(hashToken(bearerToken));
-  return expiresAt !== undefined && expiresAt > Date.now();
+  return Boolean(bearerToken) && wasHashRecentlyVerified(hashToken(bearerToken));
+}
+
+/** Verifications running and waiting at the gate, for tests and diagnostics. */
+export function verificationGateStats(): { active: number; queued: number } {
+  return verificationGate.stats();
+}
+
+/**
+ * Ends a token's exemption once it fails verification, so a token that verified once (and was
+ * later revoked, or is sent with a hint where it is not valid) counts as rejected again.
+ */
+export function forgetVerifiedToken(bearerToken: string): void {
+  if (bearerToken) recentlyVerifiedTokens.delete(hashToken(bearerToken));
 }
 
 /**
@@ -168,6 +207,10 @@ export async function resolveSalesforceUserFromToken(
     return simulatedUser;
   }
 
+  if (!isPlausibleBearerToken(bearerToken)) {
+    throw new Error('Malformed Salesforce Bearer token');
+  }
+
   // The caller's real token goes to the hint on a cache miss, and the allowlist alone admits the simulated host.
   if (instanceUrlHint) assertNotSimulatedOrgHost(instanceUrlHint, 'Salesforce instance URL');
 
@@ -190,6 +233,31 @@ export async function resolveSalesforceUserFromToken(
   const fallbackInstanceUrl = validateSalesforceInstanceUrl(sfSettings.instanceUrl || baseLoginUrl);
   assertNotSimulatedOrgHost(fallbackInstanceUrl, 'Salesforce instance URL');
 
+  const rejectionKey = `${tokenHash}|${baseLoginUrl}`;
+  if (wasRecentlyRejected(rejectionKey)) {
+    throw new Error('Salesforce token verification failed (HTTP 401)');
+  }
+
+  return verificationGate.run(wasHashRecentlyVerified(tokenHash), async () => {
+    // Another request with this token may have finished verifying while this one waited.
+    const verifiedMeanwhile = identityCache.get(tokenHash);
+    if (verifiedMeanwhile && verifiedMeanwhile.expiresAt > Date.now()) {
+      enforceOrgIdLock(verifiedMeanwhile.user.organizationId);
+      rememberVerifiedToken(tokenHash);
+      return { ...verifiedMeanwhile.user, accessToken: bearerToken };
+    }
+    return verifyWithSalesforce(bearerToken, tokenHash, rejectionKey, baseLoginUrl, fallbackInstanceUrl, sfSettings.apiVersion);
+  });
+}
+
+async function verifyWithSalesforce(
+  bearerToken: string,
+  tokenHash: string,
+  rejectionKey: string,
+  baseLoginUrl: string,
+  fallbackInstanceUrl: string,
+  storedApiVersion: string
+): Promise<VerifiedSalesforceUser> {
   // 2. Call Salesforce OIDC /services/oauth2/userinfo to verify token & get user_id + custom_domain
   const userInfoRes = await fetch(`${baseLoginUrl}/services/oauth2/userinfo`, {
     method: 'GET',
@@ -197,9 +265,12 @@ export async function resolveSalesforceUserFromToken(
       Authorization: `Bearer ${bearerToken}`,
       Accept: 'application/json',
     },
+    signal: AbortSignal.timeout(VERIFICATION_TIMEOUT_MS),
   });
 
   if (!userInfoRes.ok) {
+    // Only a 401 says the token itself is invalid; other statuses may be passing faults.
+    if (userInfoRes.status === 401) rememberRejectedToken(rejectionKey);
     throw new Error(`Salesforce token verification failed (HTTP ${userInfoRes.status})`);
   }
 
@@ -223,7 +294,7 @@ export async function resolveSalesforceUserFromToken(
   assertNotSimulatedOrgHost(instanceUrl, 'Salesforce instance URL');
 
   // 3. Query the User's ProfileId and Profile.Name via Salesforce REST API
-  const apiVersion = sfSettings.apiVersion || config.salesforce.apiVersion;
+  const apiVersion = storedApiVersion || config.salesforce.apiVersion;
   const soql = `SELECT Id, Username, Name, Email, ProfileId, Profile.Name FROM User WHERE Id = '${escapeSoqlString(userId)}' LIMIT 1`;
   const queryRes = await fetch(
     `${instanceUrl}/services/data/${apiVersion}/query?q=${encodeURIComponent(soql)}`,
@@ -232,6 +303,7 @@ export async function resolveSalesforceUserFromToken(
         Authorization: `Bearer ${bearerToken}`,
         Accept: 'application/json',
       },
+      signal: AbortSignal.timeout(VERIFICATION_TIMEOUT_MS),
     }
   );
 

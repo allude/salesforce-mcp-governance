@@ -1,5 +1,5 @@
 import './helpers/env.js';
-// Covers the /mcp limit on rejected bearer tokens in src/index.ts (mcpFailedTokenLimiter) and the
+// Covers the /mcp limit on rejected bearer tokens in src/index.ts (mcpRejectedTokenLimiter) and the
 // recently-verified exemption it reads from src/salesforce/client.ts. Each test sends from its own
 // forwarded client address (the test env trusts X-Forwarded-For from loopback), so buckets never mix.
 import { after, before, beforeEach, describe, test } from 'node:test';
