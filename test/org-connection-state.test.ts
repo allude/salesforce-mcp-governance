@@ -3,7 +3,10 @@ import './helpers/env.js';
 // what a failed connect leaves behind, when a connection stops counting as verified, and the audit trail.
 import { after, afterEach, before, beforeEach, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { config } from '../src/config.js';
 import { repairConnectInstanceUrls, store } from '../src/db/store.js';
@@ -289,13 +292,20 @@ describe('the instance URL MCP uses to verify tokens', () => {
     assert.equal(settings.instanceUrl, settings.loginUrl);
   });
 
-  test('upgrading leaves a real org on the same host alone', () => {
-    store.updateSalesforceSettings({ authMode: 'jwt_bearer', connectionStatus: 'connected', connectedOrgId: ORG_ID });
-    setRawInstanceUrl(SIMULATED_ORG_INSTANCE_URL);
+  test('upgrading removes the simulated host even from a row a real org reports connecting on', () => {
+    // A real connect can no longer produce this host, and no real token may reach it, so the row's
+    // real Org ID is no reason to keep it as the MCP host.
+    for (const written of [SIMULATED_ORG_INSTANCE_URL, ...SIMULATED_HOST_VARIANTS]) {
+      store.updateSalesforceSettings({ authMode: 'jwt_bearer', connectionStatus: 'connected', connectedOrgId: ORG_ID });
+      setRawInstanceUrl(written);
 
-    repairConnectInstanceUrls();
+      repairConnectInstanceUrls();
 
-    assert.equal(rawInstanceUrl(), SIMULATED_ORG_INSTANCE_URL);
+      assert.equal(rawInstanceUrl(), 'https://login.salesforce.com', written);
+      const settings = store.getSalesforceSettings();
+      assert.equal(settings.connectionStatus, 'connected', written);
+      assert.equal(settings.connectedOrgId, ORG_ID, written);
+    }
   });
 
   test('upgrading removes the simulated host from a jwt_bearer row whose live connect failed', () => {
@@ -393,6 +403,64 @@ describe('the simulated host however it is written', () => {
     assert.equal(res.body.sfSettings.connectionStatus, 'connected');
     assert.equal(res.body.sfSettings.syncInstanceUrl, SIMULATED_ORG_INSTANCE_URL);
     assert.equal(rawInstanceUrl(), MCP_HOST);
+  });
+});
+
+describe('the MCP host when the store starts', () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+  /** Loads the store in a child process, as the server does at startup, with these env values. */
+  function bootStore(dbPath: string, env: Record<string, string> = {}) {
+    execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', "await import('./src/db/store.ts');"], {
+      cwd: repoRoot,
+      env: { ...process.env, DB_PATH: dbPath, ...env },
+      stdio: 'pipe',
+      timeout: 60_000,
+    });
+  }
+
+  function storedHosts(dbPath: string) {
+    const db = new DatabaseSync(dbPath);
+    try {
+      return db.prepare('SELECT instance_url, connection_status, connected_org_id FROM sf_connection_settings WHERE id = 1').get() as {
+        instance_url: string;
+        connection_status: string;
+        connected_org_id: string;
+      };
+    } finally {
+      db.close();
+    }
+  }
+
+  const freshDbPath = () => path.join(path.dirname(process.env.DB_PATH as string), `boot-${uid()}.sqlite`);
+
+  for (const written of [SIMULATED_ORG_INSTANCE_URL, SIMULATED_HOST_VARIANTS[0]]) {
+    test(`a fresh database seeded from SALESFORCE_LOGIN_URL=${written} does not keep it as the MCP host`, () => {
+      const dbPath = freshDbPath();
+      bootStore(dbPath, { SALESFORCE_LOGIN_URL: written });
+      assert.equal(storedHosts(dbPath).instance_url, 'https://login.salesforce.com');
+    });
+  }
+
+  test('a database a real org connected on with the simulated host saved is repaired at startup', () => {
+    const dbPath = freshDbPath();
+    bootStore(dbPath);
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.prepare(
+        `UPDATE sf_connection_settings SET instance_url = ?, auth_mode = 'jwt_bearer', connection_status = 'connected', connected_org_id = ? WHERE id = 1`
+      ).run(SIMULATED_HOST_VARIANTS[0], ORG_ID);
+    } finally {
+      db.close();
+    }
+
+    bootStore(dbPath);
+
+    assert.deepEqual({ ...storedHosts(dbPath) }, {
+      instance_url: 'https://login.salesforce.com',
+      connection_status: 'connected',
+      connected_org_id: ORG_ID,
+    });
   });
 });
 

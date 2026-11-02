@@ -150,6 +150,12 @@ export async function resolveSalesforceUserFromToken(
   const baseLoginUrl = validateSalesforceInstanceUrl(
     instanceUrlHint || sfSettings.instanceUrl || 'https://login.salesforce.com'
   );
+  // A stored instance URL can name the simulated host too (a database saved before the hostname match,
+  // or SALESFORCE_LOGIN_URL seeded with it), and the allowlist admits it, so both hosts the token may
+  // reach are checked here, before it is sent anywhere.
+  assertNotSimulatedOrgHost(baseLoginUrl, 'Salesforce instance URL');
+  const fallbackInstanceUrl = validateSalesforceInstanceUrl(sfSettings.instanceUrl || baseLoginUrl);
+  assertNotSimulatedOrgHost(fallbackInstanceUrl, 'Salesforce instance URL');
 
   // 2. Call Salesforce OIDC /services/oauth2/userinfo to verify token & get user_id + custom_domain
   const userInfoRes = await fetch(`${baseLoginUrl}/services/oauth2/userinfo`, {
@@ -173,13 +179,15 @@ export async function resolveSalesforceUserFromToken(
   enforceOrgIdLock(orgId);
 
   // Determine the user's REST API instance URL from userinfo urls.custom_domain or urls.rest
-  let instanceUrl = validateSalesforceInstanceUrl(sfSettings.instanceUrl || baseLoginUrl);
+  let instanceUrl = fallbackInstanceUrl;
   if (userInfo.urls?.custom_domain) {
     instanceUrl = validateSalesforceInstanceUrl(userInfo.urls.custom_domain);
   } else if (userInfo.urls?.rest) {
     const restOrigin = new URL(userInfo.urls.rest).origin;
     instanceUrl = validateSalesforceInstanceUrl(restOrigin);
   }
+  // The profile lookup and every later tool call send the token here.
+  assertNotSimulatedOrgHost(instanceUrl, 'Salesforce instance URL');
 
   // 3. Query the User's ProfileId and Profile.Name via Salesforce REST API
   const apiVersion = sfSettings.apiVersion || config.salesforce.apiVersion;

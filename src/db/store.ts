@@ -26,7 +26,7 @@ import {
   validatePrivateKeyPem,
 } from '../salesforce/jwtConnection.js';
 import { salesforceIdKey, salesforceIdsMatch } from '../salesforce/ids.js';
-import { isSimulatedOrgHost, isUninitialisedMcpTokenHost, SIMULATED_ORG_ID } from '../salesforce/simulatedOrg.js';
+import { isSimulatedOrgHost, isUninitialisedMcpTokenHost } from '../salesforce/simulatedOrg.js';
 
 const dbDir = path.dirname(config.dbPath);
 if (!fs.existsSync(dbDir)) {
@@ -389,14 +389,14 @@ function runSchemaMigrations() {
   ensureColumnExists('sf_connection_settings', 'sync_instance_url', "TEXT NOT NULL DEFAULT ''");
 
   addSimulatedColumnAndMarkLegacyRows();
-  repairConnectInstanceUrls();
 }
 
 /**
  * Connect used to write its host into instance_url, which MCP sends bearer tokens to. A connected row
- * keeps showing that host as its sync instance. The simulated host is removed from instance_url unless
- * a real org connected on it, because auth_mode alone does not show that: saving the mode or a failed
- * live connect could leave jwt_bearer on a simulated host. Any other value may be the admin's, so it stays.
+ * keeps showing that host as its sync instance. The simulated host is removed from instance_url whatever
+ * the connection state says: no real token may reach it, and a real connect can no longer produce it, so
+ * a row that names it with a real org ID (an old exact-match guard let the port form through) is no
+ * evidence of a real org there. Any other value may be the admin's, so it stays.
  */
 export function repairConnectInstanceUrls() {
   db.prepare(`
@@ -405,11 +405,9 @@ export function repairConnectInstanceUrls() {
   `).run();
   // Matched in code by hostname, as an exact SQL match missed the host with a port, other case or trailing dot.
   const row = db
-    .prepare('SELECT instance_url, login_url, auth_mode, connected_org_id FROM sf_connection_settings WHERE id = 1')
-    .get() as { instance_url: string; login_url: string; auth_mode: string; connected_org_id: string } | undefined;
+    .prepare('SELECT instance_url, login_url FROM sf_connection_settings WHERE id = 1')
+    .get() as { instance_url: string; login_url: string } | undefined;
   if (!row || !isSimulatedOrgHost(row.instance_url)) return;
-  const connectedOrgId = row.connected_org_id.trim();
-  if (row.auth_mode !== 'simulated' && connectedOrgId !== '' && connectedOrgId !== SIMULATED_ORG_ID) return;
   const replacement = isSimulatedOrgHost(row.login_url) ? 'https://login.salesforce.com' : row.login_url;
   db.prepare('UPDATE sf_connection_settings SET instance_url = ? WHERE id = 1').run(replacement);
 }
@@ -518,6 +516,8 @@ function initializeSystemSingletons() {
 }
 
 initializeSystemSingletons();
+// After the seed, which fills instance_url from SALESFORCE_LOGIN_URL and could write the simulated host.
+repairConnectInstanceUrls();
 
 /** The portal admin log action written once per policy simulation. */
 export const SIMULATE_MCP_CALL_ACTION = 'SIMULATE_MCP_CALL';

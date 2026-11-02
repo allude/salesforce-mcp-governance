@@ -641,6 +641,70 @@ test('an X-Salesforce-Instance-Url naming the simulated org host, however writte
   }
 });
 
+test('a stored instance URL naming the simulated org host, however written, is refused before the token is sent', async (t) => {
+  const h = await startHarness(t);
+  preserveSalesforceSettings(t);
+  const seeded = seedProfile(t, ['list_enabled_objects']);
+  // Written straight to the store, as a database saved before the hostname match, or seeded from
+  // SALESFORCE_LOGIN_URL, could hold it.
+  const stored = [
+    'https://enterprise-org.my.salesforce.com',
+    'https://enterprise-org.my.salesforce.com:8443',
+    'https://ENTERPRISE-ORG.My.Salesforce.com',
+    'https://enterprise-org.my.salesforce.com.',
+  ];
+
+  for (const instanceUrl of stored) {
+    await t.test(`${instanceUrl} with no hint`, async () => {
+      store.updateSalesforceSettings({ instanceUrl });
+      const token = addSalesforceUser(h.sf, { profileId: seeded.profileId, profileName: seeded.profileName });
+      const res = await rpc(h, token, 'tools/list');
+      assert.equal(res.status, 401, JSON.stringify(res.body));
+      assert.ok(challengeOf(res).includes('error="invalid_token"'), challengeOf(res));
+      assert.deepEqual(callsBearing(h.sf, token), [], 'the token was not sent anywhere');
+    });
+
+    await t.test(`${instanceUrl} behind a real hint, as the fallback instance`, async () => {
+      store.updateSalesforceSettings({ instanceUrl });
+      const token = addSalesforceUser(h.sf, { profileId: seeded.profileId, profileName: seeded.profileName });
+      const res = await rpc(h, token, 'tools/list', {}, { 'X-Salesforce-Instance-Url': 'https://acme.my.salesforce.com' });
+      assert.equal(res.status, 401, JSON.stringify(res.body));
+      assert.deepEqual(callsBearing(h.sf, token), [], 'the token was not sent anywhere');
+    });
+
+    await t.test(`${instanceUrl} does not stop a simulator token, which never reaches Salesforce`, async () => {
+      store.updateSalesforceSettings({ instanceUrl });
+      h.sf.reset();
+      const token = createSimulatorToken({ profileId: seeded.profileId, profileName: seeded.profileName });
+      const res = await rpc(h, token, 'tools/list');
+      assert.equal(res.status, 200, JSON.stringify(res.body));
+      assert.deepEqual(toolNames(res.body), ['list_enabled_objects']);
+      assert.deepEqual(h.sf.calls, []);
+    });
+  }
+});
+
+test('a userinfo answer naming the simulated org host as the instance is refused before the profile lookup', async (t) => {
+  const h = await startHarness(t);
+  preserveSalesforceSettings(t);
+  store.updateSalesforceSettings({ instanceUrl: 'https://acme.my.salesforce.com' });
+  const seeded = seedProfile(t, ['list_enabled_objects']);
+  const token = addSalesforceUser(h.sf, {
+    profileId: seeded.profileId,
+    profileName: seeded.profileName,
+    instanceUrl: 'https://enterprise-org.my.salesforce.com:8443',
+  });
+
+  const res = await rpc(h, token, 'tools/list');
+
+  assert.equal(res.status, 401, JSON.stringify(res.body));
+  assert.deepEqual(
+    callsBearing(h.sf, token).map((call) => call.url.origin + call.url.pathname),
+    ['https://acme.my.salesforce.com/services/oauth2/userinfo'],
+    'only the configured host saw the token'
+  );
+});
+
 test('SSRF guard: a Salesforce-domain X-Salesforce-Instance-Url is honoured for the userinfo call', async (t) => {
   const h = await startHarness(t);
   const seeded = seedProfile(t, ['list_enabled_objects']);
