@@ -40,9 +40,14 @@ function derSet(items: Buffer[]): Buffer {
 }
 
 function derInteger(buf: Buffer): Buffer {
+  // DER integers are minimal, and OpenSSL refuses a padded one: about 1 random serial in 512 starts
+  // with a zero byte the next byte does not need, which made certificate generation throw.
+  let start = 0;
+  while (start < buf.length - 1 && buf[start] === 0x00 && (buf[start + 1] & 0x80) === 0) start++;
+  const minimal = buf.subarray(start);
   // Ensure positive integer in two's complement DER
-  const needsLeadingZero = buf.length > 0 && (buf[0] & 0x80) !== 0;
-  const content = needsLeadingZero ? Buffer.concat([Buffer.from([0x00]), buf]) : buf;
+  const needsLeadingZero = minimal.length > 0 && (minimal[0] & 0x80) !== 0;
+  const content = needsLeadingZero ? Buffer.concat([Buffer.from([0x00]), minimal]) : minimal;
   return derTag(0x02, content);
 }
 
