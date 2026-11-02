@@ -24,6 +24,7 @@ import {
   NavViewId,
 } from '@/types/governance';
 import { Card, Badge, Switch } from '@/components/ui/primitives';
+import { useModalDialog } from './useModalDialog';
 import {
   connectionStatusBadge,
   dialogClickCounts,
@@ -91,6 +92,7 @@ export function SalesforceOrgConnectionView({
   // Held from the click, so what Confirm sends always matches the warning on screen.
   const [replaceKeyConfirm, setReplaceKeyConfirm] = useState<ReplaceKeyConfirmation | null>(null);
   const replaceKeyConfirmOpenedAt = useRef(0);
+  const replaceKeyModal = useModalDialog(replaceKeyConfirm !== null, () => setReplaceKeyConfirm(null));
   const [connecting, setConnecting] = useState(false);
   const [saving, setSaving] = useState(false);
   const [copiedCert, setCopiedCert] = useState(false);
@@ -1137,21 +1139,20 @@ export function SalesforceOrgConnectionView({
           className="cmdk-scrim"
           onClick={() => {
             if (dialogClickCounts(replaceKeyConfirmOpenedAt.current, Date.now())) {
-              setReplaceKeyConfirm(null);
+              replaceKeyModal.close();
             }
           }}
         >
           <div
+            ref={replaceKeyModal.dialogRef}
             className="cmdk-box"
             role="alertdialog"
             aria-modal="true"
             aria-labelledby="replace-key-confirm-title"
             aria-describedby="replace-key-confirm-body"
+            tabIndex={-1}
             style={{ maxWidth: 480 }}
             onClick={(e) => e.stopPropagation()}
-            onKeyDown={(e) => {
-              if (e.key === 'Escape') setReplaceKeyConfirm(null);
-            }}
           >
             <div className="card-h">
               <div className="card-t" id="replace-key-confirm-title">
@@ -1175,10 +1176,10 @@ export function SalesforceOrgConnectionView({
                 }}
               >
                 <button
+                  ref={replaceKeyModal.initialFocusRef}
                   type="button"
                   className="btn"
-                  autoFocus
-                  onClick={() => setReplaceKeyConfirm(null)}
+                  onClick={replaceKeyModal.close}
                 >
                   Cancel
                 </button>
@@ -1187,7 +1188,7 @@ export function SalesforceOrgConnectionView({
                   className="btn dng"
                   onClick={() => {
                     if (!dialogClickCounts(replaceKeyConfirmOpenedAt.current, Date.now())) return;
-                    setReplaceKeyConfirm(null);
+                    replaceKeyModal.close();
                     void generateCertBundle(replaceKeyConfirm);
                   }}
                 >

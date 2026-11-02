@@ -39,6 +39,7 @@ import {
 import { CommandPalette } from '@/components/views/CommandPalette';
 import { profileSyncResultMessage } from '@/components/views/profileSyncReview';
 import { mcpActivityStatus } from '@/components/views/mcpActivity';
+import { useModalDialog } from '@/components/views/useModalDialog';
 import { estimateClockOffsetMs } from '@/components/views/trafficChart';
 import { DEFAULT_OVERVIEW_LOG_CAPS, logPageUrl, type OverviewLogCaps } from '@/components/views/logHistory';
 import {
@@ -165,6 +166,7 @@ export default function AdminPortalPage() {
   // Starts off so the burst button cannot show in production before the first overview loads.
   const [devToolsEnabled, setDevToolsEnabled] = useState(false);
   const [seedConfirmOpen, setSeedConfirmOpen] = useState(false);
+  const seedConfirmModal = useModalDialog(seedConfirmOpen, () => setSeedConfirmOpen(false));
 
   const notify = useCallback((msg: string, isError = false) => {
     setToast({ msg, isError });
@@ -1430,18 +1432,17 @@ export default function AdminPortalPage() {
 
       {/* SAMPLE MATRIX CONFIRMATION */}
       {seedConfirmOpen && (
-        <div className="cmdk-scrim" onClick={() => setSeedConfirmOpen(false)}>
+        <div className="cmdk-scrim" onClick={seedConfirmModal.close}>
           <div
+            ref={seedConfirmModal.dialogRef}
             className="cmdk-box"
             role="alertdialog"
             aria-modal="true"
             aria-labelledby="seed-confirm-title"
             aria-describedby="seed-confirm-body"
+            tabIndex={-1}
             style={{ maxWidth: 480 }}
             onClick={(e) => e.stopPropagation()}
-            onKeyDown={(e) => {
-              if (e.key === 'Escape') setSeedConfirmOpen(false);
-            }}
           >
             <div className="card-h">
               <div className="card-t" id="seed-confirm-title">
@@ -1461,10 +1462,10 @@ export default function AdminPortalPage() {
                 }}
               >
                 <button
+                  ref={seedConfirmModal.initialFocusRef}
                   type="button"
                   className="btn"
-                  autoFocus
-                  onClick={() => setSeedConfirmOpen(false)}
+                  onClick={seedConfirmModal.close}
                 >
                   Cancel
                 </button>
@@ -1472,7 +1473,7 @@ export default function AdminPortalPage() {
                   type="button"
                   className="btn dng"
                   onClick={() => {
-                    setSeedConfirmOpen(false);
+                    seedConfirmModal.close();
                     void reportFailureAndStop(handleSeedEnterpriseMatrix)();
                   }}
                 >
