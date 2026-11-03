@@ -40,6 +40,7 @@ import {
   type OverviewLogCaps,
 } from './logHistory';
 import { trafficBuckets, trafficChartSubtitle, type TrafficRange } from './trafficChart';
+import { SUCCESS_RATE_TARGET, successRate } from './dashboardFigures';
 
 // ============================================================================
 // 1. DASHBOARD VIEW
@@ -107,9 +108,7 @@ export function TrafficDashboardView({
   const errorCalls =
     mcpStats?.erroredMcpRequests ??
     realLogs.filter((l) => l.status === 'ERROR').length;
-  const successRate = totalCalls
-    ? ((allowedCalls / totalCalls) * 100).toFixed(1)
-    : '100.0';
+  const success = successRate(totalCalls, errorCalls);
 
   const sortedLatencies = useMemo(
     () =>
@@ -266,12 +265,13 @@ export function TrafficDashboardView({
         <div className="kpi">
           <div className="k-lbl">
             <span>Success rate</span>
-            <span className="dot ok" />
+            <span className={`dot ${success.meetsTarget ? 'ok' : 'err'}`} />
           </div>
-          <div className="k-val">{successRate}%</div>
+          <div className="k-val">{success.label}%</div>
           <div className="k-sub">
             <span>
-              {errorCalls} transport errors · target ≥ 98.0%
+              {errorCalls} errors · denials are not failures · target ≥{' '}
+              {SUCCESS_RATE_TARGET.toFixed(1)}%
             </span>
           </div>
         </div>
