@@ -22,8 +22,18 @@ describe('successRate', () => {
     assert.equal(successRate(100, 2).meetsTarget, true);
   });
 
-  test('the target is judged before rounding: 97.96% shows as 98.0 but misses', () => {
-    assert.deepEqual(successRate(10_000, 204), { label: '98.0', meetsTarget: false });
+  test('a rate just short of the target never reads as meeting it: 97.96% shows as 97.9', () => {
+    assert.deepEqual(successRate(4901, 100), { label: '97.9', meetsTarget: false });
+    assert.deepEqual(successRate(49, 1), { label: '97.9', meetsTarget: false });
+  });
+
+  test('the target is judged on the counts, and the label rounds down', () => {
+    for (const [total, errors] of [[100, 2], [50, 1], [1000, 20], [7, 0], [3, 1]] as const) {
+      const exact = ((total - errors) * 100) / total;
+      assert.equal(successRate(total, errors).meetsTarget, exact >= 98, `${total}/${errors}`);
+    }
+    assert.equal(successRate(50, 1).label, '98.0');
+    assert.equal(successRate(3, 1).label, '66.6');
   });
 
   test('no calls is 100% and meets the target', () => {
