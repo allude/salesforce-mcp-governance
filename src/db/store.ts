@@ -393,8 +393,62 @@ function runSchemaMigrations() {
   ensureColumnExists('sf_connection_settings', 'sync_instance_url', "TEXT NOT NULL DEFAULT ''");
 
   addSimulatedColumnAndMarkLegacyRows();
-  // Dashboard figures read recent real calls by time; the column must exist first.
-  db.exec('CREATE INDEX IF NOT EXISTS idx_mcp_copilot_logs_real_time ON mcp_copilot_logs (simulated, timestamp)');
+  // The dashboard's 24-hour figures read recent calls by time. The index is on timestamp alone: one
+  // led by `simulated` would take over the `simulated = 0 ... ORDER BY rowid DESC LIMIT n` queries,
+  // which then read and sort every real row instead of stopping after n.
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mcp_copilot_logs_timestamp ON mcp_copilot_logs (timestamp)');
+  addTrafficMinuteRollup();
+}
+
+/** Adds (sign 1) or removes (sign -1) one log row's call to its minute, if it is a real call. */
+function trafficMinuteUpsert(row: 'NEW' | 'OLD', sign: 1 | -1): string {
+  return `INSERT INTO mcp_traffic_minutes (minute, ok, warn, err)
+    SELECT CAST(strftime('%s', ${row}.timestamp) AS INTEGER) / 60,
+           ${sign} * (${row}.status = 'ALLOWED'),
+           ${sign} * (${row}.status = 'DENIED'),
+           ${sign} * (${row}.status NOT IN ('ALLOWED', 'DENIED'))
+    WHERE ${row}.simulated = 0 AND strftime('%s', ${row}.timestamp) IS NOT NULL
+    ON CONFLICT(minute) DO UPDATE SET
+      ok = ok + excluded.ok, warn = warn + excluded.warn, err = err + excluded.err;`;
+}
+
+/**
+ * Real calls counted per minute and outcome, for the dashboard chart, which would otherwise read every
+ * row of the last 7 days on each poll. Triggers keep it in the same transaction as each log write,
+ * from any process. It is created and filled from the existing log in one transaction, so no write
+ * can land between the two.
+ */
+function addTrafficMinuteRollup() {
+  runInTransaction(() => {
+    const exists = db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mcp_traffic_minutes'")
+      .get();
+    if (exists) return;
+    db.exec(`
+      CREATE TABLE mcp_traffic_minutes (
+        minute INTEGER PRIMARY KEY, -- Unix time / 60
+        ok INTEGER NOT NULL DEFAULT 0,
+        warn INTEGER NOT NULL DEFAULT 0,
+        err INTEGER NOT NULL DEFAULT 0
+      );
+
+      INSERT INTO mcp_traffic_minutes (minute, ok, warn, err)
+        SELECT CAST(strftime('%s', timestamp) AS INTEGER) / 60 AS minute,
+               SUM(status = 'ALLOWED'), SUM(status = 'DENIED'), SUM(status NOT IN ('ALLOWED', 'DENIED'))
+        FROM mcp_copilot_logs
+        WHERE simulated = 0 AND strftime('%s', timestamp) IS NOT NULL
+        GROUP BY minute;
+
+      CREATE TRIGGER mcp_traffic_minutes_on_insert AFTER INSERT ON mcp_copilot_logs
+      BEGIN ${trafficMinuteUpsert('NEW', 1)} END;
+
+      CREATE TRIGGER mcp_traffic_minutes_on_delete AFTER DELETE ON mcp_copilot_logs
+      BEGIN ${trafficMinuteUpsert('OLD', -1)} END;
+
+      CREATE TRIGGER mcp_traffic_minutes_on_update AFTER UPDATE OF timestamp, status, simulated ON mcp_copilot_logs
+      BEGIN ${trafficMinuteUpsert('OLD', -1)} ${trafficMinuteUpsert('NEW', 1)} END;
+    `);
+  });
 }
 
 /**
@@ -1956,30 +2010,30 @@ export const store = {
   },
 
   /**
-   * The dashboard chart's counts for each range, read from the table: the /overview list holds only
-   * the newest rows, which cover minutes of a busy day. Every real call counts, rejected tokens
-   * included, as in the totals; simulator runs do not. The window reaches back one extra slice, so the
-   * slice holding its edge is whole, and has no end, so a row ahead of the clock still shows.
+   * The dashboard chart's counts for each range, from the per-minute rollup of the whole log: the
+   * /overview list holds only the newest rows, which cover minutes of a busy day. Every real call
+   * counts, rejected tokens included, as in the totals; simulator runs do not. It starts at the slice
+   * holding (window + one slice) ago, so the slice holding the window's edge is whole, and has no end,
+   * so a row ahead of the clock still shows.
    */
   getCopilotMcpTrafficSeries(nowMs: number): McpTrafficSeries {
     const read = (range: McpTrafficRange) => {
       const { windowMs, sliceMs } = TRAFFIC_SERIES_SHAPE[range];
+      const sliceMinutes = sliceMs / 60_000;
       const rows = db
         .prepare(
           // node:sqlite binds JS numbers as REAL, which would make this a fractional division.
-          `SELECT CAST(strftime('%s', timestamp) AS INTEGER) / CAST(:sliceSec AS INTEGER) AS slice,
-                  SUM(status = 'ALLOWED') AS ok,
-                  SUM(status = 'DENIED') AS warn,
-                  SUM(status NOT IN ('ALLOWED', 'DENIED')) AS err
-           FROM mcp_copilot_logs
-           WHERE simulated = 0 AND timestamp >= :since
+          `SELECT minute / CAST(:sliceMinutes AS INTEGER) AS slice,
+                  SUM(ok) AS ok, SUM(warn) AS warn, SUM(err) AS err
+           FROM mcp_traffic_minutes
+           WHERE minute >= CAST(:firstMinute AS INTEGER)
            GROUP BY slice
-           HAVING slice IS NOT NULL
+           HAVING SUM(ok) + SUM(warn) + SUM(err) > 0
            ORDER BY slice`
         )
         .all({
-          sliceSec: sliceMs / 1000,
-          since: new Date(nowMs - windowMs - sliceMs).toISOString(),
+          sliceMinutes,
+          firstMinute: Math.floor((nowMs - windowMs - sliceMs) / sliceMs) * sliceMinutes,
         }) as Array<{ slice: number; ok: number; warn: number; err: number }>;
       const slices: McpTrafficSlice[] = rows.map((r) => ({
         start: r.slice * sliceMs,

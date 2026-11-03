@@ -212,8 +212,8 @@ describe('getCopilotMcpTrafficSeries', () => {
     logCall('edge@acme.com');
     // An hour and 30 s later the call's 1-minute slice still straddles the 1h window's edge.
     assert.equal(total(store.getCopilotMcpTrafficSeries(now + HOUR + 30_000)['1h']), 1);
-    // A minute past that, the whole slice is outside.
-    assert.equal(total(store.getCopilotMcpTrafficSeries(now + HOUR + MINUTE + 1)['1h']), 0);
+    // Once a whole slice lies between it and the edge, it is no longer sent.
+    assert.equal(total(store.getCopilotMcpTrafficSeries(now + HOUR + 2 * MINUTE)['1h']), 0);
   });
 
   test('a row ahead of the server clock is still sent', () => {
