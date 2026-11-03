@@ -10,6 +10,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { store, UNVERIFIED_CALLER_USERNAME } from '../src/db/store.js';
 import { TrafficDashboardView } from '../src/components/views/DashboardAndLogsViews.js';
 import type { CopilotMcpLogEntry, McpActivityFigures } from '../src/types/governance.js';
+import { formatShortTime } from '../src/components/ui/primitives.js';
 import { startTestServer, loginAsAdmin, adminFetch, type AdminSession, type TestServer } from './helpers/server.js';
 
 const MINUTE = 60_000;
@@ -157,6 +158,7 @@ describe('getCopilotMcpActivityFigures', () => {
     const now = freshSlot();
     assert.deepEqual(store.getCopilotMcpActivityFigures(now), {
       windowHours: 24,
+      asOf: new Date(now).toISOString(),
       verifiedCalls: 0,
       activeUsers: 0,
       activeProfiles: 0,
@@ -248,10 +250,11 @@ describe('the dashboard shows the server figures', () => {
   };
   // Recent denials rightly lists rejected tokens; the two ranking cards come before it.
   const rankings = (html: string) => html.slice(html.indexOf('Most used tools'), html.indexOf('Recent denials'));
-  const render = (mcpActivity: McpActivityFigures | null) =>
+  const VIEW_NOW = Date.parse('2026-11-01T12:00:00.000Z');
+  const render = (mcpActivity: McpActivityFigures | null, clockNow = VIEW_NOW) =>
     renderToStaticMarkup(
       createElement(TrafficDashboardView, {
-        clockNow: Date.parse('2026-11-01T12:00:00.000Z'),
+        clockNow,
         clockOffsetMs: 0,
         mcpActivity,
         copilotLogs: Array.from({ length: 50 }, (_, i) => ({ ...rejected, id: `mcp_${i}` })),
@@ -264,23 +267,35 @@ describe('the dashboard shows the server figures', () => {
       })
     );
 
+  const figures: McpActivityFigures = {
+    windowHours: 24,
+    asOf: new Date(VIEW_NOW).toISOString(),
+    verifiedCalls: 420,
+    activeUsers: 31,
+    activeProfiles: 12,
+    p95LatencyMs: 510,
+    avgLatencyMs: 190,
+    topTools: [{ toolName: 'soql_query', calls: 230 }],
+    topUsers: [{ username: 'priya@acme.com', profileName: 'Enterprise Sales AE', calls: 41 }],
+  };
+
   test('rankings and KPIs come from the figures, not from rejected rows in the list', () => {
-    const html = render({
-      windowHours: 24,
-      verifiedCalls: 420,
-      activeUsers: 31,
-      activeProfiles: 12,
-      p95LatencyMs: 510,
-      avgLatencyMs: 190,
-      topTools: [{ toolName: 'soql_query', calls: 230 }],
-      topUsers: [{ username: 'priya@acme.com', profileName: 'Enterprise Sales AE', calls: 41 }],
-    });
+    const html = render(figures);
     assert.doesNotMatch(rankings(html), /mcp_authenticate|unverified_caller/);
     assert.match(rankings(html), /priya@acme\.com/);
     assert.match(html, /Enterprise Sales AE/);
     assert.match(html, /avg 190 ms · 420 verified calls, last 24 h/);
     assert.match(html, />31</);
     assert.match(html, /across 12 profiles, last 24 h/);
+  });
+
+  test('while live refresh is paused, the figures say when their window ended instead of "last"', () => {
+    const html = render(figures, VIEW_NOW + 3 * HOUR);
+    const end = formatShortTime(figures.asOf);
+    assert.doesNotMatch(html, /last 24 h\b/, "the chart's own \"last 24 hours\" is not one of the figures");
+    assert.ok(html.includes(`420 verified calls, 24 h to ${end}`));
+    assert.ok(html.includes(`across 12 profiles, 24 h to ${end}`));
+    assert.ok(html.includes(`Copilot callers, 24 h to ${end}`));
   });
 
   test('before the server answers, the figures are empty rather than read from the list', () => {

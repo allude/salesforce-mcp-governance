@@ -42,7 +42,7 @@ import {
   type OverviewLogCaps,
 } from './logHistory';
 import { trafficBuckets, trafficChartSubtitle, type TrafficRange } from './trafficChart';
-import { SUCCESS_RATE_TARGET, successRate } from './dashboardFigures';
+import { SUCCESS_RATE_TARGET, activityWindowLabel, successRate } from './dashboardFigures';
 
 // ============================================================================
 // 1. DASHBOARD VIEW
@@ -118,7 +118,7 @@ export function TrafficDashboardView({
     realLogs.filter((l) => l.status === 'ERROR').length;
   const success = successRate(totalCalls, errorCalls);
 
-  const activityWindow = `last ${mcpActivity?.windowHours ?? 24} h`;
+  const activityWindow = activityWindowLabel(mcpActivity, clockNow + clockOffsetMs);
   const verifiedCalls = mcpActivity?.verifiedCalls ?? 0;
   const p95Latency = mcpActivity?.p95LatencyMs ?? 0;
   const avgLatency = mcpActivity?.avgLatencyMs ?? 0;

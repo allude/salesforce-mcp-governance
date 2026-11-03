@@ -1999,6 +1999,7 @@ export const store = {
 
     return {
       windowHours,
+      asOf: new Date(nowMs).toISOString(),
       verifiedCalls: summary.calls,
       activeUsers: summary.users,
       activeProfiles: summary.profiles,

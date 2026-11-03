@@ -5,7 +5,9 @@ import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { SUCCESS_RATE_TARGET, successRate } from '../src/components/views/dashboardFigures.js';
+import { SUCCESS_RATE_TARGET, activityWindowLabel, successRate } from '../src/components/views/dashboardFigures.js';
+import { formatShortTime } from '../src/components/ui/primitives.js';
+import type { McpActivityFigures } from '../src/types/governance.js';
 import { TrafficDashboardView, type McpRequestStats } from '../src/components/views/DashboardAndLogsViews.js';
 
 describe('successRate', () => {
@@ -75,5 +77,25 @@ describe('Success rate KPI', () => {
     );
     assert.match(html, />95\.0%</);
     assert.match(html, /class="dot err"/);
+  });
+});
+
+describe('activityWindowLabel', () => {
+  const asOf = '2026-11-01T12:00:00.000Z';
+  const at = Date.parse(asOf);
+  const figures = { windowHours: 24, asOf } as McpActivityFigures;
+
+  test('fresh figures cover the last 24 h', () => {
+    assert.equal(activityWindowLabel(figures, at), 'last 24 h');
+    assert.equal(activityWindowLabel(figures, at + 2 * 60_000 - 1), 'last 24 h');
+  });
+
+  test('figures two minutes old or more say when their window ended', () => {
+    assert.equal(activityWindowLabel(figures, at + 2 * 60_000), `24 h to ${formatShortTime(asOf)}`);
+  });
+
+  test('with no figures, or an unreadable time, it falls back to the window alone', () => {
+    assert.equal(activityWindowLabel(null, at), 'last 24 h');
+    assert.equal(activityWindowLabel({ ...figures, asOf: 'nope' }, at + 86_400_000), 'last 24 h');
   });
 });

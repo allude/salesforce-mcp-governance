@@ -160,8 +160,9 @@ export interface CopilotMcpLogRecord {
  * runs and rejected tokens are left out: neither is a Copilot user calling a tool.
  */
 export interface McpActivityFigures {
-  /** The window ends at the server's clock when it answered. */
   windowHours: number;
+  /** Where the window ends: the server's clock when it answered. */
+  asOf: string;
   verifiedCalls: number;
   activeUsers: number;
   activeProfiles: number;
