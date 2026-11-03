@@ -81,8 +81,9 @@ describe('Success rate KPI', () => {
 });
 
 describe('activityWindowLabel', () => {
-  const asOf = '2026-11-01T12:00:00.000Z';
-  const at = Date.parse(asOf);
+  // Local noon, so the same-day cases hold in any time zone.
+  const at = new Date(2026, 10, 1, 12, 0, 0).getTime();
+  const asOf = new Date(at).toISOString();
   const figures = { windowHours: 24, asOf } as McpActivityFigures;
 
   test('fresh figures cover the last 24 h', () => {
@@ -92,6 +93,13 @@ describe('activityWindowLabel', () => {
 
   test('figures two minutes old or more say when their window ended', () => {
     assert.equal(activityWindowLabel(figures, at + 2 * 60_000), `24 h to ${formatShortTime(asOf)}`);
+    assert.equal(activityWindowLabel(figures, at + 11 * 3_600_000), `24 h to ${formatShortTime(asOf)}`);
+  });
+
+  test('figures from an earlier day say which day', () => {
+    const day = new Date(at).toLocaleDateString([], { month: 'short', day: 'numeric' });
+    assert.equal(activityWindowLabel(figures, at + 13 * 3_600_000), `24 h to ${day} ${formatShortTime(asOf)}`);
+    assert.equal(activityWindowLabel(figures, at + 3 * 86_400_000), `24 h to ${day} ${formatShortTime(asOf)}`);
   });
 
   test('with no figures, or an unreadable time, it falls back to the window alone', () => {

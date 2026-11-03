@@ -290,7 +290,7 @@ describe('the dashboard shows the server figures', () => {
   });
 
   test('while live refresh is paused, the figures say when their window ended instead of "last"', () => {
-    const html = render(figures, VIEW_NOW + 3 * HOUR);
+    const html = render(figures, VIEW_NOW + 3 * MINUTE);
     const end = formatShortTime(figures.asOf);
     assert.doesNotMatch(html, /last 24 h\b/, "the chart's own \"last 24 hours\" is not one of the figures");
     assert.ok(html.includes(`420 verified calls, 24 h to ${end}`));
