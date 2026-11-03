@@ -50,7 +50,7 @@ Start both services with `npm run dev`. On first start the backend seeds one por
    * **Client ID:** `0oa...`
    * **Client Secret:** `<your-client-secret>` *(encrypted at rest in SQLite with AES-256-GCM, never returned by the API)*
    * **Required Okta Group Claim:** e.g. `MCP-Admins`. Users whose ID token `groups` claim lacks it are denied.
-   * **Redirect URI (optional):** leave empty to use `<BASE_URL>/auth/okta/callback`, which follows `BASE_URL` if it changes. It must match the URI registered in Okta.
+   * **Redirect URI (optional):** leave empty to use `<BASE_URL>/auth/okta/callback`, which follows `BASE_URL` if it changes. It must match the URI registered in Okta. In production the issuer and this URI (or, when it is empty, the `BASE_URL` default) must be `https://`: saving and sign-in are refused otherwise.
 4. Save. Okta sign-in errors (for example a missing group) are shown on the login screen.
 5. Sign out. The login screen now offers **Sign In with Okta SSO** next to the username and password form.
 
@@ -62,11 +62,13 @@ You can also pre-fill these settings from `OKTA_ISSUER`, `OKTA_CLIENT_ID`, `OKTA
 
 Every Copilot user is matched to a Profile registered here by the `ProfileId` of their Salesforce user (15- and 18-character IDs match each other). If no registered ID matches, the user's Profile name is matched instead, so keep Profile names unique. Users whose Profile matches neither get no tools at all.
 
+Pulling Profiles from the org stores each one under its 18-character ID and keeps its Access Group assignments. If an older version left a Profile stored under both forms, the pull merges the rows when that adds no access beyond the row in force, or when only one row has groups, which the review names. If the rows have different groups and merging would add access, both stay unchanged and the review lists them: delete one or give them the same groups, then pull again.
+
 1. Export your Profiles, for example with the Salesforce CLI:
    ```bash
    sf data query --query "SELECT Id, Name FROM Profile ORDER BY Name" --result-format csv --target-org <alias>
    ```
-2. In **Salesforce > Profiles**, click **Upload CSV File** or **Paste CSV**. The format is two columns, `id,name`; a header row is skipped and existing Profiles are updated. You can also add one Profile at a time.
+2. In **Salesforce > Profiles**, click **Upload CSV File** or **Paste CSV**. The format is two columns, `id,name`; a header row is skipped and existing Profiles are updated. A row in either ID form updates the Profile already stored, and an 18-character ID upgrades a stored 15-character one, keeping its Access Groups. You can also add one Profile at a time; **Add profile** refuses an ID already stored, in either form, and names the stored row, which you can open to edit.
 
 ## 4. Importing Objects & Fields
 
@@ -83,5 +85,5 @@ Deleting an Object also removes it from every Access Group, so re-importing it l
    * **Objects:** for each Object, `Read`, `Create`, `Update`, `Delete`, and the **allowed fields**. An Object row with no CRUD box ticked grants nothing, including its fields.
 2. In **Access Matrix > Profile Group Matrix**, assign groups to each Profile. A Profile's permissions are the union of its groups, limited to globally enabled Objects and Fields.
 3. Use the **policy simulator** on the Dashboard to check what a Profile can do with a given tool and object. The underlying API call (`POST /api/admin/test-mcp-access`) also returns a signed 15-minute `simulatorBearerToken` you can use against `/mcp`; calls made with it get simulated Salesforce data and never reach Salesforce.
-4. To lock the server to your org, open **Settings > Portal Login & Okta SSO > Salesforce Connection & Org ID Lock**, enter the expected Org ID (`00D...`) and turn on **Reject tokens from other orgs**. The same card sets the login/instance URL used to verify tokens (it must be inside `SALESFORCE_ALLOWED_DOMAINS`) and the API version.
-5. Watch **Logs > Copilot MCP Traffic (PII Stripped)** for every runtime decision (`ALLOWED`, `DENIED`, `ERROR`), and **Logs > Portal Admin Activity** for every admin change.
+4. To lock the server to your org, open **Org Connection (JWT)**, turn on **Enforce Salesforce Org ID Lock** and enter the expected Org ID (`00D...`). The same page sets the login URL, the API version and the **MCP token host**, which is where MCP verifies users' tokens. The token host must be inside `SALESFORCE_ALLOWED_DOMAINS` and cannot be the simulated org's host. A successful live connect moves it to the connected org's host only while it is blank, `login.salesforce.com` or `test.salesforce.com`, and never replaces a host you set to anything else.
+5. Watch **Logs > Copilot MCP Traffic (PII Stripped)** for every runtime decision (`ALLOWED`, `DENIED`, `ERROR`), and **Logs > Portal Admin Activity** for every admin change. Each view opens with the latest rows of each kind, which its toolbar names (for example `latest 150 calls + latest 50 simulated + latest 50 rejected`), so older rows of one kind can be missing between rows of another; **Load older** below the table reads back through the whole log without gaps. **Export CSV** reads the whole log with the view's filters applied, up to the newest 10,000 matching rows; when that limit cuts an export, the file name ends in `-newest-10000-rows` and the portal says so.

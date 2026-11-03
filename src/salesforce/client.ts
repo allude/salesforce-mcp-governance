@@ -2,6 +2,10 @@ import crypto from 'node:crypto';
 import { config } from '../config.js';
 import { store } from '../db/store.js';
 import { hashToken, timingSafeStringEqual } from '../security/crypto.js';
+import { salesforceIdsMatch } from './ids.js';
+import { assertNotSimulatedOrgHost } from './simulatedOrg.js';
+import { createVerificationGate } from './verificationGate.js';
+import { isPlausibleBearerToken } from '../mcp/bearer.js';
 
 export interface VerifiedSalesforceUser {
   userId: string;
@@ -13,6 +17,8 @@ export interface VerifiedSalesforceUser {
   profileName: string;
   instanceUrl: string;
   accessToken: string;
+  /** Set only by verifySimulatorToken, so it cannot be claimed by a caller. */
+  simulated?: true;
 }
 
 interface CachedIdentity {
@@ -25,8 +31,62 @@ const identityCache = new Map<string, CachedIdentity>();
 const CACHE_TTL_MS = 120 * 1000;
 const CACHE_MAX_ENTRIES = 5000;
 
+// Hashes of tokens that passed verification in the last hour, with their expiry. Only the /mcp
+// failed-attempt limiter reads this, so a caller whose token already proved valid keeps working
+// while someone floods the same client IP with bad tokens. It never skips verification itself.
+const recentlyVerifiedTokens = new Map<string, number>();
+const recentlyVerifiedAtHost = new Map<string, number>();
+const RECENTLY_VERIFIED_TTL_MS = 60 * 60 * 1000;
+
+// Tokens Salesforce answered 401 for, keyed by token hash and the host asked, so repeating a junk
+// token costs nothing. Only a definite 401 is remembered; a 5xx or a timeout may pass.
+const recentlyRejectedTokens = new Map<string, number>();
+const RECENTLY_REJECTED_TTL_MS = 5 * 60 * 1000;
+
+const VERIFICATION_TIMEOUT_MS = 10 * 1000;
+const verificationGate = createVerificationGate({ maxConcurrent: 8, maxQueued: 100, maxWaitMs: 10 * 1000 });
+
+/**
+ * Salesforce could not give a verdict on the token: it timed out, could not be reached, or answered
+ * 5xx or 429. Not a verdict on the token, so a token that verified before keeps its exemption and
+ * the caller is told to retry rather than that its token is invalid.
+ */
+export class SalesforceUnavailableError extends Error {
+  constructor(detail: string) {
+    super(`Salesforce could not verify the token right now (${detail}); try again shortly`);
+    this.name = 'SalesforceUnavailableError';
+  }
+}
+
+const isAbort = (err: unknown) => err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError');
+
+/** fetch with the verification timeout; a timeout or network failure is SalesforceUnavailableError. */
+async function fetchForVerification(url: string, headers: Record<string, string>): Promise<Response> {
+  try {
+    return await fetch(url, { headers, signal: AbortSignal.timeout(VERIFICATION_TIMEOUT_MS) });
+  } catch (err) {
+    throw new SalesforceUnavailableError(isAbort(err) ? 'timed out' : 'not reachable');
+  }
+}
+
+/**
+ * Reads a JSON body. A body that arrived but is not JSON is Salesforce's answer; a timeout or a
+ * connection lost while reading it is not a verdict either.
+ */
+async function readVerificationJson(res: Response): Promise<any> {
+  try {
+    return await res.json();
+  } catch (err) {
+    if (err instanceof SyntaxError) throw err;
+    throw new SalesforceUnavailableError(isAbort(err) ? 'timed out' : 'not reachable');
+  }
+}
+
 const SIMULATOR_TOKEN_PREFIX = 'sf_sim_';
 const SIMULATOR_TOKEN_TTL_SECONDS = 15 * 60;
+const SIMULATED_IDENTITY_PREFIX = 'simulated:';
+const SIMULATED_NAME_MAX_LENGTH = 64;
+const DEFAULT_SIMULATED_NAME = 'test-user';
 
 /**
  * Validates that a Salesforce instance URL belongs to an allowed Salesforce domain
@@ -47,6 +107,11 @@ export function validateSalesforceInstanceUrl(rawUrl: string): string {
   }
   if (parsed.username || parsed.password) {
     throw new Error('Salesforce instance URL must not contain credentials');
+  }
+  // Salesforce serves on 443 only (which URL parsing drops); another port on an allowed host could
+  // only hang or reach something that is not Salesforce.
+  if (parsed.port) {
+    throw new Error('Salesforce instance URL must not name a port other than 443');
   }
 
   const host = parsed.hostname.toLowerCase();
@@ -84,15 +149,7 @@ export function salesforceAuthorizationBase(): string {
   return 'https://login.salesforce.com';
 }
 
-/** Salesforce IDs are 15-char case-sensitive or 18-char with a checksum suffix; compare on the first 15. */
-export function salesforceIdsMatch(a: string, b: string): boolean {
-  const left = (a || '').trim();
-  const right = (b || '').trim();
-  if (!left || !right) return false;
-  if (left === right) return true;
-  const isSfId = (v: string) => /^[a-zA-Z0-9]{15}([a-zA-Z0-9]{3})?$/.test(v);
-  return isSfId(left) && isSfId(right) && left.slice(0, 15) === right.slice(0, 15);
-}
+export { salesforceIdsMatch };
 
 /** Rejects identities from any org other than the configured one when the Org ID lock is on. */
 function enforceOrgIdLock(organizationId: string): void {
@@ -117,6 +174,67 @@ function cacheIdentity(tokenHash: string, entry: CachedIdentity): void {
   identityCache.set(tokenHash, entry);
 }
 
+/** Sets `key` to expire after `ttlMs`, evicting expired and then oldest entries at the size cap. */
+function rememberUntil(entries: Map<string, number>, key: string, ttlMs: number): void {
+  const now = Date.now();
+  if (!entries.has(key) && entries.size >= CACHE_MAX_ENTRIES) {
+    for (const [k, expiresAt] of entries) {
+      if (expiresAt <= now) entries.delete(k);
+    }
+    while (entries.size >= CACHE_MAX_ENTRIES) {
+      const oldest = entries.keys().next().value;
+      if (oldest === undefined) break;
+      entries.delete(oldest);
+    }
+  }
+  // Delete first so a refreshed entry moves to the end and is evicted last.
+  entries.delete(key);
+  entries.set(key, now + ttlMs);
+}
+
+const isLive = (entries: Map<string, number>, key: string) => {
+  const expiresAt = entries.get(key);
+  return expiresAt !== undefined && expiresAt > Date.now();
+};
+
+/**
+ * Remembers that a token verified; with `hostKey` (token hash and login host), also where Salesforce
+ * vouched for it. Only a failure at that host keeps the exemption when Salesforce gives no verdict,
+ * so a caller cannot keep it by pointing the instance-URL hint at a host that never answers.
+ */
+function rememberVerifiedToken(tokenHash: string, hostKey?: string): void {
+  rememberUntil(recentlyVerifiedTokens, tokenHash, RECENTLY_VERIFIED_TTL_MS);
+  if (hostKey) rememberUntil(recentlyVerifiedAtHost, hostKey, RECENTLY_VERIFIED_TTL_MS);
+}
+
+const wasHashRecentlyVerified = (tokenHash: string) => isLive(recentlyVerifiedTokens, tokenHash);
+const wasVerifiedAtHost = (tokenHash: string, hostKey: string) =>
+  wasHashRecentlyVerified(tokenHash) && isLive(recentlyVerifiedAtHost, hostKey);
+
+function rememberRejectedToken(rejectionKey: string): void {
+  rememberUntil(recentlyRejectedTokens, rejectionKey, RECENTLY_REJECTED_TTL_MS);
+}
+
+const wasRecentlyRejected = (rejectionKey: string) => isLive(recentlyRejectedTokens, rejectionKey);
+
+/** True when this exact bearer token passed verification within the last hour. */
+export function wasTokenRecentlyVerified(bearerToken: string): boolean {
+  return Boolean(bearerToken) && wasHashRecentlyVerified(hashToken(bearerToken));
+}
+
+/** Verifications running and waiting at the gate, for tests and diagnostics. */
+export function verificationGateStats(): { active: number; queued: number } {
+  return verificationGate.stats();
+}
+
+/**
+ * Ends a token's exemption once it fails verification, so a token that verified once (and was
+ * later revoked, or is sent with a hint where it is not valid) counts as rejected again.
+ */
+export function forgetVerifiedToken(bearerToken: string): void {
+  if (bearerToken) recentlyVerifiedTokens.delete(hashToken(bearerToken));
+}
+
 /**
  * Validates a Salesforce OAuth 2.0 Bearer token and resolves the user's exact
  * Salesforce Profile ID and Profile Name.
@@ -134,13 +252,23 @@ export async function resolveSalesforceUserFromToken(
 
   // 1. Check if this is an Admin Simulator token for testing RBAC policies locally
   if (bearerToken.startsWith(SIMULATOR_TOKEN_PREFIX)) {
-    return verifySimulatorToken(bearerToken);
+    const simulatedUser = verifySimulatorToken(bearerToken);
+    rememberVerifiedToken(hashToken(bearerToken));
+    return simulatedUser;
   }
+
+  if (!isPlausibleBearerToken(bearerToken)) {
+    throw new Error('Malformed Salesforce Bearer token');
+  }
+
+  // The caller's real token goes to the hint on a cache miss, and the allowlist alone admits the simulated host.
+  if (instanceUrlHint) assertNotSimulatedOrgHost(instanceUrlHint, 'Salesforce instance URL');
 
   const tokenHash = hashToken(bearerToken);
   const cached = identityCache.get(tokenHash);
   if (cached && cached.expiresAt > Date.now()) {
     enforceOrgIdLock(cached.user.organizationId);
+    rememberVerifiedToken(tokenHash);
     return { ...cached.user, accessToken: bearerToken };
   }
 
@@ -148,21 +276,65 @@ export async function resolveSalesforceUserFromToken(
   const baseLoginUrl = validateSalesforceInstanceUrl(
     instanceUrlHint || sfSettings.instanceUrl || 'https://login.salesforce.com'
   );
+  // A stored instance URL can name the simulated host too (a database saved before the hostname match,
+  // or SALESFORCE_LOGIN_URL seeded with it), and the allowlist admits it, so both hosts the token may
+  // reach are checked here, before it is sent anywhere.
+  assertNotSimulatedOrgHost(baseLoginUrl, 'Salesforce instance URL');
+  const fallbackInstanceUrl = validateSalesforceInstanceUrl(sfSettings.instanceUrl || baseLoginUrl);
+  assertNotSimulatedOrgHost(fallbackInstanceUrl, 'Salesforce instance URL');
 
+  const rejectionKey = `${tokenHash}|${baseLoginUrl}`;
+  const refuseIfRecentlyRejected = () => {
+    if (wasRecentlyRejected(rejectionKey)) throw new Error('Salesforce token verification failed (HTTP 401)');
+  };
+  refuseIfRecentlyRejected();
+
+  // Priority only for a token Salesforce vouched for at this same host.
+  return verificationGate.run(wasVerifiedAtHost(tokenHash, rejectionKey), async () => {
+    // Another request with this token may have finished verifying, or been rejected, while this one waited.
+    const verifiedMeanwhile = identityCache.get(tokenHash);
+    if (verifiedMeanwhile && verifiedMeanwhile.expiresAt > Date.now()) {
+      enforceOrgIdLock(verifiedMeanwhile.user.organizationId);
+      rememberVerifiedToken(tokenHash);
+      return { ...verifiedMeanwhile.user, accessToken: bearerToken };
+    }
+    refuseIfRecentlyRejected();
+    try {
+      return await verifyWithSalesforce(bearerToken, tokenHash, rejectionKey, baseLoginUrl, fallbackInstanceUrl, sfSettings.apiVersion);
+    } catch (err) {
+      // No verdict from a host that never vouched for this token: the exemption ends, as for a rejection.
+      if (err instanceof SalesforceUnavailableError && !wasVerifiedAtHost(tokenHash, rejectionKey)) {
+        recentlyVerifiedTokens.delete(tokenHash);
+      }
+      throw err;
+    }
+  });
+}
+
+async function verifyWithSalesforce(
+  bearerToken: string,
+  tokenHash: string,
+  rejectionKey: string,
+  baseLoginUrl: string,
+  fallbackInstanceUrl: string,
+  storedApiVersion: string
+): Promise<VerifiedSalesforceUser> {
   // 2. Call Salesforce OIDC /services/oauth2/userinfo to verify token & get user_id + custom_domain
-  const userInfoRes = await fetch(`${baseLoginUrl}/services/oauth2/userinfo`, {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${bearerToken}`,
-      Accept: 'application/json',
-    },
+  const userInfoRes = await fetchForVerification(`${baseLoginUrl}/services/oauth2/userinfo`, {
+    Authorization: `Bearer ${bearerToken}`,
+    Accept: 'application/json',
   });
 
   if (!userInfoRes.ok) {
+    // Only a 401 says the token itself is invalid; 5xx and 429 are passing faults, not verdicts.
+    if (userInfoRes.status >= 500 || userInfoRes.status === 429) {
+      throw new SalesforceUnavailableError(`HTTP ${userInfoRes.status}`);
+    }
+    if (userInfoRes.status === 401) rememberRejectedToken(rejectionKey);
     throw new Error(`Salesforce token verification failed (HTTP ${userInfoRes.status})`);
   }
 
-  const userInfo = (await userInfoRes.json()) as any;
+  const userInfo = await readVerificationJson(userInfoRes);
   const userId: string = userInfo.user_id;
   const orgId: string = userInfo.organization_id;
   if (typeof userId !== 'string' || !userId || typeof orgId !== 'string' || !orgId) {
@@ -171,24 +343,24 @@ export async function resolveSalesforceUserFromToken(
   enforceOrgIdLock(orgId);
 
   // Determine the user's REST API instance URL from userinfo urls.custom_domain or urls.rest
-  let instanceUrl = validateSalesforceInstanceUrl(sfSettings.instanceUrl || baseLoginUrl);
+  let instanceUrl = fallbackInstanceUrl;
   if (userInfo.urls?.custom_domain) {
     instanceUrl = validateSalesforceInstanceUrl(userInfo.urls.custom_domain);
   } else if (userInfo.urls?.rest) {
     const restOrigin = new URL(userInfo.urls.rest).origin;
     instanceUrl = validateSalesforceInstanceUrl(restOrigin);
   }
+  // The profile lookup and every later tool call send the token here.
+  assertNotSimulatedOrgHost(instanceUrl, 'Salesforce instance URL');
 
   // 3. Query the User's ProfileId and Profile.Name via Salesforce REST API
-  const apiVersion = sfSettings.apiVersion || config.salesforce.apiVersion;
+  const apiVersion = storedApiVersion || config.salesforce.apiVersion;
   const soql = `SELECT Id, Username, Name, Email, ProfileId, Profile.Name FROM User WHERE Id = '${escapeSoqlString(userId)}' LIMIT 1`;
-  const queryRes = await fetch(
+  const queryRes = await fetchForVerification(
     `${instanceUrl}/services/data/${apiVersion}/query?q=${encodeURIComponent(soql)}`,
     {
-      headers: {
-        Authorization: `Bearer ${bearerToken}`,
-        Accept: 'application/json',
-      },
+      Authorization: `Bearer ${bearerToken}`,
+      Accept: 'application/json',
     }
   );
 
@@ -198,7 +370,7 @@ export async function resolveSalesforceUserFromToken(
   let profileName = '';
 
   if (queryRes.ok) {
-    const queryData = (await queryRes.json()) as any;
+    const queryData = await readVerificationJson(queryRes);
     const userRecord = queryData.records?.[0];
     if (userRecord) {
       profileId = String(userRecord.ProfileId || '');
@@ -221,6 +393,7 @@ export async function resolveSalesforceUserFromToken(
     user: verifiedUser,
     expiresAt: Date.now() + CACHE_TTL_MS,
   });
+  rememberVerifiedToken(tokenHash, rejectionKey);
 
   return {
     ...verifiedUser,
@@ -336,6 +509,20 @@ function signSimulatorPayload(encodedPayload: string): string {
 }
 
 /**
+ * The identity simulated traffic is logged under. Admins choose the name, so the prefix keeps it
+ * from passing as a real Salesforce user; removing control and bidi characters keeps it from being
+ * made to look like something else in the log.
+ */
+function simulatedIdentity(rawName: unknown): string {
+  const cleaned = String(rawName ?? '')
+    .replace(/[\p{C}\p{Zl}\p{Zp}]/gu, '')
+    .trim()
+    .replace(/^(simulated:\s*)+/i, '');
+  const name = Array.from(cleaned).slice(0, SIMULATED_NAME_MAX_LENGTH).join('').trim();
+  return `${SIMULATED_IDENTITY_PREFIX}${name || DEFAULT_SIMULATED_NAME}`;
+}
+
+/**
  * Creates an HMAC-signed simulation token (valid 15 minutes) for testing Profile RBAC policies on `/mcp`.
  * Only authenticated portal admins can mint one, via `POST /api/admin/test-mcp-access`.
  */
@@ -348,8 +535,8 @@ export function createSimulatorToken(params: {
   const payload = {
     userId: '005SIM000000001AAA',
     organizationId: '00DSIM000000001AAA',
-    username: params.username || 'alex.demo@company.my.salesforce.com',
-    email: params.email || 'alex.demo@company.com',
+    username: simulatedIdentity(params.username),
+    email: params.email || 'simulated.user@example.invalid',
     displayName: `Simulated User (${params.profileName})`,
     profileId: params.profileId,
     profileName: params.profileName,
@@ -382,13 +569,15 @@ function verifySimulatorToken(token: string): VerifiedSalesforceUser {
   return {
     userId: String(decoded.userId || ''),
     organizationId: String(decoded.organizationId || ''),
-    username: String(decoded.username || ''),
+    // Applied here too: a token minted before this rule existed stays valid for up to 15 minutes.
+    username: simulatedIdentity(decoded.username),
     email: String(decoded.email || ''),
     displayName: String(decoded.displayName || ''),
     profileId: String(decoded.profileId || ''),
     profileName: String(decoded.profileName || ''),
     instanceUrl: String(decoded.instanceUrl || ''),
     accessToken: token,
+    simulated: true,
   };
 }
 

@@ -8,14 +8,17 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { config } from './config.js';
 import { handleMcpStreamableHttpRequest } from './mcp/streamableHttp.js';
-import { salesforceAuthorizationBase } from './salesforce/client.js';
+import { salesforceAuthorizationBase, wasTokenRecentlyVerified } from './salesforce/client.js';
 import {
   handleOktaLoginRedirect,
   handleOktaCallback,
   requireAdminAuth,
 } from './security/adminAuth.js';
-import { adminRouter } from './routes/adminRoutes.js';
+import { adminRouter, recordObjectSyncFailure } from './routes/adminRoutes.js';
 import { hashToken } from './security/crypto.js';
+import { clientIpIsForwarded, rateLimitIpKey } from './security/clientIp.js';
+import { createFailureWindow } from './security/failureWindow.js';
+import { parseBearerToken } from './mcp/bearer.js';
 
 export const app = express();
 
@@ -60,6 +63,28 @@ app.use(
   },
   express.json({ limit: '25mb' })
 );
+// Applying an org sync posts back the metadata its preview returned, which also outgrows 1 MB on a
+// large org. Same protections; a body the parser refuses is still a failed apply, so it is audited.
+const OBJECT_SYNC_BODY_LIMIT = '25mb';
+app.use(
+  '/api/admin/objects/pull-apply',
+  (req: Request, res: Response, next: NextFunction) => {
+    requireAdminAuth(req, res, next).catch(next);
+  },
+  express.json({ limit: OBJECT_SYNC_BODY_LIMIT }),
+  (err: any, req: Request, _res: Response, next: NextFunction) => {
+    // No session here means the auth check itself threw, which is not a failed apply by anyone.
+    if ((req as any).adminSession) {
+      recordObjectSyncFailure(
+        req,
+        err?.type === 'entity.too.large'
+          ? `the request body is larger than the ${OBJECT_SYNC_BODY_LIMIT} limit.`
+          : 'the request body could not be read as JSON.'
+      );
+    }
+    next(err);
+  }
+);
 app.use(express.json({ limit: '1mb' }));
 
 // 2. Rate Limiting for Auth & MCP Endpoints
@@ -68,6 +93,7 @@ const authLimiter = rateLimit({
   max: 60,
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: (req: Request) => rateLimitIpKey(req.ip),
   message: { error: 'Too many authentication attempts, please try again later.' },
 });
 
@@ -78,6 +104,7 @@ const loginLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   skipSuccessfulRequests: true,
+  keyGenerator: (req: Request) => rateLimitIpKey(req.ip),
   message: { error: 'Too many authentication attempts, please try again later.' },
 });
 
@@ -105,7 +132,7 @@ const adminApiLimiter = rateLimit({
   legacyHeaders: false,
   keyGenerator: (req: Request) => {
     const session = req.cookies?.sf_mcp_admin_session;
-    return typeof session === 'string' && session ? `session:${hashToken(session)}` : `ip:${req.ip}`;
+    return typeof session === 'string' && session ? `session:${hashToken(session)}` : `ip:${rateLimitIpKey(req.ip)}`;
   },
   message: { error: 'Too many requests, please slow down.' },
 });
@@ -116,11 +143,45 @@ const mcpLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req: Request) => {
-    const auth = req.headers.authorization;
-    const token = typeof auth === 'string' && /^bearer\s+/i.test(auth) ? auth.replace(/^bearer\s+/i, '').trim() : '';
-    return token ? `token:${hashToken(token)}` : `ip:${req.ip}`;
+    const token = parseBearerToken(req.headers.authorization);
+    return token ? `token:${hashToken(token)}` : `ip:${rateLimitIpKey(req.ip)}`;
   },
 });
+
+// mcpLimiter gives every token its own bucket, so a client sending a new junk token each time was
+// never limited by it. Rejected tokens are also counted per client IP, 30 a minute, but only where
+// a trusted proxy named the client (clientIpIsForwarded). Otherwise req.ip is whatever connected,
+// usually the portal proxy that every caller shares, so that count would be one limit anyone could
+// use up and lock out every new sign-in; there the cost is bounded instead by the rejected-token
+// cache and the verification gate in salesforce/client.ts. A request is counted only once it has
+// been answered and its token did not verify, and a token that verified within the last hour is
+// never refused here.
+const REJECTED_TOKEN_LIMIT = 30;
+const rejectedTokenWindow = createFailureWindow({ windowMs: 60 * 1000, max: REJECTED_TOKEN_LIMIT, maxKeys: 10_000 });
+
+function mcpRejectedTokenLimiter(req: Request, res: Response, next: NextFunction): void {
+  const token = parseBearerToken(req.headers.authorization);
+  if (!token || wasTokenRecentlyVerified(token) || !clientIpIsForwarded(req)) {
+    next();
+    return;
+  }
+  const key = rateLimitIpKey(req.ip);
+  const retryAfter = rejectedTokenWindow.retryAfterSeconds(key);
+  if (retryAfter > 0) {
+    res.setHeader('Retry-After', String(retryAfter));
+    res.status(429).json({
+      jsonrpc: '2.0',
+      error: { code: -32001, message: 'Too many rejected tokens from this client, please try again later.' },
+      id: null,
+    });
+    return;
+  }
+  res.on('finish', () => {
+    // Set by the /mcp handler when the token did not verify (401, or 503 when Salesforce gave no verdict).
+    if (res.locals.tokenNotVerified === true) rejectedTokenWindow.record(key);
+  });
+  next();
+}
 
 // 3. RFC 9728 OAuth 2.0 Protected Resource Metadata (For MCP OAuth Discovery & Copilot Studio)
 app.get('/.well-known/oauth-protected-resource', (_req, res) => {
@@ -144,7 +205,7 @@ app.get('/healthz', (_req, res) => {
 });
 
 // 4. Streamable HTTP MCP Endpoint (POST, GET, DELETE /mcp; mcpCors above answers OPTIONS preflights)
-app.all('/mcp', mcpLimiter, (req: Request, res: Response, next: NextFunction) => {
+app.all('/mcp', mcpLimiter, mcpRejectedTokenLimiter, (req: Request, res: Response, next: NextFunction) => {
   handleMcpStreamableHttpRequest(req, res).catch(next);
 });
 

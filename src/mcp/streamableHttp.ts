@@ -1,9 +1,16 @@
 import { Request, Response } from 'express';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { resolveSalesforceUserFromToken, salesforceAuthorizationBase } from '../salesforce/client.js';
+import {
+  forgetVerifiedToken,
+  resolveSalesforceUserFromToken,
+  SalesforceUnavailableError,
+  salesforceAuthorizationBase,
+} from '../salesforce/client.js';
+import { VerificationBusyError } from '../salesforce/verificationGate.js';
+import { parseBearerToken } from './bearer.js';
 import { createUserScopedMcpServer } from './server.js';
 import { config } from '../config.js';
-import { store } from '../db/store.js';
+import { store, UNVERIFIED_CALLER_USERNAME } from '../db/store.js';
 
 /** Keeps reflected error text header-safe: printable ASCII only, no quotes or backslashes. */
 export function toHeaderSafe(text: string): string {
@@ -14,8 +21,8 @@ export async function handleMcpStreamableHttpRequest(
   req: Request,
   res: Response
 ): Promise<void> {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.toLowerCase().startsWith('bearer ')) {
+  const bearerToken = parseBearerToken(req.headers.authorization);
+  if (!bearerToken) {
     const authUrl = salesforceAuthorizationBase();
     res.setHeader(
       'WWW-Authenticate',
@@ -32,7 +39,6 @@ export async function handleMcpStreamableHttpRequest(
     return;
   }
 
-  const bearerToken = authHeader.slice(7).trim();
   const instanceUrlHint = req.headers['x-salesforce-instance-url'] as
     | string
     | undefined;
@@ -44,8 +50,20 @@ export async function handleMcpStreamableHttpRequest(
       instanceUrlHint
     );
   } catch (err: any) {
+    // Capacity, not a verdict on the token: no log row, and the client keeps its token and retries.
+    if (err instanceof VerificationBusyError) {
+      res.setHeader('Retry-After', '5');
+      res.status(503).json({ jsonrpc: '2.0', error: { code: -32000, message: err.message }, id: null });
+      return;
+    }
+    // Salesforce gave no verdict: logged and counted like a rejection (the token is still unverified),
+    // but a token that verified before keeps its exemption, and the client is told to retry, not
+    // that its token is invalid.
+    const unavailable = err instanceof SalesforceUnavailableError;
+    if (!unavailable) forgetVerifiedToken(bearerToken);
+    res.locals.tokenNotVerified = true;
     store.recordCopilotMcpLog({
-      sfUsername: 'unverified_caller',
+      sfUsername: UNVERIFIED_CALLER_USERNAME,
       profileId: 'unverified',
       profileName: 'Unverified Token',
       matchedGroups: [],
@@ -56,6 +74,12 @@ export async function handleMcpStreamableHttpRequest(
       rawRequestPayload: { method: req.body?.method || 'unknown' },
       rawResponseSummary: { error: err?.message || 'Token validation failed' },
     });
+
+    if (unavailable) {
+      res.setHeader('Retry-After', '5');
+      res.status(503).json({ jsonrpc: '2.0', error: { code: -32000, message: err.message }, id: null });
+      return;
+    }
 
     res.setHeader(
       'WWW-Authenticate',

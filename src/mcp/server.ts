@@ -16,8 +16,10 @@ import {
   resolveEffectiveProfilePermissions,
 } from '../rbac/policyEngine.js';
 import { store } from '../db/store.js';
+import type { McpActionId } from '../types/governance.js';
 
-const TOOL_INPUT_SCHEMAS: Record<string, object> = {
+// Keyed by McpActionId: a tool added to the catalog without a schema here does not compile.
+export const TOOL_INPUT_SCHEMAS: Record<McpActionId, object> = {
   list_enabled_objects: {
     type: 'object',
     properties: {},
@@ -180,6 +182,7 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
       const latencyMs = Math.max(1, Date.now() - startTime);
       store.recordCopilotMcpLog({
         sfUsername: user.username,
+        simulated: user.simulated,
         profileId: user.profileId,
         profileName: user.profileName,
         matchedGroups: evaluation.matchedGroups,
@@ -247,8 +250,17 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
           throw new Error(`Object '${objectName}' is not a valid Salesforce API name.`);
         }
 
+        // Fields an admin kept after a sync removed them from the org. They stay in policy, but
+        // sending them to Salesforce would fail the whole call, so they are left out and reported.
+        const objPerm = effective.objectPermissions.get(objectName);
+        const missingInOrg = new Set(
+          Array.from(objPerm?.missingInOrgFields || []).map((f) => f.toLowerCase())
+        );
+        const isMissingInOrg = (field: string) => missingInOrg.has(field.toLowerCase());
+        const withIgnoredFields = (ignored: string[]) =>
+          ignored.length > 0 ? { ignoredMissingFields: ignored } : {};
+
         if (toolName === 'describe_object') {
-          const objPerm = effective.objectPermissions.get(objectName);
           responsePayload = {
             objectName,
             permissions: {
@@ -258,6 +270,7 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
               canDelete: objPerm?.canDelete || false,
             },
             allowedFields: evaluation.allowedFields,
+            activeOrgFields: evaluation.allowedFields.filter((f) => !isMissingInOrg(f)),
           };
         } else if (toolName === 'soql_query') {
           const requestedFields: string[] = Array.isArray(args.fields)
@@ -273,22 +286,37 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
             assertSafeSoqlWhereClause(whereClause, evaluation.allowedFields);
           }
 
-          const selectFields =
-            requestedFields.length > 0 ? requestedFields.join(', ') : 'Id';
+          const ignoredMissingFields = requestedFields.filter(isMissingInOrg);
+          let activeFields = requestedFields.filter((f) => !isMissingInOrg(f));
+
           const requestedLimit = Math.floor(Number(args.limit));
           const limit = Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.min(requestedLimit, 200) : 50;
-          const soql = `SELECT ${selectFields} FROM ${objectName}${
-            whereClause ? ` WHERE ${whereClause}` : ''
-          } LIMIT ${limit}`;
+          const runQuery = () => {
+            const soql = `SELECT ${activeFields.length > 0 ? activeFields.join(', ') : 'Id'} FROM ${objectName}${
+              whereClause ? ` WHERE ${whereClause}` : ''
+            } LIMIT ${limit}`;
+            return salesforceRestRequest(user, 'GET', `/query?q=${encodeURIComponent(soql)}`);
+          };
 
-          const sfRes = await salesforceRestRequest(
-            user,
-            'GET',
-            `/query?q=${encodeURIComponent(soql)}`
-          );
+          let sfRes: unknown;
+          try {
+            sfRes = await runQuery();
+          } catch (queryErr: any) {
+            // A field deleted in the org since the last sync: drop it from the SELECT and retry once.
+            // Only a field this call selected qualifies; a bad WHERE field still fails.
+            const invalidField = String(queryErr?.message || '').match(/No such column '([^']+)'/i)?.[1];
+            const selected = invalidField
+              ? activeFields.find((f) => f.toLowerCase() === invalidField.toLowerCase())
+              : undefined;
+            if (!selected) throw queryErr;
+            ignoredMissingFields.push(selected);
+            activeFields = activeFields.filter((f) => f !== selected);
+            sfRes = await runQuery();
+          }
           responsePayload = {
             objectName,
-            fieldsQueried: requestedFields,
+            fieldsQueried: activeFields.length > 0 ? activeFields : ['Id'],
+            ...withIgnoredFields(ignoredMissingFields),
             totalSize: (sfRes as any)?.totalSize ?? 0,
             records: (sfRes as any)?.records ?? [],
           };
@@ -298,7 +326,8 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
             ? args.fields.map(String)
             : evaluation.allowedFields.filter((f) => API_NAME_PATTERN.test(f));
           assertFieldsAllowed(requestedFields, evaluation.allowedFields, objectName, effective.profileName);
-          const fieldList = requestedFields.length > 0 ? requestedFields : ['Id'];
+          const activeFields = requestedFields.filter((f) => !isMissingInOrg(f));
+          const fieldList = activeFields.length > 0 ? activeFields : ['Id'];
 
           const record = await salesforceRestRequest(
             user,
@@ -309,37 +338,41 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
             objectName,
             recordId,
             fieldsReturned: fieldList,
+            ...withIgnoredFields(requestedFields.filter(isMissingInOrg)),
             record,
           };
-        } else if (toolName === 'create_record') {
+        } else if (toolName === 'create_record' || toolName === 'update_record') {
+          const recordId = toolName === 'update_record' ? requireRecordId(args) : undefined;
           const fieldValues = requireFieldValues(args);
           assertFieldsAllowed(Object.keys(fieldValues), evaluation.allowedFields, objectName, effective.profileName);
 
-          const sfRes = await salesforceRestRequest<{ id?: string; success?: boolean; errors?: unknown[] }>(
-            user,
-            'POST',
-            `/sobjects/${objectName}`,
-            fieldValues
+          const ignoredMissingFields = Object.keys(fieldValues).filter(isMissingInOrg);
+          const activeValues = Object.fromEntries(
+            Object.entries(fieldValues).filter(([field]) => !isMissingInOrg(field))
           );
-          responsePayload = {
-            status: 'SUCCESS',
-            tool: toolName,
-            objectName,
-            recordId: sfRes?.id,
-            fieldNames: Object.keys(fieldValues),
-          };
-        } else if (toolName === 'update_record') {
-          const recordId = requireRecordId(args);
-          const fieldValues = requireFieldValues(args);
-          assertFieldsAllowed(Object.keys(fieldValues), evaluation.allowedFields, objectName, effective.profileName);
+          if (Object.keys(activeValues).length === 0) {
+            throw new Error(`Every field in this ${toolName} call no longer exists in the Salesforce org.`);
+          }
 
-          await salesforceRestRequest(user, 'PATCH', `/sobjects/${objectName}/${recordId}`, fieldValues);
+          let writtenId = recordId;
+          if (recordId) {
+            await salesforceRestRequest(user, 'PATCH', `/sobjects/${objectName}/${recordId}`, activeValues);
+          } else {
+            const sfRes = await salesforceRestRequest<{ id?: string; success?: boolean; errors?: unknown[] }>(
+              user,
+              'POST',
+              `/sobjects/${objectName}`,
+              activeValues
+            );
+            writtenId = sfRes?.id;
+          }
           responsePayload = {
             status: 'SUCCESS',
             tool: toolName,
             objectName,
-            recordId,
-            fieldNames: Object.keys(fieldValues),
+            recordId: writtenId,
+            fieldNames: Object.keys(activeValues),
+            ...withIgnoredFields(ignoredMissingFields),
           };
         } else if (toolName === 'delete_record') {
           const recordId = requireRecordId(args);
@@ -356,6 +389,7 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
       const latencyMs = Math.max(1, Date.now() - startTime);
       store.recordCopilotMcpLog({
         sfUsername: user.username,
+        simulated: user.simulated,
         profileId: effective.profileId,
         profileName: effective.profileName,
         matchedGroups: evaluation.matchedGroups,
@@ -380,6 +414,7 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
       const denied = err instanceof PolicyViolationError;
       store.recordCopilotMcpLog({
         sfUsername: user.username,
+        simulated: user.simulated,
         profileId: user.profileId,
         profileName: user.profileName,
         matchedGroups: evaluation.matchedGroups,

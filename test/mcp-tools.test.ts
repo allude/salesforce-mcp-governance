@@ -487,6 +487,7 @@ describe('MCP tools/call end-to-end through HTTP /mcp with a mocked Salesforce o
         permissions: { canRead: true, canCreate: true, canUpdate: true, canDelete: true },
         // The group also lists SSN__c, but it is disabled globally.
         allowedFields: ['Id', 'Name', 'Industry'],
+        activeOrgFields: ['Id', 'Name', 'Industry'],
       });
       expectAuditRow(outcome, FULL, 'describe_object', 'ALLOWED', 'Account');
       expectNothingSentToSalesforce(outcome);

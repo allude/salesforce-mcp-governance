@@ -16,8 +16,17 @@ import {
   PortalAdminLogRecord,
   OktaSsoSettings,
   SalesforceConnectionSettings,
+  ProfileSyncDiffPreview,
+  ObjectSyncDiffPreview,
   PortalUserSummary,
 } from '../types/governance.js';
+import {
+  PulledOrgObjectMetadata,
+  inspectCertificatePem,
+  validatePrivateKeyPem,
+} from '../salesforce/jwtConnection.js';
+import { salesforceIdKey, salesforceIdsMatch } from '../salesforce/ids.js';
+import { isSimulatedOrgHost, isUninitialisedMcpTokenHost } from '../salesforce/simulatedOrg.js';
 
 const dbDir = path.dirname(config.dbPath);
 if (!fs.existsSync(dbDir)) {
@@ -26,20 +35,190 @@ if (!fs.existsSync(dbDir)) {
 
 const db = new DatabaseSync(config.dbPath);
 
-/** Runs `fn` atomically: either every statement in it commits or none does. */
-function runInTransaction<T>(fn: () => T): T {
+let transactionDepth = 0;
+let transactionDoomed = false;
+
+/**
+ * Runs `fn` atomically: either every statement in it commits or none does. A nested call joins the
+ * open transaction. Its failure dooms the whole transaction, even if an outer step catches the error,
+ * so a half-applied inner step can never commit. `fn` must be synchronous.
+ */
+export function runInTransaction<T>(fn: () => T): T {
+  if (transactionDepth > 0) {
+    transactionDepth++;
+    try {
+      return fn();
+    } catch (err) {
+      transactionDoomed = true;
+      throw err;
+    } finally {
+      transactionDepth--;
+    }
+  }
+
   db.exec('BEGIN IMMEDIATE');
+  transactionDepth = 1;
+  transactionDoomed = false;
   try {
     const result = fn();
+    if (transactionDoomed) {
+      throw new Error('Transaction rolled back: a nested step failed.');
+    }
     db.exec('COMMIT');
     return result;
   } catch (err) {
     db.exec('ROLLBACK');
     throw err;
+  } finally {
+    transactionDepth = 0;
+    transactionDoomed = false;
   }
 }
 
+/**
+ * Deletes a field and revokes it from every Access Group, reporting which groups lost it.
+ * While a case variant still exists the grants still refer to it and stay.
+ */
+function deleteFieldAndRevokeGrants(objName: string, fldName: string): { deleted: boolean; revokedGroups: string[] } {
+  return runInTransaction(() => {
+    const res = db
+      .prepare('DELETE FROM sf_object_fields WHERE object_name = ? AND field_name = ?')
+      .run(objName, fldName);
+    if (res.changes === 0) return { deleted: false, revokedGroups: [] };
+    const variantRemains = db
+      .prepare(
+        'SELECT 1 FROM sf_object_fields WHERE lower(object_name) = lower(?) AND lower(field_name) = lower(?) LIMIT 1'
+      )
+      .get(objName, fldName);
+    if (variantRemains) return { deleted: true, revokedGroups: [] };
+
+    const now = new Date().toISOString();
+    const rows = db.prepare('SELECT id, name, object_permissions_json FROM access_groups').all() as Array<{
+      id: string;
+      name: string;
+      object_permissions_json: string;
+    }>;
+    const updateGroup = db.prepare(
+      'UPDATE access_groups SET object_permissions_json = ?, updated_at = ? WHERE id = ?'
+    );
+    const revokedGroups: string[] = [];
+    for (const row of rows) {
+      const perms = JSON.parse(row.object_permissions_json || '[]') as GroupObjectPermission[];
+      let changed = false;
+      const kept = perms.map((p) => {
+        if (String(p.objectName).toLowerCase() !== objName.toLowerCase()) return p;
+        const allowedFields = (p.allowedFields || []).filter(
+          (f) => String(f).toLowerCase() !== fldName.toLowerCase()
+        );
+        if (allowedFields.length === (p.allowedFields || []).length) return p;
+        changed = true;
+        return { ...p, allowedFields };
+      });
+      if (changed) {
+        updateGroup.run(JSON.stringify(kept), now, row.id);
+        revokedGroups.push(row.name);
+      }
+    }
+    return { deleted: true, revokedGroups };
+  });
+}
+
+/**
+ * Deletes an Object and its fields and revokes it from every Access Group, reporting which groups
+ * lost it. Grants match objects case-insensitively; while a case variant (e.g. 'Account' after
+ * deleting a stray 'account') still exists, the grants still refer to it and must stay.
+ */
+function deleteObjectAndRevokeGrants(objectName: string): { deleted: boolean; revokedGroups: string[] } {
+  return runInTransaction(() => {
+    const res = db.prepare('DELETE FROM sf_objects WHERE object_name = ?').run(objectName);
+    if (res.changes === 0) return { deleted: false, revokedGroups: [] };
+    const variantRemains = db
+      .prepare('SELECT 1 FROM sf_objects WHERE lower(object_name) = lower(?) LIMIT 1')
+      .get(objectName);
+    if (variantRemains) return { deleted: true, revokedGroups: [] };
+
+    const now = new Date().toISOString();
+    const rows = db.prepare('SELECT id, name, object_permissions_json FROM access_groups').all() as Array<{
+      id: string;
+      name: string;
+      object_permissions_json: string;
+    }>;
+    const updateGroup = db.prepare(
+      'UPDATE access_groups SET object_permissions_json = ?, updated_at = ? WHERE id = ?'
+    );
+    const revokedGroups: string[] = [];
+    for (const row of rows) {
+      const perms = JSON.parse(row.object_permissions_json || '[]') as GroupObjectPermission[];
+      const kept = perms.filter((p) => String(p.objectName).toLowerCase() !== objectName.toLowerCase());
+      if (kept.length !== perms.length) {
+        updateGroup.run(JSON.stringify(kept), now, row.id);
+        revokedGroups.push(row.name);
+      }
+    }
+    return { deleted: true, revokedGroups };
+  });
+}
+
+/**
+ * Local rows by lower-case name. Salesforce API names are case-insensitive, but a database from an
+ * older version can hold 'Account' and 'account' as separate rows: org sync acts on all of them.
+ */
+function groupObjectsByLowerName(objects: SalesforceObject[]): Map<string, SalesforceObject[]> {
+  const groups = new Map<string, SalesforceObject[]>();
+  for (const obj of objects) {
+    const key = obj.objectName.toLowerCase();
+    groups.set(key, [...(groups.get(key) || []), obj]);
+  }
+  return groups;
+}
+
+/**
+ * One entry per object, however many spellings the pull asked about: the routes pull every tracked
+ * name, so a case-variant database reports the same object twice. A field any entry reports is
+ * present, and so is an object, so that a disagreement can never lead to a deletion.
+ */
+function mergePulledEntriesByObject<
+  F extends { fieldName: string },
+  T extends { objectName: string; label?: string; isCustom?: boolean; existsInOrg: boolean; fields: F[] },
+>(entries: T[]): T[] {
+  const merged = new Map<string, { entry: T; fields: Map<string, F> }>();
+  for (const entry of entries) {
+    const key = entry.objectName.toLowerCase();
+    const seen = merged.get(key);
+    if (!seen) {
+      merged.set(key, { entry, fields: new Map(entry.fields.map((f) => [f.fieldName.toLowerCase(), f])) });
+      continue;
+    }
+    seen.entry = {
+      ...seen.entry,
+      label: entry.label ?? seen.entry.label,
+      isCustom: entry.isCustom ?? seen.entry.isCustom,
+      existsInOrg: seen.entry.existsInOrg || entry.existsInOrg,
+    };
+    for (const f of entry.fields) seen.fields.set(f.fieldName.toLowerCase(), f);
+  }
+  return Array.from(merged.values(), ({ entry, fields }) => ({ ...entry, fields: Array.from(fields.values()) }));
+}
+
 let warnedUndecryptableOktaSecret = false;
+let warnedUndecryptablePrivateKey = false;
+
+/** Decrypts the stored JWT private key. A key that cannot be decrypted reads as empty and is flagged, never thrown. */
+function readStoredPrivateKey(privateKeyEnc: string): { privateKeyPem: string; undecryptable: boolean } {
+  try {
+    return { privateKeyPem: privateKeyEnc ? decryptSecret(privateKeyEnc) : '', undecryptable: false };
+  } catch {
+    // Usually APP_SECRET_KEY changed. Keep the ciphertext (updateSalesforceSettings never overwrites
+    // it unless a new key is entered) and tell the operator once.
+    if (!warnedUndecryptablePrivateKey) {
+      warnedUndecryptablePrivateKey = true;
+      console.warn(
+        '[store] The stored Salesforce JWT private key cannot be decrypted with the current APP_SECRET_KEY. Restore that key, or enter a new private key in Connect to Salesforce Org.'
+      );
+    }
+    return { privateKeyPem: '', undecryptable: true };
+  }
+}
 
 db.exec(`
   PRAGMA journal_mode = WAL;
@@ -58,6 +237,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS sf_profiles (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
+    missing_in_org INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
   );
 
@@ -67,6 +247,7 @@ db.exec(`
     is_custom INTEGER NOT NULL DEFAULT 0,
     enabled INTEGER NOT NULL DEFAULT 1,
     source_path TEXT NOT NULL DEFAULT '',
+    missing_in_org INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
   );
 
@@ -78,6 +259,7 @@ db.exec(`
     is_custom INTEGER NOT NULL DEFAULT 0,
     required INTEGER NOT NULL DEFAULT 0,
     enabled INTEGER NOT NULL DEFAULT 1,
+    missing_in_org INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (object_name, field_name),
     FOREIGN KEY (object_name) REFERENCES sf_objects(object_name) ON DELETE CASCADE
   );
@@ -139,14 +321,98 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS sf_connection_settings (
     id INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled INTEGER NOT NULL DEFAULT 0,
+    auth_mode TEXT NOT NULL DEFAULT 'jwt_bearer',
+    login_url TEXT NOT NULL DEFAULT 'https://login.salesforce.com',
+    client_id TEXT NOT NULL DEFAULT '',
+    username TEXT NOT NULL DEFAULT '',
+    private_key_enc TEXT NOT NULL DEFAULT '',
+    certificate_pem TEXT NOT NULL DEFAULT '',
+    cert_fingerprint TEXT NOT NULL DEFAULT '',
+    connection_status TEXT NOT NULL DEFAULT 'disconnected',
+    last_connected_at TEXT,
+    last_error TEXT NOT NULL DEFAULT '',
+    connected_org_id TEXT NOT NULL DEFAULT '',
+    connected_user TEXT NOT NULL DEFAULT '',
     expected_org_id TEXT NOT NULL DEFAULT '',
     instance_url TEXT NOT NULL DEFAULT 'https://login.salesforce.com',
+    sync_instance_url TEXT NOT NULL DEFAULT '',
     api_version TEXT NOT NULL DEFAULT 'v62.0',
     enforce_org_id_lock INTEGER NOT NULL DEFAULT 0,
     sfdx_objects_folder_path TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
   );
 `);
+
+/** Returns true only when this call added the column. */
+function ensureColumnExists(tableName: string, columnName: string, columnDef: string): boolean {
+  const cols = db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>;
+  if (cols.some((c) => c.name === columnName)) return false;
+  db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnDef}`);
+  return true;
+}
+
+/**
+ * Before this column existed, simulator calls were logged unmarked under these default names, which
+ * would otherwise count as real traffic. It runs only when the column is added, in one transaction
+ * with it, so an interrupted upgrade retries and a later real row under such a name is left alone.
+ * Naming the identities also leaves rejected-token rows out: those are logged as unverified_caller.
+ */
+function addSimulatedColumnAndMarkLegacyRows() {
+  runInTransaction(() => {
+    if (!ensureColumnExists('mcp_copilot_logs', 'simulated', 'INTEGER NOT NULL DEFAULT 0')) return;
+    db.prepare(
+      `UPDATE mcp_copilot_logs SET simulated = 1
+       WHERE sf_username IN ('copilot.user@enterprise.com', 'alex.demo@company.my.salesforce.com')`
+    ).run();
+  });
+}
+
+function runSchemaMigrations() {
+  ensureColumnExists('sf_profiles', 'missing_in_org', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumnExists('sf_objects', 'missing_in_org', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumnExists('sf_object_fields', 'missing_in_org', 'INTEGER NOT NULL DEFAULT 0');
+
+  ensureColumnExists('sf_connection_settings', 'enabled', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumnExists('sf_connection_settings', 'auth_mode', "TEXT NOT NULL DEFAULT 'jwt_bearer'");
+  ensureColumnExists('sf_connection_settings', 'login_url', "TEXT NOT NULL DEFAULT 'https://login.salesforce.com'");
+  ensureColumnExists('sf_connection_settings', 'client_id', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('sf_connection_settings', 'username', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('sf_connection_settings', 'private_key_enc', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('sf_connection_settings', 'certificate_pem', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('sf_connection_settings', 'cert_fingerprint', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('sf_connection_settings', 'connection_status', "TEXT NOT NULL DEFAULT 'disconnected'");
+  ensureColumnExists('sf_connection_settings', 'last_connected_at', 'TEXT');
+  ensureColumnExists('sf_connection_settings', 'last_error', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('sf_connection_settings', 'connected_org_id', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('sf_connection_settings', 'connected_user', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('sf_connection_settings', 'sync_instance_url', "TEXT NOT NULL DEFAULT ''");
+
+  addSimulatedColumnAndMarkLegacyRows();
+}
+
+/**
+ * Connect used to write its host into instance_url, which MCP sends bearer tokens to. A connected row
+ * keeps showing that host as its sync instance. The simulated host is removed from instance_url whatever
+ * the connection state says: no real token may reach it, and a real connect can no longer produce it, so
+ * a row that names it with a real org ID (an old exact-match guard let the port form through) is no
+ * evidence of a real org there. Any other value may be the admin's, so it stays.
+ */
+export function repairConnectInstanceUrls() {
+  db.prepare(`
+    UPDATE sf_connection_settings SET sync_instance_url = instance_url
+    WHERE connection_status = 'connected' AND sync_instance_url = ''
+  `).run();
+  // Matched in code by hostname, as an exact SQL match missed the host with a port, other case or trailing dot.
+  const row = db
+    .prepare('SELECT instance_url, login_url FROM sf_connection_settings WHERE id = 1')
+    .get() as { instance_url: string; login_url: string } | undefined;
+  if (!row || !isSimulatedOrgHost(row.instance_url)) return;
+  const replacement = isSimulatedOrgHost(row.login_url) ? 'https://login.salesforce.com' : row.login_url;
+  db.prepare('UPDATE sf_connection_settings SET instance_url = ? WHERE id = 1').run(replacement);
+}
+
+runSchemaMigrations();
 
 function hashPassword(password: string, salt: string): string {
   return crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
@@ -250,6 +516,99 @@ function initializeSystemSingletons() {
 }
 
 initializeSystemSingletons();
+// After the seed, which fills instance_url from SALESFORCE_LOGIN_URL and could write the simulated host.
+repairConnectInstanceUrls();
+
+/** The portal admin log action written once per policy simulation. */
+export const SIMULATE_MCP_CALL_ACTION = 'SIMULATE_MCP_CALL';
+
+/** The MCP log user for a bearer token that failed verification, so the caller is unknown. */
+export const UNVERIFIED_CALLER_USERNAME = 'unverified_caller';
+
+function toCopilotMcpLogRecord(r: any): CopilotMcpLogRecord {
+  return {
+    id: r.id,
+    timestamp: r.timestamp,
+    sfUsername: r.sf_username,
+    profileId: r.profile_id,
+    profileName: r.profile_name,
+    matchedGroups: JSON.parse(r.matched_groups_json || '[]'),
+    toolName: r.tool_name,
+    targetObject: r.target_object,
+    status: r.status,
+    latencyMs: r.latency_ms,
+    sanitizedRequestPayload: r.sanitized_request_payload,
+    sanitizedResponseSummary: r.sanitized_response_summary,
+    ...(r.simulated ? { simulated: true as const } : {}),
+  };
+}
+
+function toPortalAdminLogRecord(r: any): PortalAdminLogRecord {
+  return {
+    id: r.id,
+    timestamp: r.timestamp,
+    adminUsername: r.admin_username,
+    authMethod: r.auth_method,
+    action: r.action,
+    target: r.target,
+    details: r.details,
+    ipAddress: r.ip_address,
+  };
+}
+
+/** Keeps the rowid a log query selected as `seq`, the order rows were written in and the paging cursor. */
+function withSeq<T>(toRecord: (r: any) => T): (r: any) => T & { seq: number } {
+  return (r) => ({ ...toRecord(r), seq: Number(r.seq) });
+}
+
+export interface LogPageCursor {
+  /** Only rows written before this `seq`; omitted for the newest page. */
+  before?: number;
+  limit: number;
+}
+
+export interface CopilotMcpLogPageQuery extends LogPageCursor {
+  status?: 'ALLOWED' | 'DENIED' | 'ERROR';
+  simulated?: boolean;
+  toolName?: string;
+  targetObject?: string;
+}
+
+export interface PortalAdminLogPageQuery extends LogPageCursor {
+  action?: string;
+  authMethod?: 'password' | 'okta_sso';
+}
+
+export interface LogPage<T> {
+  rows: Array<T & { seq: number }>;
+  /** The `before` cursor for the next older page, or null when no older matching row exists. */
+  nextBefore: number | null;
+}
+
+/** Reads one more row than asked for, so the caller learns whether an older page exists. */
+function readLogPage<T>(
+  table: 'mcp_copilot_logs' | 'portal_admin_logs',
+  where: string[],
+  params: Record<string, string | number>,
+  cursor: LogPageCursor,
+  toRecord: (r: any) => T
+): LogPage<T> {
+  const conditions = [...where];
+  const bound: Record<string, string | number> = { ...params, limit: cursor.limit + 1 };
+  if (cursor.before !== undefined) {
+    conditions.push('rowid < :before');
+    bound.before = cursor.before;
+  }
+  const filter = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const rows = db
+    .prepare(`SELECT rowid AS seq, * FROM ${table} ${filter} ORDER BY rowid DESC LIMIT :limit`)
+    .all(bound) as any[];
+  const page = rows.slice(0, cursor.limit).map(withSeq(toRecord));
+  return {
+    rows: page,
+    nextBefore: rows.length > cursor.limit ? page[page.length - 1].seq : null,
+  };
+}
 
 /**
  * Strips all sensitive data values from a payload while preserving keys, field names, and structure
@@ -307,6 +666,81 @@ export function stripSensitivePayloadData(input: unknown): unknown {
 }
 
 export { parseSfdxFilesToObjects } from './importers.js';
+
+/** Local Profile rows by Salesforce ID key, keeping `rows` order within each key. */
+function groupProfileForms(rows: SalesforceProfile[]): Map<string, SalesforceProfile[]> {
+  const forms = new Map<string, SalesforceProfile[]>();
+  for (const row of rows) {
+    const key = salesforceIdKey(row.id);
+    forms.set(key, [...(forms.get(key) || []), row]);
+  }
+  return forms;
+}
+
+/** The ID a Profile is stored under after a sync: an 18-character form is never given up for a 15. */
+function profileSyncTargetId(orgId: string, forms: SalesforceProfile[]): string {
+  return forms.find((f) => f.id.length > orgId.length)?.id ?? orgId;
+}
+
+/**
+ * Moves Profile rows onto `targetId` inside the caller's transaction, creating that row from the
+ * first replaced one if needed. The foreign key has no ON UPDATE CASCADE, so memberships move
+ * before the old rows go.
+ */
+function replaceProfileRows(targetId: string, replaced: SalesforceProfile[]): void {
+  const first = replaced[0];
+  db.prepare(`
+    INSERT OR IGNORE INTO sf_profiles (id, name, missing_in_org, updated_at) VALUES (?, ?, ?, ?)
+  `).run(targetId, first.name, first.missingInOrg ? 1 : 0, new Date().toISOString());
+  for (const row of replaced) {
+    db.prepare(`
+      INSERT OR IGNORE INTO profile_group_memberships (profile_id, group_id)
+      SELECT ?, group_id FROM profile_group_memberships WHERE profile_id = ?
+    `).run(targetId, row.id);
+    db.prepare('DELETE FROM sf_profiles WHERE id = ?').run(row.id);
+  }
+}
+
+/**
+ * The rows to rename so a Profile stored under several forms keeps the row in force, or null if no
+ * rename can. `forms` must be in `getProfiles` order, which sorts by name then ID: a form that would
+ * overtake the first row is renamed with it if its higher ID then loses the tie.
+ */
+function profileFormsToRename(forms: SalesforceProfile[], name: string): SalesforceProfile[] | null {
+  const [inForce, ...others] = forms;
+  const overtaking = others.filter((f) => f.name < name || (f.name === name && f.id < inForce.id));
+  if (overtaking.some((f) => f.id < inForce.id)) return null;
+  return [inForce, ...overtaking];
+}
+
+/**
+ * Decides what a sync may do with several local rows that are forms of one org Profile. `forms` must
+ * be in `getProfiles` order, so the first row is the one the policy engine resolves and its groups
+ * are the access in force. Rows with different groups merge only if the union adds nothing to that;
+ * otherwise neither dropping a row (a membership disappears) nor the union (access grows) is safe.
+ * When only one set of groups exists it is kept even if an empty row is in force today, as that is
+ * the assignment an admin made; the caller must report `granted`.
+ */
+function planProfileForms(forms: SalesforceProfile[], groupIdsOf: (profileId: string) => string[]) {
+  const inForce = new Set(groupIdsOf(forms[0].id));
+  const union = Array.from(new Set(forms.flatMap((f) => groupIdsOf(f.id))));
+  const granted = union.filter((groupId) => !inForce.has(groupId));
+  const distinctSets = new Set(
+    forms.map((f) => [...groupIdsOf(f.id)].sort().join('\n')).filter((set) => set !== '')
+  );
+  return { conflict: distinctSets.size > 1 && granted.length > 0, union, granted };
+}
+
+/** What an Okta settings save may change. An omitted field keeps the stored value. */
+export interface OktaConfigInput {
+  enabled?: boolean;
+  oktaDomain?: string;
+  issuer?: string;
+  clientId?: string;
+  clientSecret?: string;
+  redirectUri?: string;
+  adminGroup?: string;
+}
 
 export const store = {
   // ============================================================================
@@ -404,13 +838,14 @@ export const store = {
   },
 
   // ============================================================================
-  // 2. SALESFORCE -> PROFILES (List + CSV Import)
+  // 2. SALESFORCE -> PROFILES (List + CSV Import + Org Pull & Reconciliation)
   // ============================================================================
   getProfiles(): SalesforceProfile[] {
-    const rows = db.prepare('SELECT * FROM sf_profiles ORDER BY name ASC').all() as any[];
+    const rows = db.prepare('SELECT * FROM sf_profiles ORDER BY name ASC, id ASC').all() as any[];
     return rows.map((r) => ({
       id: r.id,
       name: r.name,
+      missingInOrg: Boolean(r.missing_in_org),
       updatedAt: r.updated_at,
     }));
   },
@@ -418,39 +853,93 @@ export const store = {
   getProfileById(id: string): SalesforceProfile | null {
     const r = db.prepare('SELECT * FROM sf_profiles WHERE id = ?').get(id.trim()) as any;
     if (!r) return null;
-    return { id: r.id, name: r.name, updatedAt: r.updated_at };
+    return {
+      id: r.id,
+      name: r.name,
+      missingInOrg: Boolean(r.missing_in_org),
+      updatedAt: r.updated_at,
+    };
   },
 
-  upsertProfile(id: string, name: string): { profile: SalesforceProfile; action: 'inserted' | 'updated' } {
+  /**
+   * Saves a Profile under whichever form of its ID is already stored, so no entry point adds a second
+   * row. An 18-character form upgrades a stored 15-character row and keeps its memberships. If several
+   * forms are stored already, the row the policy engine resolves is updated and the rest are left for
+   * org sync to reconcile; `nameKept` reports a rename refused because it would change that row.
+   */
+  upsertProfile(
+    id: string,
+    name: string,
+    // Only org sync passes this; a re-import or manual save must not clear what sync flagged.
+    missingInOrg?: boolean
+  ): {
+    profile: SalesforceProfile;
+    action: 'inserted' | 'updated';
+    previousId?: string;
+    nameKept?: boolean;
+  } {
     const cleanId = id.trim();
     const cleanName = name.trim();
-    const existing = this.getProfileById(cleanId);
-    const now = new Date().toISOString();
-    db.prepare(`
-      INSERT INTO sf_profiles (id, name, updated_at)
-      VALUES (?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        name = excluded.name,
-        updated_at = excluded.updated_at
-    `).run(cleanId, cleanName, now);
-    return {
-      profile: { id: cleanId, name: cleanName, updatedAt: now },
-      action: existing ? 'updated' : 'inserted',
-    };
+    return runInTransaction(() => {
+      const forms = this.getProfiles().filter((p) => salesforceIdsMatch(p.id, cleanId));
+      const now = new Date().toISOString();
+
+      if (forms.length === 0) {
+        const nextMissing = missingInOrg ?? false;
+        db.prepare(`
+          INSERT INTO sf_profiles (id, name, missing_in_org, updated_at) VALUES (?, ?, ?, ?)
+        `).run(cleanId, cleanName, nextMissing ? 1 : 0, now);
+        return {
+          profile: { id: cleanId, name: cleanName, missingInOrg: nextMissing, updatedAt: now },
+          action: 'inserted' as const,
+        };
+      }
+
+      const stored = forms[0];
+      const nextMissing = missingInOrg ?? stored.missingInOrg;
+      const rename = db.prepare('UPDATE sf_profiles SET name = ?, updated_at = ? WHERE id = ?');
+      const setMissing = db.prepare('UPDATE sf_profiles SET missing_in_org = ? WHERE id = ?');
+
+      if (forms.length > 1) {
+        setMissing.run(nextMissing ? 1 : 0, stored.id);
+        const toRename = profileFormsToRename(forms, cleanName);
+        for (const form of toRename || []) rename.run(cleanName, now, form.id);
+        return {
+          profile: { ...stored, name: toRename ? cleanName : stored.name, missingInOrg: nextMissing },
+          action: 'updated' as const,
+          ...(toRename ? {} : { nameKept: true }),
+        };
+      }
+
+      const upgrades = cleanId.length > stored.id.length;
+      const targetId = upgrades ? cleanId : stored.id;
+      if (upgrades) replaceProfileRows(targetId, [stored]);
+      rename.run(cleanName, now, targetId);
+      setMissing.run(nextMissing ? 1 : 0, targetId);
+      return {
+        profile: { id: targetId, name: cleanName, missingInOrg: nextMissing, updatedAt: now },
+        action: 'updated' as const,
+        ...(upgrades ? { previousId: stored.id } : {}),
+      };
+    });
   },
 
   importProfilesFromCsvRows(
     rows: Array<{ id: string; name: string }>
-  ): { inserted: number; updated: number; total: number } {
+  ): { inserted: number; updated: number; idsUpgraded: number; namesKept: number; total: number } {
     let inserted = 0;
     let updated = 0;
+    let idsUpgraded = 0;
+    let namesKept = 0;
     for (const r of rows) {
       if (!r.id || !r.name) continue;
       const res = this.upsertProfile(r.id, r.name);
       if (res.action === 'inserted') inserted++;
       else updated++;
+      if (res.previousId) idsUpgraded++;
+      if (res.nameKept) namesKept++;
     }
-    return { inserted, updated, total: this.getProfiles().length };
+    return { inserted, updated, idsUpgraded, namesKept, total: this.getProfiles().length };
   },
 
   deleteProfile(id: string): boolean {
@@ -458,8 +947,204 @@ export const store = {
     return res.changes > 0;
   },
 
+  previewProfilesSyncFromOrg(
+    orgProfiles: Array<{ id: string; name: string; userType?: string }>,
+    orgInfo: { orgId: string; instanceUrl: string }
+  ): ProfileSyncDiffPreview {
+    const existingProfiles = this.getProfiles();
+    const formsByKey = groupProfileForms(existingProfiles);
+    const orgKeys = new Set(orgProfiles.map((p) => salesforceIdKey(p.id)));
+
+    const mappings = this.getProfileGroupMappings();
+    const groups = this.getGroups();
+    const groupIdsOf = (profileId: string) =>
+      mappings.find((item) => item.profileId === profileId)?.groupIds || [];
+    const groupNames = (groupIds: string[]) =>
+      groupIds.map((gid) => groups.find((g) => g.id === gid)?.name || gid);
+
+    const added: ProfileSyncDiffPreview['added'] = [];
+    const updated: ProfileSyncDiffPreview['updated'] = [];
+    const removedFromOrg: ProfileSyncDiffPreview['removedFromOrg'] = [];
+    const duplicates: ProfileSyncDiffPreview['duplicates'] = [];
+
+    for (const op of orgProfiles) {
+      const cleanId = op.id.trim();
+      const cleanName = op.name.trim();
+      const forms = formsByKey.get(salesforceIdKey(cleanId)) || [];
+      if (forms.length === 0) {
+        added.push({
+          id: cleanId,
+          name: cleanName,
+          userType: op.userType || 'Standard',
+        });
+        continue;
+      }
+      const targetId = profileSyncTargetId(cleanId, forms);
+      if (forms.length > 1) {
+        const plan = planProfileForms(forms, groupIdsOf);
+        duplicates.push({
+          id: targetId,
+          name: cleanName,
+          rows: forms.map((f) => ({ id: f.id, name: f.name, groupNames: groupNames(groupIdsOf(f.id)) })),
+          outcome: plan.conflict ? 'conflict' : 'merge',
+          resultGroupNames: plan.conflict ? [] : groupNames(plan.union),
+          grantedGroupNames: plan.conflict ? [] : groupNames(plan.granted),
+        });
+        if (plan.conflict) continue;
+      }
+      const prev = forms[0];
+      updated.push({
+        id: cleanId,
+        name: cleanName,
+        previousName: prev.name,
+        ...(prev.id !== targetId ? { previousId: prev.id } : {}),
+        unchanged: forms.length === 1 && prev.id === targetId && prev.name === cleanName && !prev.missingInOrg,
+      });
+    }
+
+    for (const local of existingProfiles) {
+      if (!orgKeys.has(salesforceIdKey(local.id))) {
+        removedFromOrg.push({
+          id: local.id,
+          name: local.name,
+          mappedGroupNames: groupNames(groupIdsOf(local.id)),
+        });
+      }
+    }
+
+    return {
+      orgId: orgInfo.orgId,
+      instanceUrl: orgInfo.instanceUrl,
+      added,
+      updated,
+      removedFromOrg,
+      duplicates,
+    };
+  },
+
+  /**
+   * Applies a Profile sync in one transaction: any failure leaves the database untouched. An id in
+   * `upserts` is present in the org, so a remove or keep-as-missing entry for any form of it is
+   * ignored. Local forms of an upserted id become one row under its 18-character form, memberships
+   * included, unless `planProfileForms` finds a conflict: those rows stay exactly as they are, since
+   * even a rename could change which one the policy engine resolves.
+   */
+  applyProfilesSyncFromOrg(input: {
+    upserts: Array<{ id: string; name: string }>;
+    removeProfileIds: string[];
+    keptMissingProfileIds?: string[];
+  }): {
+    inserted: number;
+    updated: number;
+    removed: number;
+    keptMissing: number;
+    total: number;
+    affected: {
+      upserted: string[];
+      removed: string[];
+      keptMissing: string[];
+      groupsLosingMembers: string[];
+      idsUpgraded: string[];
+      duplicatesMerged: string[];
+      duplicatesUnresolved: string[];
+      accessGranted: string[];
+    };
+  } {
+    return runInTransaction(() => {
+      let inserted = 0;
+      let updated = 0;
+      const affected = {
+        upserted: [] as string[],
+        removed: [] as string[],
+        keptMissing: [] as string[],
+        groupsLosingMembers: [] as string[],
+        idsUpgraded: [] as string[],
+        duplicatesMerged: [] as string[],
+        duplicatesUnresolved: [] as string[],
+        accessGranted: [] as string[],
+      };
+      const presentInOrg = new Set<string>();
+      const formsByKey = groupProfileForms(this.getProfiles());
+      const groupIdsOf = (profileId: string) =>
+        (db
+          .prepare('SELECT group_id FROM profile_group_memberships WHERE profile_id = ?')
+          .all(profileId) as Array<{ group_id: string }>).map((row) => row.group_id);
+      const groupName = db.prepare('SELECT name FROM access_groups WHERE id = ?');
+
+      for (const p of input.upserts) {
+        if (!p.id || !p.name) continue;
+        const key = salesforceIdKey(p.id);
+        presentInOrg.add(key);
+        const forms = formsByKey.get(key) || [];
+
+        if (forms.length > 1) {
+          const plan = planProfileForms(forms, groupIdsOf);
+          if (plan.conflict) {
+            affected.duplicatesUnresolved.push(p.name.trim());
+            continue;
+          }
+          affected.duplicatesMerged.push(p.name.trim());
+          for (const groupId of plan.granted) {
+            const group = groupName.get(groupId) as { name: string } | undefined;
+            affected.accessGranted.push(`${p.name.trim()} now grants ${group?.name || groupId}`);
+          }
+        }
+
+        const targetId = profileSyncTargetId(p.id.trim(), forms);
+        const replaced = forms.filter((f) => f.id !== targetId);
+        // One row is left, so the upsert below writes exactly the row sync chose.
+        if (replaced.length > 0) replaceProfileRows(targetId, replaced);
+        const res = this.upsertProfile(targetId, p.name, false);
+        if (forms.length === 0) inserted++;
+        else updated++;
+        affected.upserted.push(res.profile.name);
+        if (forms.length === 1 && replaced.length === 1) affected.idsUpgraded.push(res.profile.name);
+        formsByKey.set(key, [res.profile]);
+      }
+
+      const lostGroups = new Set<string>();
+      const groupNamesOfProfile = db.prepare(`
+        SELECT g.name AS name FROM profile_group_memberships m
+        JOIN access_groups g ON g.id = m.group_id
+        WHERE m.profile_id = ?
+      `);
+      for (const remId of input.removeProfileIds || []) {
+        const id = remId.trim();
+        if (presentInOrg.has(salesforceIdKey(id))) continue;
+        const existing = this.getProfileById(id);
+        if (!existing) continue;
+        for (const row of groupNamesOfProfile.all(id) as Array<{ name: string }>) {
+          lostGroups.add(row.name);
+        }
+        if (this.deleteProfile(id)) {
+          affected.removed.push(existing.name);
+        }
+      }
+      affected.groupsLosingMembers = Array.from(lostGroups);
+
+      for (const keptId of input.keptMissingProfileIds || []) {
+        const id = keptId.trim();
+        if (presentInOrg.has(salesforceIdKey(id))) continue;
+        const existing = this.getProfileById(id);
+        if (existing) {
+          db.prepare('UPDATE sf_profiles SET missing_in_org = 1 WHERE id = ?').run(id);
+          affected.keptMissing.push(existing.name);
+        }
+      }
+
+      return {
+        inserted,
+        updated,
+        removed: affected.removed.length,
+        keptMissing: affected.keptMissing.length,
+        total: this.getProfiles().length,
+        affected,
+      };
+    });
+  },
+
   // ============================================================================
-  // 3. SALESFORCE -> OBJECTS (Toggle On/Off + SFDX Folder Import)
+  // 3. SALESFORCE -> OBJECTS (Toggle On/Off + SFDX Folder Import + Org Pull & Reconciliation)
   // ============================================================================
   getObjects(): SalesforceObject[] {
     const objRows = db.prepare('SELECT * FROM sf_objects ORDER BY object_name ASC').all() as any[];
@@ -478,6 +1163,7 @@ export const store = {
         isCustom: Boolean(f.is_custom),
         required: Boolean(f.required),
         enabled: Boolean(f.enabled),
+        missingInOrg: Boolean(f.missing_in_org),
       });
       fieldsByObj.set(f.object_name, list);
     }
@@ -493,9 +1179,24 @@ export const store = {
         fieldCount: fields.length,
         enabledFieldCount: fields.filter((f) => f.enabled).length,
         fields,
+        missingInOrg: Boolean(o.missing_in_org),
         updatedAt: o.updated_at,
       };
     });
+  },
+
+  /**
+   * The stored spelling of an object name. Salesforce API names are case-insensitive, so a name
+   * differing only by case is the same object: incoming names go through this first, because a new
+   * row would start enabled and undo an admin's disable.
+   */
+  resolveObjectName(objectName: string): string {
+    const name = objectName.trim();
+    const row = (db.prepare('SELECT object_name FROM sf_objects WHERE object_name = ?').get(name) ||
+      db
+        .prepare('SELECT object_name FROM sf_objects WHERE lower(object_name) = lower(?) ORDER BY object_name LIMIT 1')
+        .get(name)) as { object_name: string } | undefined;
+    return row?.object_name ?? name;
   },
 
   upsertObjectWithFields(input: {
@@ -504,6 +1205,7 @@ export const store = {
     isCustom?: boolean;
     enabled?: boolean;
     sourcePath?: string;
+    missingInOrg?: boolean;
     fields?: Array<{
       fieldName: string;
       label?: string;
@@ -511,6 +1213,7 @@ export const store = {
       isCustom?: boolean;
       required?: boolean;
       enabled?: boolean;
+      missingInOrg?: boolean;
     }>;
   }): SalesforceObject {
     const now = new Date().toISOString();
@@ -540,48 +1243,82 @@ export const store = {
         ? Boolean(existing.enabled)
         : true;
     const sourcePath = input.sourcePath ?? existing?.source_path ?? 'manual';
+    // Only org sync passes this; a re-import or manual save must not clear what sync flagged.
+    const missingInOrg =
+      input.missingInOrg !== undefined
+        ? input.missingInOrg
+        : existing
+        ? Boolean(existing.missing_in_org)
+        : false;
 
     db.prepare(`
-      INSERT INTO sf_objects (object_name, label, is_custom, enabled, source_path, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO sf_objects (object_name, label, is_custom, enabled, source_path, missing_in_org, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(object_name) DO UPDATE SET
         label = excluded.label,
         is_custom = excluded.is_custom,
         enabled = excluded.enabled,
         source_path = excluded.source_path,
+        missing_in_org = excluded.missing_in_org,
         updated_at = excluded.updated_at
-    `).run(objName, label, isCustom ? 1 : 0, enabled ? 1 : 0, sourcePath, now);
+    `).run(objName, label, isCustom ? 1 : 0, enabled ? 1 : 0, sourcePath, missingInOrg ? 1 : 0, now);
 
     const fieldsToUpsert = input.fields || [
       { fieldName: 'Id', label: 'Record ID', fieldType: 'Id', isCustom: false, required: true },
       { fieldName: 'Name', label: 'Name', fieldType: 'Text', isCustom: false, required: false },
     ];
 
-    // An explicit `enabled` is applied; when it is omitted (e.g. an SFDX re-import) an existing
-    // field keeps the admin's manual toggle.
-    const fieldUpsertSql = (applyEnabled: boolean) => `
-      INSERT INTO sf_object_fields (object_name, field_name, label, field_type, is_custom, required, enabled)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+    // An explicit `enabled` or `missingInOrg` is applied; when omitted (e.g. an SFDX re-import) an
+    // existing field keeps the admin's manual toggle and what org sync flagged.
+    const fieldUpsertSql = (applyEnabled: boolean, applyMissingInOrg: boolean) => `
+      INSERT INTO sf_object_fields (object_name, field_name, label, field_type, is_custom, required, enabled, missing_in_org)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(object_name, field_name) DO UPDATE SET
         label = excluded.label,
         field_type = excluded.field_type,
         is_custom = excluded.is_custom,
-        required = excluded.required${applyEnabled ? ',\n        enabled = excluded.enabled' : ''}
+        required = excluded.required${applyMissingInOrg ? ',\n        missing_in_org = excluded.missing_in_org' : ''}${applyEnabled ? ',\n        enabled = excluded.enabled' : ''}
     `;
-    const upsertFieldKeepEnabled = db.prepare(fieldUpsertSql(false));
-    const upsertFieldSetEnabled = db.prepare(fieldUpsertSql(true));
+    const fieldUpsertStatements = new Map<string, ReturnType<typeof db.prepare>>();
+    const fieldUpsertStatement = (applyEnabled: boolean, applyMissingInOrg: boolean) => {
+      const key = `${applyEnabled}:${applyMissingInOrg}`;
+      let statement = fieldUpsertStatements.get(key);
+      if (!statement) {
+        statement = db.prepare(fieldUpsertSql(applyEnabled, applyMissingInOrg));
+        fieldUpsertStatements.set(key, statement);
+      }
+      return statement;
+    };
+
+    const existingFieldNames = (
+      db.prepare('SELECT field_name FROM sf_object_fields WHERE object_name = ? ORDER BY field_name').all(objName) as Array<{
+        field_name: string;
+      }>
+    ).map((r) => r.field_name);
+    const exactFieldNames = new Set(existingFieldNames);
+    const fieldNameByLower = new Map<string, string>();
+    for (const name of existingFieldNames) {
+      if (!fieldNameByLower.has(name.toLowerCase())) fieldNameByLower.set(name.toLowerCase(), name);
+    }
 
     for (const f of fieldsToUpsert) {
       if (!f.fieldName) continue;
-      const stmt = f.enabled !== undefined ? upsertFieldSetEnabled : upsertFieldKeepEnabled;
+      const requestedField = f.fieldName.trim();
+      const fieldName = exactFieldNames.has(requestedField)
+        ? requestedField
+        : fieldNameByLower.get(requestedField.toLowerCase()) ?? requestedField;
+      exactFieldNames.add(fieldName);
+      if (!fieldNameByLower.has(fieldName.toLowerCase())) fieldNameByLower.set(fieldName.toLowerCase(), fieldName);
+      const stmt = fieldUpsertStatement(f.enabled !== undefined, f.missingInOrg !== undefined);
       stmt.run(
         objName,
-        f.fieldName.trim(),
+        fieldName,
         (f.label || f.fieldName).trim(),
         f.fieldType || 'Text',
         (f.isCustom ?? f.fieldName.endsWith('__c')) ? 1 : 0,
         f.required ? 1 : 0,
-        f.enabled !== undefined ? (f.enabled ? 1 : 0) : 1
+        f.enabled !== undefined ? (f.enabled ? 1 : 0) : 1,
+        f.missingInOrg ? 1 : 0
       );
     }
 
@@ -595,7 +1332,7 @@ export const store = {
     let fieldsImported = 0;
     for (const obj of parsedObjects) {
       this.upsertObjectWithFields({
-        objectName: obj.objectName,
+        objectName: this.resolveObjectName(obj.objectName),
         label: obj.label,
         isCustom: obj.isCustom,
         sourcePath: obj.sourcePath,
@@ -684,36 +1421,282 @@ export const store = {
   },
 
   /**
+   * Deletes a field and revokes it from every Access Group, so a later sync that brings the field
+   * back does not silently restore access an admin removed. Returns null when there is no such field.
+   */
+  deleteObjectField(objectName: string, fieldName: string): SalesforceObject | null {
+    const objName = objectName.trim();
+    const fldName = fieldName.trim();
+    if (!deleteFieldAndRevokeGrants(objName, fldName).deleted) return null;
+    return this.getObjects().find((o) => o.objectName === objName) || null;
+  },
+
+  /**
    * Deletes an Object and its fields, and revokes it from every Access Group, so re-importing the
    * object later (e.g. an SFDX re-sync) does not silently restore access an admin removed.
    */
   deleteObject(objectName: string): boolean {
-    return runInTransaction(() => {
-      const res = db.prepare('DELETE FROM sf_objects WHERE object_name = ?').run(objectName);
-      if (res.changes === 0) return false;
-      // Grants match objects case-insensitively; while a case variant (e.g. 'Account' after deleting a
-      // stray 'account') still exists, the grants still refer to it and must stay.
-      const variantRemains = db
-        .prepare('SELECT 1 FROM sf_objects WHERE lower(object_name) = lower(?) LIMIT 1')
-        .get(objectName);
-      if (variantRemains) return true;
+    return deleteObjectAndRevokeGrants(objectName).deleted;
+  },
 
-      const now = new Date().toISOString();
-      const rows = db.prepare('SELECT id, object_permissions_json FROM access_groups').all() as Array<{
-        id: string;
-        object_permissions_json: string;
-      }>;
-      const updateGroup = db.prepare(
-        'UPDATE access_groups SET object_permissions_json = ?, updated_at = ? WHERE id = ?'
+  /**
+   * Computes a non-destructive preview of Object & Field additions, updates, and removals
+   * compared against the live Salesforce Org metadata.
+   */
+  previewObjectsSyncFromOrg(
+    pulledMetadata: PulledOrgObjectMetadata[],
+    orgInfo: { orgId: string; instanceUrl: string }
+  ): ObjectSyncDiffPreview {
+    const localByName = groupObjectsByLowerName(this.getObjects());
+    const groups = this.getGroups();
+
+    const upsertedObjects: ObjectSyncDiffPreview['upsertedObjects'] = [];
+    const removedObjectsFromOrg: ObjectSyncDiffPreview['removedObjectsFromOrg'] = [];
+
+    for (const pulled of mergePulledEntriesByObject(pulledMetadata)) {
+      const variants = localByName.get(pulled.objectName.toLowerCase()) || [];
+
+      if (!pulled.existsInOrg) {
+        const referencedInGroups = groups
+          .filter((g) =>
+            g.objectPermissions.some(
+              (op) => op.objectName.toLowerCase() === pulled.objectName.toLowerCase()
+            )
+          )
+          .map((g) => g.name);
+
+        for (const variant of variants) {
+          removedObjectsFromOrg.push({
+            objectName: variant.objectName,
+            label: variant.label,
+            fieldCount: variant.fields.length,
+            referencedInGroups,
+          });
+        }
+        continue;
+      }
+
+      const orgFieldMap = new Map(
+        pulled.fields.map((f) => [f.fieldName.toLowerCase(), f])
       );
-      for (const row of rows) {
-        const perms = JSON.parse(row.object_permissions_json || '[]') as GroupObjectPermission[];
-        const kept = perms.filter((p) => String(p.objectName).toLowerCase() !== objectName.toLowerCase());
-        if (kept.length !== perms.length) {
-          updateGroup.run(JSON.stringify(kept), now, row.id);
+      const localFieldNames = new Set(
+        variants.flatMap((v) => v.fields.map((f) => f.fieldName.toLowerCase()))
+      );
+
+      const addedFields: ObjectSyncDiffPreview['upsertedObjects'][number]['addedFields'] = [];
+      let updatedFieldsCount = 0;
+
+      for (const f of pulled.fields) {
+        if (!localFieldNames.has(f.fieldName.toLowerCase())) {
+          addedFields.push(f);
+        } else {
+          updatedFieldsCount++;
         }
       }
-      return true;
+
+      const removedFieldsFromOrg: ObjectSyncDiffPreview['upsertedObjects'][number]['removedFieldsFromOrg'] = [];
+      for (const variant of variants) {
+        for (const lf of variant.fields) {
+          if (!orgFieldMap.has(lf.fieldName.toLowerCase())) {
+            const referencedInGroups = groups
+              .filter((g) =>
+                g.objectPermissions.some(
+                  (op) =>
+                    op.objectName.toLowerCase() === pulled.objectName.toLowerCase() &&
+                    op.allowedFields.some(
+                      (af) => af.toLowerCase() === lf.fieldName.toLowerCase()
+                    )
+                )
+              )
+              .map((g) => g.name);
+
+            removedFieldsFromOrg.push({
+              objectName: variant.objectName,
+              fieldName: lf.fieldName,
+              label: lf.label,
+              fieldType: lf.fieldType,
+              enabled: lf.enabled,
+              referencedInGroups,
+            });
+          }
+        }
+      }
+
+      upsertedObjects.push({
+        objectName: pulled.objectName,
+        label: pulled.label,
+        isCustom: pulled.isCustom,
+        isNewObject: variants.length === 0,
+        totalOrgFields: pulled.fields.length,
+        addedFields,
+        updatedFieldsCount,
+        removedFieldsFromOrg,
+        caseVariants: variants.length > 1 ? variants.map((v) => v.objectName) : [],
+      });
+    }
+
+    return {
+      orgId: orgInfo.orgId,
+      instanceUrl: orgInfo.instanceUrl,
+      upsertedObjects,
+      removedObjectsFromOrg,
+    };
+  },
+
+  /**
+   * Applies the Object & Field sync from Salesforce Org in one transaction, so any failure leaves the
+   * database untouched. Deletes ONLY the objects/fields the user explicitly chose to remove and the
+   * pull reports as gone, and marks kept removed items with `missing_in_org = 1`.
+   *
+   * Case variants of an object are one object in the org, so each decision covers them all, but their
+   * rows are not merged: that would change access without an admin choosing it.
+   */
+  applyObjectsSyncFromOrg(input: {
+    pulledMetadata: Array<{
+      objectName: string;
+      label?: string;
+      isCustom?: boolean;
+      existsInOrg: boolean;
+      fields: Array<{
+        fieldName: string;
+        label?: string;
+        fieldType?: string;
+        isCustom?: boolean;
+        required?: boolean;
+      }>;
+    }>;
+    removeObjectNames: string[];
+    removeFields: Array<{ objectName: string; fieldName: string }>;
+  }): {
+    objectsUpserted: number;
+    fieldsUpserted: number;
+    objectsRemoved: number;
+    fieldsRemoved: number;
+    objectsKeptMissing: number;
+    fieldsKeptMissing: number;
+    affected: {
+      objectsSynced: string[];
+      objectsRemoved: string[];
+      fieldsRemoved: string[];
+      objectsKeptMissing: string[];
+      fieldsKeptMissing: string[];
+      groupsLosingGrants: string[];
+    };
+  } {
+    const removeObjSet = new Set(
+      (input.removeObjectNames || []).map((n) => n.toLowerCase())
+    );
+    const removeFieldSet = new Set(
+      (input.removeFields || []).map(
+        (f) => `${f.objectName.toLowerCase()}.${f.fieldName.toLowerCase()}`
+      )
+    );
+    return runInTransaction(() => {
+      let fieldsUpserted = 0;
+      const lostGrants = new Set<string>();
+      const affected = {
+        objectsSynced: [] as string[],
+        objectsRemoved: [] as string[],
+        fieldsRemoved: [] as string[],
+        objectsKeptMissing: [] as string[],
+        fieldsKeptMissing: [] as string[],
+        groupsLosingGrants: [] as string[],
+      };
+
+      const localByName = groupObjectsByLowerName(this.getObjects());
+
+      for (const pulled of mergePulledEntriesByObject(input.pulledMetadata)) {
+        const variants = localByName.get(pulled.objectName.toLowerCase()) || [];
+
+        if (!pulled.existsInOrg) {
+          for (const variant of variants) {
+            if (removeObjSet.has(variant.objectName.toLowerCase())) {
+              // Grants are revoked with the last variant: until then they still refer to a row.
+              const result = deleteObjectAndRevokeGrants(variant.objectName);
+              if (result.deleted) {
+                affected.objectsRemoved.push(variant.objectName);
+                result.revokedGroups.forEach((g) => lostGrants.add(g));
+              }
+            } else {
+              db.prepare(
+                'UPDATE sf_objects SET missing_in_org = 1, updated_at = ? WHERE object_name = ?'
+              ).run(new Date().toISOString(), variant.objectName);
+              affected.objectsKeptMissing.push(variant.objectName);
+            }
+          }
+          continue;
+        }
+
+        // A new field goes on one row, and only if no variant has it yet: a new row starts enabled,
+        // which would expose a field an admin disabled on the other variant.
+        const newFieldsRow = this.resolveObjectName(pulled.objectName);
+        const heldByAnyVariant = new Set(
+          variants.flatMap((v) => v.fields.map((f) => f.fieldName.toLowerCase()))
+        );
+        const rowsToSync = variants.length > 0 ? variants : [{ objectName: newFieldsRow, fields: [] }];
+
+        for (const row of rowsToSync) {
+          const heldByRow = new Set(row.fields.map((f) => f.fieldName.toLowerCase()));
+          const fields = pulled.fields.filter((f) => {
+            const name = f.fieldName.toLowerCase();
+            return heldByRow.has(name) || (row.objectName === newFieldsRow && !heldByAnyVariant.has(name));
+          });
+
+          // Upsert the object and its present org fields (setting missing_in_org = 0). Named one by one
+          // so `enabled` stays the admin's: nothing in a pull may decide what is exposed.
+          const syncedObject = this.upsertObjectWithFields({
+            objectName: row.objectName,
+            label: pulled.label,
+            isCustom: pulled.isCustom,
+            sourcePath: 'salesforce-org-jwt',
+            missingInOrg: false,
+            fields: fields.map((f) => ({
+              fieldName: f.fieldName,
+              label: f.label,
+              fieldType: f.fieldType,
+              isCustom: f.isCustom,
+              required: f.required,
+              missingInOrg: false,
+            })),
+          });
+          affected.objectsSynced.push(syncedObject.objectName);
+          fieldsUpserted += fields.length;
+        }
+
+        // Handle local fields on this object that were NOT in the Salesforce Org
+        const orgFieldSet = new Set(pulled.fields.map((f) => f.fieldName.toLowerCase()));
+        for (const variant of variants) {
+          for (const lf of variant.fields) {
+            if (!orgFieldSet.has(lf.fieldName.toLowerCase())) {
+              const key = `${variant.objectName.toLowerCase()}.${lf.fieldName.toLowerCase()}`;
+              const qualifiedName = `${variant.objectName}.${lf.fieldName}`;
+              if (removeFieldSet.has(key)) {
+                const result = deleteFieldAndRevokeGrants(variant.objectName, lf.fieldName);
+                if (result.deleted) {
+                  affected.fieldsRemoved.push(qualifiedName);
+                  result.revokedGroups.forEach((g) => lostGrants.add(g));
+                }
+              } else {
+                db.prepare(
+                  'UPDATE sf_object_fields SET missing_in_org = 1 WHERE object_name = ? AND field_name = ?'
+                ).run(variant.objectName, lf.fieldName);
+                affected.fieldsKeptMissing.push(qualifiedName);
+              }
+            }
+          }
+        }
+      }
+      affected.groupsLosingGrants = Array.from(lostGrants);
+
+      return {
+        objectsUpserted: affected.objectsSynced.length,
+        fieldsUpserted,
+        objectsRemoved: affected.objectsRemoved.length,
+        fieldsRemoved: affected.fieldsRemoved.length,
+        objectsKeptMissing: affected.objectsKeptMissing.length,
+        fieldsKeptMissing: affected.fieldsKeptMissing.length,
+        affected,
+      };
     });
   },
 
@@ -826,22 +1809,64 @@ export const store = {
     const rows = db
       .prepare('SELECT * FROM mcp_copilot_logs ORDER BY rowid DESC LIMIT ?')
       .all(limit) as any[];
-    return rows.map((r) => ({
-      id: r.id,
-      timestamp: r.timestamp,
-      sfUsername: r.sf_username,
-      profileId: r.profile_id,
-      profileName: r.profile_name,
-      matchedGroups: JSON.parse(r.matched_groups_json || '[]'),
-      toolName: r.tool_name,
-      targetObject: r.target_object,
-      status: r.status,
-      latencyMs: r.latency_ms,
-      sanitizedRequestPayload: r.sanitized_request_payload,
-      sanitizedResponseSummary: r.sanitized_response_summary,
-    }));
+    return rows.map(toCopilotMcpLogRecord);
   },
 
+  /**
+   * Newest first, with verified calls, simulated calls and rejected tokens capped separately, so
+   * neither simulator runs nor junk bearer tokens (which anyone can send) can push verified calls out
+   * of what the portal can see. Every row stays in the table.
+   */
+  getCopilotMcpLogsCappedByKind(
+    realLimit: number,
+    simulatedLimit: number,
+    rejectedLimit: number
+  ): CopilotMcpLogRecord[] {
+    const rows = db
+      .prepare(
+        `SELECT * FROM (
+           SELECT rowid AS seq, * FROM mcp_copilot_logs
+           WHERE simulated = 0 AND sf_username <> :unverified ORDER BY rowid DESC LIMIT :realLimit
+         )
+         UNION ALL
+         SELECT * FROM (
+           SELECT rowid AS seq, * FROM mcp_copilot_logs WHERE simulated <> 0 ORDER BY rowid DESC LIMIT :simulatedLimit
+         )
+         UNION ALL
+         SELECT * FROM (
+           SELECT rowid AS seq, * FROM mcp_copilot_logs
+           WHERE simulated = 0 AND sf_username = :unverified ORDER BY rowid DESC LIMIT :rejectedLimit
+         )
+         ORDER BY seq DESC`
+      )
+      .all({ unverified: UNVERIFIED_CALLER_USERNAME, realLimit, simulatedLimit, rejectedLimit }) as any[];
+    return rows.map(withSeq(toCopilotMcpLogRecord));
+  },
+
+  /**
+   * One page of the whole MCP log, newest first, for reading past the /overview caps. Pass the
+   * previous page's `nextBefore` as `before`; it is null once the oldest matching row is returned.
+   */
+  getCopilotMcpLogPage(query: CopilotMcpLogPageQuery): LogPage<CopilotMcpLogRecord> {
+    const where: string[] = [];
+    const params: Record<string, string | number> = {};
+    if (query.status !== undefined) {
+      where.push('status = :status');
+      params.status = query.status;
+    }
+    if (query.simulated !== undefined) where.push(query.simulated ? 'simulated <> 0' : 'simulated = 0');
+    if (query.toolName !== undefined) {
+      where.push('tool_name = :toolName');
+      params.toolName = query.toolName;
+    }
+    if (query.targetObject !== undefined) {
+      where.push('target_object = :targetObject');
+      params.targetObject = query.targetObject;
+    }
+    return readLogPage('mcp_copilot_logs', where, params, query, toCopilotMcpLogRecord);
+  },
+
+  /** Totals for the dashboard KPIs: real traffic only, so the simulator cannot inflate them. */
   getCopilotMcpLogStats(): { total: number; allowed: number; denied: number; errors: number } {
     const row = db
       .prepare(
@@ -849,10 +1874,27 @@ export const store = {
                 COALESCE(SUM(CASE WHEN status = 'ALLOWED' THEN 1 ELSE 0 END), 0) AS allowed,
                 COALESCE(SUM(CASE WHEN status = 'DENIED' THEN 1 ELSE 0 END), 0) AS denied,
                 COALESCE(SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END), 0) AS errors
-         FROM mcp_copilot_logs`
+         FROM mcp_copilot_logs
+         WHERE simulated = 0`
       )
       .get() as { total: number; allowed: number; denied: number; errors: number };
     return { total: row.total, allowed: row.allowed, denied: row.denied, errors: row.errors };
+  },
+
+  /**
+   * When the last real call reached the MCP tools, read from the table because rejected-token rows
+   * can fill the capped list. A rejected token does not count: anyone can send one, and it would
+   * present an unauthenticated request as MCP activity.
+   */
+  getLastRealMcpCallAt(): string | null {
+    const row = db
+      .prepare(
+        `SELECT timestamp FROM mcp_copilot_logs
+         WHERE simulated = 0 AND sf_username <> ?
+         ORDER BY rowid DESC LIMIT 1`
+      )
+      .get(UNVERIFIED_CALLER_USERNAME) as { timestamp: string } | undefined;
+    return row?.timestamp ?? null;
   },
 
   recordCopilotMcpLog(input: {
@@ -866,6 +1908,8 @@ export const store = {
     latencyMs: number;
     rawRequestPayload: unknown;
     rawResponseSummary: unknown;
+    /** Callers pass this from a verified token or a server route, never from request input. */
+    simulated?: boolean;
   }): CopilotMcpLogRecord {
     const id = `mcp_${Date.now().toString(36)}_${crypto.randomBytes(8).toString('hex')}`;
     const timestamp = new Date().toISOString();
@@ -884,8 +1928,8 @@ export const store = {
       INSERT INTO mcp_copilot_logs (
         id, timestamp, sf_username, profile_id, profile_name, matched_groups_json,
         tool_name, target_object, status, latency_ms,
-        sanitized_request_payload, sanitized_response_summary
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        sanitized_request_payload, sanitized_response_summary, simulated
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       timestamp,
@@ -898,7 +1942,8 @@ export const store = {
       input.status,
       input.latencyMs,
       sanitizedReq,
-      sanitizedRes
+      sanitizedRes,
+      input.simulated ? 1 : 0
     );
 
     return {
@@ -914,6 +1959,7 @@ export const store = {
       latencyMs: input.latencyMs,
       sanitizedRequestPayload: sanitizedReq,
       sanitizedResponseSummary: sanitizedRes,
+      ...(input.simulated ? { simulated: true as const } : {}),
     };
   },
 
@@ -921,16 +1967,42 @@ export const store = {
     const rows = db
       .prepare('SELECT * FROM portal_admin_logs ORDER BY rowid DESC LIMIT ?')
       .all(limit) as any[];
-    return rows.map((r) => ({
-      id: r.id,
-      timestamp: r.timestamp,
-      adminUsername: r.admin_username,
-      authMethod: r.auth_method,
-      action: r.action,
-      target: r.target,
-      details: r.details,
-      ipAddress: r.ip_address,
-    }));
+    return rows.map(toPortalAdminLogRecord);
+  },
+
+  /**
+   * Newest first, with policy simulations capped apart from every other action so a run of them
+   * cannot push earlier audit entries out of the portal view. Every row stays in the table.
+   */
+  getPortalAdminLogsCappedByKind(otherLimit: number, simulationLimit: number): PortalAdminLogRecord[] {
+    const rows = db
+      .prepare(
+        `SELECT * FROM (
+           SELECT rowid AS seq, * FROM portal_admin_logs WHERE action <> :action ORDER BY rowid DESC LIMIT :otherLimit
+         )
+         UNION ALL
+         SELECT * FROM (
+           SELECT rowid AS seq, * FROM portal_admin_logs WHERE action = :action ORDER BY rowid DESC LIMIT :simulationLimit
+         )
+         ORDER BY seq DESC`
+      )
+      .all({ action: SIMULATE_MCP_CALL_ACTION, otherLimit, simulationLimit }) as any[];
+    return rows.map(withSeq(toPortalAdminLogRecord));
+  },
+
+  /** One page of the whole portal audit log, newest first; paged like getCopilotMcpLogPage. */
+  getPortalAdminLogPage(query: PortalAdminLogPageQuery): LogPage<PortalAdminLogRecord> {
+    const where: string[] = [];
+    const params: Record<string, string | number> = {};
+    if (query.action !== undefined) {
+      where.push('action = :action');
+      params.action = query.action;
+    }
+    if (query.authMethod !== undefined) {
+      where.push('auth_method = :authMethod');
+      params.authMethod = query.authMethod;
+    }
+    return readLogPage('portal_admin_logs', where, params, query, toPortalAdminLogRecord);
   },
 
   recordPortalAdminLog(input: {
@@ -1004,15 +2076,34 @@ export const store = {
     };
   },
 
-  updateOktaConfig(input: {
-    enabled?: boolean;
-    oktaDomain?: string;
-    issuer?: string;
-    clientId?: string;
-    clientSecret?: string;
-    redirectUri?: string;
-    adminGroup?: string;
-  }): OktaSsoSettings {
+  /**
+   * The values a save of `input` would store. The production https gate reads this, so it judges
+   * the same result the save writes, including values kept from the stored row.
+   */
+  resolveOktaSave(input: OktaConfigInput) {
+    const current = this.getOktaConfig();
+    const oktaDomain = (input.oktaDomain ?? current.oktaDomain).trim();
+    const derivedIssuer = oktaDomain
+      ? `https://${oktaDomain.replace(/^https?:\/\//, '').replace(/\/+$/, '')}/oauth2/default`
+      : '';
+    const domainChanged = oktaDomain !== current.oktaDomain;
+    // An explicit issuer wins; an empty one means "derive from the domain". Otherwise keep a custom
+    // issuer (e.g. the Okta org authorization server) across saves that do not change the domain.
+    const requestedIssuer = input.issuer?.trim();
+    const issuer = requestedIssuer
+      ? requestedIssuer
+      : input.issuer !== undefined || domainChanged || !current.issuer
+      ? derivedIssuer
+      : current.issuer;
+    return {
+      enabled: Boolean(input.enabled ?? current.enabled),
+      oktaDomain,
+      issuer,
+      redirectUri: (input.redirectUri ?? current.redirectUri).trim(),
+    };
+  },
+
+  updateOktaConfig(input: OktaConfigInput): OktaSsoSettings {
     const current = this.getOktaConfig();
     const storedSecretEnc = (
       db.prepare('SELECT client_secret_enc FROM okta_config WHERE id = 1').get() as { client_secret_enc: string }
@@ -1023,19 +2114,7 @@ export const store = {
       input.clientSecret !== undefined && input.clientSecret !== ''
         ? encryptSecret(input.clientSecret)
         : storedSecretEnc;
-    const nextDomain = (input.oktaDomain ?? current.oktaDomain).trim();
-    const derivedIssuer = nextDomain
-      ? `https://${nextDomain.replace(/^https?:\/\//, '').replace(/\/+$/, '')}/oauth2/default`
-      : '';
-    const domainChanged = nextDomain !== current.oktaDomain;
-    // An explicit issuer wins; an empty one means "derive from the domain". Otherwise keep a custom
-    // issuer (e.g. the Okta org authorization server) across saves that do not change the domain.
-    const requestedIssuer = input.issuer?.trim();
-    const nextIssuer = requestedIssuer
-      ? requestedIssuer
-      : input.issuer !== undefined || domainChanged || !current.issuer
-      ? derivedIssuer
-      : current.issuer;
+    const next = this.resolveOktaSave(input);
     const now = new Date().toISOString();
 
     db.prepare(`
@@ -1044,12 +2123,12 @@ export const store = {
           client_secret_enc = ?, redirect_uri = ?, admin_group = ?, updated_at = ?
       WHERE id = 1
     `).run(
-      (input.enabled ?? current.enabled) ? 1 : 0,
-      nextDomain,
-      nextIssuer,
+      next.enabled ? 1 : 0,
+      next.oktaDomain,
+      next.issuer,
       (input.clientId ?? current.clientId).trim(),
       nextSecretEnc,
-      (input.redirectUri ?? current.redirectUri).trim(),
+      next.redirectUri,
       (input.adminGroup ?? current.adminGroup).trim(),
       now
     );
@@ -1067,37 +2146,159 @@ export const store = {
     };
   },
 
-  getSalesforceSettings(): SalesforceConnectionSettings {
+  getSalesforceSettings(): SalesforceConnectionSettings & { privateKeyPem?: string } {
     const row = db.prepare('SELECT * FROM sf_connection_settings WHERE id = 1').get() as any;
+    const { privateKeyPem, undecryptable } = readStoredPrivateKey(row.private_key_enc);
     return {
-      expectedOrgId: row.expected_org_id,
-      instanceUrl: row.instance_url,
-      apiVersion: row.api_version,
+      enabled: Boolean(row.enabled),
+      authMode: row.auth_mode === 'simulated' ? 'simulated' : 'jwt_bearer',
+      loginUrl: row.login_url || 'https://login.salesforce.com',
+      clientId: row.client_id || '',
+      username: row.username || '',
+      hasPrivateKey: Boolean(privateKeyPem),
+      privateKeyUndecryptable: undecryptable,
+      certificatePem: row.certificate_pem || '',
+      certFingerprint: row.cert_fingerprint || '',
+      connectionStatus:
+        row.connection_status === 'connected' ||
+        row.connection_status === 'error' ||
+        row.connection_status === 'not_verified'
+          ? row.connection_status
+          : 'disconnected',
+      lastConnectedAt: row.last_connected_at || null,
+      lastError: row.last_error || '',
+      connectedOrgId: row.connected_org_id || '',
+      connectedUser: row.connected_user || '',
+      expectedOrgId: row.expected_org_id || '',
+      instanceUrl: row.instance_url || 'https://login.salesforce.com',
+      syncInstanceUrl: row.sync_instance_url || '',
+      apiVersion: row.api_version || 'v62.0',
       enforceOrgIdLock: Boolean(row.enforce_org_id_lock),
-      sfdxObjectsFolderPath: row.sfdx_objects_folder_path,
+      sfdxObjectsFolderPath: row.sfdx_objects_folder_path || '',
       updatedAt: row.updated_at,
     };
   },
 
+  getSalesforceSettingsWithSecrets(): SalesforceConnectionSettings & { privateKeyPem: string } {
+    const row = db.prepare('SELECT private_key_enc FROM sf_connection_settings WHERE id = 1').get() as {
+      private_key_enc: string;
+    };
+    const { privateKeyPem } = readStoredPrivateKey(row.private_key_enc);
+    const base = this.getSalesforceSettings();
+    return {
+      ...base,
+      privateKeyPem,
+    };
+  },
+
   updateSalesforceSettings(
-    input: Partial<SalesforceConnectionSettings>
+    input: Partial<SalesforceConnectionSettings> & { privateKeyPem?: string }
   ): SalesforceConnectionSettings {
     const current = this.getSalesforceSettings();
     const now = new Date().toISOString();
+
+    const storedPrivateKeyEnc = (
+      db.prepare('SELECT private_key_enc FROM sf_connection_settings WHERE id = 1').get() as { private_key_enc: string }
+    ).private_key_enc;
+    // A blank key means "keep the stored one"; the stored ciphertext is kept as-is, even if it
+    // cannot be decrypted right now, so a key change never silently destroys it.
+    const nextPrivateKeyEnc =
+      input.privateKeyPem !== undefined && input.privateKeyPem.trim() !== ''
+        ? encryptSecret(validatePrivateKeyPem(input.privateKeyPem))
+        : storedPrivateKeyEnc;
+
+    const nextCertPem =
+      input.certificatePem !== undefined
+        ? input.certificatePem.trim()
+        : current.certificatePem;
+    const certInfo = inspectCertificatePem(nextCertPem);
+    const nextFingerprint =
+      input.certFingerprint !== undefined
+        ? input.certFingerprint
+        : certInfo?.fingerprintSha256 || current.certFingerprint;
+
+    const nextLoginUrl = (input.loginUrl ?? current.loginUrl).trim() || 'https://login.salesforce.com';
+    const nextInstanceUrl = (input.instanceUrl ?? current.instanceUrl).trim() || nextLoginUrl;
+
     db.prepare(`
       UPDATE sf_connection_settings
-      SET expected_org_id = ?, instance_url = ?, api_version = ?,
-          enforce_org_id_lock = ?, sfdx_objects_folder_path = ?, updated_at = ?
+      SET enabled = ?,
+          auth_mode = ?,
+          login_url = ?,
+          client_id = ?,
+          username = ?,
+          private_key_enc = ?,
+          certificate_pem = ?,
+          cert_fingerprint = ?,
+          connection_status = ?,
+          last_connected_at = ?,
+          last_error = ?,
+          connected_org_id = ?,
+          connected_user = ?,
+          expected_org_id = ?,
+          instance_url = ?,
+          sync_instance_url = ?,
+          api_version = ?,
+          enforce_org_id_lock = ?,
+          sfdx_objects_folder_path = ?,
+          updated_at = ?
       WHERE id = 1
     `).run(
+      (input.enabled ?? current.enabled) ? 1 : 0,
+      input.authMode ?? current.authMode,
+      nextLoginUrl,
+      (input.clientId ?? current.clientId).trim(),
+      (input.username ?? current.username).trim(),
+      nextPrivateKeyEnc,
+      nextCertPem,
+      nextFingerprint,
+      input.connectionStatus ?? current.connectionStatus,
+      input.lastConnectedAt !== undefined ? input.lastConnectedAt : current.lastConnectedAt,
+      input.lastError !== undefined ? input.lastError : current.lastError,
+      (input.connectedOrgId ?? current.connectedOrgId).trim(),
+      (input.connectedUser ?? current.connectedUser).trim(),
       (input.expectedOrgId ?? current.expectedOrgId).trim(),
-      (input.instanceUrl ?? current.instanceUrl).trim(),
+      nextInstanceUrl,
+      (input.syncInstanceUrl ?? current.syncInstanceUrl).trim(),
       (input.apiVersion ?? current.apiVersion).trim(),
       (input.enforceOrgIdLock ?? current.enforceOrgIdLock) ? 1 : 0,
       (input.sfdxObjectsFolderPath ?? current.sfdxObjectsFolderPath).trim(),
       now
     );
     return this.getSalesforceSettings();
+  },
+
+  /**
+   * Saves a successful connect. Its host always goes in sync_instance_url. instance_url decides where MCP
+   * sends bearer tokens, so a real connect may only initialise it, and a host an admin set is never moved.
+   * A simulated connect never writes it, and the simulated host is never adopted.
+   */
+  saveVerifiedSalesforceConnection(
+    input: Partial<SalesforceConnectionSettings> & { privateKeyPem?: string },
+    session: { orgId: string; username: string; instanceUrl: string; authMode: 'jwt_bearer' | 'simulated' }
+  ): SalesforceConnectionSettings {
+    return runInTransaction(() => {
+      const { instance_url: currentHost } = db
+        .prepare('SELECT instance_url FROM sf_connection_settings WHERE id = 1')
+        .get() as { instance_url: string };
+      if (
+        session.authMode !== 'simulated' &&
+        !isSimulatedOrgHost(session.instanceUrl) &&
+        isUninitialisedMcpTokenHost(currentHost)
+      ) {
+        db.prepare('UPDATE sf_connection_settings SET instance_url = ? WHERE id = 1').run(session.instanceUrl);
+      }
+      return this.updateSalesforceSettings({
+        ...input,
+        enabled: true,
+        connectionStatus: 'connected',
+        lastConnectedAt: new Date().toISOString(),
+        lastError: '',
+        connectedOrgId: session.orgId,
+        connectedUser: session.username,
+        syncInstanceUrl: session.instanceUrl,
+      });
+    });
   },
 
   // Legacy compatibility alias for adminAuth.ts

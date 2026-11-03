@@ -549,8 +549,8 @@ describe('store: objects and fields', () => {
     assert.equal(saved.enabled, true);
     assert.equal(saved.sourcePath, 'manual');
     assert.deepEqual(saved.fields, [
-      { objectName, fieldName: 'Id', label: 'Record ID', fieldType: 'Id', isCustom: false, required: true, enabled: true },
-      { objectName, fieldName: 'Name', label: 'Name', fieldType: 'Text', isCustom: false, required: false, enabled: true },
+      { objectName, fieldName: 'Id', label: 'Record ID', fieldType: 'Id', isCustom: false, required: true, enabled: true, missingInOrg: false },
+      { objectName, fieldName: 'Name', label: 'Name', fieldType: 'Text', isCustom: false, required: false, enabled: true, missingInOrg: false },
     ]);
     assert.equal(saved.fieldCount, 2);
     assert.equal(saved.enabledFieldCount, 2);
@@ -1121,8 +1121,23 @@ describe('store: Salesforce connection settings', () => {
 
   test('seeds the defaults from SALESFORCE_LOGIN_URL and API version v62.0', () => {
     assert.deepEqual(withoutTimestamp(sfSettingsAtLoad), {
+      enabled: false,
+      authMode: 'jwt_bearer',
+      loginUrl: process.env.SALESFORCE_LOGIN_URL,
+      clientId: '',
+      username: '',
+      hasPrivateKey: false,
+      privateKeyUndecryptable: false,
+      certificatePem: '',
+      certFingerprint: '',
+      connectionStatus: 'disconnected',
+      lastConnectedAt: null,
+      lastError: '',
+      connectedOrgId: '',
+      connectedUser: '',
       expectedOrgId: '',
       instanceUrl: process.env.SALESFORCE_LOGIN_URL,
+      syncInstanceUrl: '',
       apiVersion: process.env.SALESFORCE_API_VERSION || 'v62.0',
       enforceOrgIdLock: false,
       sfdxObjectsFolderPath: '',

@@ -1,748 +1,1213 @@
 'use client';
 
-import React, { useEffect, useState } from 'react';
-import {
-  Activity,
-  ShieldCheck,
-  ShieldAlert,
-  Users,
-  Database,
-  Layers,
-  Play,
-  Search,
-  X,
-  KeyRound,
-  Lock,
-  Plus,
-  Trash2,
-  Save,
-  Terminal,
-  UserCheck,
-  ArrowRight,
-} from 'lucide-react';
-import {
-  PortalOverviewPayload,
-  CopilotMcpLogRecord,
-  PortalAdminLogRecord,
-  AVAILABLE_MCP_ACTIONS,
-  NavViewId,
+import React, { useState, useMemo } from 'react';
+import type {
+  CopilotMcpLogEntry,
+  PortalAdminLogEntry,
+  SalesforceProfile,
+  SalesforceObjectConfig,
+  AccessGroup,
+  ProfileGroupMapping,
+  OktaConfig,
+  PortalUser,
+  SalesforceConnectionSettings,
 } from '@/types/governance';
-import { Card, Badge, Switch } from '@/components/ui/primitives';
+import { MCP_TOOL_CATALOG, formatShortTime } from '@/components/ui/primitives';
+import type { FlyoutState } from './FlyoutDrawer';
+import { realTraffic } from './simulatedTraffic';
+import { portalAuditCsv, trafficLogCsv } from './csvExport';
+import {
+  auditLogKinds,
+  auditRouteQuery,
+  auditRowMatches,
+  describeHeldLogs,
+  LOG_EXPORT_MAX_ROWS,
+  LOG_EXPORT_PAGE_ROWS,
+  exportCutMessage,
+  exportFileName,
+  clearedOlderRows,
+  emptyOlderRows,
+  heldLogGaps,
+  loadOlderRows,
+  mergeNewestFirst,
+  readAllRows,
+  trafficLogKinds,
+  trafficRouteQuery,
+  trafficRowMatches,
+  type LogPage,
+  type LogQuery,
+  type OlderRowsState,
+  type OverviewLogCaps,
+} from './logHistory';
+import { trafficBuckets, trafficChartSubtitle, type TrafficRange } from './trafficChart';
 
 // ============================================================================
-// 1. LANDING DASHBOARD (Traffic on the MCP Server + Quick Test + Both Log Previews)
+// 1. DASHBOARD VIEW
 // ============================================================================
+export interface McpRequestStats {
+  totalMcpRequests: number;
+  allowedMcpRequests: number;
+  deniedMcpRequests: number;
+  erroredMcpRequests: number;
+  lastMcpCallAt: string | null;
+}
+
+interface TrafficDashboardProps {
+  /** Ticks while the live refresh is paused, so calls keep ageing through the buckets. */
+  clockNow: number;
+  /** Added to clockNow to read it on the server's clock, which stamps the log rows. */
+  clockOffsetMs: number;
+  mcpStats?: McpRequestStats | null;
+  copilotLogs: CopilotMcpLogEntry[];
+  portalLogs: PortalAdminLogEntry[];
+  profiles: SalesforceProfile[];
+  objects: SalesforceObjectConfig[];
+  groups: AccessGroup[];
+  mappings?: ProfileGroupMapping[];
+  sfSettings?: SalesforceConnectionSettings | null;
+  selectedFlyoutId?: string;
+  onNavigateTab: (tab: string) => void;
+  onOpenFlyout: (flyout: FlyoutState) => void;
+  onSeedEnterpriseMatrix?: () => void;
+}
+
 export function TrafficDashboardView({
-  overview,
-  apiFetch,
-  onRefresh,
-  onShowToast,
-  onNavigate,
-}: {
-  overview: PortalOverviewPayload;
-  apiFetch: <T = any>(url: string, options?: RequestInit) => Promise<T>;
-  onRefresh: () => Promise<void>;
-  onShowToast: (msg: string, isError?: boolean) => void;
-  onNavigate: (view: NavViewId) => void;
-}) {
-  const [testProfileId, setTestProfileId] = useState(
-    overview.profiles[0]?.id || ''
-  );
-  const [testTool, setTestTool] = useState<string>('soql_query');
-  const [testObject, setTestObject] = useState(
-    overview.objects[0]?.objectName || 'Account'
-  );
-  const [testing, setTesting] = useState(false);
-  const [lastTestResult, setLastTestResult] = useState<any>(null);
+  clockNow,
+  clockOffsetMs,
+  copilotLogs,
+  mcpStats,
+  profiles,
+  objects,
+  groups,
+  mappings = [],
+  sfSettings,
+  onNavigateTab,
+  onOpenFlyout,
+  onSeedEnterpriseMatrix,
+}: TrafficDashboardProps) {
+  const [range, setRange] = useState<TrafficRange>('24h');
 
-  const handleRunTestCall = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setTesting(true);
-    try {
-      const res = await apiFetch('/api/admin/test-mcp-access', {
-        method: 'POST',
-        body: JSON.stringify({
-          profileId: testProfileId || overview.profiles[0]?.id || '00e000000000000',
-          toolName: testTool,
-          targetObject: testObject,
-          samplePayload: {
-            objectName: testObject,
-            fields: ['Id', 'Name'],
-            whereClause: "Name = 'Sensitive Customer Name'",
-            customerSecretValue: 'SSN-999-00-1234',
-          },
-        }),
-      });
-      setLastTestResult(res);
-      await onRefresh();
-      onShowToast(
-        res.evaluation?.permitted
-          ? 'MCP Call Permitted (Logged with PII stripped)'
-          : 'MCP Call Denied by Profile Group Matrix'
-      );
-    } catch (err: any) {
-      onShowToast(err.message, true);
-    } finally {
-      setTesting(false);
-    }
+  const getProfileGroupIds = (profileId: string): string[] => {
+    const found = mappings.find((m) => m.profileId === profileId);
+    return found ? found.groupIds : [];
   };
 
+  const realLogs = useMemo(() => realTraffic(copilotLogs), [copilotLogs]);
+
+  // KPI metrics
+  // Totals come from the server: copilotLogs holds only the latest rows. The latency and user
+  // figures below are computed from those rows and labelled as such.
+  const totalCalls = mcpStats?.totalMcpRequests ?? realLogs.length;
+  const allowedCalls =
+    mcpStats?.allowedMcpRequests ??
+    realLogs.filter((l) => l.status === 'ALLOWED').length;
+  const deniedCalls =
+    mcpStats?.deniedMcpRequests ??
+    realLogs.filter((l) => l.status === 'DENIED').length;
+  const errorCalls =
+    mcpStats?.erroredMcpRequests ??
+    realLogs.filter((l) => l.status === 'ERROR').length;
+  const successRate = totalCalls
+    ? ((allowedCalls / totalCalls) * 100).toFixed(1)
+    : '100.0';
+
+  const sortedLatencies = useMemo(
+    () =>
+      realLogs
+        .map((l) => l.latencyMs || 0)
+        .sort((a, b) => a - b),
+    [realLogs]
+  );
+  const p95Latency = sortedLatencies.length
+    ? sortedLatencies[Math.floor(sortedLatencies.length * 0.95)]
+    : 0;
+  const avgLatency = sortedLatencies.length
+    ? Math.round(
+        sortedLatencies.reduce((acc, v) => acc + v, 0) / sortedLatencies.length
+      )
+    : 0;
+
+  const uniqueUsers = useMemo(
+    () => new Set(realLogs.map((l) => l.sfUsername)).size,
+    [realLogs]
+  );
+  const uniqueProfilesInLogs = useMemo(
+    () => new Set(realLogs.map((l) => l.profileId)).size,
+    [realLogs]
+  );
+
+  const buckets = useMemo(
+    () => trafficBuckets(realLogs, range, clockNow + clockOffsetMs),
+    [realLogs, range, clockNow, clockOffsetMs]
+  );
+
+  const maxBucket = Math.max(
+    1,
+    ...buckets.map((b) => b.ok + b.warn + b.err)
+  );
+
+  // Top tools
+  const topTools = useMemo(() => {
+    const counts: Record<string, number> = {};
+    realLogs.forEach((l) => {
+      counts[l.toolName] = (counts[l.toolName] || 0) + 1;
+    });
+    return Object.entries(counts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 6);
+  }, [realLogs]);
+  const maxToolCount = Math.max(1, ...topTools.map((t) => t[1]));
+
+  // Top users
+  const topUsers = useMemo(() => {
+    const map: Record<
+      string,
+      { user: string; profile: string; n: number; denied: number }
+    > = {};
+    realLogs.forEach((l) => {
+      if (!map[l.sfUsername]) {
+        map[l.sfUsername] = {
+          user: l.sfUsername,
+          profile: l.profileName,
+          n: 0,
+          denied: 0,
+        };
+      }
+      map[l.sfUsername].n += 1;
+      if (l.status === 'DENIED') map[l.sfUsername].denied += 1;
+    });
+    return Object.values(map)
+      .sort((a, b) => b.n - a.n)
+      .slice(0, 5);
+  }, [realLogs]);
+  const maxUserCount = Math.max(1, ...topUsers.map((u) => u.n));
+
+  // Governance health / Needs attention
+  const unassignedProfiles = profiles.filter(
+    (p) => getProfileGroupIds(p.id).length === 0
+  );
+  const disabledObjects = objects.filter((o) => !o.enabled);
+  const missingInOrgCount =
+    profiles.filter((p) => p.missingInOrg).length +
+    objects.filter(
+      (o) => o.missingInOrg || o.fields.some((f) => f.missingInOrg)
+    ).length;
+  const destructiveGroups = groups.filter((g) =>
+    g.allowedActions?.includes('delete_record')
+  );
+  const recentDenials = realLogs
+    .filter((l) => l.status === 'DENIED')
+    .slice(0, 5);
+
+  const totalFields = objects.reduce((acc, o) => acc + o.fields.length, 0);
+  const enabledFields = objects.reduce(
+    (acc, o) => acc + o.fields.filter((f) => f.enabled).length,
+    0
+  );
+
   return (
-    <div className="space-y-6">
-      {/* Dense KPI Strip */}
-      <div className="grid grid-cols-2 gap-3.5 sm:grid-cols-3 lg:grid-cols-6">
-        <Card className="p-4">
-          <div className="text-[11px] font-bold tracking-wider text-slate-400 uppercase">
-            MCP Requests
-          </div>
-          <div className="mt-1 font-mono text-2xl font-bold text-slate-900">
-            {overview.stats.totalMcpRequests}
-          </div>
-          <div className="mt-1 text-[11px] text-slate-500">
-            Copilot runtime traffic
-          </div>
-        </Card>
-
-        <Card className="p-4">
-          <div className="text-[11px] font-bold tracking-wider text-emerald-600 uppercase">
-            Allowed Calls
-          </div>
-          <div className="mt-1 font-mono text-2xl font-bold text-emerald-600">
-            {overview.stats.allowedMcpRequests}
-          </div>
-          <div className="mt-1 text-[11px] text-slate-500">
-            Passed Group Matrix
-          </div>
-        </Card>
-
-        <Card className="p-4">
-          <div className="text-[11px] font-bold tracking-wider text-rose-600 uppercase">
-            Denied Calls
-          </div>
-          <div className="mt-1 font-mono text-2xl font-bold text-rose-600">
-            {overview.stats.deniedMcpRequests}
-          </div>
-          <div className="mt-1 text-[11px] text-slate-500">
-            Blocked by policy
-            {overview.stats.erroredMcpRequests > 0 &&
-              ` (+${overview.stats.erroredMcpRequests} Salesforce errors)`}
-          </div>
-        </Card>
-
-        <Card
-          className="cursor-pointer p-4 transition hover:border-indigo-300"
-          onClick={() => onNavigate('sf-profiles')}
-        >
-          <div className="text-[11px] font-bold tracking-wider text-slate-400 uppercase">
-            SF Profiles
-          </div>
-          <div className="mt-1 font-mono text-2xl font-bold text-slate-900">
-            {overview.stats.totalProfiles}
-          </div>
-          <div className="mt-1 text-[11px] text-indigo-600">
-            Manage Profiles →
-          </div>
-        </Card>
-
-        <Card
-          className="cursor-pointer p-4 transition hover:border-indigo-300"
-          onClick={() => onNavigate('sf-objects')}
-        >
-          <div className="text-[11px] font-bold tracking-wider text-slate-400 uppercase">
-            SF Objects
-          </div>
-          <div className="mt-1 font-mono text-2xl font-bold text-slate-900">
-            {overview.stats.enabledObjects}{' '}
-            <span className="text-sm font-normal text-slate-400">
-              / {overview.stats.totalObjects}
-            </span>
-          </div>
-          <div className="mt-1 text-[11px] text-indigo-600">
-            Enabled Objects →
-          </div>
-        </Card>
-
-        <Card
-          className="cursor-pointer p-4 transition hover:border-indigo-300"
-          onClick={() => onNavigate('matrix-groups')}
-        >
-          <div className="text-[11px] font-bold tracking-wider text-slate-400 uppercase">
-            Access Groups
-          </div>
-          <div className="mt-1 font-mono text-2xl font-bold text-slate-900">
-            {overview.stats.totalGroups}
-          </div>
-          <div className="mt-1 text-[11px] text-indigo-600">
-            Configure Groups →
-          </div>
-        </Card>
+    <div>
+      <div className="ph">
+        <div className="ph-l">
+          <h1>Dashboard</h1>
+          <p>MCP server traffic, policy health, and recent activity.</p>
+        </div>
+        <div className="ph-act">
+          {groups.length <= 1 && onSeedEnterpriseMatrix && (
+            <button
+              type="button"
+              className="btn"
+              onClick={onSeedEnterpriseMatrix}
+              title="Populate 5 standard Enterprise Access Groups & Profile mappings"
+            >
+              Load enterprise matrix
+            </button>
+          )}
+          <button
+            type="button"
+            className="btn"
+            onClick={() => onOpenFlyout({ type: 'simulator' })}
+          >
+            Simulate MCP call
+          </button>
+          <button
+            type="button"
+            className="btn"
+            onClick={() => onNavigateTab('traffic')}
+          >
+            View traffic log
+          </button>
+          <button
+            type="button"
+            className="btn pri"
+            onClick={() => onNavigateTab('matrix')}
+          >
+            Configure access matrix
+          </button>
+        </div>
       </div>
 
-      {/* Live Policy Simulator Bar (Test MCP Server Traffic) */}
-      <Card className="p-4">
-        <div className="mb-3 flex items-center justify-between">
-          <div>
-            <h3 className="text-xs font-bold tracking-wider text-slate-800 uppercase">
-              Test Copilot → MCP Server Request (Simulates Traffic & Logs with PII Stripped)
-            </h3>
-            <p className="text-[11px] text-slate-500">
-              Select a Salesforce Profile, MCP Action, and Object to verify effective permissions from your Profile Group Matrix.
-            </p>
+      {/* KPI Strip */}
+      <div className="kpis">
+        <div className="kpi">
+          <div className="k-lbl">
+            <span>MCP requests</span>
+            <span className="mono">ALL TIME</span>
           </div>
-          <span className="font-mono text-[11px] text-slate-400">
-            POST /mcp
-          </span>
+          <div className="k-val">{totalCalls}</div>
+          <div className="k-sub">
+            <span>
+              Allowed: <b style={{ color: 'var(--tx)' }}>{allowedCalls}</b> ·
+              Denied: <b style={{ color: 'var(--warn)' }}>{deniedCalls}</b>
+            </span>
+          </div>
         </div>
 
-        <form
-          onSubmit={handleRunTestCall}
-          className="grid grid-cols-1 gap-2.5 sm:grid-cols-4"
-        >
-          <input
-            type="text"
-            value={testProfileId}
-            onChange={(e) => setTestProfileId(e.target.value)}
-            placeholder={
-              overview.profiles[0]?.id || 'Enter Profile ID (e.g. 00e...)'
-            }
-            list="dashboard-profile-list"
-            className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
-          />
-          <datalist id="dashboard-profile-list">
-            {overview.profiles.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.name}
-              </option>
-            ))}
-          </datalist>
+        <div className="kpi">
+          <div className="k-lbl">
+            <span>Success rate</span>
+            <span className="dot ok" />
+          </div>
+          <div className="k-val">{successRate}%</div>
+          <div className="k-sub">
+            <span>
+              {errorCalls} transport errors · target ≥ 98.0%
+            </span>
+          </div>
+        </div>
 
-          <select
-            value={testTool}
-            onChange={(e) => setTestTool(e.target.value)}
-            className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
+        <div className="kpi">
+          <div className="k-lbl">
+            <span>Policy denials</span>
+            <span className="dot warn" />
+          </div>
+          <div className="k-val">{deniedCalls}</div>
+          <div className="k-sub">
+            <span>
+              {totalCalls
+                ? ((deniedCalls / totalCalls) * 100).toFixed(1)
+                : '0.0'}
+              % of traffic · RBAC enforced
+            </span>
+          </div>
+        </div>
+
+        <div className="kpi">
+          <div className="k-lbl">
+            <span>p95 latency</span>
+            <span className="mono">ms</span>
+          </div>
+          <div className="k-val">{p95Latency}</div>
+          <div className="k-sub">
+            <span>avg {avgLatency} ms · latest {realLogs.length} calls</span>
+          </div>
+        </div>
+
+        <div className="kpi">
+          <div className="k-lbl">
+            <span>Active users</span>
+            <span className="mono">Copilot</span>
+          </div>
+          <div className="k-val">{uniqueUsers}</div>
+          <div className="k-sub">
+            <span>
+              across {uniqueProfilesInLogs} profiles in the latest{' '}
+              {realLogs.length} calls
+            </span>
+          </div>
+        </div>
+      </div>
+
+      {/* Traffic Chart + Governance Needs Attention */}
+      <div className="g2">
+        <div className="card">
+          <div className="card-h">
+            <div>
+              <div className="card-t">MCP server traffic</div>
+              <div className="card-s">
+                {trafficChartSubtitle(range, realLogs.length)}
+              </div>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <div className="leg">
+                <span>
+                  <i style={{ background: 'rgba(0,163,255,0.8)' }} /> Allowed
+                </span>
+                <span>
+                  <i style={{ background: 'rgba(251,191,36,0.9)' }} /> Denied
+                </span>
+                <span>
+                  <i style={{ background: 'rgba(248,113,113,0.9)' }} /> Error
+                </span>
+              </div>
+              <div className="seg">
+                {(['1h', '24h', '7d'] as const).map((k) => (
+                  <button
+                    key={k}
+                    type="button"
+                    className={range === k ? 'on' : ''}
+                    onClick={() => setRange(k)}
+                  >
+                    {k.toUpperCase()}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+          <div className="card-b">
+            <div className="bars">
+              {buckets.map((b, i) => {
+                const tot = b.ok + b.warn + b.err;
+                const h = tot > 0 ? Math.max(8, (tot / maxBucket) * 108) : 3;
+                const okH = tot ? (b.ok / tot) * h : 0;
+                const warnH = tot ? (b.warn / tot) * h : 0;
+                const errH = tot ? (b.err / tot) * h : 0;
+                return (
+                  <div
+                    className="b-col"
+                    key={i}
+                    title={`${b.span} — ${b.ok} allowed, ${b.warn} denied, ${b.err} error`}
+                  >
+                    <div className="b-stk" style={{ height: `${h}px` }}>
+                      <div
+                        className="b-seg ok"
+                        style={{ height: `${okH}px` }}
+                      />
+                      <div
+                        className="b-seg warn"
+                        style={{ height: `${warnH}px` }}
+                      />
+                      <div
+                        className="b-seg err"
+                        style={{ height: `${errH}px` }}
+                      />
+                    </div>
+                    <div className="b-lbl">
+                      {(buckets.length - 1 - i) % 3 === 0 ? b.lbl : ''}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="card-h">
+            <div>
+              <div className="card-t">Needs attention</div>
+              <div className="card-s">Governance checks on current config</div>
+            </div>
+            <span className="tag mono">
+              {unassignedProfiles.length +
+                disabledObjects.length +
+                destructiveGroups.length +
+                missingInOrgCount}{' '}
+              items
+            </span>
+          </div>
+          <div
+            className="card-b"
+            style={{ display: 'flex', flexDirection: 'column', gap: 8 }}
           >
-            {AVAILABLE_MCP_ACTIONS.map((a) => (
-              <option key={a.id} value={a.id}>
-                {a.id} ({a.category})
-              </option>
-            ))}
-          </select>
+            {unassignedProfiles.length > 0 && (
+              <div
+                className="chk-row"
+                style={{
+                  border: '1px solid var(--bd)',
+                  borderRadius: 6,
+                  cursor: 'pointer',
+                }}
+                onClick={() => onNavigateTab('matrix')}
+              >
+                <div>
+                  <div
+                    style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+                  >
+                    <span className="dot warn" />
+                    <b>
+                      {unassignedProfiles.length} profile
+                      {unassignedProfiles.length > 1 ? 's' : ''} have no group
+                      assigned
+                    </b>
+                  </div>
+                  <div
+                    style={{
+                      fontSize: 11.5,
+                      color: 'var(--t3)',
+                      marginTop: 2,
+                    }}
+                  >
+                    {unassignedProfiles
+                      .slice(0, 3)
+                      .map((p) => p.name)
+                      .join(', ')}
+                    {unassignedProfiles.length > 3
+                      ? ` +${unassignedProfiles.length - 3} more`
+                      : ''}{' '}
+                    — all MCP calls denied
+                  </div>
+                </div>
+                <span className="tag">Assign &rarr;</span>
+              </div>
+            )}
 
-          <input
-            type="text"
-            value={testObject}
-            onChange={(e) => setTestObject(e.target.value)}
-            placeholder="Target Object (e.g. Account)"
-            list="dashboard-object-list"
-            className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
-          />
-          <datalist id="dashboard-object-list">
-            {overview.objects.map((o) => (
-              <option key={o.objectName} value={o.objectName}>
-                {o.label}
-              </option>
-            ))}
-          </datalist>
+            {disabledObjects.length > 0 && (
+              <div
+                className="chk-row"
+                style={{
+                  border: '1px solid var(--bd)',
+                  borderRadius: 6,
+                  cursor: 'pointer',
+                }}
+                onClick={() => onNavigateTab('objects')}
+              >
+                <div>
+                  <div
+                    style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+                  >
+                    <span className="dot off" />
+                    <b>
+                      {disabledObjects.length} object
+                      {disabledObjects.length > 1 ? 's' : ''} switched off
+                    </b>
+                  </div>
+                  <div
+                    style={{
+                      fontSize: 11.5,
+                      color: 'var(--t3)',
+                      marginTop: 2,
+                    }}
+                  >
+                    {disabledObjects
+                      .slice(0, 4)
+                      .map((o) => o.objectName)
+                      .join(', ')}
+                    {disabledObjects.length > 4
+                      ? ` +${disabledObjects.length - 4} more`
+                      : ''}{' '}
+                    — review fields before enabling
+                  </div>
+                </div>
+                <span className="tag">Review &rarr;</span>
+              </div>
+            )}
 
-          <button
-            type="submit"
-            disabled={testing}
-            className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-1.5 text-xs font-semibold text-white hover:bg-indigo-700 disabled:opacity-50"
-          >
-            <Play className="h-3.5 w-3.5" />
-            {testing ? 'Testing...' : 'Send Test MCP Call'}
-          </button>
-        </form>
+            {missingInOrgCount > 0 && (
+              <div
+                className="chk-row"
+                style={{
+                  border: '1px solid var(--bd)',
+                  borderRadius: 6,
+                  cursor: 'pointer',
+                }}
+                onClick={() => onNavigateTab('objects')}
+              >
+                <div>
+                  <div
+                    style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+                  >
+                    <span className="dot warn" />
+                    <b>
+                      {missingInOrgCount} metadata item
+                      {missingInOrgCount > 1 ? 's' : ''} flagged Missing in Org
+                    </b>
+                  </div>
+                  <div
+                    style={{
+                      fontSize: 11.5,
+                      color: 'var(--t3)',
+                      marginTop: 2,
+                    }}
+                  >
+                    Drift detected between local governance store and Salesforce
+                    org
+                  </div>
+                </div>
+                <span className="tag warn">Reconcile &rarr;</span>
+              </div>
+            )}
 
-        {lastTestResult && (
-          <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs">
-            <div className="flex items-center justify-between">
-              <span className="font-semibold text-slate-800">
-                Result:{' '}
-                {lastTestResult.evaluation?.permitted ? (
-                  <span className="text-emerald-600">ALLOWED</span>
-                ) : (
-                  <span className="text-rose-600">DENIED</span>
-                )}
-              </span>
-              <span className="font-mono text-[11px] text-slate-500">
-                {lastTestResult.evaluation?.reason}
+            {destructiveGroups.length > 0 && (
+              <div
+                className="chk-row"
+                style={{
+                  border: '1px solid var(--bd)',
+                  borderRadius: 6,
+                  cursor: 'pointer',
+                }}
+                onClick={() => onNavigateTab('groups')}
+              >
+                <div>
+                  <div
+                    style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+                  >
+                    <span className="dot err" />
+                    <b>
+                      {destructiveGroups.length} group
+                      {destructiveGroups.length > 1 ? 's' : ''} allow{' '}
+                      <span className="mono">delete_record</span>
+                    </b>
+                  </div>
+                  <div
+                    style={{
+                      fontSize: 11.5,
+                      color: 'var(--t3)',
+                      marginTop: 2,
+                    }}
+                  >
+                    {destructiveGroups.map((g) => g.name).join(', ')}
+                  </div>
+                </div>
+                <span className="tag">Inspect &rarr;</span>
+              </div>
+            )}
+
+            <div
+              className="chk-row"
+              style={{
+                border: '1px solid var(--bd)',
+                borderRadius: 6,
+                cursor: 'pointer',
+              }}
+              onClick={() => onNavigateTab('sf-connection')}
+            >
+              <div>
+                <div
+                  style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+                >
+                  <span
+                    className={`dot ${
+                      sfSettings?.connectionStatus === 'connected'
+                        ? 'ok'
+                        : 'warn'
+                    }`}
+                  />
+                  <b>
+                    Salesforce Org JWT:{' '}
+                    {sfSettings?.connectionStatus === 'connected'
+                      ? `Connected (${sfSettings.connectedOrgId})`
+                      : sfSettings?.connectionStatus === 'not_verified'
+                      ? 'Not verified'
+                      : 'Disconnected'}
+                  </b>
+                </div>
+                <div
+                  style={{
+                    fontSize: 11.5,
+                    color: 'var(--t3)',
+                    marginTop: 2,
+                  }}
+                >
+                  {sfSettings?.connectionStatus === 'connected'
+                    ? `User: ${sfSettings.connectedUser} · ${sfSettings.syncInstanceUrl}`
+                    : sfSettings?.connectionStatus === 'not_verified'
+                    ? 'Settings changed. Connect & Verify again to pull live Profiles & Objects'
+                    : 'Configure OAuth 2.0 JWT Bearer to pull live Profiles & Objects'}
+                </div>
+              </div>
+              <span className="tag">Org JWT &rarr;</span>
+            </div>
+
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                padding: '6px 4px 0',
+                fontSize: 11.5,
+                color: 'var(--t3)',
+              }}
+            >
+              <span>Config summary</span>
+              <span className="mono">
+                {objects.filter((o) => o.enabled).length}/{objects.length}{' '}
+                objects · {enabledFields}/{totalFields} fields · {groups.length}{' '}
+                groups
               </span>
             </div>
           </div>
-        )}
-      </Card>
+        </div>
+      </div>
 
-      {/* Two Separate Live Log Feeds Side-by-Side */}
-      <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
-        {/* Feed 1: Users hitting MCP Server from Copilot (PII Stripped) */}
-        <Card className="overflow-hidden">
-          <div className="flex items-center justify-between border-b border-slate-200/80 bg-slate-50/70 px-4 py-3">
-            <div>
-              <h3 className="text-xs font-bold text-slate-900">
-                1. Copilot → MCP Server Traffic Logs (PII Stripped)
-              </h3>
-              <p className="text-[11px] text-slate-500">
-                Users hitting `/mcp` from Microsoft Copilot & tools invoked
-              </p>
-            </div>
+      {/* Bottom 3 Cards */}
+      <div className="g3">
+        <div className="card">
+          <div className="card-h">
+            <div className="card-t">Most used tools</div>
+            <span className="card-s">by call count</span>
+          </div>
+          <div
+            className="card-b"
+            style={{ display: 'flex', flexDirection: 'column', gap: 8 }}
+          >
+            {topTools.length === 0 ? (
+              <div className="empty">No MCP tool calls recorded yet.</div>
+            ) : (
+              topTools.map(([tool, n]) => (
+                <div key={tool}>
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      fontSize: 12,
+                      marginBottom: 3,
+                    }}
+                  >
+                    <span className="mono">{tool}</span>
+                    <span className="mono" style={{ color: 'var(--t2)' }}>
+                      {n}
+                    </span>
+                  </div>
+                  <div
+                    style={{
+                      height: 5,
+                      background: 'var(--bg)',
+                      borderRadius: 3,
+                      overflow: 'hidden',
+                    }}
+                  >
+                    <div
+                      style={{
+                        width: `${(n / maxToolCount) * 100}%`,
+                        height: '100%',
+                        background:
+                          tool === 'delete_record'
+                            ? 'var(--err)'
+                            : 'var(--acc)',
+                      }}
+                    />
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="card-h">
+            <div className="card-t">Most active users</div>
+            <span className="card-s">Copilot callers</span>
+          </div>
+          <div
+            className="card-b"
+            style={{ display: 'flex', flexDirection: 'column', gap: 8 }}
+          >
+            {topUsers.length === 0 ? (
+              <div className="empty">No active callers yet.</div>
+            ) : (
+              topUsers.map((u) => (
+                <div key={u.user}>
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      fontSize: 12,
+                      marginBottom: 3,
+                    }}
+                  >
+                    <span>
+                      {u.user}{' '}
+                      <span style={{ color: 'var(--t3)', fontSize: 11 }}>
+                        · {u.profile}
+                      </span>
+                    </span>
+                    <span className="mono" style={{ color: 'var(--t2)' }}>
+                      {u.n}
+                    </span>
+                  </div>
+                  <div
+                    style={{
+                      height: 5,
+                      background: 'var(--bg)',
+                      borderRadius: 3,
+                      overflow: 'hidden',
+                    }}
+                  >
+                    <div
+                      style={{
+                        width: `${(u.n / maxUserCount) * 100}%`,
+                        height: '100%',
+                        background: 'var(--acc)',
+                      }}
+                    />
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="card-h">
+            <div className="card-t">Recent denials</div>
             <button
-              onClick={() => onNavigate('logs-copilot')}
-              className="inline-flex items-center gap-1 text-xs font-semibold text-indigo-600 hover:underline"
+              type="button"
+              className="btn gh sm"
+              onClick={() => onNavigateTab('traffic')}
             >
-              <span>View All ({overview.copilotLogs.length})</span>
-              <ArrowRight className="h-3 w-3" />
+              View in log &rarr;
             </button>
           </div>
-
-          <div className="overflow-x-auto">
-            <table className="w-full border-collapse text-left text-xs">
-              <thead>
-                <tr className="border-b border-slate-100 bg-slate-50/40 text-[10px] font-bold tracking-wider text-slate-400 uppercase">
-                  <th className="py-2 pr-2 pl-4">Time</th>
-                  <th className="px-2 py-2">Copilot User / Profile</th>
-                  <th className="px-2 py-2">Tool & Object</th>
-                  <th className="py-2 pr-4 pl-2 text-right">Status</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {overview.copilotLogs.length === 0 ? (
-                  <tr>
-                    <td
-                      colSpan={4}
-                      className="py-8 text-center text-xs text-slate-400"
-                    >
-                      No Copilot MCP traffic recorded yet.
-                    </td>
-                  </tr>
-                ) : (
-                  overview.copilotLogs.slice(0, 8).map((l) => (
-                    <tr key={l.id} className="hover:bg-slate-50">
-                      <td className="py-2 pr-2 pl-4 font-mono text-[11px] text-slate-500">
-                        {new Date(l.timestamp).toLocaleTimeString()}
-                      </td>
-                      <td className="px-2 py-2">
-                        <div className="font-medium text-slate-900">
-                          {l.sfUsername}
-                        </div>
-                        <div className="font-mono text-[10px] text-slate-400">
-                          {l.profileName} ({l.profileId})
-                        </div>
-                      </td>
-                      <td className="px-2 py-2 font-mono text-[11px] text-slate-800">
-                        {l.toolName}{' '}
-                        {l.targetObject && l.targetObject !== '*'
-                          ? `(${l.targetObject})`
-                          : ''}
-                      </td>
-                      <td className="py-2 pr-4 pl-2 text-right">
-                        <Badge
-                          variant={
-                            l.status === 'ALLOWED' ? 'emerald' : 'rose'
-                          }
-                        >
-                          {l.status}
-                        </Badge>
-                      </td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
+          <div className="card-b" style={{ padding: 0 }}>
+            {recentDenials.length === 0 ? (
+              <div className="empty">No policy denials in window.</div>
+            ) : (
+              recentDenials.map((r) => (
+                <div
+                  key={r.id}
+                  className="chk-row"
+                  style={{ cursor: 'pointer', padding: '8px 14px' }}
+                  onClick={() => onOpenFlyout({ type: 'traffic', data: r })}
+                >
+                  <div>
+                    <div className="mono" style={{ fontSize: 11.5 }}>
+                      {r.toolName}({r.targetObject})
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--t3)' }}>
+                      {r.sfUsername} · {r.profileName}
+                    </div>
+                  </div>
+                  <span className="mono" style={{ color: 'var(--t3)' }}>
+                    {formatShortTime(r.timestamp)}
+                  </span>
+                </div>
+              ))
+            )}
           </div>
-        </Card>
-
-        {/* Feed 2: Portal Admin Users & Configuration Actions */}
-        <Card className="overflow-hidden">
-          <div className="flex items-center justify-between border-b border-slate-200/80 bg-slate-50/70 px-4 py-3">
-            <div>
-              <h3 className="text-xs font-bold text-slate-900">
-                2. Web Portal Admin Sign-Ins & Configuration Logs
-              </h3>
-              <p className="text-[11px] text-slate-500">
-                Portal users signing in & configuration changes made
-              </p>
-            </div>
-            <button
-              onClick={() => onNavigate('logs-portal')}
-              className="inline-flex items-center gap-1 text-xs font-semibold text-indigo-600 hover:underline"
-            >
-              <span>View All ({overview.portalLogs.length})</span>
-              <ArrowRight className="h-3 w-3" />
-            </button>
-          </div>
-
-          <div className="overflow-x-auto">
-            <table className="w-full border-collapse text-left text-xs">
-              <thead>
-                <tr className="border-b border-slate-100 bg-slate-50/40 text-[10px] font-bold tracking-wider text-slate-400 uppercase">
-                  <th className="py-2 pr-2 pl-4">Time</th>
-                  <th className="px-2 py-2">Portal User</th>
-                  <th className="px-2 py-2">Action</th>
-                  <th className="py-2 pr-4 pl-2">Details</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {overview.portalLogs.length === 0 ? (
-                  <tr>
-                    <td
-                      colSpan={4}
-                      className="py-8 text-center text-xs text-slate-400"
-                    >
-                      No portal actions recorded yet.
-                    </td>
-                  </tr>
-                ) : (
-                  overview.portalLogs.slice(0, 8).map((p) => (
-                    <tr key={p.id} className="hover:bg-slate-50">
-                      <td className="py-2 pr-2 pl-4 font-mono text-[11px] text-slate-500">
-                        {new Date(p.timestamp).toLocaleTimeString()}
-                      </td>
-                      <td className="px-2 py-2">
-                        <span className="font-semibold text-slate-900">
-                          {p.adminUsername}
-                        </span>
-                        <span className="ml-1.5 rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-500">
-                          {p.authMethod}
-                        </span>
-                      </td>
-                      <td className="px-2 py-2">
-                        <Badge variant="indigo">{p.action}</Badge>
-                      </td>
-                      <td className="max-w-xs truncate py-2 pr-4 pl-2 text-[11px] text-slate-600">
-                        {p.details}
-                      </td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
-          </div>
-        </Card>
+        </div>
       </div>
     </div>
   );
 }
 
 // ============================================================================
-// 2. COPILOT MCP SERVER LOGS VIEW (With Sensitive Data Stripped Out)
+// 2. COPILOT MCP TRAFFIC LOG VIEW
 // ============================================================================
-export function CopilotMcpLogsView({
-  logs,
+
+/** Reads one page of a paged log route; the views pass the filters and cursor as the query. */
+export type FetchLogPage<T> = (query: LogQuery) => Promise<LogPage<T>>;
+
+function downloadCsv(csv: string, fileName: string) {
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/**
+ * Older rows read through a paged log route, held beside the capped /overview list. `cursor` is
+ * undefined before the first page and null once the oldest row has been read. `reload` drops the
+ * loaded pages and reads down from the newest row again, which closes a gap live refreshes opened.
+ */
+function useOlderLogRows<T extends { id: string; seq?: number }>(
+  logs: T[],
+  fetchPage: FetchLogPage<T>,
+  onNotify: (msg: string, isError?: boolean) => void
+) {
+  const [state, setState] = useState<OlderRowsState<T>>(emptyOlderRows);
+  const [loading, setLoading] = useState(false);
+  // Bumped by clear and each read, so a page that lands after a clear or reload does not bring back what they dropped.
+  const generation = React.useRef(0);
+  const held = useMemo(() => mergeNewestFirst(logs, state.older), [logs, state.older]);
+
+  // A refresh that brings rows back refills a cleared view.
+  React.useEffect(() => {
+    if (logs.length > 0) setState((prev) => (prev.cleared ? { ...prev, cleared: false } : prev));
+  }, [logs]);
+
+  const read = async (from: OlderRowsState<T>) => {
+    if (loading || from.cursor === null) return;
+    const run = ++generation.current;
+    setLoading(true);
+    try {
+      const next = await loadOlderRows((before, limit) => fetchPage({ before, limit }), from, logs);
+      // A refresh may have refilled the view while the pages were read.
+      if (run === generation.current) setState((prev) => ({ ...next, cleared: prev.cleared && next.cleared }));
+    } catch (err) {
+      onNotify(`Could not load older rows: ${err instanceof Error ? err.message : String(err)}`, true);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadOlder = () => read(state);
+  const reload = () => read(emptyOlderRows<T>());
+
+  /** Clear log: drops the loaded pages, and the view is called cleared until rows come back. */
+  const clear = () => {
+    generation.current += 1;
+    setState(clearedOlderRows<T>());
+  };
+
+  return {
+    held,
+    older: state.older,
+    cursor: state.cursor,
+    loadedTop: state.loadedTop,
+    cleared: state.cleared,
+    loading,
+    loadOlder,
+    reload,
+    clear,
+  };
+}
+
+/** The toolbar's account of the rows held, with a Reload button when live refreshes opened a gap. */
+function HeldLogsNote({
+  text,
+  gap,
+  loading,
+  onReload,
 }: {
-  logs: CopilotMcpLogRecord[];
+  text: string;
+  gap: boolean;
+  loading: boolean;
+  onReload: () => void;
 }) {
-  const [search, setSearch] = useState('');
-  const [selectedLog, setSelectedLog] = useState<CopilotMcpLogRecord | null>(
-    null
-  );
-
-  const filtered = logs.filter(
-    (l) =>
-      !search.trim() ||
-      l.sfUsername.toLowerCase().includes(search.toLowerCase()) ||
-      l.profileName.toLowerCase().includes(search.toLowerCase()) ||
-      l.profileId.toLowerCase().includes(search.toLowerCase()) ||
-      l.toolName.toLowerCase().includes(search.toLowerCase()) ||
-      l.targetObject.toLowerCase().includes(search.toLowerCase())
-  );
-
   return (
-    <div className="space-y-5">
-      <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
-        <div>
-          <h2 className="text-base font-bold text-slate-900">
-            Copilot → MCP Server Execution Logs (Sensitive Data Stripped)
-          </h2>
-          <p className="text-xs text-slate-500">
-            Logs every user hitting the MCP server from Microsoft Copilot, the tool used, matched Access Groups, and structure-only payload with literal data values stripped out (`&lt;REDACTED&gt;`).
-          </p>
-        </div>
+    <>
+      <span className="mono" style={{ color: 'var(--t3)' }} title="What this view holds">
+        ({text})
+      </span>
+      {gap && (
+        <button type="button" className="btn sm" disabled={loading} onClick={onReload}>
+          {loading ? 'Loading…' : 'Reload'}
+        </button>
+      )}
+    </>
+  );
+}
 
-        <div className="relative">
-          <Search className="pointer-events-none absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-          <input
-            type="text"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Filter user, profile, tool, object..."
-            className="w-64 rounded-lg border border-slate-200 bg-white py-1.5 pr-3 pl-8 text-xs text-slate-800 focus:border-indigo-500 focus:outline-none"
-          />
-        </div>
-      </div>
+/** Exports every matching row through the paged route, up to the export limit, and says when it was cut. */
+function useLogExport<T>(
+  fetchPage: FetchLogPage<T>,
+  onNotify: (msg: string, isError?: boolean) => void
+) {
+  const [exporting, setExporting] = useState(false);
+  const exportRows = async (
+    routeQuery: LogQuery,
+    keep: (row: T) => boolean,
+    toCsv: (rows: T[]) => string,
+    fileBase: string
+  ) => {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      // The route cannot apply the free-text search, so the limits count rows after `keep`.
+      const { rows, cut } = await readAllRows(
+        (before, limit) => fetchPage({ ...routeQuery, before, limit }),
+        LOG_EXPORT_MAX_ROWS,
+        LOG_EXPORT_PAGE_ROWS,
+        { keep }
+      );
+      const date = new Date().toISOString().slice(0, 10);
+      downloadCsv(toCsv(rows), exportFileName(fileBase, date, cut));
+      if (cut) onNotify(exportCutMessage(cut));
+    } catch (err) {
+      onNotify(`Export failed: ${err instanceof Error ? err.message : String(err)}`, true);
+    } finally {
+      setExporting(false);
+    }
+  };
+  return { exporting, exportRows };
+}
 
-      <Card className="overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full border-collapse text-left text-xs">
-            <thead>
-              <tr className="border-b border-slate-200/80 bg-slate-50/70 text-[11px] font-bold tracking-wider text-slate-400 uppercase">
-                <th className="py-2.5 pr-3 pl-4">Timestamp</th>
-                <th className="px-3 py-2.5">Salesforce User</th>
-                <th className="px-3 py-2.5">Profile</th>
-                <th className="px-3 py-2.5">Matched Groups</th>
-                <th className="px-3 py-2.5">Tool & Object</th>
-                <th className="px-3 py-2.5">Status</th>
-                <th className="py-2.5 pr-4 pl-3 text-right">Payload</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100">
-              {filtered.length === 0 ? (
-                <tr>
-                  <td
-                    colSpan={7}
-                    className="py-10 text-center text-xs text-slate-400"
-                  >
-                    No Copilot MCP requests logged yet.
-                  </td>
-                </tr>
-              ) : (
-                filtered.map((l) => (
-                  <tr
-                    key={l.id}
-                    onClick={() => setSelectedLog(l)}
-                    className="cursor-pointer hover:bg-slate-50/90"
-                  >
-                    <td className="py-2.5 pr-3 pl-4 font-mono text-[11px] text-slate-500">
-                      {new Date(l.timestamp).toLocaleString()}
-                    </td>
-                    <td className="px-3 py-2.5 font-medium text-slate-900">
-                      {l.sfUsername}
-                    </td>
-                    <td className="px-3 py-2.5">
-                      <div className="font-medium text-slate-800">
-                        {l.profileName}
-                      </div>
-                      <div className="font-mono text-[10px] text-slate-400">
-                        {l.profileId}
-                      </div>
-                    </td>
-                    <td className="px-3 py-2.5">
-                      {l.matchedGroups.length === 0 ? (
-                        <span className="text-[11px] text-slate-400">None</span>
-                      ) : (
-                        <div className="flex flex-wrap gap-1">
-                          {l.matchedGroups.map((g) => (
-                            <Badge key={g} variant="indigo">
-                              {g}
-                            </Badge>
-                          ))}
-                        </div>
-                      )}
-                    </td>
-                    <td className="px-3 py-2.5 font-mono text-xs font-semibold text-slate-800">
-                      {l.toolName}{' '}
-                      {l.targetObject && l.targetObject !== '*'
-                        ? `→ ${l.targetObject}`
-                        : ''}
-                    </td>
-                    <td className="px-3 py-2.5">
-                      <Badge
-                        variant={l.status === 'ALLOWED' ? 'emerald' : 'rose'}
-                      >
-                        {l.status}
-                      </Badge>
-                    </td>
-                    <td className="py-2.5 pr-4 pl-3 text-right">
-                      <button
-                        type="button"
-                        className="rounded-md border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-indigo-600 hover:bg-indigo-50"
-                      >
-                        View Stripped Payload
-                      </button>
-                    </td>
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
-      </Card>
-
-      {/* Slide-over Sanitized Payload Drawer */}
-      {selectedLog && (
-        <div
-          className="fixed inset-0 z-50 flex justify-end bg-slate-900/30 backdrop-blur-[1px]"
-          onClick={() => setSelectedLog(null)}
-        >
-          <div
-            className="flex h-full w-full max-w-xl flex-col border-l border-slate-200 bg-white shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between border-b border-slate-200 px-6 py-4">
-              <div>
-                <div className="flex items-center gap-2">
-                  <span className="font-mono text-sm font-bold text-indigo-600">
-                    {selectedLog.toolName}
-                  </span>
-                  <Badge
-                    variant={
-                      selectedLog.status === 'ALLOWED' ? 'emerald' : 'rose'
-                    }
-                  >
-                    {selectedLog.status}
-                  </Badge>
-                </div>
-                <p className="mt-0.5 font-mono text-[11px] text-slate-400">
-                  {selectedLog.id} •{' '}
-                  {new Date(selectedLog.timestamp).toLocaleString()}
-                </p>
-              </div>
-              <button
-                onClick={() => setSelectedLog(null)}
-                className="rounded-lg border border-slate-200 p-1.5 text-slate-500 hover:bg-slate-100"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-
-            <div className="flex-1 space-y-5 overflow-y-auto p-6 text-xs">
-              <div className="grid grid-cols-2 gap-3 rounded-xl border border-slate-200 bg-slate-50 p-3.5">
-                <div>
-                  <span className="text-[10px] font-bold text-slate-400 uppercase">
-                    Copilot Caller
-                  </span>
-                  <p className="mt-0.5 font-semibold text-slate-900">
-                    {selectedLog.sfUsername}
-                  </p>
-                </div>
-                <div>
-                  <span className="text-[10px] font-bold text-slate-400 uppercase">
-                    Salesforce Profile
-                  </span>
-                  <p className="mt-0.5 font-semibold text-slate-900">
-                    {selectedLog.profileName}
-                  </p>
-                  <p className="font-mono text-[11px] text-indigo-600">
-                    {selectedLog.profileId}
-                  </p>
-                </div>
-              </div>
-
-              <div>
-                <h4 className="mb-1.5 text-xs font-bold text-slate-700 uppercase">
-                  Sanitized Request Payload (Literal Values Stripped)
-                </h4>
-                <pre className="overflow-x-auto rounded-xl bg-slate-900 p-4 font-mono text-xs text-slate-100">
-                  {selectedLog.sanitizedRequestPayload}
-                </pre>
-              </div>
-
-              <div>
-                <h4 className="mb-1.5 text-xs font-bold text-slate-700 uppercase">
-                  Sanitized Response Summary (Records Stripped)
-                </h4>
-                <pre className="overflow-x-auto rounded-xl bg-slate-900 p-4 font-mono text-xs text-emerald-300">
-                  {selectedLog.sanitizedResponseSummary}
-                </pre>
-              </div>
-            </div>
-          </div>
-        </div>
+function LoadOlderFooter({
+  cursor,
+  loading,
+  onLoad,
+}: {
+  cursor: number | null | undefined;
+  loading: boolean;
+  onLoad: () => void;
+}) {
+  return (
+    <div className="tbl-more">
+      {cursor === null ? (
+        <span>Start of the log reached.</span>
+      ) : (
+        <button type="button" className="btn sm" disabled={loading} onClick={onLoad}>
+          {loading ? 'Loading…' : 'Load older'}
+        </button>
       )}
     </div>
   );
 }
 
-// ============================================================================
-// 3. PORTAL ADMIN AUDIT LOGS VIEW (Users signing into portal & actions taken)
-// ============================================================================
-export function PortalAdminLogsView({
-  logs,
-}: {
-  logs: PortalAdminLogRecord[];
-}) {
-  const [search, setSearch] = useState('');
+interface CopilotMcpLogsViewProps {
+  logs: CopilotMcpLogEntry[];
+  objects: SalesforceObjectConfig[];
+  selectedFlyoutId?: string;
+  initialSearch?: string;
+  caps: OverviewLogCaps['copilotLogs'];
+  fetchLogPage: FetchLogPage<CopilotMcpLogEntry>;
+  onNotify: (msg: string, isError?: boolean) => void;
+  onClearLogs: () => Promise<void>;
+  onOpenFlyout: (flyout: FlyoutState) => void;
+}
 
-  const filtered = logs.filter(
-    (l) =>
-      !search.trim() ||
-      l.adminUsername.toLowerCase().includes(search.toLowerCase()) ||
-      l.action.toLowerCase().includes(search.toLowerCase()) ||
-      l.target.toLowerCase().includes(search.toLowerCase()) ||
-      l.details.toLowerCase().includes(search.toLowerCase())
+export function CopilotMcpLogsView({
+  logs,
+  objects,
+  selectedFlyoutId,
+  initialSearch = '',
+  caps,
+  fetchLogPage,
+  onNotify,
+  onClearLogs,
+  onOpenFlyout,
+}: CopilotMcpLogsViewProps) {
+  const [q, setQ] = useState(initialSearch);
+  const [statusFilter, setStatusFilter] = useState<
+    'all' | 'ALLOWED' | 'DENIED' | 'ERROR'
+  >('all');
+  const [toolFilter, setToolFilter] = useState('all');
+  const [objFilter, setObjFilter] = useState('all');
+  const history = useOlderLogRows(logs, fetchLogPage, onNotify);
+  const { exporting, exportRows } = useLogExport(fetchLogPage, onNotify);
+
+  React.useEffect(() => {
+    if (initialSearch) setQ(initialSearch);
+  }, [initialSearch]);
+
+  const filters = useMemo(
+    () => ({ status: statusFilter, tool: toolFilter, object: objFilter, search: q }),
+    [statusFilter, toolFilter, objFilter, q]
+  );
+  const rows = useMemo(
+    () => history.held.filter((r) => trafficRowMatches(r, filters)),
+    [history.held, filters]
   );
 
+  const exportCsv = () =>
+    exportRows(trafficRouteQuery(filters), (r) => trafficRowMatches(r, filters), trafficLogCsv, 'mcp-traffic-log');
+
+  // Clearing empties only this view until the next refresh or Load older refills it, which the
+  // toolbar must not call an empty log.
+  const clearLogs = async () => {
+    history.clear();
+    await onClearLogs();
+  };
+
+  const kinds = trafficLogKinds(caps);
+  const cleared = history.cleared;
+  const gap = !cleared && heldLogGaps({ overview: logs, loadedTop: history.loadedTop, kinds }).length > 0;
+  const heldText = cleared
+    ? 'view cleared until the next refresh'
+    : describeHeldLogs({
+        overview: logs,
+        older: history.older,
+        cursor: history.cursor,
+        kinds,
+        loadedTop: history.loadedTop,
+      });
+
   return (
-    <div className="space-y-5">
-      <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
-        <div>
-          <h2 className="text-base font-bold text-slate-900">
-            Web Portal Admin Sign-Ins & Configuration Audit Logs
-          </h2>
-          <p className="text-xs text-slate-500">
-            Tracks everyone who signs into this administration portal (via Username/Password or Okta SSO) and every configuration change they make.
+    <div>
+      <div className="ph">
+        <div className="ph-l">
+          <h1>MCP traffic log</h1>
+          <p>
+            Every tool call from Microsoft Copilot Studio to the Salesforce MCP
+            server. Sensitive field values are redacted before storage.
           </p>
         </div>
-
-        <div className="relative">
-          <Search className="pointer-events-none absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-          <input
-            type="text"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Filter portal user, action, target..."
-            className="w-64 rounded-lg border border-slate-200 bg-white py-1.5 pr-3 pl-8 text-xs text-slate-800 focus:border-indigo-500 focus:outline-none"
-          />
+        <div className="ph-act">
+          <button
+            type="button"
+            className="btn pri"
+            onClick={() => onOpenFlyout({ type: 'simulator' })}
+          >
+            Simulate MCP call
+          </button>
+          <button type="button" className="btn" onClick={exportCsv} disabled={exporting}>
+            {exporting ? 'Exporting…' : 'Export CSV'}
+          </button>
+          {history.held.length > 0 && (
+            <button type="button" className="btn dng" onClick={clearLogs}>
+              Clear log
+            </button>
+          )}
         </div>
       </div>
 
-      <Card className="overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full border-collapse text-left text-xs">
+      <div className="card">
+        <div className="tbar">
+          <div className="tbar-l">
+            <div className="srch">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.75"
+              >
+                <circle cx="11" cy="11" r="7" />
+                <path d="M20 20l-3.5-3.5" />
+              </svg>
+              <input
+                placeholder="Search user, profile, tool, object…"
+                value={q}
+                onChange={(e) => setQ(e.target.value)}
+              />
+            </div>
+            <div className="seg">
+              {(
+                [
+                  ['all', 'All'],
+                  ['ALLOWED', 'Allowed'],
+                  ['DENIED', 'Denied'],
+                ] as const
+              ).map(([k, lbl]) => (
+                <button
+                  key={k}
+                  type="button"
+                  className={statusFilter === k ? 'on' : ''}
+                  onClick={() => setStatusFilter(k)}
+                >
+                  {lbl}
+                </button>
+              ))}
+            </div>
+            <select
+              className="inp"
+              style={{ width: 'auto', padding: '4px 8px', fontSize: 12 }}
+              value={toolFilter}
+              onChange={(e) => setToolFilter(e.target.value)}
+            >
+              <option value="all">All tools</option>
+              {MCP_TOOL_CATALOG.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.label}
+                </option>
+              ))}
+            </select>
+            <select
+              className="inp"
+              style={{ width: 'auto', padding: '4px 8px', fontSize: 12 }}
+              value={objFilter}
+              onChange={(e) => setObjFilter(e.target.value)}
+            >
+              <option value="all">All objects</option>
+              {objects.map((o) => (
+                <option key={o.objectName} value={o.objectName}>
+                  {o.objectName}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="tbar-r">
+            <span className="tag ok">
+              <span className="dot ok" /> PII redaction active
+            </span>
+            <span className="mono" style={{ color: 'var(--t3)' }}>
+              {rows.length} of {history.held.length} events
+            </span>
+            <HeldLogsNote text={heldText} gap={gap} loading={history.loading} onReload={history.reload} />
+          </div>
+        </div>
+
+        <div className="tbl-wrap">
+          <table className="tbl">
             <thead>
-              <tr className="border-b border-slate-200/80 bg-slate-50/70 text-[11px] font-bold tracking-wider text-slate-400 uppercase">
-                <th className="py-2.5 pr-3 pl-4">Timestamp</th>
-                <th className="px-3 py-2.5">Portal User</th>
-                <th className="px-3 py-2.5">Auth Method</th>
-                <th className="px-3 py-2.5">Action</th>
-                <th className="px-3 py-2.5">Target</th>
-                <th className="px-3 py-2.5">Details</th>
-                <th className="py-2.5 pr-4 pl-3 text-right">IP</th>
+              <tr>
+                <th>Time</th>
+                <th>User</th>
+                <th>Salesforce profile</th>
+                <th>Matched groups</th>
+                <th>MCP tool</th>
+                <th>Object</th>
+                <th>Latency</th>
+                <th>Result</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-100">
-              {filtered.length === 0 ? (
+            <tbody>
+              {rows.length === 0 ? (
                 <tr>
-                  <td
-                    colSpan={7}
-                    className="py-10 text-center text-xs text-slate-400"
-                  >
-                    No portal admin logs recorded yet.
+                  <td colSpan={8} className="empty">
+                    No matching traffic events. Click &ldquo;Simulate MCP
+                    call&rdquo; to test live policy evaluation.
                   </td>
                 </tr>
               ) : (
-                filtered.map((l) => (
-                  <tr key={l.id} className="hover:bg-slate-50/80">
-                    <td className="py-2.5 pr-3 pl-4 font-mono text-[11px] whitespace-nowrap text-slate-500">
-                      {new Date(l.timestamp).toLocaleString()}
+                rows.map((r) => (
+                  <tr
+                    key={r.id}
+                    className={`row ${
+                      selectedFlyoutId === r.id ? 'sel' : ''
+                    }`}
+                    onClick={() =>
+                      onOpenFlyout({ type: 'traffic', data: r })
+                    }
+                  >
+                    <td className="mono" style={{ color: 'var(--t2)' }}>
+                      {formatShortTime(r.timestamp)}
                     </td>
-                    <td className="px-3 py-2.5 font-semibold text-slate-900">
-                      {l.adminUsername}
+                    <td>
+                      {r.sfUsername}
+                      {r.simulated && (
+                        <>
+                          {' '}
+                          <span className="tag warn">SIMULATED</span>
+                        </>
+                      )}
                     </td>
-                    <td className="px-3 py-2.5">
-                      <Badge
-                        variant={
-                          l.authMethod === 'okta_sso' ? 'indigo' : 'slate'
-                        }
+                    <td>
+                      <div>{r.profileName}</div>
+                      <div
+                        className="mono"
+                        style={{ color: 'var(--t3)', fontSize: 10.5 }}
                       >
-                        {l.authMethod === 'okta_sso'
-                          ? 'Okta SSO'
-                          : 'Username / Password'}
-                      </Badge>
+                        {r.profileId}
+                      </div>
                     </td>
-                    <td className="px-3 py-2.5">
-                      <span className="rounded bg-indigo-50 px-2 py-0.5 font-mono text-[11px] font-bold text-indigo-700">
-                        {l.action}
+                    <td>
+                      {!r.matchedGroups || r.matchedGroups.length === 0 ? (
+                        <span className="tag warn">None</span>
+                      ) : (
+                        <div
+                          style={{
+                            display: 'flex',
+                            gap: 4,
+                            flexWrap: 'wrap',
+                          }}
+                        >
+                          {r.matchedGroups.map((gn) => (
+                            <span key={gn} className="tag">
+                              {gn}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </td>
+                    <td className="mono">{r.toolName}</td>
+                    <td className="mono">{r.targetObject}</td>
+                    <td className="mono" style={{ color: 'var(--t2)' }}>
+                      {r.latencyMs} ms
+                    </td>
+                    <td>
+                      <span
+                        className={`tag ${
+                          r.status === 'ALLOWED'
+                            ? 'ok'
+                            : r.status === 'DENIED'
+                              ? 'warn'
+                              : 'err'
+                        }`}
+                      >
+                        <span
+                          className={`dot ${
+                            r.status === 'ALLOWED'
+                              ? 'ok'
+                              : r.status === 'DENIED'
+                                ? 'warn'
+                                : 'err'
+                          }`}
+                        />
+                        {r.status}
                       </span>
-                    </td>
-                    <td className="px-3 py-2.5 font-mono text-[11px] text-slate-800">
-                      {l.target}
-                    </td>
-                    <td className="max-w-md px-3 py-2.5 text-slate-600">
-                      {l.details}
-                    </td>
-                    <td className="py-2.5 pr-4 pl-3 text-right font-mono text-[11px] text-slate-400">
-                      {l.ipAddress}
                     </td>
                   </tr>
                 ))
@@ -750,7 +1215,201 @@ export function PortalAdminLogsView({
             </tbody>
           </table>
         </div>
-      </Card>
+        <LoadOlderFooter cursor={history.cursor} loading={history.loading} onLoad={history.loadOlder} />
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// 3. PORTAL AUDIT LOG VIEW
+// ============================================================================
+interface PortalAdminLogsViewProps {
+  logs: PortalAdminLogEntry[];
+  selectedFlyoutId?: string;
+  caps: OverviewLogCaps['portalLogs'];
+  fetchLogPage: FetchLogPage<PortalAdminLogEntry>;
+  onNotify: (msg: string, isError?: boolean) => void;
+  onOpenFlyout: (flyout: FlyoutState) => void;
+}
+
+export function PortalAdminLogsView({
+  logs,
+  selectedFlyoutId,
+  caps,
+  fetchLogPage,
+  onNotify,
+  onOpenFlyout,
+}: PortalAdminLogsViewProps) {
+  const [q, setQ] = useState('');
+  const [method, setMethod] = useState<'all' | 'okta_sso' | 'password'>(
+    'all'
+  );
+  const [actionFilter, setActionFilter] = useState('all');
+  const history = useOlderLogRows(logs, fetchLogPage, onNotify);
+  const { exporting, exportRows } = useLogExport(fetchLogPage, onNotify);
+
+  const uniqueActions = useMemo(
+    () => Array.from(new Set(history.held.map((l) => l.action))),
+    [history.held]
+  );
+
+  const filters = useMemo(
+    () => ({ method, action: actionFilter, search: q }),
+    [method, actionFilter, q]
+  );
+  const rows = useMemo(
+    () => history.held.filter((r) => auditRowMatches(r, filters)),
+    [history.held, filters]
+  );
+
+  const exportCsv = () =>
+    exportRows(auditRouteQuery(filters), (r) => auditRowMatches(r, filters), portalAuditCsv, 'portal-audit-log');
+
+  const kinds = auditLogKinds(caps);
+  const gap = heldLogGaps({ overview: logs, loadedTop: history.loadedTop, kinds }).length > 0;
+  const heldText = describeHeldLogs({
+    overview: logs,
+    older: history.older,
+    cursor: history.cursor,
+    kinds,
+    loadedTop: history.loadedTop,
+  });
+
+  return (
+    <div>
+      <div className="ph">
+        <div className="ph-l">
+          <h1>Portal audit log</h1>
+          <p>
+            Administrative sign-ins and configuration changes in this control
+            plane.
+          </p>
+        </div>
+        <div className="ph-act">
+          <button type="button" className="btn" onClick={exportCsv} disabled={exporting}>
+            {exporting ? 'Exporting…' : 'Export CSV'}
+          </button>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="tbar">
+          <div className="tbar-l">
+            <div className="srch">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.75"
+              >
+                <circle cx="11" cy="11" r="7" />
+                <path d="M20 20l-3.5-3.5" />
+              </svg>
+              <input
+                placeholder="Search admin, action, target, details…"
+                value={q}
+                onChange={(e) => setQ(e.target.value)}
+              />
+            </div>
+            <div className="seg">
+              {(
+                [
+                  ['all', 'All'],
+                  ['okta_sso', 'Okta SSO'],
+                  ['password', 'Password'],
+                ] as const
+              ).map(([k, lbl]) => (
+                <button
+                  key={k}
+                  type="button"
+                  className={method === k ? 'on' : ''}
+                  onClick={() => setMethod(k)}
+                >
+                  {lbl}
+                </button>
+              ))}
+            </div>
+            <select
+              className="inp"
+              style={{ width: 'auto', padding: '4px 8px', fontSize: 12 }}
+              value={actionFilter}
+              onChange={(e) => setActionFilter(e.target.value)}
+            >
+              <option value="all">All actions</option>
+              {uniqueActions.map((a) => (
+                <option key={a} value={a}>
+                  {a}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="tbar-r">
+            <span className="mono" style={{ color: 'var(--t3)' }}>
+              {rows.length} of {history.held.length} events
+            </span>
+            <HeldLogsNote text={heldText} gap={gap} loading={history.loading} onReload={history.reload} />
+          </div>
+        </div>
+
+        <div className="tbl-wrap">
+          <table className="tbl">
+            <thead>
+              <tr>
+                <th>Timestamp</th>
+                <th>Administrator</th>
+                <th>Sign-in method</th>
+                <th>Action</th>
+                <th>Target</th>
+                <th>Details</th>
+                <th>Source IP</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="empty">
+                    No matching portal audit events.
+                  </td>
+                </tr>
+              ) : (
+                rows.map((r) => (
+                  <tr
+                    key={r.id}
+                    className={`row ${
+                      selectedFlyoutId === r.id ? 'sel' : ''
+                    }`}
+                    onClick={() => onOpenFlyout({ type: 'audit', data: r })}
+                  >
+                    <td className="mono" style={{ color: 'var(--t2)' }}>
+                      {r.timestamp.slice(0, 19).replace('T', ' ')}
+                    </td>
+                    <td>{r.adminUsername}</td>
+                    <td>
+                      <span
+                        className={`tag ${
+                          r.authMethod === 'okta_sso' ? 'acc' : ''
+                        }`}
+                      >
+                        {r.authMethod === 'okta_sso' ? 'Okta SSO' : 'Password'}
+                      </span>
+                    </td>
+                    <td>
+                      <span className="tag mono">{r.action}</span>
+                    </td>
+                    <td className="mono">{r.target}</td>
+                    <td style={{ color: 'var(--t2)' }}>{r.details}</td>
+                    <td className="mono" style={{ color: 'var(--t3)' }}>
+                      {r.ipAddress}
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+        <LoadOlderFooter cursor={history.cursor} loading={history.loading} onLoad={history.loadOlder} />
+      </div>
     </div>
   );
 }
@@ -758,403 +1417,302 @@ export function PortalAdminLogsView({
 // ============================================================================
 // 4. PORTAL AUTH & OKTA SSO SETTINGS VIEW
 // ============================================================================
+interface PortalAuthSettingsViewProps {
+  oktaSettings: OktaConfig;
+  portalUsers: PortalUser[];
+  onSaveOkta: (settings: Partial<OktaConfig> & { clientSecret?: string }) => Promise<OktaConfig>;
+  onCreatePortalUser: (user: {
+    username: string;
+    displayName?: string;
+    password: string;
+    role: string;
+  }) => Promise<void>;
+  onDeletePortalUser: (username: string) => Promise<void>;
+}
+
 export function PortalAuthSettingsView({
-  overview,
-  apiFetch,
-  onRefresh,
-  onShowToast,
-}: {
-  overview: PortalOverviewPayload;
-  apiFetch: <T = any>(url: string, options?: RequestInit) => Promise<T>;
-  onRefresh: () => Promise<void>;
-  onShowToast: (msg: string, isError?: boolean) => void;
-}) {
-  // Okta SSO State
-  const [oktaEnabled, setOktaEnabled] = useState(overview.oktaSettings.enabled);
-  const [oktaDomain, setOktaDomain] = useState(
-    overview.oktaSettings.oktaDomain
-  );
-  const [clientId, setClientId] = useState(overview.oktaSettings.clientId);
-  const [clientSecret, setClientSecret] = useState('');
-  const [adminGroup, setAdminGroup] = useState(
-    overview.oktaSettings.adminGroup
-  );
-  const [oktaIssuer, setOktaIssuer] = useState(overview.oktaSettings.issuer);
+  oktaSettings,
+  portalUsers,
+  onSaveOkta,
+  onCreatePortalUser,
+  onDeletePortalUser,
+}: PortalAuthSettingsViewProps) {
+  const [oktaDraft, setOktaDraft] = useState<OktaConfig>(oktaSettings);
+  const [oktaClientSecret, setOktaClientSecret] = useState('');
   // Only send the issuer when the admin edited it, so changing the domain re-derives a default issuer
   const [oktaIssuerEdited, setOktaIssuerEdited] = useState(false);
-  const storedIssuer = overview.oktaSettings.issuer;
-  useEffect(() => {
-    // Show what the server stored (e.g. a re-derived issuer after a domain change) unless being edited
-    if (!oktaIssuerEdited) setOktaIssuer(storedIssuer);
-  }, [storedIssuer, oktaIssuerEdited]);
-  const [oktaRedirectUri, setOktaRedirectUri] = useState(
-    overview.oktaSettings.redirectUri
-  );
-
-  // Salesforce Connection State
-  const [sfInstanceUrl, setSfInstanceUrl] = useState(overview.sfSettings.instanceUrl);
-  const [sfApiVersion, setSfApiVersion] = useState(overview.sfSettings.apiVersion);
-  const [sfExpectedOrgId, setSfExpectedOrgId] = useState(
-    overview.sfSettings.expectedOrgId
-  );
-  const [sfEnforceOrgIdLock, setSfEnforceOrgIdLock] = useState(
-    overview.sfSettings.enforceOrgIdLock
-  );
-
-  // New Portal User State
   const [newUsername, setNewUsername] = useState('');
   const [newDisplayName, setNewDisplayName] = useState('');
   const [newPassword, setNewPassword] = useState('');
+  const [newRole, setNewRole] = useState('Security Admin');
+  const [busy, setBusy] = useState(false);
 
-  const handleSaveOkta = async (e: React.FormEvent) => {
-    e.preventDefault();
-    try {
-      await apiFetch('/api/admin/okta', {
-        method: 'PUT',
-        body: JSON.stringify({
-          enabled: oktaEnabled,
-          oktaDomain,
-          // Empty issuer means "derive https://<domain>/oauth2/default"; untouched means "keep or re-derive"
-          issuer: oktaIssuerEdited ? oktaIssuer.trim() : undefined,
-          clientId,
-          clientSecret: clientSecret.trim() || undefined,
-          // Empty redirect URI means "<BASE_URL>/auth/okta/callback"
-          redirectUri: oktaRedirectUri.trim(),
-          adminGroup,
-        }),
-      });
-      setClientSecret('');
-      setOktaIssuerEdited(false);
-      await onRefresh();
-      onShowToast('Saved Okta SSO configuration');
-    } catch (err: any) {
-      onShowToast(err.message, true);
-    }
-  };
-
-  const handleSaveSalesforceSettings = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (sfEnforceOrgIdLock && !sfExpectedOrgId.trim()) {
-      onShowToast('Enter the expected Org ID before enforcing the Org ID lock.', true);
-      return;
-    }
-    try {
-      await apiFetch('/api/admin/sf-settings', {
-        method: 'PUT',
-        body: JSON.stringify({
-          instanceUrl: sfInstanceUrl.trim(),
-          apiVersion: sfApiVersion.trim(),
-          expectedOrgId: sfExpectedOrgId.trim(),
-          enforceOrgIdLock: sfEnforceOrgIdLock,
-        }),
-      });
-      await onRefresh();
-      onShowToast('Saved Salesforce connection settings');
-    } catch (err: any) {
-      onShowToast(err.message, true);
-    }
-  };
-
-  const handleAddPortalUser = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newUsername.trim() || !newPassword.trim()) return;
-    try {
-      await apiFetch('/api/admin/portal-users', {
-        method: 'POST',
-        body: JSON.stringify({
-          username: newUsername.trim(),
-          // Omitted when blank so updating an existing user's password keeps their display name
-          displayName: newDisplayName.trim() || undefined,
-          password: newPassword,
-        }),
-      });
-      setNewUsername('');
-      setNewDisplayName('');
-      setNewPassword('');
-      await onRefresh();
-      onShowToast(`Saved portal user "${newUsername.trim()}"`);
-    } catch (err: any) {
-      onShowToast(err.message, true);
-    }
-  };
-
-  const handleDeletePortalUser = async (username: string) => {
-    try {
-      await apiFetch(
-        `/api/admin/portal-users/${encodeURIComponent(username)}`,
-        {
-          method: 'DELETE',
-        }
-      );
-      await onRefresh();
-      onShowToast(`Deleted portal user "${username}"`);
-    } catch (err: any) {
-      onShowToast(err.message, true);
-    }
-  };
+  // The live poll delivers a new settings object every few seconds. Only a real change reaches the
+  // form, and never over unsaved edits.
+  const oktaBaseline = React.useRef(oktaSettings);
+  React.useEffect(() => {
+    const baseline = oktaBaseline.current;
+    if (JSON.stringify(oktaSettings) === JSON.stringify(baseline)) return;
+    oktaBaseline.current = oktaSettings;
+    setOktaDraft((draft) =>
+      JSON.stringify(draft) === JSON.stringify(baseline) ? oktaSettings : draft
+    );
+  }, [oktaSettings]);
 
   return (
-    <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-      {/* Left: Local Portal Users (Username & Password) */}
-      <Card className="p-5">
-        <h3 className="text-sm font-bold text-slate-900">
-          Portal Username & Password Accounts
-        </h3>
-        <p className="mt-0.5 text-xs text-slate-500">
-          Manage local administrator accounts that can sign into this portal with a username and password.
-        </p>
+    <div>
+      <div className="ph">
+        <div className="ph-l">
+          <h1>Portal Auth &amp; Okta SSO</h1>
+          <p>
+            Configure Okta OIDC Single Sign-On and local emergency administrator
+            accounts for this control plane.
+          </p>
+        </div>
+      </div>
 
-        <form onSubmit={handleAddPortalUser} className="mt-4 space-y-3">
-          <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
-            <input
-              type="text"
-              required
-              value={newUsername}
-              onChange={(e) => setNewUsername(e.target.value)}
-              placeholder="Username (e.g. alex)"
-              className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
-            />
-            <input
-              type="text"
-              value={newDisplayName}
-              onChange={(e) => setNewDisplayName(e.target.value)}
-              placeholder="Display Name"
-              className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
-            />
-            <input
-              type="password"
-              required
-              value={newPassword}
-              onChange={(e) => setNewPassword(e.target.value)}
-              placeholder="New Password"
-              className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
-            />
-          </div>
-          <button
-            type="submit"
-            className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-slate-800"
-          >
-            <Plus className="h-3.5 w-3.5" />
-            Add / Update Password User
-          </button>
-        </form>
-
-        <div className="mt-5 divide-y divide-slate-100 border-t border-slate-100">
-          {overview.portalUsers.map((u) => (
-            <div
-              key={u.username}
-              className="flex items-center justify-between py-2.5 text-xs"
-            >
-              <div>
-                <span className="font-mono font-bold text-slate-900">
-                  {u.username}
-                </span>
-                <span className="ml-2 text-slate-500">({u.displayName})</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <Badge variant="slate">{u.role}</Badge>
-                {overview.portalUsers.length > 1 && (
-                  <button
-                    type="button"
-                    onClick={() => handleDeletePortalUser(u.username)}
-                    className="rounded p-1 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
-                  >
-                    <Trash2 className="h-3.5 w-3.5" />
-                  </button>
-                )}
+      <div className="g2">
+        {/* Okta SSO Card */}
+        <div className="card">
+          <div className="card-h">
+            <div>
+              <div className="card-t">Okta OIDC Single Sign-On</div>
+              <div className="card-s">
+                Enterprise identity provider configuration
               </div>
             </div>
-          ))}
-        </div>
-      </Card>
-
-      {/* Right: Okta OIDC SSO Configuration */}
-      <Card className="p-5">
-        <div className="flex items-center justify-between">
-          <div>
-            <h3 className="text-sm font-bold text-slate-900">
-              Okta OIDC Single Sign-On (SSO)
-            </h3>
-            <p className="mt-0.5 text-xs text-slate-500">
-              Allow portal administrators to sign in using Okta OIDC + PKCE.
-            </p>
-          </div>
-          <Switch checked={oktaEnabled} onCheckedChange={setOktaEnabled} />
-        </div>
-
-        <form onSubmit={handleSaveOkta} className="mt-4 space-y-3">
-          <div>
-            <label className="block text-xs font-semibold text-slate-700">
-              Okta Domain
-            </label>
-            <input
-              type="text"
-              value={oktaDomain}
-              onChange={(e) => setOktaDomain(e.target.value)}
-              placeholder="your-org.okta.com"
-              className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
-            />
-          </div>
-
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <div>
-              <label className="block text-xs font-semibold text-slate-700">
-                OIDC Client ID
-              </label>
-              <input
-                type="text"
-                value={clientId}
-                onChange={(e) => setClientId(e.target.value)}
-                placeholder="0oa..."
-                className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-semibold text-slate-700">
-                OIDC Client Secret
-              </label>
-              <input
-                type="password"
-                value={clientSecret}
-                onChange={(e) => setClientSecret(e.target.value)}
-                placeholder={
-                  overview.oktaSettings.hasClientSecret
-                    ? '•••••••• (Saved)'
-                    : 'Enter Client Secret'
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span
+                className={`tag ${oktaDraft.enabled ? 'ok' : ''}`}
+              >
+                {oktaDraft.enabled ? 'Enabled' : 'Disabled'}
+              </span>
+              <button
+                type="button"
+                className={`sw ${oktaDraft.enabled ? 'on' : ''}`}
+                onClick={() =>
+                  setOktaDraft({ ...oktaDraft, enabled: !oktaDraft.enabled })
                 }
-                className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
               />
             </div>
           </div>
-
-          <div>
-            <label className="block text-xs font-semibold text-slate-700">
-              Required Okta Group Claim
-            </label>
-            <input
-              type="text"
-              value={adminGroup}
-              onChange={(e) => setAdminGroup(e.target.value)}
-              placeholder="MCP-Admins"
-              className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
-            />
-          </div>
-
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <div>
-              <label className="block text-xs font-semibold text-slate-700">
-                Issuer (optional)
-              </label>
+          <div className="card-b">
+            <div className="fld">
+              <label>Okta Organization Domain</label>
               <input
-                type="text"
-                value={oktaIssuer}
+                className="inp mono"
+                value={oktaDraft.oktaDomain}
+                onChange={(e) =>
+                  setOktaDraft({ ...oktaDraft, oktaDomain: e.target.value })
+                }
+                placeholder="https://acme-enterprise.okta.com"
+              />
+            </div>
+            <div className="fld">
+              <label>OIDC Client ID</label>
+              <input
+                className="inp mono"
+                value={oktaDraft.clientId}
+                onChange={(e) =>
+                  setOktaDraft({ ...oktaDraft, clientId: e.target.value })
+                }
+                placeholder="0oa8x92kLpQ7EnterpriseMcp"
+              />
+            </div>
+            <div className="fld">
+              <label>Authorization Server Issuer URI</label>
+              <input
+                className="inp mono"
+                value={oktaDraft.issuer}
                 onChange={(e) => {
-                  setOktaIssuer(e.target.value);
+                  setOktaDraft({ ...oktaDraft, issuer: e.target.value });
                   setOktaIssuerEdited(true);
                 }}
+                placeholder="https://acme-enterprise.okta.com/oauth2/default"
+              />
+            </div>
+            <div className="fld">
+              <label>OIDC Client Secret</label>
+              <input
+                type="password"
+                autoComplete="new-password"
+                className="inp mono"
+                value={oktaClientSecret}
+                onChange={(e) => setOktaClientSecret(e.target.value)}
                 placeholder={
-                  oktaDomain.trim()
-                    ? `https://${oktaDomain.trim().replace(/^https?:\/\//, '')}/oauth2/default`
-                    : 'https://your-org.okta.com/oauth2/default'
+                  oktaDraft.hasClientSecret
+                    ? 'Stored. Leave blank to keep it.'
+                    : 'Paste the client secret'
                 }
-                className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
               />
             </div>
-            <div>
-              <label className="block text-xs font-semibold text-slate-700">
-                Redirect URI (optional)
-              </label>
+            <div className="fld">
+              <label>Required Okta Group Claim</label>
               <input
-                type="text"
-                value={oktaRedirectUri}
-                onChange={(e) => setOktaRedirectUri(e.target.value)}
+                className="inp mono"
+                value={oktaDraft.adminGroup}
+                onChange={(e) =>
+                  setOktaDraft({ ...oktaDraft, adminGroup: e.target.value })
+                }
+                placeholder="MCP-Admins"
+              />
+            </div>
+            <div className="fld">
+              <label>Redirect URI (optional)</label>
+              <input
+                className="inp mono"
+                value={oktaDraft.redirectUri}
+                onChange={(e) =>
+                  setOktaDraft({ ...oktaDraft, redirectUri: e.target.value })
+                }
                 placeholder="<BASE_URL>/auth/okta/callback"
-                className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
               />
             </div>
-          </div>
-
-          <div className="pt-2">
-            <button
-              type="submit"
-              className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-1.5 text-xs font-semibold text-white hover:bg-indigo-700"
-            >
-              <Save className="h-3.5 w-3.5" />
-              Save Okta Configuration
-            </button>
-          </div>
-        </form>
-      </Card>
-
-      {/* Full width: Salesforce connection & Org ID lock */}
-      <Card className="p-5 lg:col-span-2">
-        <h3 className="text-sm font-bold text-slate-900">
-          Salesforce Connection & Org ID Lock
-        </h3>
-        <p className="mt-0.5 text-xs text-slate-500">
-          Where Copilot users&apos; tokens are verified, and (optionally) which single Salesforce org they must belong to.
-        </p>
-
-        <form onSubmit={handleSaveSalesforceSettings} className="mt-4 space-y-3">
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-            <div className="sm:col-span-2">
-              <label className="block text-xs font-semibold text-slate-700">
-                Login / Instance URL
-              </label>
-              <input
-                type="text"
-                value={sfInstanceUrl}
-                onChange={(e) => setSfInstanceUrl(e.target.value)}
-                placeholder="https://login.salesforce.com or https://acme.my.salesforce.com"
-                className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
-              />
+            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+              <button
+                type="button"
+                className="btn pri"
+                disabled={busy}
+                onClick={async () => {
+                  setBusy(true);
+                  try {
+                    const saved = await onSaveOkta({
+                      ...oktaDraft,
+                      // Empty issuer means "derive https://<domain>/oauth2/default"; untouched means "keep or re-derive"
+                      issuer: oktaIssuerEdited ? oktaDraft.issuer.trim() : undefined,
+                      clientSecret: oktaClientSecret.trim() || undefined,
+                      redirectUri: oktaDraft.redirectUri.trim(),
+                    });
+                    oktaBaseline.current = saved;
+                    setOktaDraft(saved);
+                    setOktaClientSecret('');
+                    setOktaIssuerEdited(false);
+                  } catch {
+                    // The error toast is already showing; stay here so the admin can retry.
+                  } finally {
+                    setBusy(false);
+                  }
+                }}
+              >
+                Save Okta configuration
+              </button>
             </div>
+          </div>
+        </div>
+
+        {/* Local Administrators Card */}
+        <div className="card">
+          <div className="card-h">
             <div>
-              <label className="block text-xs font-semibold text-slate-700">
-                API Version
-              </label>
-              <input
-                type="text"
-                value={sfApiVersion}
-                onChange={(e) => setSfApiVersion(e.target.value)}
-                placeholder="v62.0"
-                className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
-              />
+              <div className="card-t">Portal Administrators</div>
+              <div className="card-s">
+                Local password accounts (scrypt hashed)
+              </div>
             </div>
+            <span className="tag mono">{portalUsers.length} users</span>
           </div>
-
-          <div className="grid grid-cols-1 items-end gap-3 sm:grid-cols-3">
-            <div className="sm:col-span-2">
-              <label className="block text-xs font-semibold text-slate-700">
-                Expected Org ID (00D...)
-              </label>
-              <input
-                type="text"
-                value={sfExpectedOrgId}
-                onChange={(e) => setSfExpectedOrgId(e.target.value)}
-                placeholder="00D5g000000AbCdEAF"
-                className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
-              />
+          <div className="card-b">
+            <div className="chk-list" style={{ marginBottom: 14 }}>
+              {portalUsers.map((u) => (
+                <div className="chk-row" key={u.username}>
+                  <div>
+                    <div style={{ fontWeight: 500 }}>
+                      {u.displayName}{' '}
+                      <span className="tag" style={{ marginLeft: 4 }}>
+                        {u.role}
+                      </span>
+                    </div>
+                    <div className="mono" style={{ color: 'var(--t3)' }}>
+                      {u.username}
+                    </div>
+                  </div>
+                  {u.username !== 'admin' ? (
+                    <button
+                      type="button"
+                      className="btn dng sm"
+                      onClick={() => onDeletePortalUser(u.username)}
+                    >
+                      Remove
+                    </button>
+                  ) : (
+                    <span className="tag ok">Primary root</span>
+                  )}
+                </div>
+              ))}
             </div>
-            <div className="flex items-center justify-between gap-3 rounded-lg border border-slate-200 px-3 py-2">
-              <span className="text-xs font-semibold text-slate-700">
-                Reject tokens from other orgs
-              </span>
-              <Switch checked={sfEnforceOrgIdLock} onCheckedChange={setSfEnforceOrgIdLock} />
-            </div>
-          </div>
 
-          <div className="pt-2">
-            <button
-              type="submit"
-              className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-1.5 text-xs font-semibold text-white hover:bg-indigo-700"
+            <div className="sec-h">
+              <span className="sec-t">Add administrator</span>
+            </div>
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: '1fr 1fr',
+                gap: 8,
+                marginBottom: 8,
+              }}
             >
-              <Save className="h-3.5 w-3.5" />
-              Save Salesforce Settings
-            </button>
+              <input
+                className="inp"
+                placeholder="Username (e.g. secops)"
+                value={newUsername}
+                onChange={(e) => setNewUsername(e.target.value)}
+              />
+              <input
+                className="inp"
+                placeholder="Display name"
+                value={newDisplayName}
+                onChange={(e) => setNewDisplayName(e.target.value)}
+              />
+              <input
+                type="password"
+                className="inp"
+                placeholder="Password"
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+              />
+              <select
+                className="inp"
+                value={newRole}
+                onChange={(e) => setNewRole(e.target.value)}
+              >
+                <option value="Super Admin">Super Admin</option>
+                <option value="Security Admin">Security Admin</option>
+                <option value="RevOps Admin">RevOps Admin</option>
+                <option value="Read-Only Auditor">Read-Only Auditor</option>
+              </select>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+              <button
+                type="button"
+                className="btn pri"
+                disabled={busy || !newUsername.trim() || !newPassword.trim()}
+                onClick={async () => {
+                  setBusy(true);
+                  try {
+                    await onCreatePortalUser({
+                      username: newUsername.trim(),
+                      // Omitted when blank so updating an existing user's password keeps their display name
+                      displayName: newDisplayName.trim() || undefined,
+                      password: newPassword,
+                      role: newRole,
+                    });
+                    setNewUsername('');
+                    setNewDisplayName('');
+                    setNewPassword('');
+                  } catch {
+                    // The error toast is already showing; stay here so the admin can retry.
+                  } finally {
+                    setBusy(false);
+                  }
+                }}
+              >
+                Create administrator
+              </button>
+            </div>
           </div>
-        </form>
-      </Card>
+        </div>
+      </div>
     </div>
   );
 }

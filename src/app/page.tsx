@@ -1,23 +1,28 @@
 'use client';
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import type {
+  SalesforceProfile,
+  SalesforceObject,
+  AccessGroup,
+  ProfileGroupMapping,
+  CopilotMcpLogRecord,
+  PortalAdminLogRecord,
+  OktaSsoSettings,
+  SalesforceConnectionSettings,
+  PortalUserSummary,
+  AdminSession,
+  McpActionType,
+  GroupObjectPermission,
+  NavViewId,
+} from '@/types/governance';
 import {
-  LayoutDashboard,
-  Users,
-  Database,
-  Layers,
-  Grid,
-  Activity,
-  FileText,
-  KeyRound,
-  LogOut,
-  RefreshCw,
-  Shield,
-  Lock,
-  CheckCircle2,
-  ChevronRight,
-} from 'lucide-react';
-import { NavViewId, PortalOverviewPayload } from '@/types/governance';
+  TrafficDashboardView,
+  type McpRequestStats,
+  CopilotMcpLogsView,
+  PortalAdminLogsView,
+  PortalAuthSettingsView,
+} from '@/components/views/DashboardAndLogsViews';
 import {
   SalesforceProfilesView,
   SalesforceObjectsView,
@@ -26,22 +31,70 @@ import {
   AccessGroupsView,
   ProfileGroupMatrixView,
 } from '@/components/views/AccessMatrixViews';
+import { SalesforceOrgConnectionView } from '@/components/views/SalesforceOrgConnectionView';
 import {
-  TrafficDashboardView,
-  CopilotMcpLogsView,
-  PortalAdminLogsView,
-  PortalAuthSettingsView,
-} from '@/components/views/DashboardAndLogsViews';
+  FlyoutDrawer,
+  type FlyoutState,
+} from '@/components/views/FlyoutDrawer';
+import { CommandPalette } from '@/components/views/CommandPalette';
+import { profileSyncResultMessage } from '@/components/views/profileSyncReview';
+import { mcpActivityStatus } from '@/components/views/mcpActivity';
+import { useModalDialog } from '@/components/views/useModalDialog';
+import { isCommandPaletteShortcut } from '@/components/views/shortcuts';
+import { estimateClockOffsetMs } from '@/components/views/trafficChart';
+import { DEFAULT_OVERVIEW_LOG_CAPS, logPageUrl, type OverviewLogCaps } from '@/components/views/logHistory';
+import {
+  ENTERPRISE_MATRIX_WARNING,
+  enterpriseMatrixAction,
+} from '@/components/views/enterpriseMatrix';
+
+type ActiveView =
+  | 'dashboard'
+  | 'profiles'
+  | 'objects'
+  | 'sf-connection'
+  | 'groups'
+  | 'matrix'
+  | 'traffic'
+  | 'audit'
+  | 'auth-settings';
+
+const VIEW_META: Record<ActiveView, { crumb: string; title: string }> = {
+  dashboard: { crumb: 'Overview', title: 'Dashboard' },
+  profiles: {
+    crumb: 'Configure the MCP server · Salesforce',
+    title: 'Profiles',
+  },
+  objects: {
+    crumb: 'Configure the MCP server · Salesforce',
+    title: 'Objects',
+  },
+  'sf-connection': {
+    crumb: 'Configure the MCP server · Salesforce',
+    title: 'Org Connection (JWT)',
+  },
+  groups: {
+    crumb: 'Configure the MCP server · Access matrix',
+    title: 'Groups',
+  },
+  matrix: {
+    crumb: 'Configure the MCP server · Access matrix',
+    title: 'Profile ↔ Group',
+  },
+  traffic: { crumb: 'Logs', title: 'MCP traffic log' },
+  audit: { crumb: 'Logs', title: 'Portal audit log' },
+  'auth-settings': { crumb: 'Logs & Security', title: 'Portal Auth & SSO' },
+};
 
 // Fixed messages for the codes /auth/okta/callback redirects with; any other value is ignored
 // so a crafted link cannot put its own text on the login screen.
 const OKTA_AUTH_ERRORS: Record<string, string> = {
-  okta_error: 'Okta returned an error. Details are in Logs > Portal Admin Activity.',
+  okta_error: 'Okta returned an error. Details are in the Portal audit log.',
   invalid_callback: 'The Okta sign-in response was incomplete. Please try again.',
   expired_state: 'The Okta sign-in took too long or was started in another browser. Please try again.',
   state_mismatch: 'The Okta sign-in response did not match this browser session. Please try again.',
   group_denied: 'Your Okta account is not in the group required for this portal.',
-  sso_failed: 'Okta sign-in failed. Details are in Logs > Portal Admin Activity.',
+  sso_failed: 'Okta sign-in failed. Details are in the Portal audit log.',
 };
 
 /** Parses a JSON body without throwing on HTML/text error pages (e.g. a proxy 500). */
@@ -54,37 +107,136 @@ async function readJsonBody(res: Response): Promise<any> {
   }
 }
 
-export default function McpGovernancePortal() {
-  const [authenticated, setAuthenticated] = useState<boolean>(false);
-  const [checkingSession, setCheckingSession] = useState<boolean>(true);
-  const [currentUser, setCurrentUser] = useState<{
-    username: string;
-    name: string;
-    authMethod: string;
-  } | null>(null);
-  const [csrfToken, setCsrfToken] = useState<string>('');
-  const [oktaEnabled, setOktaEnabled] = useState<boolean>(false);
+function toAdminSession(user: any): AdminSession {
+  return {
+    username: user.username,
+    name: user.name,
+    displayName: user.name,
+    role: user.role || user.groups?.[0] || 'Platform Admin',
+    authMethod: user.authMethod,
+    groups: user.groups,
+  };
+}
 
-  // Login Form State
+export default function AdminPortalPage() {
+  // Session & Auth state
+  const [session, setSession] = useState<AdminSession | null>(null);
+  const [csrfToken, setCsrfToken] = useState<string>('');
+  const [authLoading, setAuthLoading] = useState(true);
   const [loginUsername, setLoginUsername] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
-  const [loginError, setLoginError] = useState<string | null>(null);
-  const [loggingIn, setLoggingIn] = useState(false);
+  const [oktaEnabled, setOktaEnabled] = useState(false);
+  const savingProfileIds = useRef<Set<string>>(new Set());
+  const [loginError, setLoginError] = useState('');
+  const [loginBusy, setLoginBusy] = useState(false);
 
-  // Active Navigation & Overview State
-  const [activeView, setActiveView] = useState<NavViewId>('dashboard');
-  const [overview, setOverview] = useState<PortalOverviewPayload | null>(null);
-  const [refreshing, setRefreshing] = useState(false);
-  const [toast, setToast] = useState<{
-    message: string;
-    isError?: boolean;
-  } | null>(null);
+  // Navigation & UI state
+  const [view, setView] = useState<ActiveView>('dashboard');
+  const [flyout, setFlyout] = useState<FlyoutState | null>(null);
+  const [cmdkOpen, setCmdkOpen] = useState(false);
+  const [theme, setTheme] = useState<'dark' | 'light'>('dark');
+  const [liveStream, setLiveStream] = useState(true);
+  const [toast, setToast] = useState<{ msg: string; isError: boolean } | null>(null);
+  const [trafficSearchFilter, setTrafficSearchFilter] = useState('');
+  const [orgCatalogTrigger, setOrgCatalogTrigger] = useState(0);
 
-  const showToast = useCallback((message: string, isError?: boolean) => {
-    setToast({ message, isError });
-    setTimeout(() => {
-      setToast((prev) => (prev?.message === message ? null : prev));
-    }, 3500);
+  // Workspace Data state
+  const [profiles, setProfiles] = useState<SalesforceProfile[]>([]);
+  const [objects, setObjects] = useState<SalesforceObject[]>([]);
+  const [groups, setGroups] = useState<AccessGroup[]>([]);
+  const [mappings, setMappings] = useState<ProfileGroupMapping[]>([]);
+  const [copilotLogs, setCopilotLogs] = useState<CopilotMcpLogRecord[]>([]);
+  const [portalLogs, setPortalLogs] = useState<PortalAdminLogRecord[]>([]);
+  const [logCaps, setLogCaps] = useState<OverviewLogCaps>(DEFAULT_OVERVIEW_LOG_CAPS);
+  const [oktaSettings, setOktaSettings] = useState<OktaSsoSettings>({
+    enabled: false,
+    oktaDomain: '',
+    clientId: '',
+    issuer: '',
+    hasClientSecret: false,
+    redirectUri: '',
+    adminGroup: '',
+    updatedAt: '',
+  });
+  const [sfSettings, setSfSettings] =
+    useState<SalesforceConnectionSettings | null>(null);
+  const [portalUsers, setPortalUsers] = useState<PortalUserSummary[]>([]);
+  const [mcpStats, setMcpStats] = useState<McpRequestStats | null>(null);
+  const [clockNow, setClockNow] = useState(() => Date.now());
+  const [clockOffsetMs, setClockOffsetMs] = useState(0);
+  // Starts off so the burst button cannot show in production before the first overview loads.
+  const [devToolsEnabled, setDevToolsEnabled] = useState(false);
+  const [seedConfirmOpen, setSeedConfirmOpen] = useState(false);
+  const seedConfirmModal = useModalDialog(seedConfirmOpen, () => setSeedConfirmOpen(false));
+
+  const notify = useCallback((msg: string, isError = false) => {
+    setToast({ msg, isError });
+  }, []);
+
+  /** Shows a failed change to the admin, then rethrows so the caller keeps its form or drawer open. */
+  const reportFailure =
+    <A extends unknown[], R>(fn: (...args: A) => Promise<R>) =>
+    async (...args: A): Promise<R> => {
+      try {
+        return await fn(...args);
+      } catch (err: any) {
+        notify(err?.message || 'The change could not be saved.', true);
+        throw err;
+      }
+    };
+
+  /** For one-click actions with nothing to keep open: shows the failure and ends there. */
+  const reportFailureAndStop =
+    <A extends unknown[]>(fn: (...args: A) => Promise<unknown>) =>
+    async (...args: A): Promise<void> => {
+      try {
+        await fn(...args);
+      } catch (err: any) {
+        notify(err?.message || 'The change could not be saved.', true);
+      }
+    };
+
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), toast.isError ? 8000 : 3200);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  // Theme initialization & sync
+  useEffect(() => {
+    const saved =
+      typeof window !== 'undefined'
+        ? (localStorage.getItem('mcp_portal_theme') as 'dark' | 'light' | null)
+        : null;
+    const initial = saved === 'light' ? 'light' : 'dark';
+    setTheme(initial);
+    document.documentElement.setAttribute('data-theme', initial);
+  }, []);
+
+  const toggleTheme = useCallback(() => {
+    setTheme((prev) => {
+      const next = prev === 'dark' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', next);
+      try {
+        localStorage.setItem('mcp_portal_theme', next);
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+  }, []);
+
+  // Global Cmd+K / Ctrl+K shortcut. An open modal dialog (useModalDialog) stops the chord in its
+  // capture-phase listener, so it never reaches this one.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (isCommandPaletteShortcut(e)) {
+        e.preventDefault();
+        setCmdkOpen((o) => !o);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
   }, []);
 
   // Refreshes what the login screen offers (Okta may have been enabled while signed in).
@@ -99,89 +251,59 @@ export default function McpGovernancePortal() {
   }, []);
 
   const handleSessionExpired = useCallback(() => {
-    setAuthenticated(false);
-    setCurrentUser(null);
-    setOverview(null);
+    setSession(null);
+    setFlyout(null);
     setCsrfToken('');
     setLoginPassword('');
     setLoginError('Your session has ended. Please sign in again.');
     void refreshLoginOptions();
   }, [refreshLoginOptions]);
 
-  const fetchOverview = useCallback(async () => {
-    const res = await fetch('/api/admin/overview', {
-      credentials: 'include',
-    });
-    if (res.status === 401) {
-      handleSessionExpired();
-      return;
-    }
-    const data = await readJsonBody(res);
-    if (res.ok) {
-      setOverview(data as PortalOverviewPayload);
-    } else {
-      showToast(data.error || `Could not load portal data (${res.status})`, true);
-    }
-  }, [handleSessionExpired, showToast]);
-
-  const checkSession = useCallback(async () => {
-    setCheckingSession(true);
+  const fetchWorkspace = useCallback(async () => {
     try {
-      const res = await fetch('/api/admin/session', {
+      const sentAt = Date.now();
+      const res = await fetch('/api/admin/overview', {
         credentials: 'include',
       });
+      if (res.status === 401) {
+        handleSessionExpired();
+        return;
+      }
+      if (!res.ok) return;
       const data = await readJsonBody(res);
-      if (!res.ok) {
-        setLoginError(
-          `The MCP backend is not reachable (${res.status}). Start it with \`npm run dev\` (backend on :3001).`
-        );
-      }
-      setOktaEnabled(Boolean(data.oktaSso?.enabled));
-
-      if (data.authenticated) {
-        setAuthenticated(true);
-        setCurrentUser(data.user);
-        setCsrfToken(data.csrfToken || '');
-        await fetchOverview();
-      } else {
-        setAuthenticated(false);
-        setCurrentUser(null);
-      }
+      const receivedAt = Date.now();
+      setClockOffsetMs(estimateClockOffsetMs(data.serverTime, sentAt, receivedAt));
+      // New rows are measured against a fresh reading, not the last 30-second tick.
+      setClockNow(receivedAt);
+      setProfiles(data.profiles || []);
+      setObjects(data.objects || []);
+      setGroups(data.groups || []);
+      setMappings(data.profileGroupMappings || []);
+      setCopilotLogs(data.copilotLogs || []);
+      setMcpStats(data.stats || null);
+      setDevToolsEnabled(data.devToolsEnabled === true);
+      setPortalLogs(data.portalLogs || []);
+      if (data.logCaps) setLogCaps(data.logCaps);
+      if (data.oktaSettings) setOktaSettings(data.oktaSettings);
+      if (data.sfSettings) setSfSettings(data.sfSettings);
+      if (data.portalUsers) setPortalUsers(data.portalUsers);
     } catch {
-      setAuthenticated(false);
-    } finally {
-      setCheckingSession(false);
+      // ignore transient poll error
     }
-  }, [fetchOverview]);
+  }, [handleSessionExpired]);
 
-  useEffect(() => {
-    // Okta callback failures come back as /?auth_error=<message>
-    const params = new URLSearchParams(window.location.search);
-    const authError = params.get('auth_error');
-    if (authError) {
-      setLoginError(OKTA_AUTH_ERRORS[authError] || 'Okta sign-in failed. Please try again.');
-      params.delete('auth_error');
-      const query = params.toString();
-      window.history.replaceState(null, '', `${window.location.pathname}${query ? `?${query}` : ''}`);
-    }
-    checkSession();
-  }, [checkSession]);
-
+  // Authenticated API helper with CSRF header
   const apiFetch = useCallback(
-    async <T = any>(url: string, options?: RequestInit): Promise<T> => {
+    async <T = any>(url: string, options: RequestInit = {}): Promise<T> => {
       const send = (token: string) => {
-        const headers = new Headers(options?.headers || {});
-        if (!headers.has('Content-Type') && options?.body) {
+        const headers = new Headers(options.headers || {});
+        if (!headers.has('Content-Type') && options.body) {
           headers.set('Content-Type', 'application/json');
         }
         if (token) {
           headers.set('X-CSRF-Token', token);
         }
-        return fetch(url, {
-          ...options,
-          credentials: 'include',
-          headers,
-        });
+        return fetch(url, { ...options, credentials: 'include', headers });
       };
 
       let res = await send(csrfToken);
@@ -191,20 +313,20 @@ export default function McpGovernancePortal() {
       // but only if it is still the same account. Never replay a change as someone else.
       if (res.status === 403 && /CSRF/i.test(String(data.error))) {
         const sessionRes = await fetch('/api/admin/session', { credentials: 'include' });
-        const session = await readJsonBody(sessionRes);
-        if (session.authenticated && session.csrfToken) {
+        const current = await readJsonBody(sessionRes);
+        if (current.authenticated && current.csrfToken) {
           const sameAccount =
-            session.user?.username === currentUser?.username &&
-            session.user?.authMethod === currentUser?.authMethod;
-          setCsrfToken(session.csrfToken);
+            current.user?.username === session?.username &&
+            current.user?.authMethod === session?.authMethod;
+          setCsrfToken(current.csrfToken);
           if (!sameAccount) {
-            setCurrentUser(session.user);
-            await fetchOverview();
+            setSession(toAdminSession(current.user));
+            await fetchWorkspace();
             throw new Error(
-              `This browser is now signed in as "${session.user?.username}" (another tab). The change was not applied; review it and try again.`
+              `This browser is now signed in as "${current.user?.username}" (another tab). The change was not applied; review it and try again.`
             );
           }
-          res = await send(session.csrfToken);
+          res = await send(current.csrfToken);
           data = await readJsonBody(res);
         }
       }
@@ -217,533 +339,1161 @@ export default function McpGovernancePortal() {
       }
       return data as T;
     },
-    [csrfToken, currentUser, fetchOverview, handleSessionExpired]
+    [csrfToken, session, fetchWorkspace, handleSessionExpired]
   );
 
-  const handleLoginSubmit = async (e: React.FormEvent) => {
+  // Check session on mount
+  useEffect(() => {
+    // Okta callback failures come back as /?auth_error=<code>
+    const params = new URLSearchParams(window.location.search);
+    const authError = params.get('auth_error');
+    if (authError) {
+      setLoginError(OKTA_AUTH_ERRORS[authError] || 'Okta sign-in failed. Please try again.');
+      params.delete('auth_error');
+      const query = params.toString();
+      window.history.replaceState(null, '', `${window.location.pathname}${query ? `?${query}` : ''}`);
+    }
+    (async () => {
+      try {
+        const res = await fetch('/api/admin/session', {
+          credentials: 'include',
+        });
+        const data = await readJsonBody(res);
+        if (!res.ok) {
+          setLoginError(
+            `The MCP backend is not reachable (${res.status}). Start it with \`npm run dev\` (backend on :3001).`
+          );
+        }
+        setOktaEnabled(Boolean(data.oktaSso?.enabled));
+        if (data.authenticated && data.user) {
+          setSession(toAdminSession(data.user));
+          if (data.csrfToken) setCsrfToken(data.csrfToken);
+          await fetchWorkspace();
+        }
+      } catch {
+        // not logged in
+      } finally {
+        setAuthLoading(false);
+      }
+    })();
+  }, [fetchWorkspace]);
+
+  // Live refresh interval when liveStream is active
+  useEffect(() => {
+    if (!session || !liveStream) return;
+    const iv = setInterval(() => {
+      fetchWorkspace();
+    }, 5000);
+    return () => clearInterval(iv);
+  }, [session, liveStream, fetchWorkspace]);
+
+  // Keeps relative times moving while the live refresh is paused
+  useEffect(() => {
+    if (!session) return;
+    setClockNow(Date.now());
+    const iv = setInterval(() => setClockNow(Date.now()), 30000);
+    return () => clearInterval(iv);
+  }, [session]);
+
+  // Auth handlers
+  const handlePasswordLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    setLoginError(null);
-    setLoggingIn(true);
+    setLoginError('');
+    setLoginBusy(true);
     try {
       const res = await fetch('/api/admin/login', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          username: loginUsername.trim(),
+          username: loginUsername,
           password: loginPassword,
         }),
       });
       const data = await readJsonBody(res);
       if (!res.ok) {
-        setLoginError(data.error || 'Login failed');
-        return;
+        throw new Error(data.error || 'Authentication failed');
       }
-      setCsrfToken(data.csrfToken);
-      setCurrentUser(data.user);
-      setAuthenticated(true);
+      setSession(toAdminSession(data.user));
       setLoginPassword('');
-      setLoginError(null);
-      await fetchOverview();
+      if (data.csrfToken) setCsrfToken(data.csrfToken);
+      await fetchWorkspace();
+      notify(`Signed in as ${data.user.name}`);
     } catch (err: any) {
-      setLoginError(err.message || 'Network error');
+      setLoginError(err.message || 'Sign-in failed');
     } finally {
-      setLoggingIn(false);
+      setLoginBusy(false);
     }
   };
 
   const handleLogout = async () => {
     try {
-      const res = await fetch('/api/admin/logout', {
-        method: 'POST',
-        credentials: 'include',
-        headers: csrfToken ? { 'X-CSRF-Token': csrfToken } : undefined,
-      });
-      if (!res.ok) {
-        throw new Error(`Sign out failed (${res.status})`);
-      }
+      await apiFetch('/api/admin/logout', { method: 'POST' });
     } catch (err: any) {
       // Keep the user signed in so they know the session is still active.
-      showToast(err?.message || 'Sign out failed', true);
+      notify(err?.message || 'Sign out failed');
       return;
     }
-    setAuthenticated(false);
-    setCurrentUser(null);
-    setOverview(null);
+    setSession(null);
+    setFlyout(null);
     setCsrfToken('');
     setLoginPassword('');
     void refreshLoginOptions();
   };
 
-  const handleManualRefresh = async () => {
-    setRefreshing(true);
+  // Mutation handlers
+  const handleUpsertProfile = async (
+    id: string,
+    name: string,
+    options?: { creating?: boolean }
+  ) => {
+    const data = await apiFetch('/api/admin/profiles', {
+      method: 'POST',
+      body: JSON.stringify({ id, name, creating: options?.creating === true }),
+    });
+    if (data.profiles) setProfiles(data.profiles);
+    await fetchWorkspace();
+    notify(`Saved profile "${name}"`);
+  };
+
+  const handleDeleteProfile = async (id: string) => {
+    const data = await apiFetch(
+      `/api/admin/profiles/${encodeURIComponent(id)}`,
+      { method: 'DELETE' }
+    );
+    if (data.profiles) setProfiles(data.profiles);
+    await fetchWorkspace();
+    notify(`Removed profile ${id}`);
+  };
+
+  const handleImportCsv = async (csvText: string) => {
+    const data = await apiFetch('/api/admin/profiles/import-csv', {
+      method: 'POST',
+      body: JSON.stringify({ csvText }),
+    });
+    if (data.profiles) setProfiles(data.profiles);
+    await fetchWorkspace();
+    notify(
+      `Imported profiles from CSV (${data.summary?.inserted || 0} added, ${
+        data.summary?.updated || 0
+      } updated${
+        data.summary?.namesKept
+          ? `; ${data.summary.namesKept} stored under two ID forms kept their name`
+          : ''
+      })`
+    );
+  };
+
+  const handleToggleProfileGroup = async (
+    profileId: string,
+    groupId: string
+  ) => {
+    // One save per Profile at a time: a second click would send a replacement list computed from
+    // stale state, which could silently undo a revocation.
+    if (savingProfileIds.current.has(profileId)) return;
+    savingProfileIds.current.add(profileId);
     try {
-      await fetchOverview();
+      await saveProfileGroupToggle(profileId, groupId);
     } finally {
-      setRefreshing(false);
+      savingProfileIds.current.delete(profileId);
+      // Always reload so the row shows what the server actually stored
+      await fetchWorkspace();
     }
   };
 
-  if (checkingSession) {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-slate-50 text-xs font-semibold text-slate-500">
-        Checking portal session...
-      </div>
+  const saveProfileGroupToggle = async (
+    profileId: string,
+    groupId: string
+  ) => {
+    const existing =
+      mappings.find((m) => m.profileId === profileId)?.groupIds || [];
+    const has = existing.includes(groupId);
+    const nextGroupIds = has
+      ? existing.filter((x) => x !== groupId)
+      : [...existing, groupId];
+
+    const data = await apiFetch(
+      `/api/admin/profile-groups/${encodeURIComponent(profileId)}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({ groupIds: nextGroupIds }),
+      }
     );
-  }
+    if (data.profileGroupMappings) setMappings(data.profileGroupMappings);
+    await fetchWorkspace();
+  };
 
-  // =========================================================================
-  // 1. PORTAL LOGIN SCREEN (Username/Password OR Okta SSO)
-  // =========================================================================
-  if (!authenticated) {
+  const handleToggleObject = async (objectName: string, enabled: boolean) => {
+    const data = await apiFetch(
+      `/api/admin/objects/${encodeURIComponent(objectName)}/toggle`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({ enabled }),
+      }
+    );
+    if (data.objects) setObjects(data.objects);
+    notify(`${objectName} ${enabled ? 'enabled' : 'disabled'}`);
+  };
+
+  const handleBulkToggleAllObjects = async (enabled: boolean) => {
+    for (const o of objects) {
+      if (o.enabled !== enabled) {
+        await apiFetch(
+          `/api/admin/objects/${encodeURIComponent(o.objectName)}/toggle`,
+          {
+            method: 'PUT',
+            body: JSON.stringify({ enabled }),
+          }
+        );
+      }
+    }
+    await fetchWorkspace();
+    notify(`${enabled ? 'Enabled' : 'Disabled'} all Salesforce objects`);
+  };
+
+  const handleToggleField = async (
+    objectName: string,
+    fieldName: string,
+    enabled: boolean
+  ) => {
+    const data = await apiFetch(
+      `/api/admin/objects/${encodeURIComponent(
+        objectName
+      )}/fields/${encodeURIComponent(fieldName)}/toggle`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({ enabled }),
+      }
+    );
+    if (data.objects) setObjects(data.objects);
+  };
+
+  const handleBulkToggleFields = async (
+    objectName: string,
+    enabled: boolean
+  ) => {
+    const data = await apiFetch(
+      `/api/admin/objects/${encodeURIComponent(objectName)}/fields/bulk`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({ enabled }),
+      }
+    );
+    if (data.objects) setObjects(data.objects);
+    notify(
+      `${enabled ? 'Enabled' : 'Disabled'} all fields on ${objectName}`
+    );
+  };
+
+  const handleSyncSfdxPath = async (folderPath: string) => {
+    const data = await apiFetch('/api/admin/objects/import-local-folder', {
+      method: 'POST',
+      body: JSON.stringify({ folderPath }),
+    });
+    if (data.objects) setObjects(data.objects);
+    await fetchWorkspace();
+    notify(
+      `Synced ${data.summary?.objectsImported || 0} objects from ${folderPath}`
+    );
+  };
+
+  const handleSyncUploadedFiles = async (
+    files: Array<{ relativePath: string; content: string }>
+  ) => {
+    const data = await apiFetch('/api/admin/objects/import-sfdx-files', {
+      method: 'POST',
+      body: JSON.stringify({ files }),
+    });
+    if (data.objects) setObjects(data.objects);
+    await fetchWorkspace();
+    notify(
+      `Synced ${
+        data.summary?.objectsImported || 0
+      } SObjects from uploaded SFDX bundle`
+    );
+  };
+
+  const handleSaveGroup = async (group: {
+    id?: string;
+    name: string;
+    description: string;
+    allowedActions: McpActionType[];
+    objectPermissions: GroupObjectPermission[];
+  }) => {
+    const data = await apiFetch('/api/admin/groups', {
+      method: 'POST',
+      body: JSON.stringify(group),
+    });
+    if (data.groups) setGroups(data.groups);
+    await fetchWorkspace();
+    notify(`Saved access group "${group.name}"`);
+    return data.group;
+  };
+
+  const handleDeleteGroup = async (groupId: string) => {
+    const data = await apiFetch(
+      `/api/admin/groups/${encodeURIComponent(groupId)}`,
+      { method: 'DELETE' }
+    );
+    if (data.groups) setGroups(data.groups);
+    if (data.profileGroupMappings) setMappings(data.profileGroupMappings);
+    await fetchWorkspace();
+    notify('Deleted access group');
+  };
+
+  const handleSeedEnterpriseMatrix = async () => {
+    const data = await apiFetch('/api/admin/workspace/seed-sample', {
+      method: 'POST',
+    });
+    if (data.profiles) setProfiles(data.profiles);
+    if (data.objects) setObjects(data.objects);
+    if (data.groups) setGroups(data.groups);
+    if (data.profileGroupMappings) setMappings(data.profileGroupMappings);
+    await fetchWorkspace();
+    notify('Loaded Reference Enterprise Access Matrix (5 Groups + Mappings)');
+  };
+  const requestSeedEnterpriseMatrix = enterpriseMatrixAction(devToolsEnabled, () =>
+    setSeedConfirmOpen(true)
+  );
+
+  const handleTestMcpCall = async (payload: {
+    profileId: string;
+    toolName: string;
+    targetObject: string;
+    username?: string;
+    samplePayload?: Record<string, unknown>;
+  }) => {
+    return apiFetch('/api/admin/test-mcp-access', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  };
+
+  // Org Pull handlers
+  const handlePreviewPullProfilesFromOrg = async () => {
+    const data = await apiFetch('/api/admin/profiles/pull-preview', {
+      method: 'POST',
+    });
+    return data.preview;
+  };
+
+  const handleApplyPullProfilesFromOrg = async (payload: {
+    upserts: Array<{ id: string; name: string }>;
+    removeProfileIds: string[];
+    keptMissingProfileIds: string[];
+  }) => {
+    const data = await apiFetch('/api/admin/profiles/pull-apply', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    if (data.profiles) setProfiles(data.profiles);
+    await fetchWorkspace();
+    notify(profileSyncResultMessage(data.summary));
+  };
+
+  const handleFetchOrgObjectCatalog = async () => {
+    const data = await apiFetch('/api/admin/objects/org-catalog');
+    return data.catalog || [];
+  };
+
+  const handlePreviewPullObjectsFromOrg = async (objectNames: string[]) => {
+    const data = await apiFetch('/api/admin/objects/pull-preview', {
+      method: 'POST',
+      body: JSON.stringify({ objectNames, includeTracked: true }),
+    });
+    return {
+      preview: data.preview,
+      pulledMetadata: data.pulledMetadata,
+    };
+  };
+
+  const handleApplyPullObjectsFromOrg = async (payload: {
+    pulledMetadata: any[];
+    removeObjectNames: string[];
+    removeFields: Array<{ objectName: string; fieldName: string }>;
+  }) => {
+    const data = await apiFetch('/api/admin/objects/pull-apply', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    if (data.objects) setObjects(data.objects);
+    await fetchWorkspace();
+    notify(
+      `Synced ${data.summary?.objectsUpserted || 0} SObjects (${
+        data.summary?.fieldsUpserted || 0
+      } fields) from Salesforce Org`
+    );
+  };
+
+  const mapNavIdToView = (navId: NavViewId): ActiveView => {
+    if (navId === 'sf-profiles') return 'profiles';
+    if (navId === 'sf-objects') return 'objects';
+    if (navId === 'matrix-groups') return 'groups';
+    if (navId === 'matrix-profile-groups') return 'matrix';
+    if (navId === 'logs-copilot') return 'traffic';
+    if (navId === 'logs-portal') return 'audit';
+    if (navId === 'settings-auth') return 'auth-settings';
+    if (navId === 'settings-salesforce') return 'sf-connection';
+    return 'dashboard';
+  };
+
+  // Loading state
+  if (authLoading) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-slate-100 p-4">
-        <div className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-7 shadow-lg">
-          <div className="flex items-center gap-3 border-b border-slate-100 pb-4">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-600 text-white">
-              <Shield className="h-5 w-5" />
-            </div>
-            <div>
-              <h1 className="text-base font-bold text-slate-900">
-                Salesforce MCP Server Portal
-              </h1>
-              <p className="text-xs text-slate-500">
-                Sign in with Username & Password or Okta SSO to administer the MCP server
-              </p>
-            </div>
-          </div>
-
-          {loginError && (
-            <div className="mt-4 rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-2.5 text-xs font-semibold text-rose-700">
-              {loginError}
-            </div>
-          )}
-
-          <form onSubmit={handleLoginSubmit} className="mt-5 space-y-4">
-            <div>
-              <label className="block text-xs font-semibold text-slate-700">
-                Username
-              </label>
-              <input
-                type="text"
-                required
-                value={loginUsername}
-                onChange={(e) => setLoginUsername(e.target.value)}
-                placeholder="admin"
-                className="mt-1 w-full rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-2 text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold text-slate-700">
-                Password
-              </label>
-              <input
-                type="password"
-                required
-                value={loginPassword}
-                onChange={(e) => setLoginPassword(e.target.value)}
-                placeholder="••••••••"
-                className="mt-1 w-full rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-2 text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
-              />
-            </div>
-
-            <button
-              type="submit"
-              disabled={loggingIn}
-              className="w-full rounded-xl bg-indigo-600 py-2.5 text-xs font-bold text-white shadow-xs transition hover:bg-indigo-700 disabled:opacity-50"
-            >
-              {loggingIn ? 'Signing in...' : 'Sign In with Username & Password'}
-            </button>
-          </form>
-
-          <div className="my-4 flex items-center gap-3">
-            <div className="h-px flex-1 bg-slate-200" />
-            <span className="text-[11px] font-semibold text-slate-400 uppercase">
-              or
-            </span>
-            <div className="h-px flex-1 bg-slate-200" />
-          </div>
-
-          {oktaEnabled ? (
-            <a
-              href="/auth/okta/login"
-              className="flex w-full items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white py-2.5 text-xs font-bold text-slate-800 transition hover:bg-slate-50"
-            >
-              <KeyRound className="h-4 w-4 text-indigo-600" />
-              <span>Sign In with Okta SSO</span>
-            </a>
-          ) : (
-            <div
-              aria-disabled="true"
-              className="flex w-full cursor-not-allowed items-center justify-center gap-2 rounded-xl border border-slate-200 bg-slate-50 py-2.5 text-xs font-bold text-slate-400"
-            >
-              <KeyRound className="h-4 w-4" />
-              <span>
-                Sign In with Okta SSO{' '}
-                <span className="font-normal">(Configure after login)</span>
-              </span>
-            </div>
-          )}
-
-          {process.env.NODE_ENV !== 'production' && (
-            <p className="mt-4 text-center font-mono text-[11px] text-slate-400">
-              Development default login: <strong className="text-slate-600">admin</strong> /{' '}
-              <strong className="text-slate-600">admin123</strong> (unless ADMIN_BOOTSTRAP_* is set)
-            </p>
-          )}
+      <div
+        style={{
+          height: '100vh',
+          display: 'grid',
+          placeItems: 'center',
+          background: 'var(--bg)',
+          color: 'var(--t2)',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span className="dot ok" />
+          <span className="mono">
+            Initializing Salesforce MCP Control Plane…
+          </span>
         </div>
       </div>
     );
   }
 
-  // =========================================================================
-  // 2. AUTHENTICATED PORTAL SHELL
-  // =========================================================================
-  return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 antialiased">
-      {toast && (
+  // Unauthenticated Login View
+  if (!session) {
+    return (
+      <div
+        style={{
+          minHeight: '100vh',
+          display: 'grid',
+          placeItems: 'center',
+          background:
+            'radial-gradient(circle at 50% 0%, rgba(0,163,255,0.12), transparent 55%), var(--bg)',
+          padding: 20,
+        }}
+      >
         <div
-          className={`fixed right-6 bottom-6 z-50 flex items-center gap-2 rounded-xl border px-4 py-2.5 text-xs font-semibold shadow-lg ${
-            toast.isError
-              ? 'border-rose-200 bg-rose-600 text-white'
-              : 'border-slate-800 bg-slate-900 text-white'
-          }`}
+          className="card"
+          style={{
+            width: '100%',
+            maxWidth: 430,
+            boxShadow: 'var(--shadow-lg)',
+          }}
         >
-          <CheckCircle2 className="h-4 w-4 text-indigo-400" />
-          <span>{toast.message}</span>
-        </div>
-      )}
+          <div className="card-h" style={{ padding: '16px 20px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <div className="brand-mark">
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.2"
+                >
+                  <path d="M12 2L3 7v10l9 5 9-5V7l-9-5z" />
+                  <path d="M12 8v8M8 10l4 2 4-2" />
+                </svg>
+              </div>
+              <div>
+                <div className="brand-t">Salesforce MCP</div>
+                <div className="brand-s">
+                  v2.4 · Enterprise Governance Control Plane
+                </div>
+              </div>
+            </div>
+            <button
+              type="button"
+              className="btn gh sm"
+              onClick={toggleTheme}
+              title="Toggle Dark / Light Theme"
+            >
+              {theme === 'dark' ? '☀' : '☾'}
+            </button>
+          </div>
 
-      {/* Fixed Left Sidebar */}
-      <aside className="fixed inset-y-0 left-0 z-30 flex w-64 flex-col border-r border-slate-200 bg-white">
-        {/* Brand Header */}
-        <div className="flex h-14 items-center justify-between border-b border-slate-100 px-4">
-          <div className="flex items-center gap-2.5">
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-indigo-600 text-white">
-              <Shield className="h-4 w-4" />
-            </div>
-            <div>
-              <div className="text-xs font-bold text-slate-900">
-                Salesforce MCP
+          <div className="card-b" style={{ padding: 20 }}>
+            {loginError && (
+              <div
+                style={{
+                  marginBottom: 14,
+                  padding: '8px 12px',
+                  borderRadius: 6,
+                  border: '1px solid rgba(248,113,113,0.4)',
+                  background: 'var(--err-d)',
+                  color: 'var(--err)',
+                  fontSize: 12,
+                }}
+              >
+                {loginError}
               </div>
-              <div className="text-[10px] text-slate-400">
-                Copilot Control Portal
+            )}
+
+            {/* Okta OIDC SSO: the server redirects to Okta and verifies the callback */}
+            {oktaEnabled && (
+              <>
+                <a
+                  className="btn pri"
+                  style={{ width: '100%', padding: '8px 12px', marginBottom: 16 }}
+                  href="/auth/okta/login"
+                >
+                  <span className="dot ok" />
+                  Continue with Okta SSO
+                </a>
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 10,
+                    margin: '14px 0',
+                    color: 'var(--t3)',
+                    fontSize: 11,
+                  }}
+                >
+                  <div
+                    style={{ flex: 1, height: 1, background: 'var(--bd)' }}
+                  />
+                  <span>OR LOCAL ADMINISTRATOR</span>
+                  <div
+                    style={{ flex: 1, height: 1, background: 'var(--bd)' }}
+                  />
+                </div>
+              </>
+            )}
+
+            <form onSubmit={handlePasswordLogin}>
+              <div className="fld">
+                <label>Username</label>
+                <input
+                  className="inp mono"
+                  value={loginUsername}
+                  onChange={(e) => setLoginUsername(e.target.value)}
+                />
               </div>
-            </div>
+              <div className="fld">
+                <div
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                  }}
+                >
+                  <label>Password</label>
+                  {process.env.NODE_ENV !== 'production' && (
+                    <button
+                      type="button"
+                      className="btn gh sm"
+                      style={{ padding: '1px 5px', fontSize: 10.5 }}
+                      onClick={() => {
+                        setLoginUsername('admin');
+                        setLoginPassword('admin123');
+                      }}
+                    >
+                      Fill development default
+                    </button>
+                  )}
+                </div>
+                <input
+                  type="password"
+                  className="inp mono"
+                  value={loginPassword}
+                  onChange={(e) => setLoginPassword(e.target.value)}
+                />
+              </div>
+              <button
+                type="submit"
+                className="btn"
+                style={{ width: '100%', padding: '8px 12px' }}
+                disabled={loginBusy}
+              >
+                Sign in with password
+              </button>
+            </form>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Computed counts for sidebar
+  const enabledObjectsCount = objects.filter((o) => o.enabled).length;
+  const assignedProfilesCount = profiles.filter((p) => {
+    const found = mappings.find((m) => m.profileId === p.id);
+    return found && found.groupIds.length > 0;
+  }).length;
+  const meta = VIEW_META[view] || VIEW_META.dashboard;
+  // Read on the server's clock, which stamps the call, so the pill agrees with the chart under skew.
+  const mcpActivity = mcpActivityStatus(mcpStats ? mcpStats.lastMcpCallAt : undefined, clockNow + clockOffsetMs);
+  const selectedFlyoutId =
+    flyout?.data?.id || flyout?.data?.objectName || undefined;
+  const displayUser = session.displayName || session.name || session.username;
+
+  return (
+    <div className="shell">
+      {/* LEFT SIDEBAR */}
+      <aside className="sb">
+        <div className="brand">
+          <div className="brand-mark">
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.2"
+            >
+              <path d="M12 2L3 7v10l9 5 9-5V7l-9-5z" />
+              <path d="M12 8v8M8 10l4 2 4-2" />
+            </svg>
+          </div>
+          <div>
+            <div className="brand-t">Salesforce MCP</div>
+            <div className="brand-s">v2.4 · admin portal</div>
           </div>
         </div>
 
-        {/* Navigation Links */}
-        <nav className="flex-1 space-y-5 overflow-y-auto px-3 py-4 text-xs">
-          {/* Top Dashboard Link */}
-          <div>
+        <nav className="nav" aria-label="Primary">
+          <div className="nav-sec">
             <button
-              onClick={() => setActiveView('dashboard')}
-              className={`flex w-full items-center justify-between rounded-lg px-3 py-2 font-semibold transition ${
-                activeView === 'dashboard'
-                  ? 'bg-indigo-50 text-indigo-600'
-                  : 'text-slate-700 hover:bg-slate-50'
-              }`}
+              type="button"
+              className={`nav-it ${view === 'dashboard' ? 'on' : ''}`}
+              onClick={() => setView('dashboard')}
             >
-              <span className="flex items-center gap-2.5">
-                <LayoutDashboard className="h-4 w-4" />
-                <span>Dashboard (Traffic)</span>
+              <span>
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.75"
+                >
+                  <rect x="3" y="3" width="7" height="9" rx="1.5" />
+                  <rect x="14" y="3" width="7" height="5" rx="1.5" />
+                  <rect x="14" y="12" width="7" height="9" rx="1.5" />
+                  <rect x="3" y="16" width="7" height="5" rx="1.5" />
+                </svg>
+                Dashboard
               </span>
             </button>
           </div>
 
-          {/* Configure the MCP Server Section Header */}
-          <div className="border-t border-slate-100 pt-3">
-            <div className="px-2 text-[10px] font-extrabold tracking-wider text-indigo-600 uppercase">
-              Configure the MCP Server
+          <div className="nav-sec">
+            <div className="nav-h">Configure the MCP server</div>
+
+            <div className="nav-grp">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.75"
+              >
+                <path d="M17.5 19a4.5 4.5 0 0 0 .5-8.97A6 6 0 0 0 6.2 8.5 4 4 0 0 0 6 16.5" />
+              </svg>
+              Salesforce
+            </div>
+            <div className="nav-sub">
+              <button
+                type="button"
+                className={`nav-it ${view === 'profiles' ? 'on' : ''}`}
+                onClick={() => setView('profiles')}
+              >
+                <span>Profiles</span>
+                <span className="ct">{profiles.length}</span>
+              </button>
+              <button
+                type="button"
+                className={`nav-it ${view === 'objects' ? 'on' : ''}`}
+                onClick={() => setView('objects')}
+              >
+                <span>Objects</span>
+                <span className="ct">
+                  {enabledObjectsCount}/{objects.length}
+                </span>
+              </button>
+              <button
+                type="button"
+                className={`nav-it ${view === 'sf-connection' ? 'on' : ''}`}
+                onClick={() => setView('sf-connection')}
+              >
+                <span>Org Connection (JWT)</span>
+                <span
+                  className={`dot ${
+                    sfSettings?.connectionStatus === 'connected' ? 'ok' : 'off'
+                  }`}
+                />
+              </button>
             </div>
 
-            {/* # Salesforce */}
-            <div className="mt-3">
-              <div className="px-2.5 pb-1 text-[11px] font-bold text-slate-400 uppercase">
-                # Salesforce
-              </div>
-              <div className="space-y-1">
-                <button
-                  onClick={() => setActiveView('sf-profiles')}
-                  className={`flex w-full items-center justify-between rounded-lg px-3 py-2 font-medium transition ${
-                    activeView === 'sf-profiles'
-                      ? 'bg-indigo-50 font-semibold text-indigo-600'
-                      : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
-                  }`}
-                >
-                  <span className="flex items-center gap-2">
-                    <Users className="h-3.5 w-3.5" />
-                    <span>Profiles</span>
-                  </span>
-                  <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-600">
-                    {overview?.profiles.length || 0}
-                  </span>
-                </button>
-
-                <button
-                  onClick={() => setActiveView('sf-objects')}
-                  className={`flex w-full items-center justify-between rounded-lg px-3 py-2 font-medium transition ${
-                    activeView === 'sf-objects'
-                      ? 'bg-indigo-50 font-semibold text-indigo-600'
-                      : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
-                  }`}
-                >
-                  <span className="flex items-center gap-2">
-                    <Database className="h-3.5 w-3.5" />
-                    <span>Objects</span>
-                  </span>
-                  <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-600">
-                    {overview?.stats.enabledObjects || 0}/
-                    {overview?.stats.totalObjects || 0}
-                  </span>
-                </button>
-              </div>
+            <div className="nav-grp" style={{ marginTop: 10 }}>
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.75"
+              >
+                <path d="M12 3l8 4v5c0 5-3.5 8.5-8 9-4.5-.5-8-4-8-9V7l8-4z" />
+              </svg>
+              Access matrix
             </div>
-
-            {/* # Access Matrix */}
-            <div className="mt-4">
-              <div className="px-2.5 pb-1 text-[11px] font-bold text-slate-400 uppercase">
-                # Access Matrix
-              </div>
-              <div className="space-y-1">
-                <button
-                  onClick={() => setActiveView('matrix-groups')}
-                  className={`flex w-full items-center justify-between rounded-lg px-3 py-2 font-medium transition ${
-                    activeView === 'matrix-groups'
-                      ? 'bg-indigo-50 font-semibold text-indigo-600'
-                      : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
-                  }`}
-                >
-                  <span className="flex items-center gap-2">
-                    <Layers className="h-3.5 w-3.5" />
-                    <span>Groups</span>
-                  </span>
-                  <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-600">
-                    {overview?.groups.length || 0}
-                  </span>
-                </button>
-
-                <button
-                  onClick={() => setActiveView('matrix-profile-groups')}
-                  className={`flex w-full items-center justify-between rounded-lg px-3 py-2 font-medium transition ${
-                    activeView === 'matrix-profile-groups'
-                      ? 'bg-indigo-50 font-semibold text-indigo-600'
-                      : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
-                  }`}
-                >
-                  <span className="flex items-center gap-2">
-                    <Grid className="h-3.5 w-3.5" />
-                    <span>Profile Group Matrix</span>
-                  </span>
-                </button>
-              </div>
+            <div className="nav-sub">
+              <button
+                type="button"
+                className={`nav-it ${view === 'groups' ? 'on' : ''}`}
+                onClick={() => setView('groups')}
+              >
+                <span>Groups</span>
+                <span className="ct">{groups.length}</span>
+              </button>
+              <button
+                type="button"
+                className={`nav-it ${view === 'matrix' ? 'on' : ''}`}
+                onClick={() => setView('matrix')}
+              >
+                <span>Profile &harr; Group</span>
+                <span className="ct">
+                  {assignedProfilesCount}/{profiles.length}
+                </span>
+              </button>
             </div>
+          </div>
 
-            {/* # Audit Logs & Portal Auth */}
-            <div className="mt-4 border-t border-slate-100 pt-3">
-              <div className="px-2.5 pb-1 text-[11px] font-bold text-slate-400 uppercase">
-                # Logs & Administration
-              </div>
-              <div className="space-y-1">
-                <button
-                  onClick={() => setActiveView('logs-copilot')}
-                  className={`flex w-full items-center justify-between rounded-lg px-3 py-2 font-medium transition ${
-                    activeView === 'logs-copilot'
-                      ? 'bg-indigo-50 font-semibold text-indigo-600'
-                      : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
-                  }`}
+          <div className="nav-sec">
+            <div className="nav-h">Logs &amp; Security</div>
+            <button
+              type="button"
+              className={`nav-it ${view === 'traffic' ? 'on' : ''}`}
+              onClick={() => setView('traffic')}
+            >
+              <span>
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.75"
                 >
-                  <span className="flex items-center gap-2">
-                    <Activity className="h-3.5 w-3.5" />
-                    <span>Copilot MCP Logs</span>
-                  </span>
-                  <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-600">
-                    {overview?.copilotLogs.length || 0}
-                  </span>
-                </button>
-
-                <button
-                  onClick={() => setActiveView('logs-portal')}
-                  className={`flex w-full items-center justify-between rounded-lg px-3 py-2 font-medium transition ${
-                    activeView === 'logs-portal'
-                      ? 'bg-indigo-50 font-semibold text-indigo-600'
-                      : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
-                  }`}
+                  <path d="M3 12h4l3-7 4 14 3-7h4" />
+                </svg>
+                MCP traffic
+              </span>
+              <span className="ct">{mcpStats?.totalMcpRequests ?? copilotLogs.length}</span>
+            </button>
+            <button
+              type="button"
+              className={`nav-it ${view === 'audit' ? 'on' : ''}`}
+              onClick={() => setView('audit')}
+            >
+              <span>
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.75"
                 >
-                  <span className="flex items-center gap-2">
-                    <FileText className="h-3.5 w-3.5" />
-                    <span>Portal Admin Logs</span>
-                  </span>
-                  <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-600">
-                    {overview?.portalLogs.length || 0}
-                  </span>
-                </button>
-
-                <button
-                  onClick={() => setActiveView('settings-auth')}
-                  className={`flex w-full items-center justify-between rounded-lg px-3 py-2 font-medium transition ${
-                    activeView === 'settings-auth'
-                      ? 'bg-indigo-50 font-semibold text-indigo-600'
-                      : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
-                  }`}
+                  <path d="M9 12h6M9 16h6M7 4h10a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z" />
+                </svg>
+                Portal audit
+              </span>
+              <span className="ct">{portalLogs.length}</span>
+            </button>
+            <button
+              type="button"
+              className={`nav-it ${view === 'auth-settings' ? 'on' : ''}`}
+              onClick={() => setView('auth-settings')}
+            >
+              <span>
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.75"
                 >
-                  <span className="flex items-center gap-2">
-                    <KeyRound className="h-3.5 w-3.5" />
-                    <span>Portal Login & Okta SSO</span>
-                  </span>
-                </button>
-              </div>
-            </div>
+                  <rect x="4" y="11" width="16" height="9" rx="2" />
+                  <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+                </svg>
+                Portal Auth &amp; SSO
+              </span>
+            </button>
           </div>
         </nav>
 
-        {/* Signed-in User Footer */}
-        <div className="border-t border-slate-100 p-3">
-          <div className="flex items-center justify-between rounded-xl bg-slate-50 px-3 py-2 text-xs">
-            <div className="min-w-0">
-              <div className="truncate font-bold text-slate-900">
-                {currentUser?.username}
-              </div>
-              <div className="truncate text-[10px] text-slate-500">
-                {currentUser?.authMethod === 'okta_oidc'
-                  ? 'Okta SSO'
-                  : 'Password Auth'}
+        <div className="sb-ft">
+          <div className="u-row">
+            <div className="av">
+              {displayUser
+                .split(' ')
+                .map((s: string) => s[0])
+                .join('')
+                .slice(0, 2)
+                .toUpperCase()}
+            </div>
+            <div className="u-meta">
+              <div className="u-name">{displayUser}</div>
+              <div className="u-role">
+                <span className="dot ok" />
+                <span>
+                  {String(session.authMethod).toLowerCase().includes('okta')
+                    ? 'Okta SSO'
+                    : 'Password'}
+                </span>
+                <span>· {session.role || 'Admin'}</span>
               </div>
             </div>
+          </div>
+          <div style={{ display: 'flex', gap: 6 }}>
             <button
-              onClick={handleLogout}
-              title="Sign Out"
-              className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-200 hover:text-slate-900"
+              type="button"
+              className="btn sm"
+              style={{ flex: 1, justifyContent: 'center' }}
+              onClick={() => setView('auth-settings')}
             >
-              <LogOut className="h-4 w-4" />
+              SSO Settings
+            </button>
+            <button
+              type="button"
+              className="btn sm"
+              onClick={handleLogout}
+              title="Sign out"
+            >
+              Sign out
             </button>
           </div>
         </div>
       </aside>
 
-      {/* Main Content Area */}
-      <div className="pl-64">
-        <header className="sticky top-0 z-20 flex h-14 items-center justify-between border-b border-slate-200 bg-white/95 px-6 backdrop-blur-xs">
-          <div className="flex items-center gap-2 text-xs">
-            <span className="font-semibold text-slate-400">MCP Server</span>
-            <ChevronRight className="h-3.5 w-3.5 text-slate-300" />
-            <span className="font-bold text-slate-900">
-              {activeView === 'dashboard' && 'Dashboard (Traffic Overview)'}
-              {activeView === 'sf-profiles' && 'Salesforce > Profiles'}
-              {activeView === 'sf-objects' && 'Salesforce > Objects'}
-              {activeView === 'matrix-groups' && 'Access Matrix > Groups'}
-              {activeView === 'matrix-profile-groups' &&
-                'Access Matrix > Profile Group Matrix'}
-              {activeView === 'logs-copilot' &&
-                'Logs > Copilot MCP Traffic (PII Stripped)'}
-              {activeView === 'logs-portal' && 'Logs > Portal Admin Activity'}
-              {activeView === 'settings-auth' &&
-                'Settings > Portal Login & Okta SSO'}
-            </span>
+      {/* MAIN WORKSPACE */}
+      <div className="main">
+        <header className="top">
+          <div className="crumb">
+            <span>{meta.crumb}</span>
+            <span className="sep">/</span>
+            <b>{meta.title}</b>
           </div>
 
-          <div className="flex items-center gap-3">
-            <span className="rounded-md bg-emerald-50 px-2.5 py-1 font-mono text-[11px] font-semibold text-emerald-700">
-              POST /mcp Active
-            </span>
+          <div className="top-r">
             <button
-              onClick={handleManualRefresh}
-              className="rounded-lg border border-slate-200 p-1.5 text-slate-600 hover:bg-slate-50"
-              title="Refresh Data"
+              type="button"
+              className="pill"
+              onClick={() => setCmdkOpen(true)}
+              title="Open Command Palette (⌘K)"
             >
-              <RefreshCw
-                className={`h-3.5 w-3.5 ${
-                  refreshing ? 'animate-spin text-indigo-600' : ''
+              <span>Search / Jump</span>
+              <span className="kbd">⌘K</span>
+            </button>
+
+            <button
+              type="button"
+              className="pill"
+              onClick={() => setFlyout({ type: 'simulator' })}
+              title="Time of the last real MCP call; simulated calls are not counted. Click to open the MCP call simulator."
+              aria-label={`${mcpActivity.label}. Open the MCP call simulator`}
+            >
+              <span className={`dot ${mcpActivity.tone}`} />
+              <span>{mcpActivity.label}</span>
+              <span className="kbd">Simulate</span>
+            </button>
+
+            <button
+              type="button"
+              className="pill"
+              onClick={() => setView('sf-connection')}
+              title="Configure Salesforce OAuth 2.0 JWT Bearer connection"
+            >
+              <span
+                className={`dot ${
+                  sfSettings?.connectionStatus === 'connected' ? 'ok' : 'warn'
                 }`}
               />
+              <span>
+                Salesforce ·{' '}
+                <span className="mono">
+                  {sfSettings?.connectionStatus === 'connected'
+                    ? sfSettings.connectedOrgId
+                    : sfSettings?.connectionStatus === 'not_verified'
+                    ? 'not verified'
+                    : 'JWT setup'}
+                </span>
+              </span>
+            </button>
+
+            <button
+              type="button"
+              className={`live-chip ${liveStream ? 'on' : ''}`}
+              onClick={() => setLiveStream((v) => !v)}
+              title="Toggle live telemetry auto-refresh"
+            >
+              <span className={`dot ${liveStream ? 'ok' : 'off'}`} />
+              {liveStream ? 'Live' : 'Paused'}
+            </button>
+
+            <button
+              type="button"
+              className="btn gh sm"
+              onClick={toggleTheme}
+              title={`Switch to ${theme === 'dark' ? 'Light' : 'Dark'} theme`}
+            >
+              {theme === 'dark' ? '☀' : '☾'}
             </button>
           </div>
         </header>
 
-        <main className="mx-auto max-w-[1440px] p-6">
-          {!overview ? (
-            <div className="py-16 text-center text-xs text-slate-400">
-              Loading MCP Server state...
-            </div>
-          ) : (
-            <>
-              {activeView === 'dashboard' && (
-                <TrafficDashboardView
-                  overview={overview}
-                  apiFetch={apiFetch}
-                  onRefresh={handleManualRefresh}
-                  onShowToast={showToast}
-                  onNavigate={setActiveView}
-                />
-              )}
+        <main className="cnt">
+          {view === 'dashboard' && (
+            <TrafficDashboardView
+              clockNow={clockNow}
+              clockOffsetMs={clockOffsetMs}
+              copilotLogs={copilotLogs}
+              mcpStats={mcpStats}
+              portalLogs={portalLogs}
+              profiles={profiles}
+              objects={objects}
+              groups={groups}
+              mappings={mappings}
+              sfSettings={sfSettings}
+              selectedFlyoutId={selectedFlyoutId}
+              onNavigateTab={(next) => setView(next as ActiveView)}
+              onOpenFlyout={(f) => setFlyout(f)}
+              onSeedEnterpriseMatrix={requestSeedEnterpriseMatrix}
+            />
+          )}
 
-              {activeView === 'sf-profiles' && (
-                <SalesforceProfilesView
-                  profiles={overview.profiles}
-                  groups={overview.groups}
-                  mappings={overview.profileGroupMappings}
-                  apiFetch={apiFetch}
-                  onRefresh={handleManualRefresh}
-                  onShowToast={showToast}
-                  onNavigate={setActiveView}
-                />
-              )}
+          {view === 'profiles' && (
+            <SalesforceProfilesView
+              profiles={profiles}
+              groups={groups}
+              objects={objects}
+              mappings={mappings}
+              sfSettings={sfSettings}
+              selectedFlyoutId={selectedFlyoutId}
+              onOpenFlyout={(f) => setFlyout(f)}
+              onPreviewPullProfilesFromOrg={handlePreviewPullProfilesFromOrg}
+              onApplyPullProfilesFromOrg={reportFailure(handleApplyPullProfilesFromOrg)}
+              onNavigateToOrgConnection={() => setView('sf-connection')}
+            />
+          )}
 
-              {activeView === 'sf-objects' && (
-                <SalesforceObjectsView
-                  objects={overview.objects}
-                  savedFolderPath={overview.sfSettings.sfdxObjectsFolderPath}
-                  apiFetch={apiFetch}
-                  onRefresh={handleManualRefresh}
-                  onShowToast={showToast}
-                />
-              )}
+          {view === 'objects' && (
+            <SalesforceObjectsView
+              objects={objects}
+              groups={groups}
+              sfSettings={sfSettings}
+              selectedFlyoutId={selectedFlyoutId}
+              externalCatalogTrigger={orgCatalogTrigger}
+              onToggleObject={reportFailureAndStop(handleToggleObject)}
+              onBulkToggleAllObjects={reportFailureAndStop(handleBulkToggleAllObjects)}
+              onOpenFlyout={(f) => setFlyout(f)}
+              onFetchOrgObjectCatalog={handleFetchOrgObjectCatalog}
+              onPreviewPullObjectsFromOrg={handlePreviewPullObjectsFromOrg}
+              onApplyPullObjectsFromOrg={reportFailure(handleApplyPullObjectsFromOrg)}
+              onNavigateToOrgConnection={() => setView('sf-connection')}
+            />
+          )}
 
-              {activeView === 'matrix-groups' && (
-                <AccessGroupsView
-                  groups={overview.groups}
-                  objects={overview.objects}
-                  apiFetch={apiFetch}
-                  onRefresh={handleManualRefresh}
-                  onShowToast={showToast}
-                  onNavigate={setActiveView}
-                />
-              )}
+          {view === 'sf-connection' && sfSettings && (
+            <SalesforceOrgConnectionView
+              sfSettings={sfSettings}
+              apiFetch={apiFetch}
+              onRefresh={fetchWorkspace}
+              onShowToast={notify}
+              onNavigate={(navId) => setView(mapNavIdToView(navId))}
+              devToolsEnabled={devToolsEnabled}
+            />
+          )}
 
-              {activeView === 'matrix-profile-groups' && (
-                <ProfileGroupMatrixView
-                  profiles={overview.profiles}
-                  groups={overview.groups}
-                  mappings={overview.profileGroupMappings}
-                  apiFetch={apiFetch}
-                  onRefresh={handleManualRefresh}
-                  onShowToast={showToast}
-                  onNavigate={setActiveView}
-                />
-              )}
+          {view === 'groups' && (
+            <AccessGroupsView
+              groups={groups}
+              objects={objects}
+              profiles={profiles}
+              mappings={mappings}
+              selectedFlyoutId={selectedFlyoutId}
+              onOpenFlyout={(f) => setFlyout(f)}
+              onSeedEnterpriseMatrix={requestSeedEnterpriseMatrix}
+            />
+          )}
 
-              {activeView === 'logs-copilot' && (
-                <CopilotMcpLogsView logs={overview.copilotLogs} />
-              )}
+          {view === 'matrix' && (
+            <ProfileGroupMatrixView
+              profiles={profiles}
+              groups={groups}
+              objects={objects}
+              mappings={mappings}
+              onToggleProfileGroup={reportFailureAndStop(handleToggleProfileGroup)}
+              onOpenFlyout={(f) => setFlyout(f)}
+              onSeedEnterpriseMatrix={requestSeedEnterpriseMatrix}
+            />
+          )}
 
-              {activeView === 'logs-portal' && (
-                <PortalAdminLogsView logs={overview.portalLogs} />
-              )}
+          {view === 'traffic' && (
+            <CopilotMcpLogsView
+              logs={copilotLogs}
+              objects={objects}
+              selectedFlyoutId={selectedFlyoutId}
+              initialSearch={trafficSearchFilter}
+              caps={logCaps.copilotLogs}
+              fetchLogPage={(query) => apiFetch(logPageUrl('/api/admin/mcp-logs', query))}
+              onNotify={notify}
+              onClearLogs={async () => {
+                setCopilotLogs([]);
+                notify('Cleared view buffer');
+              }}
+              onOpenFlyout={(f) => setFlyout(f)}
+            />
+          )}
 
-              {activeView === 'settings-auth' && (
-                <PortalAuthSettingsView
-                  overview={overview}
-                  apiFetch={apiFetch}
-                  onRefresh={handleManualRefresh}
-                  onShowToast={showToast}
-                />
-              )}
-            </>
+          {view === 'audit' && (
+            <PortalAdminLogsView
+              logs={portalLogs}
+              selectedFlyoutId={selectedFlyoutId}
+              caps={logCaps.portalLogs}
+              fetchLogPage={(query) => apiFetch(logPageUrl('/api/admin/portal-logs', query))}
+              onNotify={notify}
+              onOpenFlyout={(f) => setFlyout(f)}
+            />
+          )}
+
+          {view === 'auth-settings' && (
+            <PortalAuthSettingsView
+              oktaSettings={oktaSettings}
+              portalUsers={portalUsers}
+              onSaveOkta={reportFailure(async (updated) => {
+                const data = await apiFetch('/api/admin/okta', {
+                  method: 'PUT',
+                  body: JSON.stringify(updated),
+                });
+                if (data.oktaSettings) setOktaSettings(data.oktaSettings);
+                await fetchWorkspace();
+                notify('Updated Okta OIDC SSO settings');
+                return data.oktaSettings;
+              })}
+              onCreatePortalUser={reportFailure(async (user) => {
+                const data = await apiFetch('/api/admin/portal-users', {
+                  method: 'POST',
+                  body: JSON.stringify(user),
+                });
+                if (data.portalUsers) setPortalUsers(data.portalUsers);
+                await fetchWorkspace();
+                notify(`Saved administrator "${user.username}"`);
+              })}
+              onDeletePortalUser={reportFailureAndStop(async (username) => {
+                const data = await apiFetch(
+                  `/api/admin/portal-users/${encodeURIComponent(username)}`,
+                  { method: 'DELETE' }
+                );
+                if (data.portalUsers) setPortalUsers(data.portalUsers);
+                await fetchWorkspace();
+                notify(`Removed administrator "${username}"`);
+              })}
+            />
           )}
         </main>
       </div>
+
+      {/* CONTEXTUAL SLIDE-OVER FLYOUT DRAWER */}
+      <FlyoutDrawer
+        flyout={flyout}
+        onClose={() => setFlyout(null)}
+        onOpenFlyout={(next) => setFlyout(next)}
+        onNavigateView={(nextView, filterUser) => {
+          if (filterUser !== undefined) setTrafficSearchFilter(filterUser);
+          setView(nextView as ActiveView);
+        }}
+        profiles={profiles}
+        objects={objects}
+        groups={groups}
+        mappings={mappings}
+        sfSettings={sfSettings}
+        devToolsEnabled={devToolsEnabled}
+        onUpsertProfile={reportFailure(handleUpsertProfile)}
+        onDeleteProfile={reportFailure(handleDeleteProfile)}
+        onImportCsv={reportFailure(handleImportCsv)}
+        onToggleProfileGroup={reportFailureAndStop(handleToggleProfileGroup)}
+        onToggleObject={reportFailureAndStop(handleToggleObject)}
+        onToggleField={reportFailureAndStop(handleToggleField)}
+        onBulkToggleFields={reportFailureAndStop(handleBulkToggleFields)}
+        onSyncSfdxPath={reportFailure(handleSyncSfdxPath)}
+        onSyncUploadedFiles={reportFailure(handleSyncUploadedFiles)}
+        onOpenOrgObjectCatalogModal={() => {
+          setView('objects');
+          setOrgCatalogTrigger((c) => c + 1);
+        }}
+        onSaveGroup={reportFailure(handleSaveGroup)}
+        onDeleteGroup={reportFailure(handleDeleteGroup)}
+        onTestMcpCall={reportFailure(handleTestMcpCall)}
+        onRefreshWorkspace={fetchWorkspace}
+        notify={notify}
+      />
+
+      {/* COMMAND PALETTE (Cmd+K) */}
+      <CommandPalette
+        open={cmdkOpen}
+        onClose={() => setCmdkOpen(false)}
+        onNavigateView={(v) => setView(v as ActiveView)}
+        onOpenFlyout={(f) => setFlyout(f)}
+        onSeedEnterpriseMatrix={requestSeedEnterpriseMatrix}
+        onToggleTheme={toggleTheme}
+        theme={theme}
+        profiles={profiles}
+        objects={objects}
+        groups={groups}
+      />
+
+      {/* SAMPLE MATRIX CONFIRMATION */}
+      {seedConfirmOpen && (
+        <div className="cmdk-scrim" onClick={seedConfirmModal.close}>
+          <div
+            ref={seedConfirmModal.dialogRef}
+            className="cmdk-box"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="seed-confirm-title"
+            aria-describedby="seed-confirm-body"
+            tabIndex={-1}
+            style={{ maxWidth: 480 }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="card-h">
+              <div className="card-t" id="seed-confirm-title">
+                Load the sample enterprise matrix?
+              </div>
+            </div>
+            <div className="card-b">
+              <p id="seed-confirm-body" style={{ fontSize: 12.5, color: 'var(--t2)' }}>
+                {ENTERPRISE_MATRIX_WARNING}
+              </p>
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'flex-end',
+                  gap: 8,
+                  marginTop: 12,
+                }}
+              >
+                <button
+                  ref={seedConfirmModal.initialFocusRef}
+                  type="button"
+                  className="btn"
+                  onClick={seedConfirmModal.close}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="btn dng"
+                  onClick={() => {
+                    seedConfirmModal.close();
+                    void reportFailureAndStop(handleSeedEnterpriseMatrix)();
+                  }}
+                >
+                  Replace mappings and load
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* TOAST BANNER */}
+      {toast && (
+        <div className="toast-banner" role={toast.isError ? 'alert' : 'status'}>
+          <span className={`dot ${toast.isError ? 'err' : 'ok'}`} />
+          <span>{toast.msg}</span>
+        </div>
+      )}
     </div>
   );
 }
