@@ -557,6 +557,54 @@ describe('a connect that does not succeed', () => {
     assert.deepEqual(stored(), before);
   });
 
+  test('a connect whose Org ID Salesforce does not report is refused and saves nothing, with or without the lock', async () => {
+    const before = stored();
+    // No identity URL, and userinfo refuses the unknown access token.
+    answerTokenExchange(() => Response.json({ access_token: `sync_tok_${uid()}`, instance_url: SYNC_HOST }));
+
+    for (const body of [{}, { expectedOrgId: ORG_ID, enforceOrgIdLock: true }]) {
+      const res = await connect(body);
+
+      assert.equal(res.status, 400, JSON.stringify(body));
+      assert.match(res.body.error, /valid Org ID/);
+      assert.deepEqual(stored(), before);
+      assert.equal(store.getSalesforceSettings().connectionStatus, 'error');
+      assert.equal(store.getSalesforceSettings().connectedOrgId, '');
+    }
+  });
+
+  test('an identity URL without a valid Org ID falls back to the one userinfo reports', async () => {
+    const accessToken = `sync_tok_${uid()}`;
+    sf.addUser(accessToken, {
+      userId: '005000000000001AAA',
+      organizationId: ORG_ID,
+      username: `u${uid()}@acme.example`,
+      profileId: '00e000000000001AAA',
+      profileName: 'P',
+    });
+    answerTokenExchange(() =>
+      Response.json({
+        access_token: accessToken,
+        instance_url: SYNC_HOST,
+        id: 'https://login.salesforce.com/id/not-an-org-id/005000000000001AAA',
+      })
+    );
+
+    const res = await connect();
+
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(res.body.sfSettings.connectedOrgId, ORG_ID);
+  });
+
+  test('the Org ID lock accepts the 15-character form of the reported 18-character Org ID', async () => {
+    answerTokenExchange(tokenGranted());
+
+    const res = await connect({ expectedOrgId: ORG_ID.slice(0, 15), enforceOrgIdLock: true });
+
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(res.body.sfSettings.connectedOrgId, ORG_ID);
+  });
+
   test('a success saves the submitted settings and key', async () => {
     const candidate = { ...changes(), expectedOrgId: ORG_ID };
     answerTokenExchange(tokenGranted());

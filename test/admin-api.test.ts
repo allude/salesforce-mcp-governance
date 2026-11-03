@@ -9,7 +9,8 @@ import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import { installSalesforceMock, type SalesforceMock } from './helpers/salesforceMock.js';
 import { mcpRequest, startTestServer, type AdminSession, type TestServer } from './helpers/server.js';
 import { store } from '../src/db/store.js';
-import { config, DEV_FALLBACK_SECRET_KEY } from '../src/config.js';
+import { config, DEV_FALLBACK_SECRET_KEY, KNOWN_DEFAULT_PASSWORDS } from '../src/config.js';
+import { PORTAL_PASSWORD_MIN_LENGTH } from '../src/security/passwordPolicy.js';
 import type { AccessGroup, PortalAdminLogRecord } from '../src/types/governance.js';
 
 // Admin REST API over HTTP: session auth, CSRF, every route of src/routes/adminRoutes.ts, the
@@ -209,6 +210,17 @@ function addPortalUser(t: TestContext): { username: string; password: string } {
   store.upsertPortalUser({ username, displayName: 'Fixture Admin', password, role: 'Admin' });
   t.after(() => removePortalUser(username));
   return { username, password };
+}
+
+/** Runs `fn` with the app treating this as production, for the runtime checks that read config.isProd. */
+async function asProduction<T>(fn: () => Promise<T>): Promise<T> {
+  const mutable = config as { isProd: boolean };
+  mutable.isProd = true;
+  try {
+    return await fn();
+  } finally {
+    mutable.isProd = false;
+  }
 }
 
 const mappedGroupIds = (profileId: string) =>
@@ -1088,6 +1100,26 @@ describe('Admin REST API', () => {
       assertNotAudited(mark, admin.ip);
     });
 
+    it('in production, POST /objects/import-local-folder is refused (403) and reads nothing', async (t) => {
+      const admin = await signIn();
+      const widget = newObjectName('ProdWidget');
+      t.after(() => {
+        store.deleteObject(widget);
+      });
+      const folderPath = path.join(tmpRoot, `objects-${nextNumber()}`);
+      writeFile(path.join(folderPath, widget, `${widget}.object-meta.xml`), objectMetaXml('Prod Widget'));
+      const settingsBefore = store.getSalesforceSettings();
+      const mark = auditMark();
+
+      const res = await asProduction(() => call(admin, 'POST', '/api/admin/objects/import-local-folder', { folderPath }));
+
+      assert.equal(res.status, 403);
+      assert.match(res.body.error, /outside production/);
+      assert.equal(objectInStore(widget), undefined);
+      assert.deepEqual(store.getSalesforceSettings(), settingsBefore);
+      assertNotAudited(mark, admin.ip);
+    });
+
     it('DELETE /objects/:objectName deletes the object and its fields', async (t) => {
       const admin = await signIn();
       const objectName = addObject(t, 'Doomed', ['Id', 'Name', 'Notes__c']);
@@ -1331,6 +1363,54 @@ describe('Admin REST API', () => {
         store.deleteProfile(profileId);
       });
       await mutate(second, 'POST', '/api/admin/profiles', { id: profileId, name: `Created by ${username}` }, 'CREATE_PROFILE', profileId);
+    });
+
+    it(`POST /portal-users refuses a password shorter than ${PORTAL_PASSWORD_MIN_LENGTH} characters (400) and saves nothing`, async (t) => {
+      const admin = await signIn();
+      const { username, password } = addPortalUser(t);
+      const newcomer = newUsername('short');
+      t.after(() => removePortalUser(newcomer));
+      const tooShort = 'x'.repeat(PORTAL_PASSWORD_MIN_LENGTH - 1);
+      const mark = auditMark();
+
+      for (const target of [newcomer, username]) {
+        const res = await call(admin, 'POST', '/api/admin/portal-users', { username: target, password: tooShort });
+        assert.equal(res.status, 400, target);
+        assert.match(res.body.error, new RegExp(`at least ${PORTAL_PASSWORD_MIN_LENGTH} characters`));
+      }
+
+      assert.ok(!store.getPortalUsers().some((u) => u.username === newcomer));
+      assert.ok(store.verifyPortalUserCredentials(username, password), 'the existing password is kept');
+      assertNotAudited(mark, admin.ip);
+
+      // Exactly the minimum is enough, as the portal form says.
+      const justLongEnough = 'y'.repeat(PORTAL_PASSWORD_MIN_LENGTH);
+      await mutate(admin, 'POST', '/api/admin/portal-users', { username: newcomer, password: justLongEnough }, 'UPSERT_PORTAL_USER', newcomer);
+      assert.ok(store.verifyPortalUserCredentials(newcomer, justLongEnough));
+    });
+
+    it('in production, POST /portal-users refuses every publicly known default password (400)', async (t) => {
+      const admin = await signIn();
+      const { username, password } = addPortalUser(t);
+      const newcomer = newUsername('known');
+      t.after(() => removePortalUser(newcomer));
+      // Shorter ones are already refused by the length rule; at least one must reach the known-password check.
+      assert.ok(KNOWN_DEFAULT_PASSWORDS.some((known) => known.length >= PORTAL_PASSWORD_MIN_LENGTH));
+      const mark = auditMark();
+
+      await asProduction(async () => {
+        for (const target of [newcomer, username]) {
+          for (const known of KNOWN_DEFAULT_PASSWORDS) {
+            const res = await call(admin, 'POST', '/api/admin/portal-users', { username: target, password: known });
+            assert.equal(res.status, 400, `${target}: ${known}`);
+            assert.match(res.body.error, known.length < PORTAL_PASSWORD_MIN_LENGTH ? /at least/ : /publicly known/);
+          }
+        }
+      });
+
+      assert.ok(!store.getPortalUsers().some((u) => u.username === newcomer));
+      assert.ok(store.verifyPortalUserCredentials(username, password), 'the existing password is kept');
+      assertNotAudited(mark, admin.ip);
     });
 
     it('DELETE /portal-users/:username removes the admin, who then can no longer sign in', async (t) => {

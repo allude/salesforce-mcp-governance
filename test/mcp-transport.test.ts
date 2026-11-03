@@ -3,7 +3,8 @@ import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import net from 'node:net';
-import { store } from '../src/db/store.js';
+import { config } from '../src/config.js';
+import { store, UNVERIFIED_CALLER_USERNAME } from '../src/db/store.js';
 import { createSimulatorToken, validateSalesforceInstanceUrl } from '../src/salesforce/client.js';
 import { toHeaderSafe } from '../src/mcp/streamableHttp.js';
 import { AVAILABLE_MCP_ACTIONS } from '../src/types/governance.js';
@@ -406,6 +407,33 @@ test('createSimulatorToken mints sf_sim_<payload>.<sig>; /mcp accepts it, scoped
   assert.deepEqual(toolNames(res.body), ['list_enabled_objects', 'soql_query']);
   assert.deepEqual(h.sf.calls, [], 'simulator tokens never reach Salesforce');
   assert.deepEqual(h.sf.nonSalesforceCalls, []);
+});
+
+test('in production /mcp refuses a valid simulator token with 401, logs it as unverified, and never calls Salesforce', async (t) => {
+  const h = await startHarness(t);
+  const seeded = seedProfile(t, ['list_enabled_objects']);
+  const token = createSimulatorToken({ profileId: seeded.profileId, profileName: seeded.profileName });
+  const unverifiedRows = () =>
+    store.getCopilotMcpLogs(5000).filter((row) => row.sfUsername === UNVERIFIED_CALLER_USERNAME).length;
+  const rowsBefore = unverifiedRows();
+
+  const mutable = config as { isProd: boolean };
+  mutable.isProd = true;
+  let res;
+  try {
+    res = await rpc(h, token, 'tools/list');
+  } finally {
+    mutable.isProd = false;
+  }
+
+  assert.equal(res.status, 401, JSON.stringify(res.body));
+  assert.equal(res.body?.error?.code, -32001);
+  assert.equal(res.body?.result, undefined);
+  assert.ok(challengeOf(res).includes('error="invalid_token"'), challengeOf(res));
+  assert.equal(unverifiedRows(), rowsBefore + 1);
+  assert.deepEqual(h.sf.calls, []);
+  // The same token still works outside production, so the refusal is the production rule, not the token.
+  assert.equal((await rpc(h, token, 'tools/list')).status, 200);
 });
 
 test('a hand-forged simulator token without a valid signature is rejected with 401', async (t) => {

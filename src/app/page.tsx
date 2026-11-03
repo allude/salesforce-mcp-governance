@@ -1130,7 +1130,8 @@ export default function AdminPortalPage() {
                     ? 'Okta SSO'
                     : 'Password'}
                 </span>
-                <span>· {session.role || 'Admin'}</span>
+                {/* Roles are not enforced yet, so every portal administrator has full access. */}
+                <span>· Full admin</span>
               </div>
             </div>
           </div>
@@ -1327,10 +1328,6 @@ export default function AdminPortalPage() {
               caps={logCaps.copilotLogs}
               fetchLogPage={(query) => apiFetch(logPageUrl('/api/admin/mcp-logs', query))}
               onNotify={notify}
-              onClearLogs={async () => {
-                setCopilotLogs([]);
-                notify('Cleared view buffer');
-              }}
               onOpenFlyout={(f) => setFlyout(f)}
             />
           )}

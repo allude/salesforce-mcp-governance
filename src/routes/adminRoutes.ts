@@ -9,6 +9,7 @@ import {
   effectiveOktaRedirectUri,
   verifyAdminSessionFromRequest,
 } from '../security/adminAuth.js';
+import { PORTAL_PASSWORD_MIN_LENGTH } from '../security/passwordPolicy.js';
 import {
   createSimulatorToken,
   resolveSalesforceUserFromToken,
@@ -24,7 +25,7 @@ import {
   fetchObjectsMetadataFromOrgSession,
   SalesforceOrgTokenSession,
 } from '../salesforce/jwtConnection.js';
-import { config } from '../config.js';
+import { config, KNOWN_DEFAULT_PASSWORDS } from '../config.js';
 import { parseObjectSyncPayload, parseProfileSyncPayload } from './orgSyncPayload.js';
 import { LogPageQueryError, parseMcpLogPageQuery, parsePortalLogPageQuery } from './logPageQuery.js';
 import { isSalesforceId, salesforceIdsMatch } from '../salesforce/ids.js';
@@ -770,9 +771,14 @@ adminRouter.post('/objects/import-sfdx-files', (req: Request, res: Response) => 
 
 /**
  * POST /api/admin/objects/import-local-folder
- * Reads a local SFDX `force-app/main/default/objects` directory path on the server
+ * Development only: reads a local SFDX `force-app/main/default/objects` directory path on the server.
+ * Refused in production, where it would read any directory the server process can.
  */
 adminRouter.post('/objects/import-local-folder', (req: Request, res: Response) => {
+  if (config.isProd) {
+    res.status(403).json({ error: 'Importing from a server folder is only available outside production.' });
+    return;
+  }
   const { folderPath } = req.body || {};
   if (!folderPath || typeof folderPath !== 'string') {
     res.status(400).json({
@@ -1549,11 +1555,22 @@ adminRouter.post('/portal-users', (req: Request, res: Response) => {
     res.status(400).json({ error: 'Username and password are required.' });
     return;
   }
+  // Startup refuses a production database holding a publicly known password, so one saved here
+  // would stop the next boot.
+  const newPassword = String(password);
+  if (newPassword.length < PORTAL_PASSWORD_MIN_LENGTH) {
+    res.status(400).json({ error: `The password must be at least ${PORTAL_PASSWORD_MIN_LENGTH} characters.` });
+    return;
+  }
+  if (config.isProd && KNOWN_DEFAULT_PASSWORDS.includes(newPassword)) {
+    res.status(400).json({ error: 'That password is publicly known and cannot be used in production.' });
+    return;
+  }
 
   const saved = store.upsertPortalUser({
     username: String(username),
     displayName: displayName ? String(displayName) : undefined,
-    password: String(password),
+    password: newPassword,
     role: role ? String(role) : undefined,
   });
 
@@ -1654,12 +1671,13 @@ async function runMcpAccessSimulation(req: Request, res: Response): Promise<void
     authMethod: actor.authMethod,
     action: SIMULATE_MCP_CALL_ACTION,
     target: `Profile: ${effective.profileName} (${effective.profileId})`,
-    details: `Simulated ${String(toolName || 'list_enabled_objects')} on ${String(targetObject || '*')} as "${user.username}": ${evaluation.permitted ? 'ALLOWED' : 'DENIED'}. A 15-minute simulator token was issued.`,
+    details: `Simulated ${String(toolName || 'list_enabled_objects')} on ${String(targetObject || '*')} as "${user.username}": ${evaluation.permitted ? 'ALLOWED' : 'DENIED'}.${config.isProd ? '' : ' A 15-minute simulator token was issued.'}`,
     ipAddress: actor.ip,
   });
 
   res.json({
-    simulatorBearerToken: simToken,
+    // /mcp refuses simulator tokens in production, so none is handed out there.
+    ...(config.isProd ? {} : { simulatorBearerToken: simToken }),
     evaluation,
     effectivePermissions: {
       profileId: effective.profileId,

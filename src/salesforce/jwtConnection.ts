@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { config } from '../config.js';
 import { validateSalesforceInstanceUrl, escapeSoqlString } from './client.js';
 import { assertNotSimulatedOrgHost, SIMULATED_ORG_ID, SIMULATED_ORG_INSTANCE_URL } from './simulatedOrg.js';
+import { isSalesforceOrgId, salesforceIdsMatch } from './ids.js';
 
 export interface GeneratedCertBundle {
   privateKeyPem: string;
@@ -489,25 +490,32 @@ export async function connectToSalesforceOrgViaJwt(settings: {
     }
   }
 
-  if (!orgId) {
+  if (!isSalesforceOrgId(orgId)) {
     try {
       const uRes = await fetch(`${instanceUrl}/services/oauth2/userinfo`, {
         headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
       });
       if (uRes.ok) {
         const uData = (await uRes.json()) as any;
-        orgId = uData.organization_id || '';
+        orgId = String(uData.organization_id || '').trim();
       }
     } catch {
       // Ignore if userinfo scope not enabled
     }
   }
 
+  // Without the org's own ID the Org ID lock cannot be checked, and the connection would record an org
+  // it never confirmed, so the connect fails closed.
+  if (!isSalesforceOrgId(orgId)) {
+    throw new Error(
+      'Salesforce did not report a valid Org ID for this connection (neither the token response nor userinfo named one), so it was refused.'
+    );
+  }
+
   if (
     settings.enforceOrgIdLock &&
     settings.expectedOrgId?.trim() &&
-    orgId &&
-    !orgId.startsWith(settings.expectedOrgId.trim().slice(0, 15))
+    !salesforceIdsMatch(orgId, settings.expectedOrgId)
   ) {
     throw new Error(
       `Org ID Lock Mismatch: Connected Org '${orgId}' does not match expected Org ID '${settings.expectedOrgId}'.`
@@ -517,7 +525,7 @@ export async function connectToSalesforceOrgViaJwt(settings: {
   return {
     accessToken,
     instanceUrl,
-    orgId: orgId || settings.expectedOrgId || 'Connected',
+    orgId,
     username: settings.username.trim(),
     apiVersion,
     authMode: 'jwt_bearer',

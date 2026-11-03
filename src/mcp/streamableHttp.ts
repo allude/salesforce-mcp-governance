@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
   forgetVerifiedToken,
+  isSimulatorToken,
   resolveSalesforceUserFromToken,
   SalesforceUnavailableError,
   salesforceAuthorizationBase,
@@ -45,6 +46,10 @@ export async function handleMcpStreamableHttpRequest(
 
   let verifiedUser;
   try {
+    // Refused like any invalid token, so it is logged and counts toward the failed-attempt limit.
+    if (config.isProd && isSimulatorToken(bearerToken)) {
+      throw new Error('Simulator tokens are not accepted in production');
+    }
     verifiedUser = await resolveSalesforceUserFromToken(
       bearerToken,
       instanceUrlHint

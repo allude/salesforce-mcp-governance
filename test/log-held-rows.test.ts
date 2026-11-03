@@ -11,7 +11,6 @@ import {
   REJECTED_TOKEN_USERNAME,
   SIMULATION_ACTION,
   auditLogKinds,
-  clearedOlderRows,
   describeHeldLogs,
   emptyOlderRows,
   heldLogGaps,
@@ -186,24 +185,6 @@ describe('gaps live refreshes open above the loaded pages', () => {
     assert.deepEqual(heldLogGaps({ overview, loadedTop: undefined, kinds: mcpKinds }), []);
     assert.equal(describeHeldLogs({ overview, older: [], cursor: undefined, kinds: mcpKinds }), 'latest 150 calls');
   });
-
-  test('Load older into a cleared view refills it, so the view is no longer called cleared', async () => {
-    const log = newestFirst(times(500, () => call('real')));
-    const cleared = clearedOlderRows<CopilotMcpLogEntry>();
-    assert.equal(cleared.cleared, true);
-    assert.equal(cleared.cursor, undefined, 'Load older is still offered after a clear');
-    assert.equal(emptyOlderRows<CopilotMcpLogEntry>().cleared, false);
-
-    // Clear log empties the /overview list in the view, so the first page is all new rows.
-    const refilled = await loadOlderRows(routeOver(() => log), cleared, []);
-    assert.equal(refilled.older.length, 200);
-    assert.equal(refilled.cleared, false);
-
-    // A log with nothing to read leaves the view empty, and still cleared.
-    const empty = await loadOlderRows(routeOver((): CopilotMcpLogEntry[] => []), cleared, []);
-    assert.equal(empty.older.length, 0);
-    assert.equal(empty.cleared, true);
-  });
 });
 
 describe('Logs toolbars', () => {
@@ -218,12 +199,13 @@ describe('Logs toolbars', () => {
         caps: DEFAULT_OVERVIEW_LOG_CAPS.copilotLogs,
         fetchLogPage: noPage,
         onNotify: () => {},
-        onClearLogs: async () => {},
         onOpenFlyout: () => {},
       })
     );
     assert.ok(html.includes('(latest 150 calls + latest 50 simulated + all 7 rejected)'), html.slice(0, 500));
     assert.ok(html.includes('Load older'));
+    // The log is append-only; a button that only emptied this browser's copy read as deleting it.
+    assert.ok(!html.includes('Clear log'));
   });
 
   test('the portal audit toolbar states which rows the view holds', () => {

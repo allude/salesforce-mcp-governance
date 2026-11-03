@@ -88,6 +88,11 @@ const SIMULATED_IDENTITY_PREFIX = 'simulated:';
 const SIMULATED_NAME_MAX_LENGTH = 64;
 const DEFAULT_SIMULATED_NAME = 'test-user';
 
+/** Whether a bearer token claims to be an Admin Simulator token. Its signature is not checked here. */
+export function isSimulatorToken(bearerToken: string): boolean {
+  return bearerToken.startsWith(SIMULATOR_TOKEN_PREFIX);
+}
+
 /**
  * Validates that a Salesforce instance URL belongs to an allowed Salesforce domain
  * (`SALESFORCE_ALLOWED_DOMAINS`) to prevent Server-Side Request Forgery (SSRF) via crafted URLs.

@@ -41,13 +41,13 @@ Implemented in [`src/rbac/policyEngine.ts`](../src/rbac/policyEngine.ts) and [`s
 
 ## 4. Org ID Lock
 
-When **Reject tokens from other orgs** is on and an expected Org ID is set (**Settings > Portal Login & Okta SSO > Salesforce Connection & Org ID Lock**, or `PUT /api/admin/sf-settings`), tokens from any other Salesforce org are rejected with `401`, including identities that were already cached. 15- and 18-character Org IDs are compared on their 15-character form.
+When **Reject tokens from other orgs** is on and an expected Org ID is set (**Settings > Portal Login & Okta SSO > Salesforce Connection & Org ID Lock**, or `PUT /api/admin/sf-settings`), tokens from any other Salesforce org are rejected with `401`, including identities that were already cached. 15- and 18-character Org IDs are compared on their 15-character form. A JWT connect that cannot read the connected org's ID from Salesforce (from the token response's identity URL, or else userinfo) is refused, so a connect never skips the lock or records an org it did not confirm.
 
 ---
 
 ## 5. Signed Policy-Simulator Tokens
 
-The portal's policy simulator (`POST /api/admin/test-mcp-access`, admins only) issues `sf_sim_<payload>.<signature>` tokens so an admin can exercise `/mcp` as a given Profile. Each token is signed with HMAC-SHA256 under a sub-key derived (HKDF) from `APP_SECRET_KEY` and expires after 15 minutes. Simulated calls never reach Salesforce. They are logged with a `simulated` marker set from the verified token or the route, under the name `simulated:<name>`, so they cannot pass as a real user, and each simulation writes a portal admin log row naming the admin. Unsigned, tampered or expired simulator tokens are rejected.
+The portal's policy simulator (`POST /api/admin/test-mcp-access`, admins only) issues `sf_sim_<payload>.<signature>` tokens so an admin can exercise `/mcp` as a given Profile. Each token is signed with HMAC-SHA256 under a sub-key derived (HKDF) from `APP_SECRET_KEY` and expires after 15 minutes. Simulated calls never reach Salesforce. They are logged with a `simulated` marker set from the verified token or the route, under the name `simulated:<name>`, so they cannot pass as a real user, and each simulation writes a portal admin log row naming the admin. Unsigned, tampered or expired simulator tokens are rejected. In production the simulator issues no token and `/mcp` rejects every `sf_sim_` token with `401` without verifying it, so a simulated identity is never accepted by a production server.
 
 ---
 
@@ -99,6 +99,7 @@ Implemented in [`src/security/adminAuth.ts`](../src/security/adminAuth.ts):
 ## 10. Known Limitations
 
 * The Profile **name** fallback means a token from another org whose Profile has the same name as a registered one is matched. Its calls still run with that user's own token against their own org. Turn on the **Org ID lock** to reject other orgs entirely.
-* `POST /api/admin/objects/import-local-folder` reads XML files from any directory the backend process can access. It is admin-only and audit-logged.
+* Outside production, `POST /api/admin/objects/import-local-folder` reads XML files from any directory the backend process can access. It is admin-only and audit-logged, and production refuses it with `403`.
+* Portal users have a stored role, but no route reads it: every portal user, local or Okta, has full access to the Admin API.
 * The per-username login limit means anyone can temporarily block password sign-in for a known username (20 failures, 15 minutes). Okta SSO is unaffected.
 * Logging out clears the session cookie, but a stolen session JWT stays valid until it expires (8 hours), and changing a portal user's password does not end their existing sessions (deleting the user does). Rotating `APP_SECRET_KEY` invalidates every session.

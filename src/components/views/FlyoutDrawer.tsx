@@ -569,7 +569,9 @@ export function FlyoutDrawer({
     } · ${liveObject.fields.length} fields`;
   } else if (flyout.type === 'sync') {
     title = 'Sync Salesforce objects';
-    subtitle = 'SFDX XML folder · Local server path · Salesforce Org Pull';
+    subtitle = devToolsEnabled
+      ? 'SFDX XML folder · Local server path · Salesforce Org Pull'
+      : 'SFDX XML folder · Salesforce Org Pull';
   } else if (flyout.type === 'group' && grpDraft) {
     title = grpDraft.name || 'New Access Group';
     subtitle = `Access group · ${grpDraft.id || 'unsaved'}`;
@@ -1296,44 +1298,47 @@ export function FlyoutDrawer({
                 )}
               </div>
 
-              <div className="sec">
-                <div className="sec-h">
-                  <span className="sec-t">2. Sync from local server path</span>
-                </div>
-                <div style={{ display: 'flex', gap: 8 }}>
-                  <input
-                    className="inp mono"
-                    value={sfdxPath}
-                    onChange={(e) => setSfdxPath(e.target.value)}
-                  />
-                  <button
-                    type="button"
-                    className="btn"
-                    disabled={busy}
-                    onClick={async () => {
-                      setBusy(true);
-                      try {
-                        await onSyncSfdxPath(sfdxPath);
-                        onClose();
-                      } catch {
-                        // The error toast is already showing; stay here so the admin can retry.
-                      } finally {
-                        setBusy(false);
-                      }
-                    }}
-                  >
-                    Sync path
-                  </button>
-                </div>
-                <pre className="code" style={{ marginTop: 8 }}>{`curl -X POST http://localhost:3001/api/admin/objects/import-local-folder \\
+              {/* The API refuses this in production, where it would read any folder the server can. */}
+              {devToolsEnabled && (
+                <div className="sec">
+                  <div className="sec-h">
+                    <span className="sec-t">2. Sync from local server path</span>
+                  </div>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <input
+                      className="inp mono"
+                      value={sfdxPath}
+                      onChange={(e) => setSfdxPath(e.target.value)}
+                    />
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={busy}
+                      onClick={async () => {
+                        setBusy(true);
+                        try {
+                          await onSyncSfdxPath(sfdxPath);
+                          onClose();
+                        } catch {
+                          // The error toast is already showing; stay here so the admin can retry.
+                        } finally {
+                          setBusy(false);
+                        }
+                      }}
+                    >
+                      Sync path
+                    </button>
+                  </div>
+                  <pre className="code" style={{ marginTop: 8 }}>{`curl -X POST http://localhost:3001/api/admin/objects/import-local-folder \\
   -H "Content-Type: application/json" \\
   -d '{"folderPath":"${sfdxPath}"}'`}</pre>
-              </div>
+                </div>
+              )}
 
               <div className="sec">
                 <div className="sec-h">
                   <span className="sec-t">
-                    3. Pull from connected Salesforce org
+                    {devToolsEnabled ? 3 : 2}. Pull from connected Salesforce org
                   </span>
                   {sfSettings?.connectionStatus === 'connected' ? (
                     <span className="tag ok">
@@ -2066,7 +2071,7 @@ export function FlyoutDrawer({
                         }}
                       >
                         Signed Simulator Bearer Token (for{' '}
-                        <span className="mono">POST /api/mcp</span>):
+                        <span className="mono">POST /mcp</span>):
                       </div>
                       <pre className="code">
                         {simResult.simulatorBearerToken}

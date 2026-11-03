@@ -126,6 +126,25 @@ describe('POST /test-mcp-access', () => {
     assert.ok(entry.details.includes('simulated:ceo@acme.com'), entry.details);
     assert.ok(entry.details.includes('DENIED'), entry.details);
   });
+
+  test('in production it still evaluates the call but hands out no simulator token', async () => {
+    const { profileId, objectName } = seedProfile();
+    const mutable = config as { isProd: boolean };
+    mutable.isProd = true;
+    let res;
+    try {
+      res = await simulate({ profileId, toolName: 'soql_query', targetObject: objectName });
+    } finally {
+      mutable.isProd = false;
+    }
+
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(res.body.evaluation.permitted, true);
+    assert.equal('simulatorBearerToken' in res.body, false);
+    const entry = store.getPortalAdminLogs(50).find((l) => l.action === 'SIMULATE_MCP_CALL' && l.target.includes(profileId));
+    assert.ok(entry, 'expected a SIMULATE_MCP_CALL row');
+    assert.ok(!entry.details.includes('token'), entry.details);
+  });
 });
 
 describe('/mcp', () => {
