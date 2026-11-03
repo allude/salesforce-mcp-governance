@@ -4,6 +4,7 @@ import React, { useState, useMemo } from 'react';
 import type {
   CopilotMcpLogEntry,
   McpActivityFigures,
+  McpTrafficSeries,
   PortalAdminLogEntry,
   SalesforceProfile,
   SalesforceObjectConfig,
@@ -62,6 +63,8 @@ interface TrafficDashboardProps {
   mcpStats?: McpRequestStats | null;
   /** Recent verified calls, from the server; null until it has answered. */
   mcpActivity?: McpActivityFigures | null;
+  /** The chart's counts, from the server; null until it has answered. */
+  mcpTraffic?: McpTrafficSeries | null;
   copilotLogs: CopilotMcpLogEntry[];
   portalLogs: PortalAdminLogEntry[];
   profiles: SalesforceProfile[];
@@ -81,6 +84,7 @@ export function TrafficDashboardView({
   copilotLogs,
   mcpStats,
   mcpActivity,
+  mcpTraffic,
   profiles,
   objects,
   groups,
@@ -122,9 +126,10 @@ export function TrafficDashboardView({
   const uniqueProfilesInLogs = mcpActivity?.activeProfiles ?? 0;
 
   const buckets = useMemo(
-    () => trafficBuckets(realLogs, range, clockNow + clockOffsetMs),
-    [realLogs, range, clockNow, clockOffsetMs]
+    () => trafficBuckets(mcpTraffic?.[range], range, clockNow + clockOffsetMs),
+    [mcpTraffic, range, clockNow, clockOffsetMs]
   );
+  const callsInRange = buckets.reduce((acc, b) => acc + b.ok + b.warn + b.err, 0);
 
   const maxBucket = Math.max(
     1,
@@ -282,7 +287,7 @@ export function TrafficDashboardView({
             <div>
               <div className="card-t">MCP server traffic</div>
               <div className="card-s">
-                {trafficChartSubtitle(range, realLogs.length)}
+                {trafficChartSubtitle(range, callsInRange)}
               </div>
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>

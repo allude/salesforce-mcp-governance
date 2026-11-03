@@ -173,6 +173,24 @@ export interface McpActivityFigures {
   topUsers: Array<{ username: string; profileName: string; calls: number }>;
 }
 
+/** Real calls (simulator runs left out) counted per outcome in one fixed slice of time. */
+export interface McpTrafficSlice {
+  /** Epoch ms where the slice starts; slices are aligned to multiples of their size. */
+  start: number;
+  ok: number;
+  warn: number;
+  err: number;
+}
+
+export type McpTrafficRange = '1h' | '24h' | '7d';
+
+/**
+ * For each dashboard chart range, the counts of every logged call in its window, in slices small
+ * enough for the browser to place against its own reading of the server clock. Oldest first, with
+ * empty slices left out.
+ */
+export type McpTrafficSeries = Record<McpTrafficRange, { sliceMs: number; slices: McpTrafficSlice[] }>;
+
 export interface PortalAdminLogRecord {
   id: string;
   timestamp: string;
@@ -323,6 +341,8 @@ export interface PortalOverviewPayload {
   copilotLogs: CopilotMcpLogRecord[];
   /** Read from the whole log, unlike copilotLogs, which holds only the latest rows of each kind. */
   mcpActivity: McpActivityFigures;
+  /** The dashboard chart's counts, also read from the whole log. */
+  mcpTraffic: McpTrafficSeries;
   portalLogs: PortalAdminLogRecord[];
   /** The most rows of each kind the two log lists hold. */
   logCaps: {

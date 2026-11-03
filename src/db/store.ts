@@ -14,6 +14,9 @@ import {
   ProfileGroupMapping,
   CopilotMcpLogRecord,
   McpActivityFigures,
+  McpTrafficRange,
+  McpTrafficSeries,
+  McpTrafficSlice,
   PortalAdminLogRecord,
   OktaSsoSettings,
   SalesforceConnectionSettings,
@@ -527,6 +530,16 @@ export const SIMULATE_MCP_CALL_ACTION = 'SIMULATE_MCP_CALL';
 
 /** The MCP log user for a bearer token that failed verification, so the caller is unknown. */
 export const UNVERIFIED_CALLER_USERNAME = 'unverified_caller';
+
+/**
+ * Each chart range's window and the slice its counts are sent in. A slice divides the range's bars
+ * (5 minutes, an hour, a day), so a call is placed at most one slice from where its row would be.
+ */
+const TRAFFIC_SERIES_SHAPE: Record<McpTrafficRange, { windowMs: number; sliceMs: number }> = {
+  '1h': { windowMs: 3_600_000, sliceMs: 60_000 },
+  '24h': { windowMs: 86_400_000, sliceMs: 300_000 },
+  '7d': { windowMs: 7 * 86_400_000, sliceMs: 3_600_000 },
+};
 
 function toCopilotMcpLogRecord(r: any): CopilotMcpLogRecord {
   return {
@@ -1940,6 +1953,43 @@ export const store = {
       topTools: topTools.map((t) => ({ toolName: t.toolName, calls: t.calls })),
       topUsers: topUsers.map((u) => ({ username: u.username, profileName: u.profileName, calls: u.calls })),
     };
+  },
+
+  /**
+   * The dashboard chart's counts for each range, read from the table: the /overview list holds only
+   * the newest rows, which cover minutes of a busy day. Every real call counts, rejected tokens
+   * included, as in the totals; simulator runs do not. The window reaches back one extra slice, so the
+   * slice holding its edge is whole, and has no end, so a row ahead of the clock still shows.
+   */
+  getCopilotMcpTrafficSeries(nowMs: number): McpTrafficSeries {
+    const read = (range: McpTrafficRange) => {
+      const { windowMs, sliceMs } = TRAFFIC_SERIES_SHAPE[range];
+      const rows = db
+        .prepare(
+          // node:sqlite binds JS numbers as REAL, which would make this a fractional division.
+          `SELECT CAST(strftime('%s', timestamp) AS INTEGER) / CAST(:sliceSec AS INTEGER) AS slice,
+                  SUM(status = 'ALLOWED') AS ok,
+                  SUM(status = 'DENIED') AS warn,
+                  SUM(status NOT IN ('ALLOWED', 'DENIED')) AS err
+           FROM mcp_copilot_logs
+           WHERE simulated = 0 AND timestamp >= :since
+           GROUP BY slice
+           HAVING slice IS NOT NULL
+           ORDER BY slice`
+        )
+        .all({
+          sliceSec: sliceMs / 1000,
+          since: new Date(nowMs - windowMs - sliceMs).toISOString(),
+        }) as Array<{ slice: number; ok: number; warn: number; err: number }>;
+      const slices: McpTrafficSlice[] = rows.map((r) => ({
+        start: r.slice * sliceMs,
+        ok: r.ok,
+        warn: r.warn,
+        err: r.err,
+      }));
+      return { sliceMs, slices };
+    };
+    return { '1h': read('1h'), '24h': read('24h'), '7d': read('7d') };
   },
 
   /**

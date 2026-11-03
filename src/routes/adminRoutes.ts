@@ -433,6 +433,7 @@ adminRouter.get('/overview', (_req: Request, res: Response) => {
     profileGroupMappings,
     copilotLogs,
     mcpActivity: store.getCopilotMcpActivityFigures(now),
+    mcpTraffic: store.getCopilotMcpTrafficSeries(now),
     portalLogs,
     // The Logs views state these, so rows a cap left out are not read as missing activity.
     logCaps: {

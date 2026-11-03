@@ -12,7 +12,8 @@ import { TrafficDashboardView } from '../src/components/views/DashboardAndLogsVi
 import type { CopilotMcpLogEntry, McpActivityFigures } from '../src/types/governance.js';
 import { startTestServer, loginAsAdmin, adminFetch, type AdminSession, type TestServer } from './helpers/server.js';
 
-const HOUR = 3_600_000;
+const MINUTE = 60_000;
+const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
 // Each test writes at its own time, 10 days after the last, so no test sees another's rows.
 const BASE = Date.parse('2026-01-01T00:00:00.000Z');
@@ -167,6 +168,69 @@ describe('getCopilotMcpActivityFigures', () => {
   });
 });
 
+describe('getCopilotMcpTrafficSeries', () => {
+  const total = (s: { slices: Array<{ ok: number; warn: number; err: number }> }) =>
+    s.slices.reduce((acc, x) => acc + x.ok + x.warn + x.err, 0);
+
+  test('a full day of traffic reaches the 24h and 7d series, beyond the newest 150 rows', () => {
+    const start = freshSlot();
+    for (let h = 0; h < 24; h++) {
+      setClock(start + h * HOUR);
+      for (let i = 0; i < 10; i++) logCall('steady@acme.com');
+    }
+    const series = store.getCopilotMcpTrafficSeries(start + 23 * HOUR + 30 * MINUTE);
+    assert.equal(total(series['24h']), 240);
+    assert.equal(total(series['7d']), 240);
+    assert.equal(total(series['1h']), 10, 'only the last hour in the 1h series');
+  });
+
+  test('slices are aligned to their size, with each status in its segment', () => {
+    const at = freshSlot() + 2 * HOUR + 7 * MINUTE + 13_000;
+    setClock(at);
+    logCall('a@acme.com');
+    logCall('a@acme.com', { status: 'DENIED' });
+    logCall('a@acme.com', { status: 'ERROR' });
+
+    const series = store.getCopilotMcpTrafficSeries(at);
+    assert.deepEqual(series['1h'], { sliceMs: MINUTE, slices: [{ start: at - 13_000, ok: 1, warn: 1, err: 1 }] });
+    assert.deepEqual(series['24h'], { sliceMs: 5 * MINUTE, slices: [{ start: at - 2 * MINUTE - 13_000, ok: 1, warn: 1, err: 1 }] });
+    assert.deepEqual(series['7d'], { sliceMs: HOUR, slices: [{ start: at - 7 * MINUTE - 13_000, ok: 1, warn: 1, err: 1 }] });
+  });
+
+  test('rejected tokens count, as in the totals; simulator runs do not', () => {
+    const now = freshSlot();
+    logCall('real@acme.com');
+    logRejectedToken();
+    for (let i = 0; i < 5; i++) logCall('simulated:test-user', { simulated: true });
+
+    const [slice] = store.getCopilotMcpTrafficSeries(now)['24h'].slices;
+    assert.deepEqual([slice.ok, slice.warn, slice.err], [1, 1, 0]);
+  });
+
+  test('the window reaches back one slice past its edge, so the edge slice is whole', () => {
+    const now = freshSlot();
+    logCall('edge@acme.com');
+    // An hour and 30 s later the call's 1-minute slice still straddles the 1h window's edge.
+    assert.equal(total(store.getCopilotMcpTrafficSeries(now + HOUR + 30_000)['1h']), 1);
+    // A minute past that, the whole slice is outside.
+    assert.equal(total(store.getCopilotMcpTrafficSeries(now + HOUR + MINUTE + 1)['1h']), 0);
+  });
+
+  test('a row ahead of the server clock is still sent', () => {
+    const now = freshSlot();
+    setClock(now + 10 * MINUTE);
+    logCall('ahead@acme.com');
+    assert.equal(total(store.getCopilotMcpTrafficSeries(now)['1h']), 1);
+  });
+
+  test('no calls sends empty series', () => {
+    const now = freshSlot();
+    const series = store.getCopilotMcpTrafficSeries(now);
+    assert.deepEqual(Object.keys(series), ['1h', '24h', '7d']);
+    for (const range of Object.values(series)) assert.deepEqual(range.slices, []);
+  });
+});
+
 describe('the dashboard shows the server figures', () => {
   const rejected: CopilotMcpLogEntry = {
     id: 'mcp_x',
@@ -238,7 +302,7 @@ describe('/overview', () => {
     await server.close();
   });
 
-  test('sends the activity figures, measured on the clock it reports', async () => {
+  test('sends the activity figures and chart counts, measured on the clock it reports', async () => {
     logCall('live@acme.com', { toolName: 'describe_object' });
     logRejectedToken();
 
@@ -247,6 +311,9 @@ describe('/overview', () => {
     assert.equal(body.mcpActivity.verifiedCalls, 1);
     assert.deepEqual(body.mcpActivity.topUsers, [{ username: 'live@acme.com', profileName: 'Sales', calls: 1 }]);
     assert.deepEqual(body.mcpActivity.topTools, [{ toolName: 'describe_object', calls: 1 }]);
+    const sent = (range: string) =>
+      body.mcpTraffic[range].slices.reduce((acc: number, s: { ok: number; warn: number }) => acc + s.ok + s.warn, 0);
+    assert.deepEqual([sent('1h'), sent('24h'), sent('7d')], [2, 2, 2]);
     assert.ok(Math.abs(Date.parse(body.serverTime) - Date.now()) < 60_000);
   });
 });

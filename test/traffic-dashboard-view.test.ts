@@ -6,10 +6,11 @@ import assert from 'node:assert/strict';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { TrafficDashboardView } from '../src/components/views/DashboardAndLogsViews.js';
-import type { CopilotMcpLogEntry } from '../src/types/governance.js';
+import type { CopilotMcpLogEntry, McpTrafficSeries } from '../src/types/governance.js';
 
 const NOW = Date.parse('2026-11-01T12:00:00.000Z');
 const HOUR = 3_600_000;
+const FIVE_MIN = 300_000;
 
 const call: CopilotMcpLogEntry = {
   id: 'mcp_1',
@@ -26,11 +27,20 @@ const call: CopilotMcpLogEntry = {
   sanitizedResponseSummary: '{}',
 };
 
-const render = (clockNow: number, clockOffsetMs = 0) =>
+// That call as the server counts it: one ALLOWED in the 5-minute slice ending at NOW.
+const oneCall = { ok: 1, warn: 0, err: 0 };
+const traffic: McpTrafficSeries = {
+  '1h': { sliceMs: 60_000, slices: [{ start: NOW - 60_000, ...oneCall }] },
+  '24h': { sliceMs: FIVE_MIN, slices: [{ start: NOW - FIVE_MIN, ...oneCall }] },
+  '7d': { sliceMs: HOUR, slices: [{ start: NOW - HOUR, ...oneCall }] },
+};
+
+const render = (clockNow: number, clockOffsetMs = 0, mcpTraffic: McpTrafficSeries | null = traffic) =>
   renderToStaticMarkup(
     createElement(TrafficDashboardView, {
       clockNow,
       clockOffsetMs,
+      mcpTraffic,
       copilotLogs: [call],
       portalLogs: [],
       profiles: [],
@@ -53,5 +63,18 @@ describe('TrafficDashboardView clock', () => {
 
   test('a call that has aged out of the window leaves the chart', () => {
     assert.ok(!render(NOW + 25 * HOUR).includes('— 1 allowed'));
+  });
+});
+
+describe('TrafficDashboardView chart data', () => {
+  test('the bars and subtitle come from the server counts, not the capped list', () => {
+    const html = render(NOW);
+    assert.ok(html.includes('Requests per hour by policy outcome, 1 in the last 24 hours'));
+  });
+
+  test('before the server answers, the chart is empty even with rows in the list', () => {
+    const html = render(NOW, 0, null);
+    assert.ok(!html.includes('— 1 allowed'));
+    assert.ok(html.includes('none in the last 24 hours'));
   });
 });
