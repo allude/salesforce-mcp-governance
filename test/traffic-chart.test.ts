@@ -1,24 +1,35 @@
 import './helpers/env.js';
-// The dashboard chart must place each call by how long ago it happened, honour the selected range
-// and leave simulator rows out. `now` is a parameter so the boundaries can be pinned exactly.
+// The dashboard chart must place each call by how long ago it happened and honour the selected range.
+// `now` is a parameter so the boundaries can be pinned exactly. The server sends counts per slice of
+// time; a 1 ms slice is a single instant, so most cases here place calls exactly.
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { estimateClockOffsetMs, trafficBuckets, trafficChartSubtitle, type TrafficRange } from '../src/components/views/trafficChart.js';
+import {
+  estimateClockOffsetMs,
+  trafficBuckets,
+  trafficChartSubtitle,
+  type TrafficRange,
+  type TrafficSeries,
+} from '../src/components/views/trafficChart.js';
+import type { McpTrafficSlice } from '../src/types/governance.js';
 
 const NOW = Date.parse('2026-11-01T12:00:00.000Z');
 const MIN = 60_000;
 const HOUR = 60 * MIN;
 const DAY = 24 * HOUR;
 
-const ago = (ms: number, status = 'ALLOWED', simulated?: boolean) => ({
-  timestamp: new Date(NOW - ms).toISOString(),
-  status,
-  ...(simulated ? { simulated } : {}),
+/** One call `ms` before NOW, as a 1 ms slice. */
+const ago = (ms: number, status = 'ALLOWED'): McpTrafficSlice => ({
+  start: NOW - ms,
+  ok: status === 'ALLOWED' ? 1 : 0,
+  warn: status === 'DENIED' ? 1 : 0,
+  err: status === 'ERROR' ? 1 : 0,
 });
+const series = (slices: McpTrafficSlice[], sliceMs = 1): TrafficSeries => ({ sliceMs, slices });
 
 /** Index, counted from the newest bucket, of each bucket holding calls. */
-function filled(rows: Parameters<typeof trafficBuckets>[0], range: TrafficRange): number[] {
-  const buckets = trafficBuckets(rows, range, NOW);
+function filled(slices: McpTrafficSlice[], range: TrafficRange, sliceMs = 1): number[] {
+  const buckets = trafficBuckets(series(slices, sliceMs), range, NOW);
   return buckets
     .map((b, i) => (b.ok + b.warn + b.err > 0 ? buckets.length - 1 - i : -1))
     .filter((i) => i >= 0)
@@ -27,7 +38,7 @@ function filled(rows: Parameters<typeof trafficBuckets>[0], range: TrafficRange)
 
 describe('bucket shape and labels', () => {
   test('1h is twelve 5-minute buckets, oldest first', () => {
-    const buckets = trafficBuckets([], '1h', NOW);
+    const buckets = trafficBuckets(series([]), '1h', NOW);
     assert.equal(buckets.length, 12);
     assert.equal(buckets[0].lbl, '-55m');
     assert.equal(buckets[10].lbl, '-5m');
@@ -37,7 +48,7 @@ describe('bucket shape and labels', () => {
   });
 
   test('24h labels are hours ago rather than clock hours', () => {
-    const buckets = trafficBuckets([], '24h', NOW);
+    const buckets = trafficBuckets(series([]), '24h', NOW);
     assert.equal(buckets.length, 24);
     assert.equal(buckets[0].lbl, '-23h');
     assert.equal(buckets[22].lbl, '-1h');
@@ -46,13 +57,19 @@ describe('bucket shape and labels', () => {
   });
 
   test('7d is seven daily buckets', () => {
-    const buckets = trafficBuckets([], '7d', NOW);
+    const buckets = trafficBuckets(series([]), '7d', NOW);
     assert.deepEqual(buckets.map((b) => b.lbl), ['-6d', '-5d', '-4d', '-3d', '-2d', '-1d', 'now']);
   });
 
   test('labels do not depend on the time of day', () => {
-    const later = trafficBuckets([], '24h', NOW + 7 * HOUR + 13 * MIN);
-    assert.deepEqual(later, trafficBuckets([], '24h', NOW));
+    const later = trafficBuckets(series([]), '24h', NOW + 7 * HOUR + 13 * MIN);
+    assert.deepEqual(later, trafficBuckets(series([]), '24h', NOW));
+  });
+
+  test('no series yet draws the empty chart', () => {
+    for (const missing of [null, undefined]) {
+      assert.deepEqual(trafficBuckets(missing, '24h', NOW), trafficBuckets(series([]), '24h', NOW));
+    }
   });
 });
 
@@ -83,10 +100,10 @@ describe('bucket boundaries', () => {
   }
 
   test('the range selector filters: a 3-hour-old call shows in 24h and 7d but not 1h', () => {
-    const rows = [ago(3 * HOUR)];
-    assert.deepEqual(filled(rows, '1h'), []);
-    assert.deepEqual(filled(rows, '24h'), [3]);
-    assert.deepEqual(filled(rows, '7d'), [0]);
+    const slices = [ago(3 * HOUR)];
+    assert.deepEqual(filled(slices, '1h'), []);
+    assert.deepEqual(filled(slices, '24h'), [3]);
+    assert.deepEqual(filled(slices, '7d'), [0]);
   });
 
   test('a call eight days old shows nowhere', () => {
@@ -95,27 +112,55 @@ describe('bucket boundaries', () => {
     }
   });
 
-  test('a row keeps its bucket wherever it sits in the list', () => {
-    const rows = [ago(10 * MIN), ago(10 * MIN), ago(10 * MIN)];
-    const buckets = trafficBuckets(rows, '1h', NOW);
-    assert.equal(buckets[buckets.length - 3].ok, 3);
+  test('counts in one slice add up in its bucket', () => {
+    const buckets = trafficBuckets(series([{ start: NOW - 10 * MIN, ok: 3, warn: 2, err: 1 }]), '1h', NOW);
+    assert.deepEqual([buckets.at(-3)?.ok, buckets.at(-3)?.warn, buckets.at(-3)?.err], [3, 2, 1]);
   });
 });
 
-describe('rows that cannot be placed', () => {
-  test('invalid timestamps are dropped, not scattered', () => {
-    for (const timestamp of ['', 'not a date', '2026-13-45T99:00:00Z']) {
-      assert.deepEqual(filled([{ timestamp, status: 'ALLOWED' }], '7d'), []);
-    }
+describe('slices the size the server sends', () => {
+  test('a slice is placed by its newest instant: calls show at most one slice newer, never older', () => {
+    // A 5-minute slice from 65 to 60 minutes ago: its last instant falls in the 24h chart's 1–2 h bucket.
+    const slice = { start: NOW - 65 * MIN, ok: 4, warn: 0, err: 0 };
+    assert.deepEqual(filled([slice], '24h', 5 * MIN), [1]);
+    // Its last instant is 60 min + 1 ms ago, so the 1h chart leaves it out as just past the window.
+    assert.deepEqual(filled([slice], '1h', 5 * MIN), []);
   });
 
-  test('a timestamp just ahead of the browser clock counts as now', () => {
-    assert.deepEqual(filled([ago(-MIN)], '1h'), [0]);
+  test('a slice ending just inside the window shows in the oldest bucket', () => {
+    const slice = { start: NOW - HOUR - 30_000, ok: 1, warn: 0, err: 0 };
+    assert.deepEqual(filled([slice], '1h', MIN), [11]);
   });
 
-  test('a timestamp further in the future is clamped into the newest bucket, not dropped', () => {
-    assert.deepEqual(filled([ago(-MIN - 1)], '1h'), [0]);
-    assert.deepEqual(filled([ago(-DAY)], '7d'), [0]);
+  test('a whole day of hourly slices fills the 24h chart the 150-row list could not', () => {
+    const slices = Array.from({ length: 24 }, (_, h) => ({ start: NOW - (h + 1) * HOUR, ok: 100, warn: 10, err: 1 }));
+    const buckets = trafficBuckets(series(slices, HOUR), '24h', NOW);
+    assert.ok(buckets.every((b) => b.ok === 100 && b.warn === 10 && b.err === 1));
+  });
+
+  test('a slice the clock has not reached yet counts as now', () => {
+    assert.deepEqual(filled([{ start: NOW + 2 * MIN, ok: 1, warn: 0, err: 0 }], '1h', MIN), [0]);
+  });
+
+  test('bars age as the clock moves, with no new data', () => {
+    const slices = series([{ start: NOW - MIN, ok: 1, warn: 0, err: 0 }], MIN);
+    const index = (now: number) => {
+      const buckets = trafficBuckets(slices, '24h', now);
+      return buckets.length - 1 - buckets.findIndex((b) => b.ok === 1);
+    };
+    assert.equal(index(NOW), 0);
+    assert.equal(index(NOW + 3 * HOUR), 3);
+  });
+
+  test('a slice with an unreadable start is dropped, not scattered', () => {
+    assert.deepEqual(filled([{ start: Number.NaN, ok: 1, warn: 0, err: 0 }], '7d'), []);
+  });
+});
+
+describe('what is counted', () => {
+  test('statuses map to their segments', () => {
+    const newest = trafficBuckets(series([ago(1), ago(2), ago(3, 'DENIED'), ago(4, 'ERROR')]), '1h', NOW).at(-1);
+    assert.deepEqual([newest?.ok, newest?.warn, newest?.err], [2, 1, 1]);
   });
 });
 
@@ -141,43 +186,23 @@ describe('estimateClockOffsetMs', () => {
     test(`a browser clock this ${name} still places a 5-second-old call in the newest bucket`, () => {
       const browserNow = NOW + skew;
       const offset = estimateClockOffsetMs(at(NOW), browserNow, browserNow);
-      const newest = trafficBuckets([ago(5000)], '1h', browserNow + offset).at(-1);
+      const newest = trafficBuckets(series([ago(5000)]), '1h', browserNow + offset).at(-1);
       assert.equal(newest?.ok, 1);
     });
   }
 });
 
-describe('what is counted', () => {
-  test('simulated rows are left out', () => {
-    assert.deepEqual(filled([ago(MIN, 'ALLOWED', true), ago(MIN, 'DENIED', true)], '1h'), []);
-  });
-
-  test('a real row beside a simulated one is still counted', () => {
-    const newest = trafficBuckets([ago(MIN, 'ALLOWED', true), ago(MIN, 'DENIED')], '1h', NOW).at(-1);
-    assert.deepEqual([newest?.ok, newest?.warn, newest?.err], [0, 1, 0]);
-  });
-
-  test('statuses map to their segments', () => {
-    const newest = trafficBuckets([ago(1), ago(2), ago(3, 'DENIED'), ago(4, 'ERROR')], '1h', NOW).at(-1);
-    assert.deepEqual([newest?.ok, newest?.warn, newest?.err], [2, 1, 1]);
-  });
-});
-
 describe('trafficChartSubtitle', () => {
-  test('discloses that the chart reads a capped list', () => {
-    assert.equal(
-      trafficChartSubtitle('24h', 150),
-      'Requests per hour by policy outcome, based on the latest 150 real calls'
-    );
+  test('says how many calls the window holds', () => {
+    assert.equal(trafficChartSubtitle('24h', 2410), 'Requests per hour by policy outcome, 2410 in the last 24 hours');
   });
 
-  test('names the bucket size of each range', () => {
-    assert.match(trafficChartSubtitle('1h', 2), /^Requests per 5 minutes /);
-    assert.match(trafficChartSubtitle('7d', 2), /^Requests per day /);
+  test('names the bucket size and window of each range', () => {
+    assert.equal(trafficChartSubtitle('1h', 2), 'Requests per 5 minutes by policy outcome, 2 in the last hour');
+    assert.equal(trafficChartSubtitle('7d', 2), 'Requests per day by policy outcome, 2 in the last 7 days');
   });
 
-  test('handles one call and none', () => {
-    assert.match(trafficChartSubtitle('24h', 1), /based on the latest real call$/);
-    assert.match(trafficChartSubtitle('24h', 0), /no real calls to show$/);
+  test('an empty window reads as quiet, not as missing data', () => {
+    assert.equal(trafficChartSubtitle('24h', 0), 'Requests per hour by policy outcome, none in the last 24 hours');
   });
 });

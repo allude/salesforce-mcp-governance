@@ -1,6 +1,6 @@
-import { realTraffic } from './simulatedTraffic';
+import type { McpTrafficRange, McpTrafficSlice } from '@/types/governance';
 
-export type TrafficRange = '1h' | '24h' | '7d';
+export type TrafficRange = McpTrafficRange;
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -8,11 +8,11 @@ const DAY_MS = 24 * HOUR_MS;
 
 const RANGES: Record<
   TrafficRange,
-  { count: number; step: number; unitMs: number; suffix: string; unit: string; per: string }
+  { count: number; step: number; unitMs: number; suffix: string; unit: string; per: string; window: string }
 > = {
-  '1h': { count: 12, step: 5, unitMs: MINUTE_MS, suffix: 'm', unit: 'min', per: '5 minutes' },
-  '24h': { count: 24, step: 1, unitMs: HOUR_MS, suffix: 'h', unit: 'h', per: 'hour' },
-  '7d': { count: 7, step: 1, unitMs: DAY_MS, suffix: 'd', unit: 'd', per: 'day' },
+  '1h': { count: 12, step: 5, unitMs: MINUTE_MS, suffix: 'm', unit: 'min', per: '5 minutes', window: 'hour' },
+  '24h': { count: 24, step: 1, unitMs: HOUR_MS, suffix: 'h', unit: 'h', per: 'hour', window: '24 hours' },
+  '7d': { count: 7, step: 1, unitMs: DAY_MS, suffix: 'd', unit: 'd', per: 'day', window: '7 days' },
 };
 
 export interface TrafficBucket {
@@ -25,10 +25,10 @@ export interface TrafficBucket {
   err: number;
 }
 
-interface TrafficRow {
-  timestamp: string;
-  status: string;
-  simulated?: boolean;
+/** One range's counts as /overview sends them: fixed slices of `sliceMs`, oldest first. */
+export interface TrafficSeries {
+  sliceMs: number;
+  slices: McpTrafficSlice[];
 }
 
 /**
@@ -43,12 +43,14 @@ export function estimateClockOffsetMs(serverTime: unknown, sentAt: number, recei
 }
 
 /**
- * Buckets, oldest first, each holding the real calls made that long before `now`, which should be on
- * the server's clock. A bucket covers [k, k + 1) bucket sizes ago. A call ahead of `now` counts in the
- * newest bucket, as the header pill clamps it, because leftover skew must not hide the newest calls.
- * Calls at or beyond the window's edge or with an unreadable timestamp are left out.
+ * Buckets, oldest first, each holding the calls made that long before `now`, which should be on the
+ * server's clock. A bucket covers [k, k + 1) bucket sizes ago. The server counts calls in slices
+ * smaller than a bucket; a slice is placed by its newest instant, so a call can show up to one slice
+ * newer than it is, never older. A slice ahead of `now` counts in the newest bucket, as the header pill
+ * clamps it, because leftover skew must not hide the newest calls. Slices at or beyond the window's
+ * edge are left out. Placing them here rather than on the server keeps the bars ageing between polls.
  */
-export function trafficBuckets(rows: TrafficRow[], range: TrafficRange, now: number): TrafficBucket[] {
+export function trafficBuckets(series: TrafficSeries | null | undefined, range: TrafficRange, now: number): TrafficBucket[] {
   const { count, step, unitMs, suffix, unit } = RANGES[range];
   const sizeMs = step * unitMs;
 
@@ -64,24 +66,25 @@ export function trafficBuckets(rows: TrafficRow[], range: TrafficRange, now: num
     };
   });
 
-  for (const row of realTraffic(rows)) {
-    const time = Date.parse(row.timestamp);
-    if (Number.isNaN(time)) continue;
-    const ago = Math.floor(Math.max(now - time, 0) / sizeMs);
+  if (!series) return buckets;
+  for (const slice of series.slices) {
+    const newest = slice.start + series.sliceMs - 1;
+    if (!Number.isFinite(newest)) continue;
+    const ago = Math.floor(Math.max(now - newest, 0) / sizeMs);
     if (ago >= count) continue;
     const bucket = buckets[count - 1 - ago];
-    if (row.status === 'ALLOWED') bucket.ok += 1;
-    else if (row.status === 'DENIED') bucket.warn += 1;
-    else bucket.err += 1;
+    bucket.ok += slice.ok;
+    bucket.warn += slice.warn;
+    bucket.err += slice.err;
   }
 
   return buckets;
 }
 
-/** The chart reads the capped log list, not all history, so the subtitle has to say so. */
-export function trafficChartSubtitle(range: TrafficRange, realCallCount: number): string {
-  const base = `Requests per ${RANGES[range].per} by policy outcome`;
-  if (realCallCount === 0) return `${base}, no real calls to show`;
-  const latest = realCallCount === 1 ? 'latest real call' : `latest ${realCallCount} real calls`;
-  return `${base}, based on the ${latest}`;
+/** Says how many calls the bars hold, so an empty chart reads as a quiet window, not missing data. */
+export function trafficChartSubtitle(range: TrafficRange, callsInWindow: number): string {
+  const { per, window } = RANGES[range];
+  const base = `Requests per ${per} by policy outcome`;
+  if (callsInWindow === 0) return `${base}, none in the last ${window}`;
+  return `${base}, ${callsInWindow} in the last ${window}`;
 }

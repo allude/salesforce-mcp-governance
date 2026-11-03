@@ -155,6 +155,43 @@ export interface CopilotMcpLogRecord {
   seq?: number; // Write order (SQLite rowid) on rows from the Admin API log lists; the paging cursor
 }
 
+/**
+ * Dashboard figures for recent verified MCP calls, read from the whole log on the server. Simulator
+ * runs and rejected tokens are left out: neither is a Copilot user calling a tool.
+ */
+export interface McpActivityFigures {
+  windowHours: number;
+  /** Where the window ends: the server's clock when it answered. */
+  asOf: string;
+  verifiedCalls: number;
+  activeUsers: number;
+  activeProfiles: number;
+  p95LatencyMs: number;
+  avgLatencyMs: number;
+  /** Most calls first, at most 6. */
+  topTools: Array<{ toolName: string; calls: number }>;
+  /** Most calls first, at most 5, each with the Profile of the user's latest call. */
+  topUsers: Array<{ username: string; profileName: string; calls: number }>;
+}
+
+/** Real calls (simulator runs left out) counted per outcome in one fixed slice of time. */
+export interface McpTrafficSlice {
+  /** Epoch ms where the slice starts; slices are aligned to multiples of their size. */
+  start: number;
+  ok: number;
+  warn: number;
+  err: number;
+}
+
+export type McpTrafficRange = '1h' | '24h' | '7d';
+
+/**
+ * For each dashboard chart range, the counts of every logged call in its window, in slices small
+ * enough for the browser to place against its own reading of the server clock. Oldest first, with
+ * empty slices left out.
+ */
+export type McpTrafficSeries = Record<McpTrafficRange, { sliceMs: number; slices: McpTrafficSlice[] }>;
+
 export interface PortalAdminLogRecord {
   id: string;
   timestamp: string;
@@ -303,6 +340,10 @@ export interface PortalOverviewPayload {
   /** The server's clock when it answered, for placing log rows from a browser with a different clock. */
   serverTime: string;
   copilotLogs: CopilotMcpLogRecord[];
+  /** Read from the whole log, unlike copilotLogs, which holds only the latest rows of each kind. */
+  mcpActivity: McpActivityFigures;
+  /** The dashboard chart's counts, also read from the whole log. */
+  mcpTraffic: McpTrafficSeries;
   portalLogs: PortalAdminLogRecord[];
   /** The most rows of each kind the two log lists hold. */
   logCaps: {

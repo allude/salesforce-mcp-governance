@@ -6,7 +6,6 @@ import assert from 'node:assert/strict';
 import { store, UNVERIFIED_CALLER_USERNAME } from '../src/db/store.js';
 import { startTestServer, loginAsAdmin, adminFetch, type AdminSession, type TestServer } from './helpers/server.js';
 import { realTraffic } from '../src/components/views/simulatedTraffic.js';
-import { trafficChartSubtitle } from '../src/components/views/trafficChart.js';
 import { trafficLogCsv } from '../src/components/views/csvExport.js';
 import { auditLogKinds, describeHeldLogs, trafficLogKinds } from '../src/components/views/logHistory.js';
 
@@ -68,13 +67,17 @@ describe('MCP rows in /overview', () => {
     const denial = logCall('real.user@acme.com', 'DENIED', false);
     for (let i = 0; i < 151; i += 1) logCall('simulated:test-user', 'ALLOWED', true);
 
-    const { copilotLogs, stats } = await overview();
+    const { copilotLogs, stats, mcpTraffic } = await overview();
     const real: Array<{ id: string }> = realTraffic(copilotLogs as Array<{ id: string; simulated?: boolean }>);
 
     assert.deepEqual(real.map((r) => r.id), [denial.id]);
     assert.equal(stats.totalMcpRequests, 1);
     assert.equal(stats.deniedMcpRequests, 1);
-    assert.doesNotMatch(trafficChartSubtitle('24h', real.length), /no real calls/);
+    const charted = mcpTraffic['24h'].slices.reduce(
+      (acc: { ok: number; warn: number }, s: { ok: number; warn: number }) => ({ ok: acc.ok + s.ok, warn: acc.warn + s.warn }),
+      { ok: 0, warn: 0 }
+    );
+    assert.deepEqual(charted, { ok: 0, warn: 1 }, 'the chart holds the denial and none of the simulated calls');
     assert.ok(trafficLogCsv(copilotLogs).includes('real.user@acme.com'));
   });
 
