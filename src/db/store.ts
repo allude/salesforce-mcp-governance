@@ -13,6 +13,7 @@ import {
   GroupObjectPermission,
   ProfileGroupMapping,
   CopilotMcpLogRecord,
+  McpActivityFigures,
   PortalAdminLogRecord,
   OktaSsoSettings,
   SalesforceConnectionSettings,
@@ -389,6 +390,8 @@ function runSchemaMigrations() {
   ensureColumnExists('sf_connection_settings', 'sync_instance_url', "TEXT NOT NULL DEFAULT ''");
 
   addSimulatedColumnAndMarkLegacyRows();
+  // Dashboard figures read recent real calls by time; the column must exist first.
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mcp_copilot_logs_real_time ON mcp_copilot_logs (simulated, timestamp)');
 }
 
 /**
@@ -1879,6 +1882,64 @@ export const store = {
       )
       .get() as { total: number; allowed: number; denied: number; errors: number };
     return { total: row.total, allowed: row.allowed, denied: row.denied, errors: row.errors };
+  },
+
+  /**
+   * Who called which tools, and how fast, over the `windowHours` before `nowMs`. Read from the table
+   * because the /overview list holds only the latest rows of each kind, which skews any figure taken
+   * from it. Verified calls only: rejected tokens are not users and simulator runs are not traffic.
+   */
+  getCopilotMcpActivityFigures(nowMs: number, windowHours = 24): McpActivityFigures {
+    // Timestamps are all written by toISOString(), so they compare as strings.
+    const params = {
+      unverified: UNVERIFIED_CALLER_USERNAME,
+      since: new Date(nowMs - windowHours * 3_600_000).toISOString(),
+    };
+    const verified = `FROM mcp_copilot_logs
+       WHERE simulated = 0 AND timestamp >= :since AND sf_username <> :unverified`;
+
+    const summary = db
+      .prepare(
+        `SELECT COUNT(*) AS calls, COUNT(DISTINCT sf_username) AS users,
+                COUNT(DISTINCT profile_id) AS profiles, COALESCE(AVG(latency_ms), 0) AS avgLatency
+         ${verified}`
+      )
+      .get(params) as { calls: number; users: number; profiles: number; avgLatency: number };
+
+    // The same nearest-rank p95 the dashboard used: the value at floor(n * 0.95) in sorted order.
+    const p95 = summary.calls
+      ? (db
+          .prepare(`SELECT latency_ms AS latency ${verified} ORDER BY latency_ms LIMIT 1 OFFSET :offset`)
+          .get({ ...params, offset: Math.floor(summary.calls * 0.95) }) as { latency: number }).latency
+      : 0;
+
+    const topTools = db
+      .prepare(
+        `SELECT tool_name AS toolName, COUNT(*) AS calls ${verified}
+         GROUP BY tool_name ORDER BY calls DESC, tool_name LIMIT 6`
+      )
+      .all(params) as Array<{ toolName: string; calls: number }>;
+
+    // With a single max() aggregate, SQLite takes profile_name from the row holding the max: the
+    // user's latest call.
+    const topUsers = db
+      .prepare(
+        `SELECT sf_username AS username, profile_name AS profileName, COUNT(*) AS calls, MAX(rowid) AS latest
+         ${verified}
+         GROUP BY sf_username ORDER BY calls DESC, sf_username LIMIT 5`
+      )
+      .all(params) as Array<{ username: string; profileName: string; calls: number }>;
+
+    return {
+      windowHours,
+      verifiedCalls: summary.calls,
+      activeUsers: summary.users,
+      activeProfiles: summary.profiles,
+      p95LatencyMs: p95,
+      avgLatencyMs: Math.round(summary.avgLatency),
+      topTools: topTools.map((t) => ({ toolName: t.toolName, calls: t.calls })),
+      topUsers: topUsers.map((u) => ({ username: u.username, profileName: u.profileName, calls: u.calls })),
+    };
   },
 
   /**

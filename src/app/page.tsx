@@ -7,6 +7,7 @@ import type {
   AccessGroup,
   ProfileGroupMapping,
   CopilotMcpLogRecord,
+  McpActivityFigures,
   PortalAdminLogRecord,
   OktaSsoSettings,
   SalesforceConnectionSettings,
@@ -162,6 +163,7 @@ export default function AdminPortalPage() {
     useState<SalesforceConnectionSettings | null>(null);
   const [portalUsers, setPortalUsers] = useState<PortalUserSummary[]>([]);
   const [mcpStats, setMcpStats] = useState<McpRequestStats | null>(null);
+  const [recentMcpActivity, setRecentMcpActivity] = useState<McpActivityFigures | null>(null);
   const [clockNow, setClockNow] = useState(() => Date.now());
   const [clockOffsetMs, setClockOffsetMs] = useState(0);
   // Starts off so the burst button cannot show in production before the first overview loads.
@@ -281,6 +283,7 @@ export default function AdminPortalPage() {
       setMappings(data.profileGroupMappings || []);
       setCopilotLogs(data.copilotLogs || []);
       setMcpStats(data.stats || null);
+      setRecentMcpActivity(data.mcpActivity || null);
       setDevToolsEnabled(data.devToolsEnabled === true);
       setPortalLogs(data.portalLogs || []);
       if (data.logCaps) setLogCaps(data.logCaps);
@@ -1238,6 +1241,7 @@ export default function AdminPortalPage() {
               clockOffsetMs={clockOffsetMs}
               copilotLogs={copilotLogs}
               mcpStats={mcpStats}
+              mcpActivity={recentMcpActivity}
               portalLogs={portalLogs}
               profiles={profiles}
               objects={objects}

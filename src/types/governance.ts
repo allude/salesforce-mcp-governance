@@ -155,6 +155,24 @@ export interface CopilotMcpLogRecord {
   seq?: number; // Write order (SQLite rowid) on rows from the Admin API log lists; the paging cursor
 }
 
+/**
+ * Dashboard figures for recent verified MCP calls, read from the whole log on the server. Simulator
+ * runs and rejected tokens are left out: neither is a Copilot user calling a tool.
+ */
+export interface McpActivityFigures {
+  /** The window ends at the server's clock when it answered. */
+  windowHours: number;
+  verifiedCalls: number;
+  activeUsers: number;
+  activeProfiles: number;
+  p95LatencyMs: number;
+  avgLatencyMs: number;
+  /** Most calls first, at most 6. */
+  topTools: Array<{ toolName: string; calls: number }>;
+  /** Most calls first, at most 5, each with the Profile of the user's latest call. */
+  topUsers: Array<{ username: string; profileName: string; calls: number }>;
+}
+
 export interface PortalAdminLogRecord {
   id: string;
   timestamp: string;
@@ -303,6 +321,8 @@ export interface PortalOverviewPayload {
   /** The server's clock when it answered, for placing log rows from a browser with a different clock. */
   serverTime: string;
   copilotLogs: CopilotMcpLogRecord[];
+  /** Read from the whole log, unlike copilotLogs, which holds only the latest rows of each kind. */
+  mcpActivity: McpActivityFigures;
   portalLogs: PortalAdminLogRecord[];
   /** The most rows of each kind the two log lists hold. */
   logCaps: {
