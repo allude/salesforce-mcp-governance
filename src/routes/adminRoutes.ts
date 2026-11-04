@@ -1,5 +1,11 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { runInTransaction, SIMULATE_MCP_CALL_ACTION, store } from '../db/store.js';
+import {
+  MembershipChangeError,
+  runInTransaction,
+  SIMULATE_MCP_CALL_ACTION,
+  store,
+  type MembershipDelta,
+} from '../db/store.js';
 import { parseProfilesCsv, parseSfdxFilesToObjects } from '../db/importers.js';
 import {
   requireAdminAuth,
@@ -26,7 +32,7 @@ import {
   SalesforceOrgTokenSession,
 } from '../salesforce/jwtConnection.js';
 import { config, KNOWN_DEFAULT_PASSWORDS } from '../config.js';
-import { parseObjectSyncPayload, parseProfileSyncPayload } from './orgSyncPayload.js';
+import { parseObjectSyncPayload, parseProfileSyncPayload, type PayloadResult } from './orgSyncPayload.js';
 import { LogPageQueryError, parseMcpLogPageQuery, parsePortalLogPageQuery } from './logPageQuery.js';
 import { isSalesforceId, salesforceIdsMatch } from '../salesforce/ids.js';
 import { assertNotSimulatedOrgHost } from '../salesforce/simulatedOrg.js';
@@ -1256,17 +1262,69 @@ adminRouter.delete('/groups/:id', (req: Request, res: Response) => {
   });
 });
 
+const MEMBERSHIP_NAMES_LOGGED = 50;
+
+const isIdList = (value: unknown): value is string[] =>
+  Array.isArray(value) && value.every((id) => typeof id === 'string');
+
+/** Reads `{ add, remove }`: either may be left out, but not both. */
+function parseMembershipDelta(body: Record<string, any>, missing: string): PayloadResult<MembershipDelta> {
+  const { add, remove } = body;
+  if (add === undefined && remove === undefined) return { ok: false, error: missing };
+  if (add !== undefined && !isIdList(add)) return { ok: false, error: 'add must be an array of ids.' };
+  if (remove !== undefined && !isIdList(remove)) return { ok: false, error: 'remove must be an array of ids.' };
+  return { ok: true, value: { add: add ?? [], remove: remove ?? [] } };
+}
+
+type ProfileGroupsRequest = { delta: MembershipDelta } | { groupIds: string[]; expectedGroupIds: string[] };
+
+/** Reads the PUT body: `{ add, remove }`, or a full replacement `{ groupIds, expectedGroupIds }`. */
+function parseProfileGroupsRequest(body: Record<string, any>): PayloadResult<ProfileGroupsRequest> {
+  if (body.groupIds === undefined) {
+    const delta = parseMembershipDelta(body, 'Send { add, remove } or { groupIds, expectedGroupIds }.');
+    return delta.ok ? { ok: true, value: { delta: delta.value } } : delta;
+  }
+  if (body.add !== undefined || body.remove !== undefined) {
+    return { ok: false, error: 'Send either { add, remove } or { groupIds, expectedGroupIds }, not both.' };
+  }
+  if (!isIdList(body.groupIds)) return { ok: false, error: 'groupIds must be an array of group ids.' };
+  if (!isIdList(body.expectedGroupIds)) {
+    return {
+      ok: false,
+      error:
+        'A full replacement needs expectedGroupIds, the group ids it was built from. Use { add, remove } to change single memberships.',
+    };
+  }
+  return { ok: true, value: { groupIds: body.groupIds, expectedGroupIds: body.expectedGroupIds } };
+}
+
+const sameIdSet = (a: string[], b: string[]) => {
+  const left = new Set(a);
+  const right = new Set(b);
+  return left.size === right.size && [...left].every((id) => right.has(id));
+};
+
+/** The audit text for what a membership request changed, which may be nothing. */
+function membershipChangeClauses(added: string[], removed: string[]): string {
+  if (added.length === 0 && removed.length === 0) return ' Nothing changed.';
+  return (
+    namesClause('Added', added, MEMBERSHIP_NAMES_LOGGED) + namesClause('Removed', removed, MEMBERSHIP_NAMES_LOGGED)
+  );
+}
+
 /**
  * PUT /api/admin/profile-groups/:profileId
- * Assigns one or more Groups to a Salesforce Profile
+ * Changes the Groups mapped to a Salesforce Profile. `{ add, remove }` changes only the memberships it
+ * names. A full replacement `{ groupIds }` must carry the `expectedGroupIds` it was built from and is
+ * refused with 409 if the stored groups differ, so a stale screen cannot re-grant a revoked group.
  */
 adminRouter.put(
   '/profile-groups/:profileId',
   (req: Request, res: Response) => {
     const profileId = String(req.params.profileId);
-    const { groupIds } = req.body || {};
-    if (!Array.isArray(groupIds)) {
-      res.status(400).json({ error: 'groupIds array is required.' });
+    const parsed = parseProfileGroupsRequest(req.body || {});
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
       return;
     }
 
@@ -1276,39 +1334,110 @@ adminRouter.put(
       return;
     }
 
-    let updated;
+    const request = parsed.value;
+    const actor = getAdminInfo(req);
+    let outcome: ReturnType<typeof store.applyMembershipDelta> | { conflict: string[] };
     try {
-      updated = store.setProfileGroups(
-        profileId,
-        groupIds.map((g) => String(g))
-      );
+      // The check against the stored groups, the change and its audit entry share one transaction.
+      outcome = runInTransaction(() => {
+        let delta: MembershipDelta;
+        if ('delta' in request) {
+          delta = request.delta;
+        } else {
+          const stored = store.getProfileGroupIds(profile.id);
+          if (!sameIdSet(stored, request.expectedGroupIds)) return { conflict: stored };
+          delta = {
+            add: request.groupIds.filter((gid) => !stored.includes(gid)),
+            remove: stored.filter((gid) => !request.groupIds.includes(gid)),
+          };
+        }
+        const change = store.applyMembershipDelta(profile.id, delta);
+        const allGroups = store.getGroups();
+        const groupName = (gid: string) => allGroups.find((g) => g.id === gid)?.name || gid;
+        const groupNames = change.mapping.groupIds.map(groupName);
+        store.recordPortalAdminLog({
+          adminUsername: actor.username,
+          authMethod: actor.authMethod,
+          action: 'UPDATE_PROFILE_GROUPS',
+          target: `Profile: ${profile.name} (${profile.id})`,
+          details:
+            `Mapped Profile "${profile.name}" to Groups: [${
+              groupNames.length > 0 ? groupNames.join(', ') : 'None'
+            }].` + membershipChangeClauses(change.added.map(groupName), change.removed.map(groupName)),
+          ipAddress: actor.ip,
+        });
+        return change;
+      });
     } catch (err: any) {
-      res.status(400).json({ error: err?.message || 'Invalid groupIds.' });
+      if (!(err instanceof MembershipChangeError)) throw err;
+      res.status(400).json({ error: err.message });
       return;
     }
-    const allGroups = store.getGroups();
-    const groupNames = updated.groupIds.map(
-      (gid) => allGroups.find((g) => g.id === gid)?.name || gid
-    );
 
-    const actor = getAdminInfo(req);
-    store.recordPortalAdminLog({
-      adminUsername: actor.username,
-      authMethod: actor.authMethod,
-      action: 'UPDATE_PROFILE_GROUPS',
-      target: `Profile: ${profile.name} (${profile.id})`,
-      details: `Mapped Profile "${profile.name}" to Groups: [${
-        groupNames.length > 0 ? groupNames.join(', ') : 'None'
-      }].`,
-      ipAddress: actor.ip,
-    });
-
+    if ('conflict' in outcome) {
+      res.status(409).json({
+        error: `The Groups of Profile "${profile.name}" changed since this list was loaded, so nothing was saved. Reload and try again.`,
+        mapping: { profileId: profile.id, groupIds: outcome.conflict },
+      });
+      return;
+    }
     res.json({
-      mapping: updated,
+      mapping: outcome.mapping,
       profileGroupMappings: store.getProfileGroupMappings(),
     });
   }
 );
+
+/**
+ * POST /api/admin/groups/:id/profiles
+ * Adds Profiles to and removes Profiles from one Access Group (`{ add, remove }`, Profile ids). Every
+ * other membership stays as it is.
+ */
+adminRouter.post('/groups/:id/profiles', (req: Request, res: Response) => {
+  const id = String(req.params.id);
+  const parsed = parseMembershipDelta(req.body || {}, 'Send { add, remove } with Profile ids.');
+  if (!parsed.ok) {
+    res.status(400).json({ error: parsed.error });
+    return;
+  }
+
+  const group = store.getGroups().find((g) => g.id === id);
+  if (!group) {
+    res.status(404).json({ error: 'Group not found.' });
+    return;
+  }
+
+  const actor = getAdminInfo(req);
+  let change: ReturnType<typeof store.applyGroupMembershipDelta>;
+  try {
+    change = runInTransaction(() => {
+      const applied = store.applyGroupMembershipDelta(group.id, parsed.value);
+      const profileNames = new Map(store.getProfiles().map((p) => [p.id, p.name]));
+      const profileLabel = (pid: string) => `${profileNames.get(pid) || pid} (${pid})`;
+      const count = applied.membership.profileIds.length;
+      store.recordPortalAdminLog({
+        adminUsername: actor.username,
+        authMethod: actor.authMethod,
+        action: 'UPDATE_PROFILE_GROUPS',
+        target: `Group: ${group.name}`,
+        details:
+          `Access Group "${group.name}" is mapped to ${count} Profile${count === 1 ? '' : 's'}.` +
+          membershipChangeClauses(applied.added.map(profileLabel), applied.removed.map(profileLabel)),
+        ipAddress: actor.ip,
+      });
+      return applied;
+    });
+  } catch (err: any) {
+    if (!(err instanceof MembershipChangeError)) throw err;
+    res.status(400).json({ error: err.message });
+    return;
+  }
+
+  res.json({
+    membership: change.membership,
+    profileGroupMappings: store.getProfileGroupMappings(),
+  });
+});
 
 // ============================================================================
 // 4. SETTINGS (Okta SSO, Salesforce Connection, Portal Users, Test MCP Call)

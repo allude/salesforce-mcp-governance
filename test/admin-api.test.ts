@@ -9,6 +9,7 @@ import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import { installSalesforceMock, type SalesforceMock } from './helpers/salesforceMock.js';
 import { mcpRequest, startTestServer, type AdminSession, type TestServer } from './helpers/server.js';
 import { store } from '../src/db/store.js';
+import { adminRouter } from '../src/routes/adminRoutes.js';
 import { config, DEV_FALLBACK_SECRET_KEY, KNOWN_DEFAULT_PASSWORDS } from '../src/config.js';
 import { PORTAL_PASSWORD_MIN_LENGTH } from '../src/security/passwordPolicy.js';
 import type { AccessGroup, PortalAdminLogRecord } from '../src/types/governance.js';
@@ -563,16 +564,9 @@ describe('Admin REST API', () => {
   describe('3. CSRF protection', () => {
     interface CsrfFixture {
       profileId: string;
-      newProfileId: string;
       objectName: string;
-      newObjectName: string;
-      sfdxObjectName: string;
-      localObjectName: string;
-      folderPath: string;
       groupId: string;
-      newGroupName: string;
       username: string;
-      newUsername: string;
     }
     let fx: CsrfFixture;
     let restoreSettings: Array<() => void> = [];
@@ -591,110 +585,103 @@ describe('Admin REST API', () => {
       store.setProfileGroups(profileId, [group.id]);
       const username = newUsername('csrf.target');
       store.upsertPortalUser({ username, displayName: 'CSRF Target', password: `Pw-${RUN}-csrf`, role: 'Admin' });
-      const localObjectName = newObjectName('CsrfLocal');
-      const folderPath = path.join(tmpRoot, `csrf-objects-${RUN}`);
-      writeFile(path.join(folderPath, localObjectName, `${localObjectName}.object-meta.xml`), objectMetaXml('CSRF Local'));
 
-      fx = {
-        profileId,
-        newProfileId: newProfileId(),
-        objectName,
-        newObjectName: newObjectName('CsrfNew'),
-        sfdxObjectName: newObjectName('CsrfSfdx'),
-        localObjectName,
-        folderPath,
-        groupId: group.id,
-        newGroupName: newGroupName('CSRF New'),
-        username,
-        newUsername: newUsername('csrf.new'),
-      };
+      fx = { profileId, objectName, groupId: group.id, username };
     });
 
     after(() => {
       for (const restore of restoreSettings) restore();
       if (!fx) return;
-      for (const id of [fx.profileId, fx.newProfileId]) store.deleteProfile(id);
-      for (const name of [fx.objectName, fx.newObjectName, fx.sfdxObjectName, fx.localObjectName]) store.deleteObject(name);
-      for (const group of store.getGroups().filter((g) => g.id === fx.groupId || g.name === fx.newGroupName)) {
-        store.deleteGroup(group.id);
-      }
+      store.deleteProfile(fx.profileId);
+      store.deleteObject(fx.objectName);
+      store.deleteGroup(fx.groupId);
       removePortalUser(fx.username);
-      removePortalUser(fx.newUsername);
     });
 
-    /** Every state-changing Admin API route, with a body that would visibly change state. */
-    function mutatingRoutes(): Array<[string, string, unknown?]> {
-      return [
-        ['POST', '/api/admin/profiles', { id: fx.newProfileId, name: 'Forged' }],
-        ['POST', '/api/admin/profiles/import-csv', { csvText: `id,name\r\n${fx.newProfileId},Forged` }],
-        ['DELETE', `/api/admin/profiles/${fx.profileId}`],
-        ['POST', '/api/admin/objects', { objectName: fx.newObjectName }],
-        [
-          'POST',
-          '/api/admin/objects/import-sfdx-files',
-          {
-            files: [
-              { relativePath: `objects/${fx.sfdxObjectName}/${fx.sfdxObjectName}.object-meta.xml`, content: objectMetaXml('Forged') },
-            ],
-          },
-        ],
-        ['POST', '/api/admin/objects/import-local-folder', { folderPath: fx.folderPath }],
-        ['PUT', `/api/admin/objects/${fx.objectName}/toggle`, { enabled: false }],
-        ['PUT', `/api/admin/objects/${fx.objectName}/fields/Name/toggle`, { enabled: false }],
-        ['DELETE', `/api/admin/objects/${fx.objectName}`],
-        ['POST', '/api/admin/groups', { name: fx.newGroupName }],
-        ['DELETE', `/api/admin/groups/${fx.groupId}`],
-        ['PUT', `/api/admin/profile-groups/${fx.profileId}`, { groupIds: [] }],
-        ['PUT', '/api/admin/okta', { enabled: true, oktaDomain: 'forged.okta.com', clientSecret: 'forged-secret' }],
-        ['PUT', '/api/admin/sf-settings', { apiVersion: 'v1.0', enforceOrgIdLock: true }],
-        ['POST', '/api/admin/portal-users', { username: fx.newUsername, password: 'Forged-pass-123' }],
-        ['DELETE', `/api/admin/portal-users/${encodeURIComponent(fx.username)}`],
-        ['POST', '/api/admin/test-mcp-access', { profileId: fx.profileId, toolName: 'list_enabled_objects' }],
-      ];
+    // The walk finds 28 today; finding fewer means it has stopped seeing routes. Lower it only when removing one.
+    const MIN_MUTATING_ROUTES = 28;
+
+    /** Fills path params with this suite's fixture records, so a handler that ran would visibly change one. */
+    function samplePath(pattern: string): string {
+      const samples: Record<string, string> = {
+        id: pattern.startsWith('/groups/') ? fx.groupId : fx.profileId,
+        profileId: fx.profileId,
+        objectName: fx.objectName,
+        fieldName: 'Name',
+        username: fx.username,
+      };
+      return pattern.replace(/:(\w+)/g, (_param, name: string) => {
+        assert.ok(Object.hasOwn(samples, name), `no sample value for :${name} in ${pattern}`);
+        return encodeURIComponent(samples[name]);
+      });
+    }
+
+    /**
+     * Every state-changing Admin API route as [method, path pattern, URL], read from adminRouter's own
+     * stack so a new route is covered without being listed here. /login and /logout come before the
+     * session check and are left out.
+     */
+    function mutatingRoutes(): Array<[string, string, string]> {
+      const routes: Array<[string, string, string]> = [];
+      for (const layer of adminRouter.stack) {
+        if (!layer.route) {
+          assert.ok(!('stack' in layer.handle), 'adminRouter mounts a nested router, whose routes this walk cannot see');
+          continue;
+        }
+        // Express 4 keeps a route's methods as { post: true }, which its typings do not declare.
+        const { path: pattern, methods } = layer.route as unknown as { path: string; methods: Record<string, boolean> };
+        if (pattern === '/login' || pattern === '/logout') continue;
+        for (const method of Object.keys(methods).filter((m) => m !== 'get')) {
+          routes.push([method.toUpperCase(), `/api/admin${pattern}`, `/api/admin${samplePath(pattern)}`]);
+        }
+      }
+      assert.ok(
+        routes.length >= MIN_MUTATING_ROUTES,
+        `the adminRouter walk found ${routes.length} mutating routes, expected at least ${MIN_MUTATING_ROUTES}`
+      );
+      return routes;
     }
 
     function governanceState() {
       return {
-        profiles: [fx.profileId, fx.newProfileId].map((id) => store.getProfileById(id)),
-        objects: store
-          .getObjects()
-          .filter((o) => [fx.objectName, fx.newObjectName, fx.sfdxObjectName, fx.localObjectName].includes(o.objectName)),
-        groups: store.getGroups().filter((g) => g.id === fx.groupId || g.name === fx.newGroupName),
+        profile: store.getProfileById(fx.profileId),
+        object: objectInStore(fx.objectName),
+        group: store.getGroups().find((g) => g.id === fx.groupId),
         mapping: mappedGroupIds(fx.profileId),
         okta: store.getOktaConfig(),
         sfSettings: store.getSalesforceSettings(),
-        portalUsers: store.getPortalUsers().filter((u) => [fx.username, fx.newUsername].includes(u.username)),
-        simulations: copilotRowsFor(fx.profileId).length,
+        portalUser: store.getPortalUsers().find((u) => u.username === fx.username),
       };
     }
 
-    async function assertEveryMutationForbidden(client: Client): Promise<void> {
+    async function assertEveryMutationForbidden(t: TestContext, client: Client): Promise<void> {
       const before = governanceState();
       const mark = auditMark();
       const routes = mutatingRoutes();
 
       const outcomes: string[] = [];
-      for (const [method, urlPath, body] of routes) {
-        const res = await call(client, method, urlPath, body);
+      for (const [method, pattern, urlPath] of routes) {
+        const res = await call(client, method, urlPath);
         const csrfRejection = res.status === 403 && /X-CSRF-Token/.test(String(res.body?.error));
-        outcomes.push(`${method} ${urlPath} -> ${csrfRejection ? '403 CSRF error' : `${res.status} ${JSON.stringify(res.body)}`}`);
+        outcomes.push(`${method} ${pattern} -> ${csrfRejection ? '403 CSRF error' : `${res.status} ${JSON.stringify(res.body)}`}`);
       }
 
-      assert.deepEqual(outcomes, routes.map(([method, urlPath]) => `${method} ${urlPath} -> 403 CSRF error`));
+      assert.deepEqual(outcomes, routes.map(([method, pattern]) => `${method} ${pattern} -> 403 CSRF error`));
       assert.deepEqual(governanceState(), before, 'a request rejected for CSRF must not change any state');
       assertNotAudited(mark, client.ip);
+      t.diagnostic(`covered ${routes.length} routes: ${routes.map(([method, pattern]) => `${method} ${pattern}`).join(', ')}`);
     }
 
-    it('every mutating route rejects a valid cookie without X-CSRF-Token (403) and changes nothing', async () => {
+    it('every mutating route rejects a valid cookie without X-CSRF-Token (403) and changes nothing', async (t) => {
       const admin = await signIn();
-      await assertEveryMutationForbidden({ ...admin, csrfToken: undefined });
+      await assertEveryMutationForbidden(t, { ...admin, csrfToken: undefined });
     });
 
-    it("every mutating route rejects a valid cookie with another session's X-CSRF-Token (403) and changes nothing", async () => {
+    it("every mutating route rejects a valid cookie with another session's X-CSRF-Token (403) and changes nothing", async (t) => {
       const admin = await signIn();
       const other = await signIn();
       assert.notEqual(other.csrfToken, admin.csrfToken);
-      await assertEveryMutationForbidden({ ...admin, csrfToken: other.csrfToken });
+      await assertEveryMutationForbidden(t, { ...admin, csrfToken: other.csrfToken });
     });
   });
 
@@ -940,6 +927,20 @@ describe('Admin REST API', () => {
       assert.equal(res.body.object.enabledFieldCount, 2);
     });
 
+    it('PUT /objects/:objectName/fields/bulk disables and re-enables every field of an object', async (t) => {
+      const admin = await signIn();
+      const objectName = addObject(t, 'BulkToggle', ['Id', 'Name', 'Email__c']);
+      const bulkUrl = `/api/admin/objects/${objectName}/fields/bulk`;
+      const enabledByField = (objects: any[]) =>
+        Object.fromEntries(objects.find((o) => o.objectName === objectName).fields.map((f: any) => [f.fieldName, f.enabled]));
+
+      const off = await mutate(admin, 'PUT', bulkUrl, { enabled: false }, 'BULK_TOGGLE_FIELDS', objectName);
+      assert.deepEqual(enabledByField(off.body.objects), { Email__c: false, Id: false, Name: false });
+
+      const on = await mutate(admin, 'PUT', bulkUrl, { enabled: true }, 'BULK_TOGGLE_FIELDS', objectName);
+      assert.deepEqual(enabledByField(on.body.objects), { Email__c: true, Id: true, Name: true });
+    });
+
     it('both toggle routes answer 404 for an object that does not exist', async () => {
       const admin = await signIn();
       const missing = newObjectName('Missing');
@@ -1120,6 +1121,23 @@ describe('Admin REST API', () => {
       assertNotAudited(mark, admin.ip);
     });
 
+    it('DELETE /objects/:objectName/fields/:fieldName deletes one field and keeps the rest', async (t) => {
+      const admin = await signIn();
+      const objectName = addObject(t, 'FieldDelete', ['Id', 'Name', 'Notes__c']);
+
+      const res = await mutate(
+        admin,
+        'DELETE',
+        `/api/admin/objects/${objectName}/fields/Notes__c`,
+        undefined,
+        'DELETE_FIELD',
+        `${objectName}.Notes__c`
+      );
+
+      assert.deepEqual(res.body.object.fields.map((f: any) => f.fieldName).sort(), ['Id', 'Name']);
+      assert.deepEqual(objectInStore(objectName)?.fields.map((f) => f.fieldName).sort(), ['Id', 'Name']);
+    });
+
     it('DELETE /objects/:objectName deletes the object and its fields', async (t) => {
       const admin = await signIn();
       const objectName = addObject(t, 'Doomed', ['Id', 'Name', 'Notes__c']);
@@ -1200,37 +1218,80 @@ describe('Admin REST API', () => {
       assert.equal(store.getGroups().filter((g) => g.name === existing.name).length, 1);
     });
 
-    it('PUT /profile-groups/:profileId sets the groups mapped to a profile', async (t) => {
+    it('PUT /profile-groups/:profileId adds and removes single groups of a profile', async (t) => {
       const admin = await signIn();
       const profileId = addProfile(t);
       const first = addGroup(t, 'Matrix A');
       const second = addGroup(t, 'Matrix B');
       const url = `/api/admin/profile-groups/${profileId}`;
 
-      const both = await mutate(admin, 'PUT', url, { groupIds: [first.id, second.id] }, 'UPDATE_PROFILE_GROUPS', profileId);
-      assert.deepEqual(both.body.mapping, { profileId, groupIds: [first.id, second.id] });
+      const both = await mutate(admin, 'PUT', url, { add: [first.id, second.id] }, 'UPDATE_PROFILE_GROUPS', profileId);
+      assert.deepEqual(both.body.mapping.profileId, profileId);
+      assert.deepEqual([...both.body.mapping.groupIds].sort(), [first.id, second.id].sort());
       assert.deepEqual(mappedGroupIds(profileId)?.sort(), [first.id, second.id].sort());
       assert.ok(both.audit.details.includes(first.name) && both.audit.details.includes(second.name), both.audit.details);
+      assert.match(both.audit.details, /Added: /);
 
-      await mutate(admin, 'PUT', url, { groupIds: [second.id] }, 'UPDATE_PROFILE_GROUPS', profileId);
+      const removal = await mutate(admin, 'PUT', url, { remove: [first.id] }, 'UPDATE_PROFILE_GROUPS', profileId);
       assert.deepEqual(mappedGroupIds(profileId), [second.id]);
+      assert.ok(removal.audit.details.includes(`Removed: ${first.name}.`), removal.audit.details);
 
-      await mutate(admin, 'PUT', url, { groupIds: [] }, 'UPDATE_PROFILE_GROUPS', profileId);
+      // Nothing to change: still 200 with the current mapping, and one audit row saying so.
+      const noChange = await mutate(admin, 'PUT', url, { add: [second.id], remove: [first.id] }, 'UPDATE_PROFILE_GROUPS');
+      assert.deepEqual(noChange.body.mapping, { profileId, groupIds: [second.id] });
+      assert.match(noChange.audit.details, /Nothing changed\./);
+
+      await mutate(admin, 'PUT', url, { groupIds: [first.id], expectedGroupIds: [second.id] }, 'UPDATE_PROFILE_GROUPS');
+      assert.deepEqual(mappedGroupIds(profileId), [first.id]);
+
+      await mutate(admin, 'PUT', url, { groupIds: [], expectedGroupIds: [first.id] }, 'UPDATE_PROFILE_GROUPS');
       assert.deepEqual(mappedGroupIds(profileId), []);
     });
 
-    it('PUT /profile-groups answers 404 for an unknown profile and 400 when groupIds is not an array', async (t) => {
+    it('PUT /profile-groups refuses a full replacement whose expectedGroupIds are stale (409) and changes nothing', async (t) => {
+      const admin = await signIn();
+      const profileId = addProfile(t);
+      const stored = addGroup(t, 'Matrix Stored');
+      const revoked = addGroup(t, 'Matrix Revoked');
+      store.setProfileGroups(profileId, [stored.id]);
+      const mark = auditMark();
+
+      // Built from a screen that still showed the revoked group.
+      const res = await call(admin, 'PUT', `/api/admin/profile-groups/${profileId}`, {
+        groupIds: [stored.id, revoked.id],
+        expectedGroupIds: [revoked.id],
+      });
+
+      assert.equal(res.status, 409, JSON.stringify(res.body));
+      assert.deepEqual(res.body.mapping, { profileId, groupIds: [stored.id] });
+      assert.deepEqual(mappedGroupIds(profileId), [stored.id]);
+      assertNotAudited(mark, admin.ip);
+    });
+
+    it('PUT /profile-groups answers 404 for an unknown profile and 400 for a malformed body', async (t) => {
       const admin = await signIn();
       const profileId = addProfile(t);
       const group = addGroup(t, 'Matrix Validation');
       store.setProfileGroups(profileId, [group.id]);
+      const url = `/api/admin/profile-groups/${profileId}`;
       const mark = auditMark();
 
-      const unknownProfile = await call(admin, 'PUT', `/api/admin/profile-groups/${newProfileId()}`, { groupIds: [group.id] });
-      const notAnArray = await call(admin, 'PUT', `/api/admin/profile-groups/${profileId}`, { groupIds: group.id });
-      const missing = await call(admin, 'PUT', `/api/admin/profile-groups/${profileId}`, {});
+      const unknownProfile = await call(admin, 'PUT', `/api/admin/profile-groups/${newProfileId()}`, { add: [group.id] });
+      const statuses = [unknownProfile.status];
+      for (const body of [
+        {},
+        { add: group.id },
+        { remove: [7] },
+        { groupIds: group.id, expectedGroupIds: [group.id] },
+        // A full replacement without the groups it was built from could re-grant a revoked group.
+        { groupIds: [] },
+        { groupIds: [], expectedGroupIds: [group.id], remove: [group.id] },
+        { add: [group.id], remove: [group.id] },
+      ]) {
+        statuses.push((await call(admin, 'PUT', url, body)).status);
+      }
 
-      assert.deepEqual([unknownProfile.status, notAnArray.status, missing.status], [404, 400, 400]);
+      assert.deepEqual(statuses, [404, 400, 400, 400, 400, 400, 400, 400]);
       assert.deepEqual(mappedGroupIds(profileId), [group.id]);
       assertNotAudited(mark, admin.ip);
     });
@@ -1244,18 +1305,69 @@ describe('Admin REST API', () => {
       const mark = auditMark();
 
       // A valid group first, then an id that does not exist: all or nothing.
-      const res = await call(admin, 'PUT', `/api/admin/profile-groups/${profileId}`, {
-        groupIds: [other.id, `grp_missing_${RUN}`],
-      });
+      for (const body of [
+        { add: [other.id, `grp_missing_${RUN}`], remove: [kept.id] },
+        { groupIds: [other.id, `grp_missing_${RUN}`], expectedGroupIds: [kept.id] },
+      ]) {
+        const res = await call(admin, 'PUT', `/api/admin/profile-groups/${profileId}`, body);
 
-      const mapping = mappedGroupIds(profileId);
-      const auditRows = auditRowsSince(mark, admin.ip).map(describeAuditRow);
-      assert.deepEqual(
-        { clientError: [400, 404].includes(res.status), mapping },
-        { clientError: true, mapping: [kept.id] },
-        `PUT answered ${res.status} ${JSON.stringify(res.body)}; mapping is now ${JSON.stringify(mapping)} ` +
-          `(was ["${kept.id}"]); audit rows written: ${JSON.stringify(auditRows)}`
-      );
+        const mapping = mappedGroupIds(profileId);
+        const auditRows = auditRowsSince(mark, admin.ip).map(describeAuditRow);
+        assert.deepEqual(
+          { clientError: [400, 404].includes(res.status), mapping, auditRows },
+          { clientError: true, mapping: [kept.id], auditRows: [] },
+          `PUT ${JSON.stringify(body)} answered ${res.status} ${JSON.stringify(res.body)}`
+        );
+      }
+    });
+
+    it('POST /groups/:id/profiles adds and removes many profiles of one group', async (t) => {
+      const admin = await signIn();
+      const [first, second, third] = [addProfile(t, `Bulk One ${RUN}`), addProfile(t), addProfile(t)];
+      const group = addGroup(t, 'Bulk Target');
+      const other = addGroup(t, 'Bulk Other');
+      store.setProfileGroups(first, [group.id, other.id]);
+      const url = `/api/admin/groups/${group.id}/profiles`;
+
+      const res = await mutate(admin, 'POST', url, { add: [second, third], remove: [first] }, 'UPDATE_PROFILE_GROUPS', group.name);
+
+      assert.equal(res.body.membership.groupId, group.id);
+      assert.deepEqual([...res.body.membership.profileIds].sort(), [second, third].sort());
+      assert.deepEqual(mappedGroupIds(first), [other.id], "the profile's other group stays");
+      assert.deepEqual(mappedGroupIds(second), [group.id]);
+      assert.deepEqual(mappedGroupIds(third), [group.id]);
+      assert.deepEqual(res.body.profileGroupMappings.find((m: any) => m.profileId === second)?.groupIds, [group.id]);
+      assert.ok(res.audit.details.includes(`Removed: Bulk One ${RUN} (${first}).`), res.audit.details);
+      assert.ok(res.audit.details.includes(second) && res.audit.details.includes(third), res.audit.details);
+
+      const noChange = await mutate(admin, 'POST', url, { add: [second] }, 'UPDATE_PROFILE_GROUPS', group.name);
+      assert.deepEqual([...noChange.body.membership.profileIds].sort(), [second, third].sort());
+      assert.match(noChange.audit.details, /Nothing changed\./);
+    });
+
+    it('POST /groups/:id/profiles answers 404 for an unknown group and 400 for an unknown profile or a malformed body', async (t) => {
+      const admin = await signIn();
+      const profileId = addProfile(t);
+      const other = addProfile(t);
+      const group = addGroup(t, 'Bulk Validation');
+      store.setProfileGroups(profileId, [group.id]);
+      const url = `/api/admin/groups/${group.id}/profiles`;
+      const mark = auditMark();
+
+      const statuses = [(await call(admin, 'POST', `/api/admin/groups/grp_missing_${RUN}/profiles`, { add: [profileId] })).status];
+      for (const body of [
+        {},
+        { add: profileId },
+        { add: [other, newProfileId()], remove: [profileId] },
+        { add: [other], remove: [other] },
+      ]) {
+        statuses.push((await call(admin, 'POST', url, body)).status);
+      }
+
+      assert.deepEqual(statuses, [404, 400, 400, 400, 400]);
+      assert.deepEqual(mappedGroupIds(profileId), [group.id]);
+      assert.deepEqual(mappedGroupIds(other), []);
+      assertNotAudited(mark, admin.ip);
     });
 
     it('DELETE /groups/:id deletes the group and removes it from every profile mapping', async (t) => {
@@ -1280,6 +1392,23 @@ describe('Admin REST API', () => {
 
       assert.equal(res.status, 404);
       assertNotAudited(mark, admin.ip);
+    });
+
+    it('POST /workspace/seed-sample loads the sample groups and maps the sample profiles to them', async (t) => {
+      const admin = await signIn();
+      const profilesBefore = new Set(store.getProfiles().map((p) => p.id));
+      const groupsBefore = new Set(store.getGroups().map((g) => g.id));
+      // Deleting what the seed added also drops its mappings (ON DELETE CASCADE).
+      t.after(() => {
+        for (const group of store.getGroups().filter((g) => !groupsBefore.has(g.id))) store.deleteGroup(group.id);
+        for (const profile of store.getProfiles().filter((p) => !profilesBefore.has(p.id))) store.deleteProfile(profile.id);
+      });
+
+      const res = await mutate(admin, 'POST', '/api/admin/workspace/seed-sample', {}, 'SEED_ENTERPRISE_MATRIX', 'Access Matrix');
+
+      const seeded = res.body.groups.filter((g: any) => !groupsBefore.has(g.id)).map((g: any) => g.id);
+      assert.deepEqual(seeded.sort(), ['grp-admin', 'grp-revops', 'grp-sales-ro', 'grp-sales-rw', 'grp-svc-cases']);
+      assert.deepEqual(mappedGroupIds('00e5g000001B2k9AAC')?.sort(), ['grp-sales-ro', 'grp-sales-rw']);
     });
   });
 
@@ -1608,12 +1737,15 @@ describe('Admin REST API', () => {
         'UPSERT_OBJECT',
         'TOGGLE_OBJECT',
         'TOGGLE_FIELD',
+        'BULK_TOGGLE_FIELDS',
+        'DELETE_FIELD',
         'IMPORT_SFDX_OBJECTS_FOLDER',
         'SYNC_LOCAL_SFDX_FOLDER',
         'CREATE_GROUP',
         'UPDATE_GROUP',
         'UPDATE_PROFILE_GROUPS',
         'DELETE_GROUP',
+        'SEED_ENTERPRISE_MATRIX',
         'UPDATE_OKTA_SSO',
         'UPDATE_SF_SETTINGS',
         'UPSERT_PORTAL_USER',

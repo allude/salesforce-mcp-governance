@@ -11,6 +11,7 @@ import {
   PolicyViolationError,
   evaluateMcpToolCall,
   getVisibleToolsForUser,
+  resolveEffectiveProfilePermissions,
   type PolicyEvaluationResult,
 } from '../src/rbac/policyEngine.js';
 import { assertSafeSoqlWhereClause } from '../src/mcp/soqlGuard.js';
@@ -560,6 +561,108 @@ test("evaluateMcpToolCall: allowedFields do not depend on the alphabetical order
     sorted(whenNoGrantSortsFirst.allowedFields),
     'identical group definitions must yield identical allowedFields whatever the groups are named'
   );
+});
+
+test('evaluateMcpToolCall: an entry with no enabled fields adds Id whichever group name sorts first', (t) => {
+  const fx = new PolicyFixture(t);
+  const obj = fx.object('IdSwap', { Id: true, Name: true, Secret__c: false });
+  // Each form of "no resolvable fields": none listed, only a globally disabled field, only a field the object lacks.
+  for (const noFields of [[], ['Secret__c'], ['Ghost__c']]) {
+    const label = JSON.stringify(noFields);
+    const fieldlessFirst = fx.profile(`IdSwap Fieldless First ${label}`, [
+      fx.group(`A IdSwap Fieldless ${label}`, ['soql_query'], [grant(obj, { canRead: true }, noFields)]),
+      fx.group(`B IdSwap Name ${label}`, ['soql_query'], [grant(obj, { canRead: true }, ['Name'])]),
+    ]);
+    const nameFirst = fx.profile(`IdSwap Name First ${label}`, [
+      fx.group(`A IdSwap Name ${label}`, ['soql_query'], [grant(obj, { canRead: true }, ['Name'])]),
+      fx.group(`B IdSwap Fieldless ${label}`, ['soql_query'], [grant(obj, { canRead: true }, noFields)]),
+    ]);
+
+    for (const profile of [fieldlessFirst, nameFirst]) {
+      assert.deepEqual(
+        sorted(assertPermitted(fx.callerFor(profile), 'soql_query', obj).allowedFields),
+        ['Id', 'Name'],
+        profile.name
+      );
+    }
+  }
+});
+
+test('evaluateMcpToolCall: a Delete-only entry with no fields adds no Id, in either group order', (t) => {
+  const fx = new PolicyFixture(t);
+  const obj = fx.object('IdDeleteOnly', { Id: true, Name: true });
+  // delete_record reads no field, so Delete-only access must not make Id readable through soql_query or get_record.
+  const deleteFirst = fx.profile('IdDeleteOnly Delete First', [
+    fx.group('A IdDeleteOnly Delete', ['soql_query'], [grant(obj, { canDelete: true }, [])]),
+    fx.group('B IdDeleteOnly Name', ['soql_query'], [grant(obj, { canRead: true }, ['Name'])]),
+  ]);
+  const nameFirst = fx.profile('IdDeleteOnly Name First', [
+    fx.group('A IdDeleteOnly Name', ['soql_query'], [grant(obj, { canRead: true }, ['Name'])]),
+    fx.group('B IdDeleteOnly Delete', ['soql_query'], [grant(obj, { canDelete: true }, [])]),
+  ]);
+
+  for (const profile of [deleteFirst, nameFirst]) {
+    assert.deepEqual(sorted(assertPermitted(fx.callerFor(profile), 'soql_query', obj).allowedFields), ['Name'], profile.name);
+  }
+});
+
+test('resolveEffectiveProfilePermissions: the Id fallback keeps every field the merged-set rule gave, in every group order', (t) => {
+  const fx = new PolicyFixture(t);
+  const enabledFields = ['Id', 'Name'];
+  const obj = fx.object('IdSuperset', { Id: true, Name: true, Secret__c: false });
+  const entries: Record<string, GroupObjectPermission> = {
+    ReadNone: grant(obj, { canRead: true }, []),
+    ReadName: grant(obj, { canRead: true }, ['Name']),
+    UpdateDisabled: grant(obj, { canUpdate: true }, ['Secret__c']),
+    DeleteNone: grant(obj, { canDelete: true }, []),
+  };
+
+  // The rule before the fix: Id was added only while the fields merged so far were still empty.
+  const mergedSetRule = (order: GroupObjectPermission[]): string[] => {
+    const fields = new Set<string>();
+    let readCreateOrUpdate = false;
+    for (const entry of order) {
+      readCreateOrUpdate ||= entry.canRead || entry.canCreate || entry.canUpdate;
+      for (const f of entry.allowedFields) if (enabledFields.includes(f)) fields.add(f);
+      if (fields.size === 0 && readCreateOrUpdate) fields.add('Id');
+    }
+    return sorted([...fields]);
+  };
+
+  // Every non-empty selection of the entries, in every order.
+  const orders: string[][] = [];
+  const arrange = (prefix: string[], rest: string[]) => {
+    if (prefix.length > 0) orders.push(prefix);
+    rest.forEach((key, i) => arrange([...prefix, key], [...rest.slice(0, i), ...rest.slice(i + 1)]));
+  };
+  arrange([], Object.keys(entries));
+
+  const resultBySet = new Map<string, string[]>();
+  let ordersThatGainId = 0;
+  for (const order of orders) {
+    // A leading letter per position makes the groups' name order follow `order`.
+    const groups = order.map((key, i) =>
+      fx.group(`${String.fromCharCode(65 + i)} IdSuperset ${order.join(' ')} ${key}`, [], [entries[key]])
+    );
+    const profile = fx.profile(`IdSuperset ${order.join(' ')}`, groups);
+    const effective = resolveEffectiveProfilePermissions(profile.id, profile.name);
+    const result = sorted([...(effective.objectPermissions.get(obj)?.allowedFields ?? [])]);
+    const before = mergedSetRule(order.map((key) => entries[key]));
+
+    for (const field of before) {
+      assert.ok(result.includes(field), `${order.join(' > ')}: keeps ${field} (before: ${before}, now: ${result})`);
+    }
+    if (result.length > before.length) ordersThatGainId++;
+
+    const setKey = sorted(order).join(' ');
+    const sameSet = resultBySet.get(setKey);
+    if (sameSet) {
+      assert.deepEqual(result, sameSet, `${order.join(' > ')}: same allowedFields as any other order of ${setKey}`);
+    } else {
+      resultBySet.set(setKey, result);
+    }
+  }
+  assert.ok(ordersThatGainId > 0, 'control: some orders gain Id that the merged-set rule left out');
 });
 
 test('evaluateMcpToolCall: matches the object name case-insensitively and returns the canonical API name', (t) => {

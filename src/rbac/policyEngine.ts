@@ -136,18 +136,22 @@ export function resolveEffectiveProfilePermissions(
       existing.canUpdate = existing.canUpdate || Boolean(objPerm.canUpdate);
       existing.canDelete = existing.canDelete || Boolean(objPerm.canDelete);
 
+      let resolvedAnyField = false;
       for (const f of objPerm.allowedFields || []) {
         if (!f) continue;
         const canonical = globalObj.canonicalFieldMap.get(f.toLowerCase());
         if (canonical) {
           existing.allowedFields.add(canonical);
+          resolvedAnyField = true;
         }
       }
 
-      // Ensure that if all configured fields were removed/disabled, Id remains safe as fallback when enabled
+      // An entry whose configured fields were all removed/disabled still grants Id when Id is enabled.
+      // This is decided per entry, not on the fields merged so far, so that it never depends on the
+      // groups' (alphabetical) processing order.
       if (
-        existing.allowedFields.size === 0 &&
-        (existing.canRead || existing.canCreate || existing.canUpdate) &&
+        !resolvedAnyField &&
+        (objPerm.canRead || objPerm.canCreate || objPerm.canUpdate) &&
         globalObj.canonicalFieldMap.has('id')
       ) {
         existing.allowedFields.add(globalObj.canonicalFieldMap.get('id')!);

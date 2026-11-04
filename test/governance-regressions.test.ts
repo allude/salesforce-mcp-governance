@@ -70,16 +70,55 @@ describe('Access Groups', () => {
     const profileId = `00e${crypto.randomBytes(6).toString('hex')}`.slice(0, 15);
     store.upsertProfile(profileId, `Profile ${tag()}`);
     const group = store.upsertGroup({ name: `Keep ${tag()}`, allowedActions: ['soql_query'], objectPermissions: [] });
+    const other = store.upsertGroup({ name: `Other ${tag()}`, allowedActions: ['soql_query'], objectPermissions: [] });
     store.setProfileGroups(profileId, [group.id]);
 
-    const res = await adminFetch(server.baseUrl, session, `/api/admin/profile-groups/${profileId}`, {
+    for (const body of [
+      { add: [other.id, 'grp_deleted_in_another_tab'], remove: [group.id] },
+      { groupIds: [other.id, 'grp_deleted_in_another_tab'], expectedGroupIds: [group.id] },
+    ]) {
+      const res = await adminFetch(server.baseUrl, session, `/api/admin/profile-groups/${profileId}`, {
+        method: 'PUT',
+        body,
+      });
+      assert.equal(res.status, 400, JSON.stringify(body));
+      assert.match(res.body.error, /grp_deleted_in_another_tab/);
+      const mapping = store.getProfileGroupMappings().find((m) => m.profileId === profileId);
+      assert.deepEqual(mapping?.groupIds, [group.id]);
+    }
+  });
+
+  test('a stale tab cannot re-grant a group another tab removed', async () => {
+    const profileId = `00e${crypto.randomBytes(6).toString('hex')}`.slice(0, 15);
+    store.upsertProfile(profileId, `Profile ${tag()}`);
+    const revoked = store.upsertGroup({ name: `Revoked ${tag()}`, allowedActions: ['soql_query'], objectPermissions: [] });
+    const kept = store.upsertGroup({ name: `Kept ${tag()}`, allowedActions: ['soql_query'], objectPermissions: [] });
+    const toggled = store.upsertGroup({ name: `Toggled ${tag()}`, allowedActions: ['soql_query'], objectPermissions: [] });
+    store.setProfileGroups(profileId, [revoked.id, kept.id]);
+    const groupsOf = () =>
+      [...(store.getProfileGroupMappings().find((m) => m.profileId === profileId)?.groupIds || [])].sort();
+    const url = `/api/admin/profile-groups/${profileId}`;
+    // Both tabs loaded the matrix while the Profile had [revoked, kept].
+    const staleTab = await loginAsAdmin(server.baseUrl);
+    const staleView = [revoked.id, kept.id];
+
+    const removal = await adminFetch(server.baseUrl, session, url, { method: 'PUT', body: { remove: [revoked.id] } });
+    assert.equal(removal.status, 200);
+    assert.deepEqual(groupsOf(), [kept.id]);
+
+    // The stale tab toggles a different group on. Only that membership is sent.
+    const toggle = await adminFetch(server.baseUrl, staleTab, url, { method: 'PUT', body: { add: [toggled.id] } });
+    assert.equal(toggle.status, 200);
+    assert.deepEqual(groupsOf(), [kept.id, toggled.id].sort(), 'the removed group must stay removed');
+
+    // A full replacement built from the stale view is refused instead of re-granting the group.
+    const replacement = await adminFetch(server.baseUrl, staleTab, url, {
       method: 'PUT',
-      body: { groupIds: [group.id, 'grp_deleted_in_another_tab'] },
+      body: { groupIds: [...staleView, toggled.id], expectedGroupIds: staleView },
     });
-    assert.equal(res.status, 400);
-    assert.match(res.body.error, /grp_deleted_in_another_tab/);
-    const mapping = store.getProfileGroupMappings().find((m) => m.profileId === profileId);
-    assert.deepEqual(mapping?.groupIds, [group.id]);
+    assert.equal(replacement.status, 409);
+    assert.deepEqual([...replacement.body.mapping.groupIds].sort(), [kept.id, toggled.id].sort());
+    assert.deepEqual(groupsOf(), [kept.id, toggled.id].sort());
   });
 });
 
@@ -278,7 +317,8 @@ describe('Audit-log redaction', () => {
     assert.deepEqual(stripped.fieldNames, ['Id', 'Name']);
     assert.equal(stripped.id, '001000000000001AAA');
     assert.equal(stripped.objectName, 'Account');
-    assert.equal(stripped.toolName, '<REDACTED:string>');
+    // Stored as the tool_name column stores a name outside the catalog.
+    assert.equal(stripped.toolName, '<invalid:len=20>');
   });
 });
 

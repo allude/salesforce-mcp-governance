@@ -7,7 +7,8 @@ const nextConfig: NextConfig = {
     return [
       {
         // Portal pages only; proxied backend responses keep the backend's own headers.
-        source: '/((?!mcp|api/admin|auth/okta|\\.well-known|docs|healthz).*)',
+        // Whole segments only, so a portal page such as /mcp-traffic still gets them.
+        source: '/((?!(?:mcp|api/admin|auth/okta|\\.well-known|docs|healthz)(?:/|$)).*)',
         headers: [
           { key: 'X-Frame-Options', value: 'DENY' },
           {

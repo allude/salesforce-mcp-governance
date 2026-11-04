@@ -75,3 +75,39 @@ export function assertSafeSoqlWhereClause(whereClause: string, allowedFields: st
     throw new Error('whereClause has unbalanced parentheses.');
   }
 }
+
+/**
+ * The shape of a SOQL query for the audit log: keywords, identifiers, operators and punctuation are
+ * kept, and every literal becomes a typed placeholder. Text this tokenizer cannot read is replaced
+ * whole, so no part of it is stored.
+ */
+export function soqlSkeleton(soql: string): string {
+  const parts: string[] = [];
+  let position = 0;
+
+  while (position < soql.length) {
+    TOKEN_PATTERN.lastIndex = position;
+    const match = TOKEN_PATTERN.exec(soql);
+    if (!match || !match.groups) return '<unparseable soql>';
+    position = TOKEN_PATTERN.lastIndex;
+    parts.push(skeletonToken(match.groups, match[0]));
+  }
+
+  return parts.join('').trim();
+}
+
+function skeletonToken(groups: Record<string, string | undefined>, text: string): string {
+  const { ws, string, datetime, number, word } = groups;
+  if (ws) return ' ';
+  if (string) return '<string>';
+  if (datetime) return datetime.includes('T') ? '<datetime>' : '<date>';
+  if (number) return '<number>';
+  if (word) {
+    const upper = word.toUpperCase();
+    if (upper === 'TRUE' || upper === 'FALSE') return '<boolean>';
+    if (upper === 'NULL') return '<null>';
+    // The N of a date literal such as LAST_N_DAYS:30 is a value too.
+    return word.replace(/:\d+$/, ':<number>');
+  }
+  return text;
+}

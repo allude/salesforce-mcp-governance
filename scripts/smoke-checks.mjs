@@ -167,7 +167,7 @@ try {
     const mapping = await call(portal, '/api/admin/profile-groups/00e000000000001AAA', {
       method: 'PUT',
       headers: auth(),
-      body: { groupIds: [group.json.group.id] },
+      body: { add: [group.json.group.id] },
     });
     assert.equal(mapping.status, 200, mapping.text);
   });

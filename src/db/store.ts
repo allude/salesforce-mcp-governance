@@ -19,6 +19,7 @@ import {
   ProfileSyncDiffPreview,
   ObjectSyncDiffPreview,
   PortalUserSummary,
+  AVAILABLE_MCP_ACTIONS,
 } from '../types/governance.js';
 import {
   PulledOrgObjectMetadata,
@@ -27,6 +28,7 @@ import {
 } from '../salesforce/jwtConnection.js';
 import { salesforceIdKey, salesforceIdsMatch } from '../salesforce/ids.js';
 import { isSimulatedOrgHost, isUninitialisedMcpTokenHost } from '../salesforce/simulatedOrg.js';
+import { soqlSkeleton } from '../mcp/soqlGuard.js';
 
 const dbDir = path.dirname(config.dbPath);
 if (!fs.existsSync(dbDir)) {
@@ -615,21 +617,23 @@ function readLogPage<T>(
  * so Copilot MCP logs never store raw customer PII or record values.
  */
 export function stripSensitivePayloadData(input: unknown): unknown {
+  return stripPayloadLevel(input, true);
+}
+
+// Safe keys count only at the payload's top level. Below it, e.g. in the field-to-value map of
+// create_record and update_record, a key such as `status` or `limit` is a record field and its
+// value is customer data.
+function stripPayloadLevel(input: unknown, topLevel: boolean): unknown {
   if (input === null || input === undefined) return input;
   if (Array.isArray(input)) {
     return {
       _type: 'Array',
       count: input.length,
-      sampleStructure: input.length > 0 ? stripSensitivePayloadData(input[0]) : null,
+      sampleStructure: input.length > 0 ? stripPayloadLevel(input[0], false) : null,
     };
   }
   if (typeof input === 'object') {
     const safeKeys = new Set([
-      'objectName',
-      'object',
-      'sobject',
-      'tool',
-      'toolName',
       'fields',
       'fieldNames',
       'limit',
@@ -639,23 +643,28 @@ export function stripSensitivePayloadData(input: unknown): unknown {
       'id',
       'Id',
     ]);
-    // Structural values (object/field API names, record ids, tool names) are kept; anything that
+    // Structural values (field API names, record ids, limits) are kept; anything that
     // does not look like one (e.g. a record's values sent where field names belong) is redacted.
     const isStructuralToken = (item: unknown) =>
       typeof item === 'number' || (typeof item === 'string' && /^(\*|[A-Za-z0-9_.:-]{1,120})$/.test(item));
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(input as Record<string, unknown>)) {
+      const safe = topLevel && safeKeys.has(k);
+      const storedName = topLevel ? STORED_NAME_KEYS.get(k) : undefined;
       if (k === 'records' && Array.isArray(v)) {
         out.records = `[REDACTED ${v.length} RECORDS]`;
-      } else if (k === 'soql' && typeof v === 'string') {
-        // Redact quoted string literals in SOQL WHERE clauses (`'...'` -> `'[REDACTED]'`)
-        out.soql = v.replace(/'(?:[^'\\]|\\.)*'?/g, "'[REDACTED]'");
-      } else if (safeKeys.has(k) && (typeof v === 'number' || typeof v === 'boolean' || isStructuralToken(v))) {
+      } else if (topLevel && k === 'soql' && typeof v === 'string') {
+        // Every literal (string, number, date, ...) becomes a typed placeholder.
+        out.soql = soqlSkeleton(v);
+      } else if (storedName && typeof v === 'string') {
+        // The check the tool_name and target_object columns use, so the payload keeps no text they refuse.
+        out[k] = storedName(v);
+      } else if (safe && (typeof v === 'number' || typeof v === 'boolean' || isStructuralToken(v))) {
         out[k] = v;
-      } else if (Array.isArray(v) && safeKeys.has(k) && v.every(isStructuralToken)) {
+      } else if (Array.isArray(v) && safe && v.every(isStructuralToken)) {
         out[k] = v;
       } else if (typeof v === 'object' && v !== null) {
-        out[k] = stripSensitivePayloadData(v);
+        out[k] = stripPayloadLevel(v, false);
       } else {
         out[k] = `<REDACTED:${typeof v}>`;
       }
@@ -664,6 +673,35 @@ export function stripSensitivePayloadData(input: unknown): unknown {
   }
   return `<REDACTED:${typeof input}>`;
 }
+
+const LOGGED_TOOL_NAMES = new Set<string>([
+  ...AVAILABLE_MCP_ACTIONS.map((action) => action.id),
+  // The row /mcp writes for a rejected token (src/mcp/streamableHttp.ts).
+  'mcp_authenticate',
+]);
+
+// tool_name and target_object arrive from the caller. Text that is not a known tool or an API name
+// is stored by its length only, like any other redacted value.
+function storedToolName(toolName: string): string {
+  return LOGGED_TOOL_NAMES.has(toolName) ? toolName : `<invalid:len=${toolName.length}>`;
+}
+
+/** '*' (or '') is a call without an object. */
+function storedTargetObject(targetObject: string): string {
+  if (!targetObject || targetObject === '*' || SALESFORCE_API_NAME_PATTERN.test(targetObject)) {
+    return targetObject || '';
+  }
+  return `<invalid:len=${targetObject.length}>`;
+}
+
+// Top-level payload keys that name the tool or the object. A value of any other type under them is redacted.
+const STORED_NAME_KEYS = new Map<string, (value: string) => string>([
+  ['objectName', storedTargetObject],
+  ['object', storedTargetObject],
+  ['sobject', storedTargetObject],
+  ['tool', storedToolName],
+  ['toolName', storedToolName],
+]);
 
 export { parseSfdxFilesToObjects } from './importers.js';
 
@@ -729,6 +767,47 @@ function planProfileForms(forms: SalesforceProfile[], groupIdsOf: (profileId: st
     forms.map((f) => [...groupIdsOf(f.id)].sort().join('\n')).filter((set) => set !== '')
   );
   return { conflict: distinctSets.size > 1 && granted.length > 0, union, granted };
+}
+
+/** Single memberships to add and remove. Every membership not named stays as it is. */
+export interface MembershipDelta {
+  add: string[];
+  remove: string[];
+}
+
+/** A membership change naming a Profile or group that does not exist, or adding and removing one id. */
+export class MembershipChangeError extends Error {}
+
+/** The delta's ids without repeats; an id both added and removed has no meaning, so it is refused. */
+function distinctMembershipDelta(delta: MembershipDelta, kind: string): MembershipDelta {
+  const add = Array.from(new Set(delta.add));
+  const remove = Array.from(new Set(delta.remove));
+  const both = add.filter((id) => remove.includes(id));
+  if (both.length > 0) {
+    throw new MembershipChangeError(`${kind} id(s) both added and removed: ${both.join(', ')}`);
+  }
+  return { add, remove };
+}
+
+function unknownIdsIn(table: 'sf_profiles' | 'access_groups', ids: string[]): string[] {
+  const known = db.prepare(`SELECT 1 FROM ${table} WHERE id = ?`);
+  return ids.filter((id) => !known.get(id));
+}
+
+/**
+ * Adds and removes [profileId, groupId] memberships inside the caller's transaction and returns the
+ * ones that really changed. Each pair is one INSERT OR IGNORE or one single-row DELETE, so a
+ * membership no pair names is never touched.
+ */
+function writeMemberships(add: Array<[string, string]>, remove: Array<[string, string]>) {
+  const insert = db.prepare(
+    'INSERT OR IGNORE INTO profile_group_memberships (profile_id, group_id) VALUES (?, ?)'
+  );
+  const del = db.prepare('DELETE FROM profile_group_memberships WHERE profile_id = ? AND group_id = ?');
+  return {
+    added: add.filter(([profileId, groupId]) => insert.run(profileId, groupId).changes > 0),
+    removed: remove.filter(([profileId, groupId]) => del.run(profileId, groupId).changes > 0),
+  };
 }
 
 /** What an Okta settings save may change. An omitted field keeps the stored value. */
@@ -1802,6 +1881,76 @@ export const store = {
     return { profileId, groupIds: uniqueIds };
   },
 
+  getProfileGroupIds(profileId: string): string[] {
+    const rows = db
+      .prepare('SELECT group_id FROM profile_group_memberships WHERE profile_id = ?')
+      .all(profileId) as Array<{ group_id: string }>;
+    return rows.map((r) => r.group_id);
+  },
+
+  /**
+   * Adds and removes single groups of one Profile and keeps its other groups, so a client working
+   * from an old copy of the matrix cannot undo a change it never saw. Unknown ids are rejected before
+   * anything changes; `added` and `removed` hold only the memberships that really changed.
+   */
+  applyMembershipDelta(
+    profileId: string,
+    delta: MembershipDelta
+  ): { mapping: ProfileGroupMapping; added: string[]; removed: string[] } {
+    return runInTransaction(() => {
+      const { add, remove } = distinctMembershipDelta(delta, 'Access Group');
+      const unknownIds = unknownIdsIn('access_groups', [...add, ...remove]);
+      if (unknownIds.length > 0) {
+        throw new MembershipChangeError(`Unknown Access Group id(s): ${unknownIds.join(', ')}`);
+      }
+      if (unknownIdsIn('sf_profiles', [profileId]).length > 0) {
+        throw new MembershipChangeError(`Unknown Profile id: ${profileId}`);
+      }
+
+      const changed = writeMemberships(
+        add.map((groupId) => [profileId, groupId]),
+        remove.map((groupId) => [profileId, groupId])
+      );
+      return {
+        mapping: { profileId, groupIds: this.getProfileGroupIds(profileId) },
+        added: changed.added.map(([, groupId]) => groupId),
+        removed: changed.removed.map(([, groupId]) => groupId),
+      };
+    });
+  },
+
+  /** The same for many Profiles of one group: only the memberships of the Profiles named change. */
+  applyGroupMembershipDelta(
+    groupId: string,
+    delta: MembershipDelta
+  ): { membership: { groupId: string; profileIds: string[] }; added: string[]; removed: string[] } {
+    return runInTransaction(() => {
+      const { add, remove } = distinctMembershipDelta(delta, 'Profile');
+      if (unknownIdsIn('access_groups', [groupId]).length > 0) {
+        throw new MembershipChangeError(`Unknown Access Group id: ${groupId}`);
+      }
+      const unknownIds = unknownIdsIn('sf_profiles', [...add, ...remove]);
+      if (unknownIds.length > 0) {
+        throw new MembershipChangeError(`Unknown Profile id(s): ${unknownIds.join(', ')}`);
+      }
+
+      const changed = writeMemberships(
+        add.map((profileId) => [profileId, groupId]),
+        remove.map((profileId) => [profileId, groupId])
+      );
+      const profileIds = (
+        db
+          .prepare('SELECT profile_id FROM profile_group_memberships WHERE group_id = ?')
+          .all(groupId) as Array<{ profile_id: string }>
+      ).map((r) => r.profile_id);
+      return {
+        membership: { groupId, profileIds },
+        added: changed.added.map(([profileId]) => profileId),
+        removed: changed.removed.map(([profileId]) => profileId),
+      };
+    });
+  },
+
   // ============================================================================
   // 5. DUAL AUDIT LOGS (Copilot MCP Logs [Sanitized] & Portal Admin Logs)
   // ============================================================================
@@ -1923,6 +2072,8 @@ export const store = {
       null,
       2
     );
+    const toolName = storedToolName(input.toolName);
+    const targetObject = storedTargetObject(input.targetObject);
 
     db.prepare(`
       INSERT INTO mcp_copilot_logs (
@@ -1937,8 +2088,8 @@ export const store = {
       input.profileId,
       input.profileName,
       JSON.stringify(input.matchedGroups),
-      input.toolName,
-      input.targetObject || '',
+      toolName,
+      targetObject,
       input.status,
       input.latencyMs,
       sanitizedReq,
@@ -1953,8 +2104,8 @@ export const store = {
       profileId: input.profileId,
       profileName: input.profileName,
       matchedGroups: input.matchedGroups,
-      toolName: input.toolName,
-      targetObject: input.targetObject,
+      toolName,
+      targetObject,
       status: input.status,
       latencyMs: input.latencyMs,
       sanitizedRequestPayload: sanitizedReq,

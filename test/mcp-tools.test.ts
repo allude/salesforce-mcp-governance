@@ -984,7 +984,25 @@ describe('MCP tools/call end-to-end through HTTP /mcp with a mocked Salesforce o
         const outcome = await callTool(FULL, tool, { objectName: 'Account' });
 
         expectAccessDenied(outcome, tool, /Unknown MCP tool/);
-        expectAuditRow(outcome, FULL, tool, 'DENIED', 'Account');
+        // The caller's text is not a catalog tool, so the audit row stores only its length.
+        expectAuditRow(outcome, FULL, `<invalid:len=${tool.length}>`, 'DENIED', 'Account');
+        expectNothingSentToSalesforce(outcome);
+      }
+    });
+
+    test('an objectName that is not an API name is DENIED and the audit row stores only its length', async () => {
+      // 'ACCT-99812' looks like a structural token, so only the API-name check keeps it out of the payload.
+      for (const objectName of ['ACCT-99812', "Account WHERE Email = 'jane.doe@acme.example'"]) {
+        const outcome = await callTool(FULL, 'soql_query', { objectName, fields: ['Id'] });
+        const stored = `<invalid:len=${objectName.length}>`;
+
+        expectAccessDenied(outcome, 'soql_query', /not permitted by Groups/);
+        const row = expectAuditRow(outcome, FULL, 'soql_query', 'DENIED', stored);
+        assert.deepEqual(JSON.parse(row.sanitizedRequestPayload), { objectName: stored, fields: ['Id'] });
+        assert.deepEqual(JSON.parse(row.sanitizedResponseSummary), {
+          error: '<REDACTED:string>',
+          reason: '<REDACTED:string>',
+        });
         expectNothingSentToSalesforce(outcome);
       }
     });
@@ -1007,7 +1025,11 @@ describe('MCP tools/call end-to-end through HTTP /mcp with a mocked Salesforce o
 
       assert.deepEqual(
         auditRowsSince(marker).map((r) => [r.sfUsername, r.toolName, r.status]),
-        calls.map(([caller, tool, , status]) => [caller.username, tool, status])
+        calls.map(([caller, tool, , status]) => [
+          caller.username,
+          ALL_TOOLS.includes(tool) ? tool : `<invalid:len=${tool.length}>`,
+          status,
+        ])
       );
     });
   });

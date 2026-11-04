@@ -488,8 +488,8 @@ export default function AdminPortalPage() {
     profileId: string,
     groupId: string
   ) => {
-    // One save per Profile at a time: a second click would send a replacement list computed from
-    // stale state, which could silently undo a revocation.
+    // One save per Profile at a time: a second click before the reload would read the same state and
+    // repeat the first toggle instead of reversing it.
     if (savingProfileIds.current.has(profileId)) return;
     savingProfileIds.current.add(profileId);
     try {
@@ -505,18 +505,16 @@ export default function AdminPortalPage() {
     profileId: string,
     groupId: string
   ) => {
-    const existing =
-      mappings.find((m) => m.profileId === profileId)?.groupIds || [];
-    const has = existing.includes(groupId);
-    const nextGroupIds = has
-      ? existing.filter((x) => x !== groupId)
-      : [...existing, groupId];
+    const has = (
+      mappings.find((m) => m.profileId === profileId)?.groupIds || []
+    ).includes(groupId);
 
+    // Only the toggled membership is sent, so a group changed in another tab stays as it was.
     const data = await apiFetch(
       `/api/admin/profile-groups/${encodeURIComponent(profileId)}`,
       {
         method: 'PUT',
-        body: JSON.stringify({ groupIds: nextGroupIds }),
+        body: JSON.stringify(has ? { remove: [groupId] } : { add: [groupId] }),
       }
     );
     if (data.profileGroupMappings) setMappings(data.profileGroupMappings);
