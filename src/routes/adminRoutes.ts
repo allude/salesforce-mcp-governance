@@ -465,6 +465,8 @@ adminRouter.get('/overview', (_req: Request, res: Response) => {
     objects,
     groups,
     profileGroupMappings,
+    // Read in the same tick as the four lists above, so it is the revision they show.
+    policyRevision: store.getPolicyRevision(),
     copilotLogs,
     portalLogs,
     // The Logs views state these, so rows a cap left out are not read as missing activity.
@@ -982,9 +984,12 @@ adminRouter.put(
       return;
     }
 
-    for (const f of targetObj.fields) {
-      store.toggleObjectField(objectName, f.fieldName, Boolean(enabled));
-    }
+    // One transaction, so every field changes or none does, as one policy revision.
+    runInTransaction(() => {
+      for (const f of targetObj.fields) {
+        store.toggleObjectField(objectName, f.fieldName, Boolean(enabled));
+      }
+    });
 
     const actor = getAdminInfo(req);
     store.recordPortalAdminLog({
@@ -1999,11 +2004,6 @@ adminRouter.post('/workspace/seed-sample', (req: Request, res: Response) => {
     { id: '00e5g000001J0yVAAS', name: 'Partner Community User' },
     { id: '00e5g000001K2zWAAS', name: 'Integration Bot (Copilot)' },
   ];
-  for (const p of baseProfiles) {
-    if (!store.getProfileById(p.id)) {
-      store.upsertProfile(p.id, p.name);
-    }
-  }
 
   // Upsert the 5 reference Enterprise Access Groups
   const sampleGroups = [
@@ -2227,44 +2227,53 @@ adminRouter.post('/workspace/seed-sample', (req: Request, res: Response) => {
     },
   ];
 
-  for (const g of sampleGroups) {
-    // A grant for an Object the catalog does not have could not be saved through POST /groups either.
-    const objectPermissions = g.objectPermissions.flatMap((p) => {
-      const found = catalogObject(p.objectName);
-      return found ? [{ ...p, objectName: found.objectName }] : [];
-    });
-    const sample = { ...g, objectPermissions };
-    if (store.getGroups().some((existing) => existing.id === g.id)) store.upsertGroup(sample);
-    else store.createGroup(sample);
-  }
-
-  // Assign profiles to groups
-  const allProfiles = store.getProfiles();
-  const findProf = (id: string, nameFragment: string) =>
-    allProfiles.find((p) => p.id === id) ||
-    allProfiles.find((p) =>
-      p.name.toLowerCase().includes(nameFragment.toLowerCase())
-    );
-
-  const mappingsToApply: Array<{ id?: string; groups: string[] }> = [
-    { id: findProf('00e5g000001A9xLAAS', 'System Administrator')?.id, groups: ['grp-admin'] },
-    { id: findProf('00e5g000001B2k9AAC', 'Enterprise Sales AE')?.id, groups: ['grp-sales-ro', 'grp-sales-rw'] },
-    { id: findProf('00e5g000001B2kAAAS', 'Sales Development')?.id, groups: ['grp-sales-ro'] },
-    { id: findProf('00e5g000001C4mQAAQ', 'Sales Operations')?.id, groups: ['grp-sales-ro', 'grp-revops'] },
-    { id: findProf('00e5g000001D8pRAAU', 'Customer Support Tier 1')?.id, groups: ['grp-svc-cases'] },
-    { id: findProf('00e5g000001D8pSAAU', 'Customer Support Escalations')?.id, groups: ['grp-svc-cases', 'grp-sales-ro'] },
-    { id: findProf('00e5g000001E1vWAAS', 'Solutions Engineer')?.id, groups: ['grp-sales-ro'] },
-    { id: findProf('00e5g000001F7nZAAS', 'Marketing')?.id, groups: ['grp-sales-ro'] },
-    { id: findProf('00e5g000001G3qTAAS', 'Finance')?.id, groups: ['grp-revops'] },
-    { id: findProf('00e5g000001H9wUAAS', 'Read-Only')?.id, groups: ['grp-sales-ro'] },
-    { id: findProf('00e5g000001K2zWAAS', 'Integration Bot')?.id, groups: ['grp-sales-rw', 'grp-svc-cases'] },
-  ];
-
-  for (const m of mappingsToApply) {
-    if (m.id) {
-      store.setProfileGroups(m.id, m.groups);
+  // One transaction, so loading the matrix is all or nothing, and one policy revision.
+  runInTransaction(() => {
+    for (const p of baseProfiles) {
+      if (!store.getProfileById(p.id)) {
+        store.upsertProfile(p.id, p.name);
+      }
     }
-  }
+
+    for (const g of sampleGroups) {
+      // A grant for an Object the catalog does not have could not be saved through POST /groups either.
+      const objectPermissions = g.objectPermissions.flatMap((p) => {
+        const found = catalogObject(p.objectName);
+        return found ? [{ ...p, objectName: found.objectName }] : [];
+      });
+      const sample = { ...g, objectPermissions };
+      if (store.getGroups().some((existing) => existing.id === g.id)) store.upsertGroup(sample);
+      else store.createGroup(sample);
+    }
+
+    // Assign profiles to groups
+    const allProfiles = store.getProfiles();
+    const findProf = (id: string, nameFragment: string) =>
+      allProfiles.find((p) => p.id === id) ||
+      allProfiles.find((p) =>
+        p.name.toLowerCase().includes(nameFragment.toLowerCase())
+      );
+
+    const mappingsToApply: Array<{ id?: string; groups: string[] }> = [
+      { id: findProf('00e5g000001A9xLAAS', 'System Administrator')?.id, groups: ['grp-admin'] },
+      { id: findProf('00e5g000001B2k9AAC', 'Enterprise Sales AE')?.id, groups: ['grp-sales-ro', 'grp-sales-rw'] },
+      { id: findProf('00e5g000001B2kAAAS', 'Sales Development')?.id, groups: ['grp-sales-ro'] },
+      { id: findProf('00e5g000001C4mQAAQ', 'Sales Operations')?.id, groups: ['grp-sales-ro', 'grp-revops'] },
+      { id: findProf('00e5g000001D8pRAAU', 'Customer Support Tier 1')?.id, groups: ['grp-svc-cases'] },
+      { id: findProf('00e5g000001D8pSAAU', 'Customer Support Escalations')?.id, groups: ['grp-svc-cases', 'grp-sales-ro'] },
+      { id: findProf('00e5g000001E1vWAAS', 'Solutions Engineer')?.id, groups: ['grp-sales-ro'] },
+      { id: findProf('00e5g000001F7nZAAS', 'Marketing')?.id, groups: ['grp-sales-ro'] },
+      { id: findProf('00e5g000001G3qTAAS', 'Finance')?.id, groups: ['grp-revops'] },
+      { id: findProf('00e5g000001H9wUAAS', 'Read-Only')?.id, groups: ['grp-sales-ro'] },
+      { id: findProf('00e5g000001K2zWAAS', 'Integration Bot')?.id, groups: ['grp-sales-rw', 'grp-svc-cases'] },
+    ];
+
+    for (const m of mappingsToApply) {
+      if (m.id) {
+        store.setProfileGroups(m.id, m.groups);
+      }
+    }
+  });
 
   store.recordPortalAdminLog({
     adminUsername: actor.username,

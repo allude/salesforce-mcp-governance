@@ -39,13 +39,29 @@ if (!fs.existsSync(dbDir)) {
 
 const db = new DatabaseSync(config.dbPath);
 
+// What the policy revision triggers need to know of this connection (see installPolicyRevision):
+// whether runInTransaction has a transaction open and whether it has bumped the revision yet. A TEMP
+// table is never stored, so it starts afresh with every boot, and a rollback restores it as it does
+// everything else.
+db.exec(`
+  CREATE TEMP TABLE policy_txn (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    active INTEGER NOT NULL,
+    bumped INTEGER NOT NULL
+  );
+  INSERT INTO temp.policy_txn (id, active, bumped) VALUES (1, 0, 0);
+`);
+const openPolicyTxn = db.prepare('UPDATE temp.policy_txn SET active = 1, bumped = 0 WHERE id = 1');
+const closePolicyTxn = db.prepare('UPDATE temp.policy_txn SET active = 0, bumped = 0 WHERE id = 1');
+
 let transactionDepth = 0;
 let transactionDoomed = false;
 
 /**
  * Runs `fn` atomically: either every statement in it commits or none does. A nested call joins the
  * open transaction. Its failure dooms the whole transaction, even if an outer step catches the error,
- * so a half-applied inner step can never commit. `fn` must be synchronous.
+ * so a half-applied inner step can never commit. `fn` must be synchronous. However many policy rows
+ * the transaction changes, it raises the policy revision once, and only if it commits.
  */
 export function runInTransaction<T>(fn: () => T): T {
   if (transactionDepth > 0) {
@@ -64,10 +80,12 @@ export function runInTransaction<T>(fn: () => T): T {
   transactionDepth = 1;
   transactionDoomed = false;
   try {
+    openPolicyTxn.run();
     const result = fn();
     if (transactionDoomed) {
       throw new Error('Transaction rolled back: a nested step failed.');
     }
+    closePolicyTxn.run();
     db.exec('COMMIT');
     return result;
   } catch (err) {
@@ -352,6 +370,13 @@ db.exec(`
     sfdx_objects_folder_path TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS policy_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    revision INTEGER NOT NULL DEFAULT 1,
+    uncounted_writes INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+  );
 `);
 
 /** Returns true only when this call added the column. */
@@ -360,6 +385,67 @@ function ensureColumnExists(tableName: string, columnName: string, columnDef: st
   if (cols.some((c) => c.name === columnName)) return false;
   db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnDef}`);
   return true;
+}
+
+/** The tables an /mcp decision is made from. A change to any of their rows is a policy change. */
+const POLICY_TABLES = ['sf_profiles', 'sf_objects', 'sf_object_fields', 'access_groups', 'profile_group_memberships'];
+
+/** Columns of those tables that change without changing the policy: when a row was saved, and how often a group was. */
+const NON_POLICY_COLUMNS = new Set(['updated_at', 'version']);
+
+/**
+ * The policy revision is one counter in policy_state for everything /mcp decides from: Profiles, Objects
+ * and fields, Access Groups and memberships. It starts at 1, on a new database and on one upgraded to
+ * it alike, and never goes down. TEMP triggers on this connection raise it, so whichever store function,
+ * migration or ON DELETE CASCADE changes those rows, nobody has to remember to: an insert, a delete, or
+ * an update that changes a value other than a timestamp or a group's version. Saving the same values
+ * again fires nothing. Inside runInTransaction the first such row raises it, in the same transaction,
+ * and the rest of that transaction does not, so a change and its revision commit or roll back together.
+ * A statement outside a transaction commits by itself, so each row it changes raises it, which is why
+ * store functions that change several rows run in a transaction. Admin sessions, portal users, Okta
+ * and Salesforce connection settings and the logs are in no such table: they never raise it.
+ *
+ * Another connection has no TEMP triggers: an older release run on this database after a rollback, or
+ * a hand edit. So that its changes are not left out, triggers stored in the database add every row they
+ * fire for to uncounted_writes, on any connection, and the TEMP triggers take it away again. They name
+ * no TEMP table (they cannot), so an older release's writes still succeed. Whatever is left when the
+ * store loads was changed without being counted, and raises the revision by one before anything reads it.
+ *
+ * The compared columns are read when the store loads, so this runs after the migrations that add a
+ * column to these tables and before any that changes their rows, which then counts as a change. The
+ * stored triggers are made again each time, so they compare the same columns as the TEMP ones.
+ */
+function installPolicyRevision() {
+  const bump = `BEGIN
+    UPDATE policy_state SET revision = revision + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    WHERE id = 1 AND (SELECT active = 0 OR bumped = 0 FROM temp.policy_txn WHERE id = 1);
+    UPDATE policy_txn SET bumped = 1 WHERE id = 1 AND active = 1;
+    UPDATE policy_state SET uncounted_writes = uncounted_writes - 1 WHERE id = 1;
+  END`;
+  const tally = `BEGIN
+    UPDATE policy_state SET uncounted_writes = uncounted_writes + 1 WHERE id = 1;
+  END`;
+  runInTransaction(() => {
+    const now = new Date().toISOString();
+    db.prepare('INSERT OR IGNORE INTO policy_state (id, revision, updated_at) VALUES (1, 1, ?)').run(now);
+    for (const table of POLICY_TABLES) {
+      const changed = (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
+        .filter((c) => !NON_POLICY_COLUMNS.has(c.name))
+        .map((c) => `OLD."${c.name}" IS NOT NEW."${c.name}"`)
+        .join(' OR ');
+      for (const [event, when] of [['INSERT', ''], ['UPDATE', `WHEN ${changed}`], ['DELETE', '']]) {
+        const suffix = `${table}_${event.toLowerCase()}`;
+        db.exec(`
+          DROP TRIGGER IF EXISTS main.policy_writes_${suffix};
+          CREATE TRIGGER main.policy_writes_${suffix} AFTER ${event} ON ${table} ${when} ${tally};
+          CREATE TEMP TRIGGER policy_revision_${suffix} AFTER ${event} ON ${table} ${when} ${bump};
+        `);
+      }
+    }
+    db.prepare(
+      'UPDATE policy_state SET revision = revision + 1, uncounted_writes = 0, updated_at = ? WHERE id = 1 AND uncounted_writes <> 0'
+    ).run(now);
+  });
 }
 
 /**
@@ -455,7 +541,8 @@ function canonicalGroupGrants(
  * 'account' while Salesforce > Objects holds 'Account'. /mcp matches names case-insensitively and so
  * honoured it, but the group editor showed no such grant. This runs only when the column is added, in
  * one transaction with it, like addSimulatedColumnAndMarkLegacyRows, so it happens once. Every group it
- * changes gets version 2, so a portal tab opened before the upgrade cannot save over the result.
+ * changes gets version 2, so a portal tab opened before the upgrade cannot save over the result. If it
+ * changes any group, the policy revision goes up by one, like any other transaction that changes a group.
  */
 function addGroupVersionAndCanonicalizeGrants() {
   runInTransaction(() => {
@@ -502,6 +589,8 @@ function runSchemaMigrations() {
   ensureColumnExists('sf_profiles', 'missing_in_org', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumnExists('sf_objects', 'missing_in_org', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumnExists('sf_object_fields', 'missing_in_org', 'INTEGER NOT NULL DEFAULT 0');
+  // The policy tables now have every column they compare; the grant canonicalization below is a change.
+  installPolicyRevision();
 
   ensureColumnExists('sf_connection_settings', 'enabled', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumnExists('sf_connection_settings', 'auth_mode', "TEXT NOT NULL DEFAULT 'jwt_bearer'");
@@ -1207,27 +1296,30 @@ export const store = {
     });
   },
 
+  /** Saves every row or none, in one transaction, so an import is one policy revision. */
   importProfilesFromCsvRows(
     rows: Array<{ id: string; name: string }>
   ): { inserted: number; updated: number; idsUpgraded: number; namesKept: number; total: number } {
-    let inserted = 0;
-    let updated = 0;
-    let idsUpgraded = 0;
-    let namesKept = 0;
-    for (const r of rows) {
-      if (!r.id || !r.name) continue;
-      const res = this.upsertProfile(r.id, r.name);
-      if (res.action === 'inserted') inserted++;
-      else updated++;
-      if (res.previousId) idsUpgraded++;
-      if (res.nameKept) namesKept++;
-    }
-    return { inserted, updated, idsUpgraded, namesKept, total: this.getProfiles().length };
+    return runInTransaction(() => {
+      let inserted = 0;
+      let updated = 0;
+      let idsUpgraded = 0;
+      let namesKept = 0;
+      for (const r of rows) {
+        if (!r.id || !r.name) continue;
+        const res = this.upsertProfile(r.id, r.name);
+        if (res.action === 'inserted') inserted++;
+        else updated++;
+        if (res.previousId) idsUpgraded++;
+        if (res.nameKept) namesKept++;
+      }
+      return { inserted, updated, idsUpgraded, namesKept, total: this.getProfiles().length };
+    });
   },
 
   deleteProfile(id: string): boolean {
-    const res = db.prepare('DELETE FROM sf_profiles WHERE id = ?').run(id.trim());
-    return res.changes > 0;
+    // In a transaction, so the Profile and the memberships its delete cascades to are one policy revision.
+    return runInTransaction(() => db.prepare('DELETE FROM sf_profiles WHERE id = ?').run(id.trim()).changes > 0);
   },
 
   previewProfilesSyncFromOrg(
@@ -1520,121 +1612,127 @@ export const store = {
     if (invalidField) {
       throw new Error(`'${invalidField.fieldName}' is not a valid Salesforce field API name.`);
     }
-    const existing = db
-      .prepare('SELECT * FROM sf_objects WHERE object_name = ?')
-      .get(objName) as any;
+    // The object and its fields are one transaction, and so one policy revision.
+    return runInTransaction(() => {
+      const existing = db
+        .prepare('SELECT * FROM sf_objects WHERE object_name = ?')
+        .get(objName) as any;
 
-    const isCustom =
-      input.isCustom !== undefined
-        ? input.isCustom
-        : objName.endsWith('__c') || objName.endsWith('__mdt');
-    const label = input.label?.trim() || existing?.label || objName;
-    const enabled =
-      input.enabled !== undefined
-        ? input.enabled
-        : existing
-        ? Boolean(existing.enabled)
-        : true;
-    const sourcePath = input.sourcePath ?? existing?.source_path ?? 'manual';
-    // Only org sync passes this; a re-import or manual save must not clear what sync flagged.
-    const missingInOrg =
-      input.missingInOrg !== undefined
-        ? input.missingInOrg
-        : existing
-        ? Boolean(existing.missing_in_org)
-        : false;
+      const isCustom =
+        input.isCustom !== undefined
+          ? input.isCustom
+          : objName.endsWith('__c') || objName.endsWith('__mdt');
+      const label = input.label?.trim() || existing?.label || objName;
+      const enabled =
+        input.enabled !== undefined
+          ? input.enabled
+          : existing
+          ? Boolean(existing.enabled)
+          : true;
+      const sourcePath = input.sourcePath ?? existing?.source_path ?? 'manual';
+      // Only org sync passes this; a re-import or manual save must not clear what sync flagged.
+      const missingInOrg =
+        input.missingInOrg !== undefined
+          ? input.missingInOrg
+          : existing
+          ? Boolean(existing.missing_in_org)
+          : false;
 
-    db.prepare(`
-      INSERT INTO sf_objects (object_name, label, is_custom, enabled, source_path, missing_in_org, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(object_name) DO UPDATE SET
-        label = excluded.label,
-        is_custom = excluded.is_custom,
-        enabled = excluded.enabled,
-        source_path = excluded.source_path,
-        missing_in_org = excluded.missing_in_org,
-        updated_at = excluded.updated_at
-    `).run(objName, label, isCustom ? 1 : 0, enabled ? 1 : 0, sourcePath, missingInOrg ? 1 : 0, now);
+      db.prepare(`
+        INSERT INTO sf_objects (object_name, label, is_custom, enabled, source_path, missing_in_org, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(object_name) DO UPDATE SET
+          label = excluded.label,
+          is_custom = excluded.is_custom,
+          enabled = excluded.enabled,
+          source_path = excluded.source_path,
+          missing_in_org = excluded.missing_in_org,
+          updated_at = excluded.updated_at
+      `).run(objName, label, isCustom ? 1 : 0, enabled ? 1 : 0, sourcePath, missingInOrg ? 1 : 0, now);
 
-    const fieldsToUpsert = input.fields || [
-      { fieldName: 'Id', label: 'Record ID', fieldType: 'Id', isCustom: false, required: true },
-      { fieldName: 'Name', label: 'Name', fieldType: 'Text', isCustom: false, required: false },
-    ];
+      const fieldsToUpsert = input.fields || [
+        { fieldName: 'Id', label: 'Record ID', fieldType: 'Id', isCustom: false, required: true },
+        { fieldName: 'Name', label: 'Name', fieldType: 'Text', isCustom: false, required: false },
+      ];
 
-    // An explicit `enabled` or `missingInOrg` is applied; when omitted (e.g. an SFDX re-import) an
-    // existing field keeps the admin's manual toggle and what org sync flagged.
-    const fieldUpsertSql = (applyEnabled: boolean, applyMissingInOrg: boolean) => `
-      INSERT INTO sf_object_fields (object_name, field_name, label, field_type, is_custom, required, enabled, missing_in_org)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(object_name, field_name) DO UPDATE SET
-        label = excluded.label,
-        field_type = excluded.field_type,
-        is_custom = excluded.is_custom,
-        required = excluded.required${applyMissingInOrg ? ',\n        missing_in_org = excluded.missing_in_org' : ''}${applyEnabled ? ',\n        enabled = excluded.enabled' : ''}
-    `;
-    const fieldUpsertStatements = new Map<string, ReturnType<typeof db.prepare>>();
-    const fieldUpsertStatement = (applyEnabled: boolean, applyMissingInOrg: boolean) => {
-      const key = `${applyEnabled}:${applyMissingInOrg}`;
-      let statement = fieldUpsertStatements.get(key);
-      if (!statement) {
-        statement = db.prepare(fieldUpsertSql(applyEnabled, applyMissingInOrg));
-        fieldUpsertStatements.set(key, statement);
+      // An explicit `enabled` or `missingInOrg` is applied; when omitted (e.g. an SFDX re-import) an
+      // existing field keeps the admin's manual toggle and what org sync flagged.
+      const fieldUpsertSql = (applyEnabled: boolean, applyMissingInOrg: boolean) => `
+        INSERT INTO sf_object_fields (object_name, field_name, label, field_type, is_custom, required, enabled, missing_in_org)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(object_name, field_name) DO UPDATE SET
+          label = excluded.label,
+          field_type = excluded.field_type,
+          is_custom = excluded.is_custom,
+          required = excluded.required${applyMissingInOrg ? ',\n        missing_in_org = excluded.missing_in_org' : ''}${applyEnabled ? ',\n        enabled = excluded.enabled' : ''}
+      `;
+      const fieldUpsertStatements = new Map<string, ReturnType<typeof db.prepare>>();
+      const fieldUpsertStatement = (applyEnabled: boolean, applyMissingInOrg: boolean) => {
+        const key = `${applyEnabled}:${applyMissingInOrg}`;
+        let statement = fieldUpsertStatements.get(key);
+        if (!statement) {
+          statement = db.prepare(fieldUpsertSql(applyEnabled, applyMissingInOrg));
+          fieldUpsertStatements.set(key, statement);
+        }
+        return statement;
+      };
+
+      const existingFieldNames = (
+        db.prepare('SELECT field_name FROM sf_object_fields WHERE object_name = ? ORDER BY field_name').all(objName) as Array<{
+          field_name: string;
+        }>
+      ).map((r) => r.field_name);
+      const exactFieldNames = new Set(existingFieldNames);
+      const fieldNameByLower = new Map<string, string>();
+      for (const name of existingFieldNames) {
+        if (!fieldNameByLower.has(name.toLowerCase())) fieldNameByLower.set(name.toLowerCase(), name);
       }
-      return statement;
-    };
 
-    const existingFieldNames = (
-      db.prepare('SELECT field_name FROM sf_object_fields WHERE object_name = ? ORDER BY field_name').all(objName) as Array<{
-        field_name: string;
-      }>
-    ).map((r) => r.field_name);
-    const exactFieldNames = new Set(existingFieldNames);
-    const fieldNameByLower = new Map<string, string>();
-    for (const name of existingFieldNames) {
-      if (!fieldNameByLower.has(name.toLowerCase())) fieldNameByLower.set(name.toLowerCase(), name);
-    }
+      for (const f of fieldsToUpsert) {
+        if (!f.fieldName) continue;
+        const requestedField = f.fieldName.trim();
+        const fieldName = exactFieldNames.has(requestedField)
+          ? requestedField
+          : fieldNameByLower.get(requestedField.toLowerCase()) ?? requestedField;
+        exactFieldNames.add(fieldName);
+        if (!fieldNameByLower.has(fieldName.toLowerCase())) fieldNameByLower.set(fieldName.toLowerCase(), fieldName);
+        const stmt = fieldUpsertStatement(f.enabled !== undefined, f.missingInOrg !== undefined);
+        stmt.run(
+          objName,
+          fieldName,
+          (f.label || f.fieldName).trim(),
+          f.fieldType || 'Text',
+          (f.isCustom ?? f.fieldName.endsWith('__c')) ? 1 : 0,
+          f.required ? 1 : 0,
+          f.enabled !== undefined ? (f.enabled ? 1 : 0) : 1,
+          f.missingInOrg ? 1 : 0
+        );
+      }
 
-    for (const f of fieldsToUpsert) {
-      if (!f.fieldName) continue;
-      const requestedField = f.fieldName.trim();
-      const fieldName = exactFieldNames.has(requestedField)
-        ? requestedField
-        : fieldNameByLower.get(requestedField.toLowerCase()) ?? requestedField;
-      exactFieldNames.add(fieldName);
-      if (!fieldNameByLower.has(fieldName.toLowerCase())) fieldNameByLower.set(fieldName.toLowerCase(), fieldName);
-      const stmt = fieldUpsertStatement(f.enabled !== undefined, f.missingInOrg !== undefined);
-      stmt.run(
-        objName,
-        fieldName,
-        (f.label || f.fieldName).trim(),
-        f.fieldType || 'Text',
-        (f.isCustom ?? f.fieldName.endsWith('__c')) ? 1 : 0,
-        f.required ? 1 : 0,
-        f.enabled !== undefined ? (f.enabled ? 1 : 0) : 1,
-        f.missingInOrg ? 1 : 0
-      );
-    }
-
-    return this.getObjects().find((o) => o.objectName === objName)!;
+      return this.getObjects().find((o) => o.objectName === objName)!;
+    });
   },
 
+  /** Saves every Object or none, in one transaction, so an import is one policy revision. */
   importObjectsFromParsedSfdx(
     parsedObjects: ReturnType<typeof parseSfdxFilesToObjects>
   ): { objectsImported: number; fieldsImported: number } {
-    let objectsImported = 0;
-    let fieldsImported = 0;
-    for (const obj of parsedObjects) {
-      this.upsertObjectWithFields({
-        objectName: this.resolveObjectName(obj.objectName),
-        label: obj.label,
-        isCustom: obj.isCustom,
-        sourcePath: obj.sourcePath,
-        fields: obj.fields,
-      });
-      objectsImported++;
-      fieldsImported += obj.fields.length;
-    }
-    return { objectsImported, fieldsImported };
+    return runInTransaction(() => {
+      let objectsImported = 0;
+      let fieldsImported = 0;
+      for (const obj of parsedObjects) {
+        this.upsertObjectWithFields({
+          objectName: this.resolveObjectName(obj.objectName),
+          label: obj.label,
+          isCustom: obj.isCustom,
+          sourcePath: obj.sourcePath,
+          fields: obj.fields,
+        });
+        objectsImported++;
+        fieldsImported += obj.fields.length;
+      }
+      return { objectsImported, fieldsImported };
+    });
   },
 
   importObjectsFromLocalDiskFolder(folderPath: string): {
@@ -2061,8 +2159,8 @@ export const store = {
   },
 
   deleteGroup(id: string): boolean {
-    const res = db.prepare('DELETE FROM access_groups WHERE id = ?').run(id);
-    return res.changes > 0;
+    // In a transaction, so the group and the memberships its delete cascades to are one policy revision.
+    return runInTransaction(() => db.prepare('DELETE FROM access_groups WHERE id = ?').run(id).changes > 0);
   },
 
   getProfileGroupMappings(): ProfileGroupMapping[] {
@@ -2083,7 +2181,10 @@ export const store = {
     }));
   },
 
-  /** Replaces a Profile's groups atomically; unknown group ids are rejected before anything changes. */
+  /**
+   * Replaces a Profile's groups atomically; unknown group ids are rejected before anything changes.
+   * Only the memberships that differ are written, so saving the same groups again changes nothing.
+   */
   setProfileGroups(profileId: string, groupIds: string[]): ProfileGroupMapping {
     const uniqueIds = Array.from(new Set(groupIds));
     const knownIds = new Set(this.getGroups().map((g) => g.id));
@@ -2093,13 +2194,11 @@ export const store = {
     }
 
     runInTransaction(() => {
-      db.prepare('DELETE FROM profile_group_memberships WHERE profile_id = ?').run(profileId);
-      const ins = db.prepare(
-        'INSERT OR IGNORE INTO profile_group_memberships (profile_id, group_id) VALUES (?, ?)'
+      const stored = this.getProfileGroupIds(profileId);
+      writeMemberships(
+        uniqueIds.filter((gid) => !stored.includes(gid)).map((gid) => [profileId, gid]),
+        stored.filter((gid) => !uniqueIds.includes(gid)).map((gid) => [profileId, gid])
       );
-      for (const gid of uniqueIds) {
-        ins.run(profileId, gid);
-      }
     });
     return { profileId, groupIds: uniqueIds };
   },
@@ -2172,6 +2271,16 @@ export const store = {
         removed: changed.removed.map(([profileId]) => profileId),
       };
     });
+  },
+
+  /**
+   * The policy revision: 1 on a new database, and one more for every committed change to a Profile, an
+   * Object or field, an Access Group or a membership (see installPolicyRevision). Read inside a
+   * transaction, it already counts that transaction's change.
+   */
+  getPolicyRevision(): number {
+    const row = db.prepare('SELECT revision FROM policy_state WHERE id = 1').get() as { revision: number };
+    return Number(row.revision);
   },
 
   // ============================================================================

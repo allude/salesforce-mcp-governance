@@ -293,6 +293,7 @@ describe('store: SQLite initialisation', () => {
     'portal_admin_logs',
     'okta_config',
     'sf_connection_settings',
+    'policy_state',
   ];
 
   test('creates every table of the schema block', () => {
@@ -309,7 +310,7 @@ describe('store: SQLite initialisation', () => {
   });
 
   test('seeds exactly one row (id 1) in each settings singleton table', () => {
-    for (const table of ['okta_config', 'sf_connection_settings']) {
+    for (const table of ['okta_config', 'sf_connection_settings', 'policy_state']) {
       assert.deepEqual(
         rawAll<{ id: number }>(`SELECT id FROM ${table}`).map((r) => Number(r.id)),
         [1],

@@ -317,6 +317,11 @@ export interface PortalOverviewPayload {
   objects: SalesforceObject[];
   groups: AccessGroup[];
   profileGroupMappings: ProfileGroupMapping[];
+  /**
+   * The policy revision these lists are at: 1 on a new database and one more for every committed change
+   * to Profiles, Objects, fields, Access Groups or their mappings. It never goes down.
+   */
+  policyRevision: number;
   /** The server's clock when it answered, for placing log rows from a browser with a different clock. */
   serverTime: string;
   copilotLogs: CopilotMcpLogRecord[];
