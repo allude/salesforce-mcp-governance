@@ -13,8 +13,12 @@ import {
   GroupObjectPermission,
   ProfileGroupMapping,
   CopilotMcpLogRecord,
+  McpActivityFigures,
   McpLogDecision,
   McpLogKind,
+  McpTrafficRange,
+  McpTrafficSeries,
+  McpTrafficSlice,
   PortalAdminLogRecord,
   OktaSsoSettings,
   SalesforceConnectionSettings,
@@ -557,7 +561,9 @@ const quoteIdentifier = (name: string) => `"${name.replace(/"/g, '""')}"`;
  * only when the column is missing, in one transaction: a new table is created from LOG_TABLE_COLUMNS
  * (what a new database gets), every row is copied with its rowid as its seq, so the order and every
  * paging cursor already handed out stay as they were, the old table is dropped, the new one renamed and
- * the old table's indexes made again. Ids and every other value are copied unchanged, a column the old
+ * the old table's indexes and triggers made again. The copy fires no trigger (the new table has none
+ * yet) and DROP TABLE removes the old one's triggers before its rows, so counts kept by triggers, such
+ * as the traffic rollup's, neither double nor drop. Ids and every other value are copied unchanged, a column the old
  * table lacks gets its default, and one only the old table has (none a release wrote) is kept.
  */
 function rebuildLogTableWithSeq(table: LogTable) {
@@ -566,9 +572,14 @@ function rebuildLogTableWithSeq(table: LogTable) {
       db.prepare(`PRAGMA table_info(${quoteIdentifier(name)})`).all() as Array<{ name: string; type: string }>;
     const oldColumns = columnsOf(table);
     if (oldColumns.some((c) => c.name === 'seq')) return;
-    const indexes = (
+    // Dropping the table drops its indexes and triggers (the dashboard's traffic rollup keeps its counts
+    // with triggers on mcp_copilot_logs), so both are made again on the rebuilt table.
+    const indexesAndTriggers = (
       db
-        .prepare(`SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL`)
+        .prepare(
+          `SELECT sql FROM sqlite_master WHERE type IN ('index', 'trigger') AND tbl_name = ? AND sql IS NOT NULL
+           ORDER BY type = 'trigger'`
+        )
         .all(table) as Array<{ sql: string }>
     ).map((row) => row.sql);
 
@@ -583,7 +594,7 @@ function rebuildLogTableWithSeq(table: LogTable) {
     db.exec(`INSERT INTO ${rebuilt} (seq, ${copied}) SELECT rowid, ${copied} FROM ${table} ORDER BY rowid`);
     db.exec(`DROP TABLE ${table}`);
     db.exec(`ALTER TABLE ${rebuilt} RENAME TO ${table}`);
-    for (const sql of indexes) db.exec(sql);
+    for (const sql of indexesAndTriggers) db.exec(sql);
   });
 }
 
@@ -801,6 +812,64 @@ function runSchemaMigrations() {
   rebuildLogTableWithSeq('mcp_copilot_logs');
   rebuildLogTableWithSeq('portal_admin_logs');
   classifyMcpLogKinds();
+
+  // The dashboard's 24-hour figures read recent calls by time. The index is on timestamp alone: one
+  // led by `simulated` would take over the `simulated = 0 ... ORDER BY seq DESC LIMIT n` queries,
+  // which then read and sort every real row instead of stopping after n. After the seq rebuild
+  // above, so the rollup's triggers are made on the table that stays.
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mcp_copilot_logs_timestamp ON mcp_copilot_logs (timestamp)');
+  addTrafficMinuteRollup();
+}
+
+/** Adds (sign 1) or removes (sign -1) one log row's call to its minute, if it is a real call. */
+function trafficMinuteUpsert(row: 'NEW' | 'OLD', sign: 1 | -1): string {
+  return `INSERT INTO mcp_traffic_minutes (minute, ok, warn, err)
+    SELECT CAST(strftime('%s', ${row}.timestamp) AS INTEGER) / 60,
+           ${sign} * (${row}.status = 'ALLOWED'),
+           ${sign} * (${row}.status = 'DENIED'),
+           ${sign} * (${row}.status NOT IN ('ALLOWED', 'DENIED'))
+    WHERE ${row}.simulated = 0 AND strftime('%s', ${row}.timestamp) IS NOT NULL
+    ON CONFLICT(minute) DO UPDATE SET
+      ok = ok + excluded.ok, warn = warn + excluded.warn, err = err + excluded.err;`;
+}
+
+/**
+ * Real calls counted per minute and outcome, for the dashboard chart, which would otherwise read every
+ * row of the last 7 days on each poll. Triggers keep it in the same transaction as each log write,
+ * from any process. It is created and filled from the existing log in one transaction, so no write
+ * can land between the two.
+ */
+function addTrafficMinuteRollup() {
+  runInTransaction(() => {
+    const exists = db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mcp_traffic_minutes'")
+      .get();
+    if (exists) return;
+    db.exec(`
+      CREATE TABLE mcp_traffic_minutes (
+        minute INTEGER PRIMARY KEY, -- Unix time / 60
+        ok INTEGER NOT NULL DEFAULT 0,
+        warn INTEGER NOT NULL DEFAULT 0,
+        err INTEGER NOT NULL DEFAULT 0
+      );
+
+      INSERT INTO mcp_traffic_minutes (minute, ok, warn, err)
+        SELECT CAST(strftime('%s', timestamp) AS INTEGER) / 60 AS minute,
+               SUM(status = 'ALLOWED'), SUM(status = 'DENIED'), SUM(status NOT IN ('ALLOWED', 'DENIED'))
+        FROM mcp_copilot_logs
+        WHERE simulated = 0 AND strftime('%s', timestamp) IS NOT NULL
+        GROUP BY minute;
+
+      CREATE TRIGGER mcp_traffic_minutes_on_insert AFTER INSERT ON mcp_copilot_logs
+      BEGIN ${trafficMinuteUpsert('NEW', 1)} END;
+
+      CREATE TRIGGER mcp_traffic_minutes_on_delete AFTER DELETE ON mcp_copilot_logs
+      BEGIN ${trafficMinuteUpsert('OLD', -1)} END;
+
+      CREATE TRIGGER mcp_traffic_minutes_on_update AFTER UPDATE OF timestamp, status, simulated ON mcp_copilot_logs
+      BEGIN ${trafficMinuteUpsert('OLD', -1)} ${trafficMinuteUpsert('NEW', 1)} END;
+    `);
+  });
 }
 
 /**
@@ -950,6 +1019,16 @@ function parseIdList(json: string): string[] {
 }
 
 const storedNumberOrNull = (value: unknown) => (value === null || value === undefined ? null : Number(value));
+
+/**
+ * Each chart range's window and the slice its counts are sent in. A slice divides the range's bars
+ * (5 minutes, an hour, a day), so a call is placed at most one slice from where its row would be.
+ */
+const TRAFFIC_SERIES_SHAPE: Record<McpTrafficRange, { windowMs: number; sliceMs: number }> = {
+  '1h': { windowMs: 3_600_000, sliceMs: 60_000 },
+  '24h': { windowMs: 86_400_000, sliceMs: 300_000 },
+  '7d': { windowMs: 7 * 86_400_000, sliceMs: 3_600_000 },
+};
 
 function toCopilotMcpLogRecord(r: any): CopilotMcpLogRecord {
   return {
@@ -2622,6 +2701,102 @@ export const store = {
       )
       .get() as { total: number; allowed: number; denied: number; errors: number };
     return { total: row.total, allowed: row.allowed, denied: row.denied, errors: row.errors };
+  },
+
+  /**
+   * Who called which tools, and how fast, over the `windowHours` before `nowMs`. Read from the table
+   * because the /overview list holds only the latest rows of each kind, which skews any figure taken
+   * from it. Verified calls only: rejected tokens are not users and simulator runs are not traffic.
+   */
+  getCopilotMcpActivityFigures(nowMs: number, windowHours = 24): McpActivityFigures {
+    // Timestamps are all written by toISOString(), so they compare as strings.
+    const params = {
+      unverified: UNVERIFIED_CALLER_USERNAME,
+      since: new Date(nowMs - windowHours * 3_600_000).toISOString(),
+    };
+    const verified = `FROM mcp_copilot_logs
+       WHERE simulated = 0 AND timestamp >= :since AND sf_username <> :unverified`;
+
+    const summary = db
+      .prepare(
+        `SELECT COUNT(*) AS calls, COUNT(DISTINCT sf_username) AS users,
+                COUNT(DISTINCT profile_id) AS profiles, COALESCE(AVG(latency_ms), 0) AS avgLatency
+         ${verified}`
+      )
+      .get(params) as { calls: number; users: number; profiles: number; avgLatency: number };
+
+    // The same nearest-rank p95 the dashboard used: the value at floor(n * 0.95) in sorted order.
+    const p95 = summary.calls
+      ? (db
+          .prepare(`SELECT latency_ms AS latency ${verified} ORDER BY latency_ms LIMIT 1 OFFSET :offset`)
+          .get({ ...params, offset: Math.floor(summary.calls * 0.95) }) as { latency: number }).latency
+      : 0;
+
+    const topTools = db
+      .prepare(
+        `SELECT tool_name AS toolName, COUNT(*) AS calls ${verified}
+         GROUP BY tool_name ORDER BY calls DESC, tool_name LIMIT 6`
+      )
+      .all(params) as Array<{ toolName: string; calls: number }>;
+
+    // With a single max() aggregate, SQLite takes profile_name from the row holding the max: the
+    // user's latest call.
+    const topUsers = db
+      .prepare(
+        `SELECT sf_username AS username, profile_name AS profileName, COUNT(*) AS calls, MAX(seq) AS latest
+         ${verified}
+         GROUP BY sf_username ORDER BY calls DESC, sf_username LIMIT 5`
+      )
+      .all(params) as Array<{ username: string; profileName: string; calls: number }>;
+
+    return {
+      windowHours,
+      asOf: new Date(nowMs).toISOString(),
+      verifiedCalls: summary.calls,
+      activeUsers: summary.users,
+      activeProfiles: summary.profiles,
+      p95LatencyMs: p95,
+      avgLatencyMs: Math.round(summary.avgLatency),
+      topTools: topTools.map((t) => ({ toolName: t.toolName, calls: t.calls })),
+      topUsers: topUsers.map((u) => ({ username: u.username, profileName: u.profileName, calls: u.calls })),
+    };
+  },
+
+  /**
+   * The dashboard chart's counts for each range, from the per-minute rollup of the whole log: the
+   * /overview list holds only the newest rows, which cover minutes of a busy day. Every real call
+   * counts, rejected tokens included, as in the totals; simulator runs do not. It starts at the slice
+   * holding (window + one slice) ago, so the slice holding the window's edge is whole, and has no end,
+   * so a row ahead of the clock still shows.
+   */
+  getCopilotMcpTrafficSeries(nowMs: number): McpTrafficSeries {
+    const read = (range: McpTrafficRange) => {
+      const { windowMs, sliceMs } = TRAFFIC_SERIES_SHAPE[range];
+      const sliceMinutes = sliceMs / 60_000;
+      const rows = db
+        .prepare(
+          // node:sqlite binds JS numbers as REAL, which would make this a fractional division.
+          `SELECT minute / CAST(:sliceMinutes AS INTEGER) AS slice,
+                  SUM(ok) AS ok, SUM(warn) AS warn, SUM(err) AS err
+           FROM mcp_traffic_minutes
+           WHERE minute >= CAST(:firstMinute AS INTEGER)
+           GROUP BY slice
+           HAVING SUM(ok) + SUM(warn) + SUM(err) > 0
+           ORDER BY slice`
+        )
+        .all({
+          sliceMinutes,
+          firstMinute: Math.floor((nowMs - windowMs - sliceMs) / sliceMs) * sliceMinutes,
+        }) as Array<{ slice: number; ok: number; warn: number; err: number }>;
+      const slices: McpTrafficSlice[] = rows.map((r) => ({
+        start: r.slice * sliceMs,
+        ok: r.ok,
+        warn: r.warn,
+        err: r.err,
+      }));
+      return { sliceMs, slices };
+    };
+    return { '1h': read('1h'), '24h': read('24h'), '7d': read('7d') };
   },
 
   /**

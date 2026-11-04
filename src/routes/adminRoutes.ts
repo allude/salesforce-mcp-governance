@@ -477,9 +477,10 @@ adminRouter.get('/overview', (_req: Request, res: Response) => {
 
   // Totals cover every real logged call; the log lists themselves are only the latest rows.
   const mcpStats = store.getCopilotMcpLogStats();
+  const now = Date.now();
 
   res.json({
-    serverTime: new Date().toISOString(),
+    serverTime: new Date(now).toISOString(),
     stats: {
       totalMcpRequests: mcpStats.total,
       allowedMcpRequests: mcpStats.allowed,
@@ -498,6 +499,8 @@ adminRouter.get('/overview', (_req: Request, res: Response) => {
     // Read in the same tick as the four lists above, so it is the revision they show.
     policyRevision: store.getPolicyRevision(),
     copilotLogs,
+    mcpActivity: store.getCopilotMcpActivityFigures(now),
+    mcpTraffic: store.getCopilotMcpTrafficSeries(now),
     portalLogs,
     // The Logs views state these, so rows a cap left out are not read as missing activity.
     logCaps: {

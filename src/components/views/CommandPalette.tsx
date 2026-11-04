@@ -98,6 +98,13 @@ export function CommandPalette({
         action: () => onNavigateView('matrix'),
       },
       {
+        id: 'nav-copilot',
+        section: 'Navigation',
+        label: 'Go to Connect clients · Microsoft Copilot',
+        meta: 'Copilot Studio MCP connector setup',
+        action: () => onNavigateView('copilot'),
+      },
+      {
         id: 'nav-traffic',
         section: 'Navigation',
         label: 'Go to Logs · MCP Traffic',

@@ -3,6 +3,8 @@
 import React, { useState, useMemo } from 'react';
 import type {
   CopilotMcpLogEntry,
+  McpActivityFigures,
+  McpTrafficSeries,
   PortalAdminLogEntry,
   SalesforceProfile,
   SalesforceObjectConfig,
@@ -40,6 +42,7 @@ import {
   type OverviewLogCaps,
 } from './logHistory';
 import { trafficBuckets, trafficChartSubtitle, type TrafficRange } from './trafficChart';
+import { SUCCESS_RATE_TARGET, activityWindowLabel, successRate } from './dashboardFigures';
 
 // ============================================================================
 // 1. DASHBOARD VIEW
@@ -58,6 +61,10 @@ interface TrafficDashboardProps {
   /** Added to clockNow to read it on the server's clock, which stamps the log rows. */
   clockOffsetMs: number;
   mcpStats?: McpRequestStats | null;
+  /** Recent verified calls, from the server; null until it has answered. */
+  mcpActivity?: McpActivityFigures | null;
+  /** The chart's counts, from the server; null until it has answered. */
+  mcpTraffic?: McpTrafficSeries | null;
   copilotLogs: CopilotMcpLogEntry[];
   portalLogs: PortalAdminLogEntry[];
   profiles: SalesforceProfile[];
@@ -76,6 +83,8 @@ export function TrafficDashboardView({
   clockOffsetMs,
   copilotLogs,
   mcpStats,
+  mcpActivity,
+  mcpTraffic,
   profiles,
   objects,
   groups,
@@ -95,8 +104,8 @@ export function TrafficDashboardView({
   const realLogs = useMemo(() => realTraffic(copilotLogs), [copilotLogs]);
 
   // KPI metrics
-  // Totals come from the server: copilotLogs holds only the latest rows. The latency and user
-  // figures below are computed from those rows and labelled as such.
+  // Totals and activity figures come from the server: copilotLogs holds only the latest rows of each
+  // kind, so a figure taken from it would weigh rejected tokens and verified calls unevenly.
   const totalCalls = mcpStats?.totalMcpRequests ?? realLogs.length;
   const allowedCalls =
     mcpStats?.allowedMcpRequests ??
@@ -107,80 +116,30 @@ export function TrafficDashboardView({
   const errorCalls =
     mcpStats?.erroredMcpRequests ??
     realLogs.filter((l) => l.status === 'ERROR').length;
-  const successRate = totalCalls
-    ? ((allowedCalls / totalCalls) * 100).toFixed(1)
-    : '100.0';
+  const success = successRate(totalCalls, errorCalls);
 
-  const sortedLatencies = useMemo(
-    () =>
-      realLogs
-        .map((l) => l.latencyMs || 0)
-        .sort((a, b) => a - b),
-    [realLogs]
-  );
-  const p95Latency = sortedLatencies.length
-    ? sortedLatencies[Math.floor(sortedLatencies.length * 0.95)]
-    : 0;
-  const avgLatency = sortedLatencies.length
-    ? Math.round(
-        sortedLatencies.reduce((acc, v) => acc + v, 0) / sortedLatencies.length
-      )
-    : 0;
-
-  const uniqueUsers = useMemo(
-    () => new Set(realLogs.map((l) => l.sfUsername)).size,
-    [realLogs]
-  );
-  const uniqueProfilesInLogs = useMemo(
-    () => new Set(realLogs.map((l) => l.profileId)).size,
-    [realLogs]
-  );
+  const activityWindow = activityWindowLabel(mcpActivity, clockNow + clockOffsetMs);
+  const verifiedCalls = mcpActivity?.verifiedCalls ?? 0;
+  const p95Latency = mcpActivity?.p95LatencyMs ?? 0;
+  const avgLatency = mcpActivity?.avgLatencyMs ?? 0;
+  const uniqueUsers = mcpActivity?.activeUsers ?? 0;
+  const uniqueProfilesInLogs = mcpActivity?.activeProfiles ?? 0;
 
   const buckets = useMemo(
-    () => trafficBuckets(realLogs, range, clockNow + clockOffsetMs),
-    [realLogs, range, clockNow, clockOffsetMs]
+    () => trafficBuckets(mcpTraffic?.[range], range, clockNow + clockOffsetMs),
+    [mcpTraffic, range, clockNow, clockOffsetMs]
   );
+  const callsInRange = buckets.reduce((acc, b) => acc + b.ok + b.warn + b.err, 0);
 
   const maxBucket = Math.max(
     1,
     ...buckets.map((b) => b.ok + b.warn + b.err)
   );
 
-  // Top tools
-  const topTools = useMemo(() => {
-    const counts: Record<string, number> = {};
-    realLogs.forEach((l) => {
-      counts[l.toolName] = (counts[l.toolName] || 0) + 1;
-    });
-    return Object.entries(counts)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 6);
-  }, [realLogs]);
-  const maxToolCount = Math.max(1, ...topTools.map((t) => t[1]));
-
-  // Top users
-  const topUsers = useMemo(() => {
-    const map: Record<
-      string,
-      { user: string; profile: string; n: number; denied: number }
-    > = {};
-    realLogs.forEach((l) => {
-      if (!map[l.sfUsername]) {
-        map[l.sfUsername] = {
-          user: l.sfUsername,
-          profile: l.profileName,
-          n: 0,
-          denied: 0,
-        };
-      }
-      map[l.sfUsername].n += 1;
-      if (l.status === 'DENIED') map[l.sfUsername].denied += 1;
-    });
-    return Object.values(map)
-      .sort((a, b) => b.n - a.n)
-      .slice(0, 5);
-  }, [realLogs]);
-  const maxUserCount = Math.max(1, ...topUsers.map((u) => u.n));
+  const topTools = mcpActivity?.topTools ?? [];
+  const maxToolCount = Math.max(1, ...topTools.map((t) => t.calls));
+  const topUsers = mcpActivity?.topUsers ?? [];
+  const maxUserCount = Math.max(1, ...topUsers.map((u) => u.calls));
 
   // Governance health / Needs attention
   const unassignedProfiles = profiles.filter(
@@ -266,12 +225,13 @@ export function TrafficDashboardView({
         <div className="kpi">
           <div className="k-lbl">
             <span>Success rate</span>
-            <span className="dot ok" />
+            <span className={`dot ${success.meetsTarget ? 'ok' : 'err'}`} />
           </div>
-          <div className="k-val">{successRate}%</div>
+          <div className="k-val">{success.label}%</div>
           <div className="k-sub">
             <span>
-              {errorCalls} transport errors · target ≥ 98.0%
+              {errorCalls} errors · denials are not failures · target ≥{' '}
+              {SUCCESS_RATE_TARGET.toFixed(1)}%
             </span>
           </div>
         </div>
@@ -299,7 +259,10 @@ export function TrafficDashboardView({
           </div>
           <div className="k-val">{p95Latency}</div>
           <div className="k-sub">
-            <span>avg {avgLatency} ms · latest {realLogs.length} calls</span>
+            <span>
+              avg {avgLatency} ms · {verifiedCalls} verified calls,{' '}
+              {activityWindow}
+            </span>
           </div>
         </div>
 
@@ -311,8 +274,7 @@ export function TrafficDashboardView({
           <div className="k-val">{uniqueUsers}</div>
           <div className="k-sub">
             <span>
-              across {uniqueProfilesInLogs} profiles in the latest{' '}
-              {realLogs.length} calls
+              across {uniqueProfilesInLogs} profiles, {activityWindow}
             </span>
           </div>
         </div>
@@ -325,7 +287,7 @@ export function TrafficDashboardView({
             <div>
               <div className="card-t">MCP server traffic</div>
               <div className="card-s">
-                {trafficChartSubtitle(range, realLogs.length)}
+                {trafficChartSubtitle(range, callsInRange)}
               </div>
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -634,16 +596,16 @@ export function TrafficDashboardView({
         <div className="card">
           <div className="card-h">
             <div className="card-t">Most used tools</div>
-            <span className="card-s">by call count</span>
+            <span className="card-s">by verified calls, {activityWindow}</span>
           </div>
           <div
             className="card-b"
             style={{ display: 'flex', flexDirection: 'column', gap: 8 }}
           >
             {topTools.length === 0 ? (
-              <div className="empty">No MCP tool calls recorded yet.</div>
+              <div className="empty">No verified MCP calls in the {activityWindow}.</div>
             ) : (
-              topTools.map(([tool, n]) => (
+              topTools.map(({ toolName: tool, calls: n }) => (
                 <div key={tool}>
                   <div
                     style={{
@@ -686,17 +648,17 @@ export function TrafficDashboardView({
         <div className="card">
           <div className="card-h">
             <div className="card-t">Most active users</div>
-            <span className="card-s">Copilot callers</span>
+            <span className="card-s">Copilot callers, {activityWindow}</span>
           </div>
           <div
             className="card-b"
             style={{ display: 'flex', flexDirection: 'column', gap: 8 }}
           >
             {topUsers.length === 0 ? (
-              <div className="empty">No active callers yet.</div>
+              <div className="empty">No verified callers in the {activityWindow}.</div>
             ) : (
               topUsers.map((u) => (
-                <div key={u.user}>
+                <div key={u.username}>
                   <div
                     style={{
                       display: 'flex',
@@ -706,13 +668,13 @@ export function TrafficDashboardView({
                     }}
                   >
                     <span>
-                      {u.user}{' '}
+                      {u.username}{' '}
                       <span style={{ color: 'var(--t3)', fontSize: 11 }}>
-                        · {u.profile}
+                        · {u.profileName}
                       </span>
                     </span>
                     <span className="mono" style={{ color: 'var(--t2)' }}>
-                      {u.n}
+                      {u.calls}
                     </span>
                   </div>
                   <div
@@ -725,7 +687,7 @@ export function TrafficDashboardView({
                   >
                     <div
                       style={{
-                        width: `${(u.n / maxUserCount) * 100}%`,
+                        width: `${(u.calls / maxUserCount) * 100}%`,
                         height: '100%',
                         background: 'var(--acc)',
                       }}

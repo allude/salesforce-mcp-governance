@@ -7,6 +7,8 @@ import type {
   AccessGroup,
   ProfileGroupMapping,
   CopilotMcpLogRecord,
+  McpActivityFigures,
+  McpTrafficSeries,
   PortalAdminLogRecord,
   OktaSsoSettings,
   SalesforceConnectionSettings,
@@ -32,6 +34,7 @@ import {
   ProfileGroupMatrixView,
 } from '@/components/views/AccessMatrixViews';
 import { SalesforceOrgConnectionView } from '@/components/views/SalesforceOrgConnectionView';
+import { CopilotConnectorView } from '@/components/views/CopilotConnectorView';
 import {
   FlyoutDrawer,
   type FlyoutState,
@@ -56,6 +59,7 @@ type ActiveView =
   | 'sf-connection'
   | 'groups'
   | 'matrix'
+  | 'copilot'
   | 'traffic'
   | 'audit'
   | 'auth-settings';
@@ -82,6 +86,7 @@ const VIEW_META: Record<ActiveView, { crumb: string; title: string }> = {
     crumb: 'Configure the MCP server · Access matrix',
     title: 'Profile ↔ Group',
   },
+  copilot: { crumb: 'Connect clients', title: 'Microsoft Copilot' },
   traffic: { crumb: 'Logs', title: 'MCP traffic log' },
   audit: { crumb: 'Logs', title: 'Portal audit log' },
   'auth-settings': { crumb: 'Logs & Security', title: 'Portal Auth & SSO' },
@@ -163,6 +168,8 @@ export default function AdminPortalPage() {
     useState<SalesforceConnectionSettings | null>(null);
   const [portalUsers, setPortalUsers] = useState<PortalUserSummary[]>([]);
   const [mcpStats, setMcpStats] = useState<McpRequestStats | null>(null);
+  const [recentMcpActivity, setRecentMcpActivity] = useState<McpActivityFigures | null>(null);
+  const [mcpTraffic, setMcpTraffic] = useState<McpTrafficSeries | null>(null);
   const [clockNow, setClockNow] = useState(() => Date.now());
   const [clockOffsetMs, setClockOffsetMs] = useState(0);
   // Starts off so the burst button cannot show in production before the first overview loads.
@@ -283,6 +290,8 @@ export default function AdminPortalPage() {
       setMappings(data.profileGroupMappings || []);
       setCopilotLogs(data.copilotLogs || []);
       setMcpStats(data.stats || null);
+      setRecentMcpActivity(data.mcpActivity || null);
+      setMcpTraffic(data.mcpTraffic || null);
       setDevToolsEnabled(data.devToolsEnabled === true);
       setPortalLogs(data.portalLogs || []);
       if (data.logCaps) setLogCaps(data.logCaps);
@@ -744,6 +753,7 @@ export default function AdminPortalPage() {
     if (navId === 'logs-portal') return 'audit';
     if (navId === 'settings-auth') return 'auth-settings';
     if (navId === 'settings-salesforce') return 'sf-connection';
+    if (navId === 'connect-copilot') return 'copilot';
     return 'dashboard';
   };
 
@@ -1063,6 +1073,27 @@ export default function AdminPortalPage() {
           </div>
 
           <div className="nav-sec">
+            <div className="nav-h">Connect clients</div>
+            <button
+              type="button"
+              className={`nav-it ${view === 'copilot' ? 'on' : ''}`}
+              onClick={() => setView('copilot')}
+            >
+              <span>
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.75"
+                >
+                  <path d="M9 7V3M15 7V3M7 7h10v4a5 5 0 0 1-10 0V7zM12 16v5" />
+                </svg>
+                Microsoft Copilot
+              </span>
+            </button>
+          </div>
+
+          <div className="nav-sec">
             <div className="nav-h">Logs &amp; Security</div>
             <button
               type="button"
@@ -1145,18 +1176,11 @@ export default function AdminPortalPage() {
               </div>
             </div>
           </div>
-          <div style={{ display: 'flex', gap: 6 }}>
+          <div style={{ display: 'flex' }}>
             <button
               type="button"
               className="btn sm"
               style={{ flex: 1, justifyContent: 'center' }}
-              onClick={() => setView('auth-settings')}
-            >
-              SSO Settings
-            </button>
-            <button
-              type="button"
-              className="btn sm"
               onClick={handleLogout}
               title="Sign out"
             >
@@ -1249,6 +1273,8 @@ export default function AdminPortalPage() {
               clockOffsetMs={clockOffsetMs}
               copilotLogs={copilotLogs}
               mcpStats={mcpStats}
+              mcpActivity={recentMcpActivity}
+              mcpTraffic={mcpTraffic}
               portalLogs={portalLogs}
               profiles={profiles}
               objects={objects}
@@ -1326,6 +1352,19 @@ export default function AdminPortalPage() {
               onToggleProfileGroup={reportFailureAndStop(handleToggleProfileGroup)}
               onOpenFlyout={(f) => setFlyout(f)}
               onSeedEnterpriseMatrix={requestSeedEnterpriseMatrix}
+            />
+          )}
+
+          {view === 'copilot' && (
+            <CopilotConnectorView
+              sfSettings={sfSettings}
+              groups={groups}
+              mappings={mappings}
+              objects={objects}
+              lastMcpCallAt={mcpStats?.lastMcpCallAt}
+              serverNow={clockNow + clockOffsetMs}
+              onShowToast={notify}
+              onNavigate={(navId) => setView(mapNavIdToView(navId))}
             />
           )}
 

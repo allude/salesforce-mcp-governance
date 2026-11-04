@@ -342,4 +342,89 @@ describe('upgrading the log tables to an explicit seq', () => {
       assert.throws(() => insertPortalRow(db, 'p-zulu', 'LOGIN_SUCCESS'), /UNIQUE/);
     });
   });
+
+  test("a database that already keeps the dashboard's traffic rollup keeps it counting through the rebuild", () => {
+    // The rollup's counts are kept by triggers on mcp_copilot_logs, which the rebuild drops with the old
+    // table, and the rollup's own migration does nothing once its table exists.
+    const fresh = path.join(testTmpDir, 'fresh-seq-rollup.sqlite');
+    withStore(fresh);
+    const rollupSchema = withDb(fresh, (db) =>
+      plain(
+        db
+          .prepare(
+            `SELECT name, sql FROM sqlite_master
+             WHERE name = 'mcp_traffic_minutes' OR (type = 'trigger' AND tbl_name = 'mcp_copilot_logs')
+             ORDER BY type = 'trigger', name`
+          )
+          .all()
+      )
+    );
+    assert.deepEqual(
+      rollupSchema.map((r) => r.name),
+      ['mcp_traffic_minutes', 'mcp_traffic_minutes_on_delete', 'mcp_traffic_minutes_on_insert', 'mcp_traffic_minutes_on_update']
+    );
+
+    // The release before seq with the rollup made and filled, and calls its triggers counted since.
+    const dbPath = legacyDatabase('legacy-seq-rollup.sqlite');
+    withDb(dbPath, (db) => {
+      for (const { sql } of rollupSchema) db.exec(String(sql));
+      db.exec(`INSERT INTO mcp_traffic_minutes (minute, ok, warn, err) ${RECOUNT}`);
+      insertMcpCall(db, 'm-denied', '2026-10-01T00:05:00.000Z', 'DENIED');
+      insertMcpCall(db, 'm-error', '2026-10-01T00:05:30.000Z', 'ERROR');
+    });
+    const first = minuteOf('2026-10-01T00:00:00.000Z');
+    const before = rollup(dbPath);
+    assert.deepEqual(before, [
+      { minute: first, ok: 5, warn: 0, err: 0 },
+      { minute: first + 5, ok: 0, warn: 1, err: 1 },
+    ]);
+    assert.deepEqual(before, recount(dbPath));
+
+    withStore(dbPath);
+    const triggers = (file: string) =>
+      withDb(file, (db) =>
+        plain(db.prepare(`SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'mcp_copilot_logs' ORDER BY name`).all())
+      );
+    assert.deepEqual(triggers(dbPath), triggers(fresh), 'the triggers are on the rebuilt table');
+    assert.deepEqual(rollup(dbPath), before, 'the copy neither doubled nor dropped a count');
+
+    // Calls after the upgrade are still counted, from this release or an older one.
+    const { timestamp } = withStore<{ timestamp: string }>(
+      dbPath,
+      `store.recordCopilotMcpLog({ sfUsername: 'real.user@acme.com', profileId: '00e000000000001', profileName: 'P',
+        matchedGroups: [], toolName: 'soql_query', targetObject: 'Account', status: 'DENIED', latencyMs: 3,
+        rawRequestPayload: {}, rawResponseSummary: {} })`
+    );
+    withDb(dbPath, (db) => {
+      insertMcpCall(db, 'm-after', '2026-10-01T00:05:59.000Z', 'ALLOWED');
+      db.exec(`UPDATE mcp_copilot_logs SET status = 'ERROR' WHERE id = 'm-zulu'`);
+      db.exec(`DELETE FROM mcp_copilot_logs WHERE id = 'm-error'`);
+    });
+    assert.deepEqual(rollup(dbPath), [
+      { minute: first, ok: 4, warn: 0, err: 1 },
+      { minute: first + 5, ok: 1, warn: 1, err: 0 },
+      { minute: minuteOf(timestamp), ok: 0, warn: 1, err: 0 },
+    ]);
+    assert.deepEqual(rollup(dbPath), recount(dbPath));
+  });
 });
+
+/** A real call at `timestamp` with `status`, written as the release before seq wrote one. */
+function insertMcpCall(db: DatabaseSync, id: string, timestamp: string, status: string) {
+  db.prepare(
+    `INSERT INTO mcp_copilot_logs (id, timestamp, sf_username, profile_id, profile_name, tool_name, target_object, status, latency_ms)
+     VALUES (?, ?, 'real.user@acme.com', '00e000000000001', 'P', 'soql_query', 'Account', ?, 12)`
+  ).run(id, timestamp, status);
+}
+
+const minuteOf = (iso: string) => Math.floor(Date.parse(iso) / 60_000);
+
+/** The rollup's rows, counted again from the log itself. */
+const RECOUNT = `SELECT CAST(strftime('%s', timestamp) AS INTEGER) / 60 AS minute,
+    SUM(status = 'ALLOWED') AS ok, SUM(status = 'DENIED') AS warn, SUM(status NOT IN ('ALLOWED', 'DENIED')) AS err
+  FROM mcp_copilot_logs WHERE simulated = 0 GROUP BY minute ORDER BY minute`;
+
+const recount = (dbPath: string) => withDb(dbPath, (db) => plain(db.prepare(RECOUNT).all()));
+
+const rollup = (dbPath: string) =>
+  withDb(dbPath, (db) => plain(db.prepare('SELECT minute, ok, warn, err FROM mcp_traffic_minutes ORDER BY minute').all()));
