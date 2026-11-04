@@ -1165,18 +1165,11 @@ export default function AdminPortalPage() {
               </div>
             </div>
           </div>
-          <div style={{ display: 'flex', gap: 6 }}>
+          <div style={{ display: 'flex' }}>
             <button
               type="button"
               className="btn sm"
               style={{ flex: 1, justifyContent: 'center' }}
-              onClick={() => setView('auth-settings')}
-            >
-              SSO Settings
-            </button>
-            <button
-              type="button"
-              className="btn sm"
               onClick={handleLogout}
               title="Sign out"
             >
