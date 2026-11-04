@@ -1,6 +1,43 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+/*
+ * Tailwind CSS v4. One system: the portal's own classes (below, in the components layer) plus Tailwind's
+ * utilities, whose colours, fonts and status hues are mapped to the portal's CSS variables by the @theme
+ * block. Tailwind's preflight is left out: the base rules below are the portal's reset. Layers are
+ * declared in order, so a utility (`m-0`, `px-4`) always wins over a component class it is combined with.
+ */
+@layer theme, base, components, utilities;
+@import 'tailwindcss/theme.css' layer(theme);
+@import 'tailwindcss/utilities.css' layer(utilities);
+
+@theme inline {
+  --font-sans: var(--sans);
+  --font-mono: var(--mono);
+  --color-bg: var(--bg);
+  --color-panel: var(--pan);
+  --color-panel-2: var(--pan2);
+  --color-panel-3: var(--pan3);
+  --color-line: var(--bd);
+  --color-line-2: var(--bd2);
+  --color-fg: var(--tx);
+  --color-fg-2: var(--t2);
+  --color-fg-3: var(--t3);
+  --color-accent: var(--acc);
+  --color-primary: var(--ctl-primary);
+  --color-status-allowed: var(--status-allowed);
+  --color-status-allowed-bg: var(--status-allowed-bg);
+  --color-status-allowed-border: var(--status-allowed-border);
+  --color-status-denied: var(--status-denied);
+  --color-status-denied-bg: var(--status-denied-bg);
+  --color-status-denied-border: var(--status-denied-border);
+  --color-status-error: var(--status-error);
+  --color-status-error-bg: var(--status-error-bg);
+  --color-status-error-border: var(--status-error-border);
+  --color-lock: var(--lock);
+  --z-index-drawer: var(--z-drawer);
+  --z-index-modal: var(--z-modal);
+  --z-index-toast: var(--z-toast);
+}
+
+@layer components {
 
 :root,
 [data-theme='dark'] {
@@ -29,6 +66,37 @@
   --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
   --shadow-lg: 0 20px 50px rgba(0, 0, 0, 0.55);
   --top-bg: rgba(15, 17, 22, 0.86);
+  color-scheme: dark;
+
+  /* Status: the only hues for runtime outcomes (statusTone). Never used for controls or tier markers. */
+  --status-allowed: #34d399; /* emerald-400 */
+  --status-allowed-bg: rgba(52, 211, 153, 0.13);
+  --status-allowed-border: rgba(52, 211, 153, 0.38);
+  --status-denied: #fb7185; /* rose-400 */
+  --status-denied-bg: rgba(251, 113, 133, 0.13);
+  --status-denied-border: rgba(251, 113, 133, 0.4);
+  --status-error: #fbbf24; /* amber-400 */
+  --status-error-bg: rgba(251, 191, 36, 0.13);
+  --status-error-border: rgba(251, 191, 36, 0.4);
+
+  /* Controls: indigo primary; slate secondary and ghost. Destructive = slate outline + a confirm. */
+  --ctl-primary: #6366f1; /* indigo-500 */
+  --ctl-primary-h: #818cf8;
+  --ctl-primary-fg: #ffffff;
+  --ctl-primary-d: rgba(99, 102, 241, 0.16);
+  --ctl-focus: #818cf8;
+  --ctl-secondary: #1e2533;
+  --ctl-outline: #475569; /* slate-600 */
+
+  /* Tier C (immutable / sync-sourced) lock, and the neutral outline for SIMULATED / TEST TOKEN. */
+  --lock: #94a3b8; /* slate-400 */
+  --lock-bg: rgba(148, 163, 184, 0.1);
+  --marker-outline: #64748b;
+
+  /* Layering, lowest to highest: drawer, modal, toast. */
+  --z-drawer: 50;
+  --z-modal: 90;
+  --z-toast: 120;
 }
 
 [data-theme='light'] {
@@ -55,6 +123,29 @@
   --pur-d: rgba(124, 58, 237, 0.11);
   --shadow-lg: 0 20px 50px rgba(15, 23, 42, 0.14);
   --top-bg: rgba(244, 246, 249, 0.88);
+  color-scheme: light;
+
+  --status-allowed: #047857; /* emerald-700 */
+  --status-allowed-bg: rgba(16, 185, 129, 0.11);
+  --status-allowed-border: rgba(4, 120, 87, 0.32);
+  --status-denied: #be123c; /* rose-700 */
+  --status-denied-bg: rgba(244, 63, 94, 0.1);
+  --status-denied-border: rgba(190, 18, 60, 0.32);
+  --status-error: #b45309; /* amber-700 */
+  --status-error-bg: rgba(245, 158, 11, 0.12);
+  --status-error-border: rgba(180, 83, 9, 0.32);
+
+  --ctl-primary: #4f46e5; /* indigo-600 */
+  --ctl-primary-h: #4338ca;
+  --ctl-primary-fg: #ffffff;
+  --ctl-primary-d: rgba(79, 70, 229, 0.1);
+  --ctl-focus: #4f46e5;
+  --ctl-secondary: #f1f5f9;
+  --ctl-outline: #94a3b8;
+
+  --lock: #64748b; /* slate-500 */
+  --lock-bg: rgba(100, 116, 139, 0.1);
+  --marker-outline: #94a3b8;
 }
 
 * {
@@ -535,29 +626,37 @@ button.pill:hover {
 }
 
 .btn.pri {
-  background: var(--acc);
-  border-color: var(--acc);
-  color: #041019;
+  background: var(--ctl-primary);
+  border-color: var(--ctl-primary);
+  color: var(--ctl-primary-fg);
   font-weight: 600;
 }
 
-[data-theme='light'] .btn.pri {
-  color: #ffffff;
-}
-
 .btn.pri:hover:not(:disabled) {
-  background: var(--acc-h);
-  border-color: var(--acc-h);
+  background: var(--ctl-primary-h);
+  border-color: var(--ctl-primary-h);
 }
 
+/* Destructive: a slate outline. The confirmation dialog, not a status colour, carries the weight. */
 .btn.dng {
-  color: var(--err);
-  border-color: rgba(248, 113, 113, 0.35);
-  background: var(--err-d);
+  color: var(--tx);
+  border-color: var(--ctl-outline);
+  background: transparent;
 }
 
 .btn.dng:hover:not(:disabled) {
-  border-color: var(--err);
+  border-color: var(--t2);
+  background: var(--pan2);
+}
+
+.btn:focus-visible,
+.nav-it:focus-visible,
+.pill:focus-visible,
+.live-chip:focus-visible,
+.sw:focus-visible,
+.tgl:focus-visible {
+  outline: 2px solid var(--ctl-focus);
+  outline-offset: 1px;
 }
 
 .btn.gh {
@@ -1072,7 +1171,7 @@ table.tbl {
   inset: 0;
   background: rgba(0, 0, 0, 0.52);
   backdrop-filter: blur(2px);
-  z-index: 40;
+  z-index: calc(var(--z-drawer) - 1);
   animation: fadeIn 0.15s ease;
 }
 
@@ -1086,7 +1185,7 @@ table.tbl {
   max-width: 680px;
   background: var(--pan);
   border-left: 1px solid var(--bd2);
-  z-index: 50;
+  z-index: var(--z-drawer);
   display: flex;
   flex-direction: column;
   box-shadow: var(--shadow-lg);
@@ -1337,7 +1436,7 @@ pre.code {
   inset: 0;
   background: rgba(0, 0, 0, 0.65);
   backdrop-filter: blur(4px);
-  z-index: 90;
+  z-index: var(--z-modal);
   display: flex;
   align-items: flex-start;
   justify-content: center;
@@ -1430,7 +1529,7 @@ pre.code {
   position: fixed;
   bottom: 18px;
   right: 22px;
-  z-index: 80;
+  z-index: var(--z-toast);
   display: flex;
   align-items: center;
   gap: 10px;
@@ -1813,4 +1912,129 @@ a.ext svg {
 
 .copilot .tbl td {
   vertical-align: top;
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * Shared tokens in use: status tones (statusTone), numbers, identifiers, tier markers.
+ * ------------------------------------------------------------------------------------------- */
+
+/* Every count, latency, timestamp and status code lines up digit for digit. */
+.num,
+td,
+th,
+.kpi .k-val,
+.k-sub,
+.ct,
+.mono,
+.kbd,
+.live-chip,
+.b-lbl,
+.tag,
+time {
+  font-variant-numeric: tabular-nums;
+}
+
+.st-allowed,
+.st-denied,
+.st-error {
+  border-width: 1px;
+  border-style: solid;
+}
+
+.tag.st-allowed {
+  color: var(--status-allowed);
+  background: var(--status-allowed-bg);
+  border-color: var(--status-allowed-border);
+}
+
+.tag.st-denied {
+  color: var(--status-denied);
+  background: var(--status-denied-bg);
+  border-color: var(--status-denied-border);
+}
+
+.tag.st-error {
+  color: var(--status-error);
+  background: var(--status-error-bg);
+  border-color: var(--status-error-border);
+}
+
+.dot.st-allowed {
+  background: var(--status-allowed);
+  border: none;
+  box-shadow: 0 0 0 3px var(--status-allowed-bg);
+}
+
+/* Shapes differ too, so the tone never rests on colour alone. */
+.dot.st-denied {
+  background: var(--status-denied);
+  border: none;
+  border-radius: 1.5px;
+  transform: rotate(45deg);
+}
+
+.dot.st-error {
+  background: var(--status-error);
+  border: none;
+  border-radius: 1.5px;
+}
+
+.b-seg.st-allowed {
+  background: var(--status-allowed);
+  border: none;
+}
+
+.b-seg.st-denied {
+  background: var(--status-denied);
+  border: none;
+}
+
+.b-seg.st-error {
+  background: var(--status-error);
+  border: none;
+}
+
+.leg i.st-allowed {
+  background: var(--status-allowed);
+}
+
+.leg i.st-denied {
+  background: var(--status-denied);
+}
+
+.leg i.st-error {
+  background: var(--status-error);
+}
+
+.txt-allowed {
+  color: var(--status-allowed);
+}
+
+.txt-denied {
+  color: var(--status-denied);
+}
+
+.txt-error {
+  color: var(--status-error);
+}
+
+/* SIMULATED, TEST TOKEN and similar kind markers: neutral, dashed, never a status hue. */
+.tag.marker {
+  color: var(--t2);
+  background: transparent;
+  border: 1px dashed var(--marker-outline);
+}
+
+/* Tier C: immutable or sync-sourced identifiers carry a slate lock. */
+.lock {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--lock);
+}
+
+.lock svg {
+  width: 11px;
+  height: 11px;
+}
 }
