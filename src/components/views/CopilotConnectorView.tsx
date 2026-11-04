@@ -1,10 +1,10 @@
 'use client';
 
+import type { RouteId } from '@/components/shell/routes';
 import React, { useEffect, useMemo, useState } from 'react';
 import { Check, Copy, ExternalLink } from 'lucide-react';
 import type {
   AccessGroup,
-  NavViewId,
   ProfileGroupMapping,
   SalesforceConnectionSettings,
   SalesforceObject,
@@ -171,7 +171,7 @@ export function CopilotConnectorView({
   /** Now on the server's clock, which stamps the calls. */
   serverNow: number;
   onShowToast: (msg: string, isError?: boolean) => void;
-  onNavigate: (view: NavViewId) => void;
+  onNavigate: (route: RouteId) => void;
 }) {
   // The values come from the metadata MCP clients read, so the page says what Copilot is told.
   const [metadata, setMetadata] = useState<ProtectedResourceMetadata | null>(null);
@@ -632,20 +632,20 @@ ngrok http 3000`}</pre>
               registered and mapped to a group with tools sees no tools at all.
             </p>
             <div className="step-act">
-              <button type="button" className="btn sm" onClick={() => onNavigate('sf-profiles')}>
+              <button type="button" className="btn sm" onClick={() => onNavigate('org-profiles')}>
                 Profiles
               </button>
-              <button type="button" className="btn sm" onClick={() => onNavigate('matrix-groups')}>
+              <button type="button" className="btn sm" onClick={() => onNavigate('access-groups')}>
                 Groups
               </button>
               <button
                 type="button"
                 className="btn sm"
-                onClick={() => onNavigate('matrix-profile-groups')}
+                onClick={() => onNavigate('access-matrix')}
               >
                 Profile ↔ Group
               </button>
-              <button type="button" className="btn sm" onClick={() => onNavigate('sf-objects')}>
+              <button type="button" className="btn sm" onClick={() => onNavigate('org-objects')}>
                 Objects
               </button>
             </div>
@@ -669,7 +669,7 @@ ngrok http 3000`}</pre>
               </li>
             </ol>
             <div className="step-act">
-              <button type="button" className="btn sm" onClick={() => onNavigate('logs-copilot')}>
+              <button type="button" className="btn sm" onClick={() => onNavigate('logs-mcp')}>
                 Open MCP traffic
               </button>
             </div>
@@ -775,7 +775,7 @@ ngrok http 3000`}</pre>
                   <button
                     type="button"
                     className="btn sm"
-                    onClick={() => onNavigate('matrix-profile-groups')}
+                    onClick={() => onNavigate('access-matrix')}
                   >
                     Map Profiles to groups
                   </button>
@@ -793,7 +793,7 @@ ngrok http 3000`}</pre>
                   <button
                     type="button"
                     className="btn sm"
-                    onClick={() => onNavigate('settings-salesforce')}
+                    onClick={() => onNavigate('org-connection')}
                   >
                     Check Org Connection
                   </button>

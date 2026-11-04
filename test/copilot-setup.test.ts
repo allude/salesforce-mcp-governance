@@ -126,7 +126,7 @@ describe('salesforceHostReadiness', () => {
     for (const host of ['https://login.salesforce.com', 'https://test.salesforce.com']) {
       const check = salesforceHostReadiness(host);
       assert.equal(check.tone, 'warn', host);
-      assert.equal(check.fix?.view, 'settings-salesforce');
+      assert.equal(check.fix?.view, 'org-connection');
     }
   });
 
@@ -146,7 +146,7 @@ describe('profileAccessReadiness', () => {
   test('a Profile mapped only to a group without tools does not count', () => {
     const check = profileAccessReadiness(groups, [{ profileId: 'p1', groupIds: ['g-empty'] }]);
     assert.equal(check.tone, 'err');
-    assert.equal(check.fix?.view, 'matrix-profile-groups');
+    assert.equal(check.fix?.view, 'access-matrix');
   });
 
   test('counts the Profiles that reach a group with tools', () => {

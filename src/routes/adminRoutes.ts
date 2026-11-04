@@ -40,7 +40,7 @@ import { parseGroupObjectPermissions, parseGroupSaveRequest } from './groupPaylo
 import { restoresHeldGrant } from '../rbac/groupGrants.js';
 import { isSalesforceId, salesforceIdsMatch } from '../salesforce/ids.js';
 import { assertNotSimulatedOrgHost } from '../salesforce/simulatedOrg.js';
-import type { AccessGroup, SalesforceConnectionSettings } from '../types/governance.js';
+import type { AccessGroup, SalesforceConnectionSettings, ShellSummary } from '../types/governance.js';
 import { groupAvailabilityIssues, type GroupAvailabilityIssue } from '../groups/groupGrants.js';
 import {
   decisionLogStatus,
@@ -273,6 +273,14 @@ function correlationIdFor(res: Response): string {
   return res.locals.correlationId;
 }
 
+/**
+ * How a session signed in, as every Admin API response and audit row names it. /login and /session
+ * answer with this too, so the portal can tell a CSRF retry in the same account from a different one.
+ */
+function sessionAuthMethod(session: { authMethod?: string } | null | undefined): 'password' | 'okta_sso' {
+  return session?.authMethod === 'okta_oidc' ? 'okta_sso' : 'password';
+}
+
 function getAdminInfo(req: Request): {
   username: string;
   authMethod: 'password' | 'okta_sso';
@@ -282,7 +290,7 @@ function getAdminInfo(req: Request): {
   const session = (req as any).adminSession;
   return {
     username: session?.email || 'admin',
-    authMethod: session?.authMethod === 'okta_oidc' ? 'okta_sso' : 'password',
+    authMethod: sessionAuthMethod(session),
     ip: req.ip || '127.0.0.1',
     // Also reached before this router runs (a sync body the JSON parser refused), hence made on demand.
     correlationId: req.res ? correlationIdFor(req.res) : undefined,
@@ -342,11 +350,13 @@ adminRouter.get('/session', asyncRoute(async (req: Request, res: Response) => {
       ? {
           username: session.email,
           name: session.name,
-          authMethod: session.authMethod,
+          authMethod: sessionAuthMethod(session),
           groups: session.groups || [],
         }
       : null,
     csrfToken: session?.csrfToken || null,
+    // For the sidebar's session chip: the cookie and the JWT both last 8 h from sign-in.
+    expiresAt: session?.expiresAt ?? null,
     oktaSso: {
       enabled: okta.enabled,
       oktaDomain: okta.oktaDomain,
@@ -395,7 +405,7 @@ adminRouter.post('/login', asyncRoute(async (req: Request, res: Response) => {
     return;
   }
 
-  const { csrfToken } = await issueAdminSessionCookie(res, {
+  const { csrfToken, expiresAt } = await issueAdminSessionCookie(res, {
     sub: `portal_${verifiedUser.username}`,
     email: verifiedUser.username,
     name: verifiedUser.displayName,
@@ -416,6 +426,7 @@ adminRouter.post('/login', asyncRoute(async (req: Request, res: Response) => {
   res.json({
     success: true,
     csrfToken,
+    expiresAt,
     user: {
       username: verifiedUser.username,
       name: verifiedUser.displayName,
@@ -433,7 +444,7 @@ adminRouter.post('/logout', asyncRoute(async (req: Request, res: Response) => {
   if (session) {
     store.recordPortalAdminLog({
       adminUsername: session.email,
-      authMethod: session.authMethod === 'okta_oidc' ? 'okta_sso' : 'password',
+      authMethod: sessionAuthMethod(session),
       action: 'LOGOUT',
       target: 'Portal Auth',
       details: `User "${session.email}" signed out of the portal.`,
@@ -527,6 +538,49 @@ adminRouter.get('/overview', (_req: Request, res: Response) => {
     sfSettings,
     portalUsers,
   });
+});
+
+/**
+ * GET /api/admin/summary
+ * The shell's sidebar badges and header status, from COUNT queries (store.getShellSummary). Polled
+ * while the portal tab is visible, so it answers 304 to an unchanged If-None-Match. The ETag covers
+ * everything but serverTime. Read-only: a session is required, a CSRF token is not.
+ */
+adminRouter.get('/summary', (req: Request, res: Response) => {
+  const now = Date.now();
+  const figures = store.getShellSummary(now);
+  const etag = `"${crypto.createHash('sha256').update(JSON.stringify(figures)).digest('base64url').slice(0, 27)}"`;
+  res.setHeader('Cache-Control', 'private, no-cache');
+  res.setHeader('ETag', etag);
+  const ifNoneMatch = req.get('If-None-Match') || '';
+  if (ifNoneMatch.split(',').some((tag) => tag.trim().replace(/^W\//, '') === etag)) {
+    res.status(304).end();
+    return;
+  }
+  const summary: ShellSummary = { serverTime: new Date(now).toISOString(), ...figures };
+  res.json(summary);
+});
+
+const SEARCH_QUERY_MAX_LENGTH = 100;
+
+/**
+ * GET /api/admin/search?q=
+ * Identifiers containing q: Profiles, SObjects, Object.Field, groups, tools and log event ids. It never
+ * answers with record data, payloads or settings. Read-only.
+ */
+adminRouter.get('/search', (req: Request, res: Response) => {
+  const raw = req.query.q;
+  if (raw !== undefined && typeof raw !== 'string') {
+    res.status(400).json({ error: 'q must be a single string.' });
+    return;
+  }
+  const q = (raw || '').trim();
+  if (q.length > SEARCH_QUERY_MAX_LENGTH) {
+    res.status(400).json({ error: `q must be at most ${SEARCH_QUERY_MAX_LENGTH} characters.` });
+    return;
+  }
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.json({ q, hits: q.length < 2 ? [] : store.searchIdentifiers(q) });
 });
 
 /** Answers a malformed paging query with 400 and anything else as the page itself. */

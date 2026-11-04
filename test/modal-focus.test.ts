@@ -103,10 +103,10 @@ describe('page-wide shortcuts while a dialog is open', () => {
     }
   });
 
-  test('the page and the dialog share one test for the palette shortcut', () => {
-    const page = fs.readFileSync(new URL('../src/app/page.tsx', import.meta.url), 'utf8');
+  test('the shell and the dialog share one test for the palette shortcut', () => {
+    const page = fs.readFileSync(new URL('../src/components/shell/PortalShell.tsx', import.meta.url), 'utf8');
     const hook = fs.readFileSync(new URL('../src/components/views/useModalDialog.ts', import.meta.url), 'utf8');
-    assert.match(page, /if \(isCommandPaletteShortcut\(e\)\)/);
+    assert.match(page, /if \(isCommandPaletteShortcut\(e\)( && !anyModalOpen\(\))?\)/);
     assert.doesNotMatch(page, /e\.key\.toLowerCase\(\) === 'k'/);
     // The hook must pass the modifiers, or the chord reaches modalKeyAction as a plain k.
     assert.match(hook, /metaKey: e\.metaKey, ctrlKey: e\.ctrlKey/);
@@ -174,7 +174,6 @@ describe('MODAL_FOCUSABLE_SELECTOR', () => {
 describe('the confirmation dialogs', () => {
   const sources = {
     'key replacement': '../src/components/views/SalesforceOrgConnectionView.tsx',
-    'sample matrix': '../src/app/page.tsx',
   };
 
   for (const [name, file] of Object.entries(sources)) {
@@ -188,6 +187,39 @@ describe('the confirmation dialogs', () => {
       assert.doesNotMatch(dialog.slice(0, 3000), /autoFocus|onKeyDown/);
     });
   }
+
+  test('the shared Dialog and Drawer primitives use the modal focus handling', () => {
+    const source = fs.readFileSync(new URL('../src/components/ui/primitives.tsx', import.meta.url), 'utf8');
+    for (const name of ['Dialog', 'Drawer']) {
+      const start = source.indexOf(`export function ${name}(`);
+      assert.ok(start > 0, name);
+      const body = source.slice(start, source.indexOf('\nexport function', start + 10));
+      assert.match(body, /useModalDialog(<[^>]*>)?\(open, onClose\)/, name);
+      assert.match(body, /ref=\{modal\.dialogRef\}/, name);
+      assert.match(body, /aria-modal="true"/, name);
+      assert.doesNotMatch(body, /autoFocus|onKeyDown/, name);
+    }
+    const dialog = source.slice(source.indexOf('export function Dialog('));
+    assert.match(dialog.slice(0, 3000), /initialFocusRef: initialFocus === 'box' \? \{ current: null \} : modal\.initialFocusRef/);
+  });
+
+  test('the sample matrix confirmation is an alertdialog on the shared Dialog, focus on Cancel', () => {
+    const source = fs.readFileSync(new URL('../src/components/shell/PortalShell.tsx', import.meta.url), 'utf8');
+    const at = source.indexOf('title="Load the sample enterprise matrix?"');
+    assert.ok(at > 0);
+    const dialog = source.slice(source.lastIndexOf('<Dialog', at), at + 900);
+    assert.match(dialog, /role="alertdialog"/);
+    assert.match(dialog, /<button ref=\{initialFocusRef\} type="button" className="btn" onClick=\{close\}>\s*Cancel/);
+  });
+
+  test('the drawer and the command palette are modal layers too', () => {
+    const fly = fs.readFileSync(new URL('../src/components/views/FlyoutDrawer.tsx', import.meta.url), 'utf8');
+    assert.match(fly, /<Drawer\b/);
+    // Escape reaches the drawer only through the shared stack, never a window listener of its own.
+    assert.doesNotMatch(fly, /addEventListener\('keydown'/);
+    const palette = fs.readFileSync(new URL('../src/components/views/CommandPalette.tsx', import.meta.url), 'utf8');
+    assert.match(palette, /useModalDialog<HTMLDivElement, HTMLInputElement>\(open, onClose\)/);
+  });
 
   test('the key replacement dialog keeps its arming delay on the scrim and on Confirm', () => {
     const source = fs.readFileSync(new URL(sources['key replacement'], import.meta.url), 'utf8');

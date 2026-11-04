@@ -1,21 +1,21 @@
 'use client';
 
 import React, { useState, useEffect, useMemo } from 'react';
-import type {
-  SalesforceProfile,
-  SalesforceObjectConfig,
-  AccessGroup,
-} from '@/types/governance';
+import type { SalesforceProfile, SalesforceObjectConfig, AccessGroup, SearchHit } from '@/types/governance';
 import { isKnownMcpAction } from '@/groups/groupGrants';
 import { grantsAccess, readableGrants } from '@/rbac/groupGrants';
-import type { FlyoutState } from './FlyoutDrawer';
-import { newAccessGroupDraft } from './accessGroupDraft';
+import { VIEWS, VIEW_TABS, ROUTES, type DrawerRef, type RouteId, type ViewParams } from '@/components/shell/routes';
+import { useModalDialog } from './useModalDialog';
+import { filterPaletteItems, type PaletteItem } from './paletteFilter';
 
 interface CommandPaletteProps {
   open: boolean;
   onClose: () => void;
-  onNavigateView: (view: string) => void;
-  onOpenFlyout: (flyout: FlyoutState) => void;
+  /** Goes to a route from the route map (guarded by the shell against losing a draft). */
+  onNavigate: (route: RouteId, params?: ViewParams) => void;
+  /** Opens a drawer on the current view (guarded by the shell). */
+  onOpenDrawer: (ref: DrawerRef) => void;
+  onNewGroup: () => void;
   /** Absent in production, where the server refuses sample data. */
   onSeedEnterpriseMatrix?: () => void;
   onToggleTheme: () => void;
@@ -23,256 +23,219 @@ interface CommandPaletteProps {
   profiles: SalesforceProfile[];
   objects: SalesforceObjectConfig[];
   groups: AccessGroup[];
+  /** GET /api/admin/search: identifiers beyond the loaded lists (fields, log event ids). */
+  searchIdentifiers?: (q: string, signal: AbortSignal) => Promise<SearchHit[]>;
 }
+
+const HIT_SECTION: Record<SearchHit['kind'], string> = {
+  profile: 'Salesforce Profiles',
+  object: 'Salesforce Objects',
+  field: 'Fields',
+  group: 'Access Groups',
+  tool: 'MCP tools',
+  mcp_event: 'MCP log events',
+  admin_event: 'Admin audit events',
+};
 
 export function CommandPalette({
   open,
   onClose,
-  onNavigateView,
-  onOpenFlyout,
+  onNavigate,
+  onOpenDrawer,
+  onNewGroup,
   onSeedEnterpriseMatrix,
   onToggleTheme,
   theme,
   profiles,
   objects,
   groups,
+  searchIdentifiers,
 }: CommandPaletteProps) {
   const [query, setQuery] = useState('');
   const [activeIndex, setActiveIndex] = useState(0);
+  const [hits, setHits] = useState<SearchHit[]>([]);
+  // A dialog like the others: Escape closes the palette alone (never the drawer under it), Tab stays
+  // in, and focus goes back to whatever opened it.
+  const modal = useModalDialog<HTMLDivElement, HTMLInputElement>(open, onClose);
+  const listId = React.useId();
 
   useEffect(() => {
     if (open) {
       setQuery('');
       setActiveIndex(0);
+      setHits([]);
     }
   }, [open]);
 
-  const items = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    const list: Array<{
-      id: string;
-      section: string;
-      label: string;
-      meta: string;
-      action: () => void;
-    }> = [
-      {
-        id: 'nav-dashboard',
-        section: 'Navigation',
-        label: 'Go to Dashboard',
-        meta: 'Overview · KPIs · Needs attention',
-        action: () => onNavigateView('dashboard'),
-      },
-      {
-        id: 'nav-profiles',
-        section: 'Navigation',
-        label: 'Go to Salesforce · Profiles',
-        meta: `${profiles.length} profiles`,
-        action: () => onNavigateView('profiles'),
-      },
-      {
-        id: 'nav-objects',
-        section: 'Navigation',
-        label: 'Go to Salesforce · Objects',
-        meta: `${objects.length} SObjects`,
-        action: () => onNavigateView('objects'),
-      },
-      {
-        id: 'nav-sf-conn',
-        section: 'Navigation',
-        label: 'Go to Salesforce · Org Connection (JWT)',
-        meta: 'OAuth 2.0 JWT Bearer',
-        action: () => onNavigateView('sf-connection'),
-      },
-      {
-        id: 'nav-groups',
-        section: 'Navigation',
-        label: 'Go to Access Matrix · Groups',
-        meta: `${groups.length} groups`,
-        action: () => onNavigateView('groups'),
-      },
-      {
-        id: 'nav-matrix',
-        section: 'Navigation',
-        label: 'Go to Access Matrix · Profile ↔ Group',
-        meta: 'RBAC grid',
-        action: () => onNavigateView('matrix'),
-      },
-      {
-        id: 'nav-copilot',
-        section: 'Navigation',
-        label: 'Go to Connect clients · Microsoft Copilot',
-        meta: 'Copilot Studio MCP connector setup',
-        action: () => onNavigateView('copilot'),
-      },
-      {
-        id: 'nav-traffic',
-        section: 'Navigation',
-        label: 'Go to Logs · MCP Traffic',
-        meta: 'PII-redacted telemetry',
-        action: () => onNavigateView('traffic'),
-      },
-      {
-        id: 'nav-audit',
-        section: 'Navigation',
-        label: 'Go to Logs · Portal Audit',
-        meta: 'Admin governance log',
-        action: () => onNavigateView('audit'),
-      },
-      {
-        id: 'nav-auth',
-        section: 'Navigation',
-        label: 'Go to Portal Auth & Okta SSO',
-        meta: 'Administrators & OIDC',
-        action: () => onNavigateView('auth-settings'),
-      },
-      {
-        id: 'act-sim',
-        section: 'Quick Actions',
-        label: 'Open Live MCP Policy Simulator',
-        meta: 'Test RBAC policies',
-        action: () => onOpenFlyout({ type: 'simulator' }),
-      },
-      {
-        id: 'act-new-group',
-        section: 'Quick Actions',
-        label: 'Create New Access Group',
-        meta: 'Configure actions & R·C·U·D',
-        action: () =>
-          onOpenFlyout({
-            type: 'group',
-            data: newAccessGroupDraft(),
-          }),
-      },
-      {
-        id: 'act-import-csv',
-        section: 'Quick Actions',
-        label: 'Import Salesforce Profiles CSV',
-        meta: 'ProfileId,ProfileName',
-        action: () => onOpenFlyout({ type: 'import' }),
-      },
-      {
-        id: 'act-sync-sfdx',
-        section: 'Quick Actions',
-        label: 'Sync Salesforce SObjects (SFDX / Org Pull)',
-        meta: 'XML folder or describeGlobal',
-        action: () => onOpenFlyout({ type: 'sync' }),
-      },
-      ...(onSeedEnterpriseMatrix
-        ? [
-            {
-              id: 'act-seed',
-              section: 'Quick Actions',
-              label: 'Load Reference Enterprise Governance Matrix',
-              meta: '5 standard groups + profile mappings',
-              action: () => onSeedEnterpriseMatrix(),
-            },
-          ]
-        : []),
-      {
-        id: 'act-theme',
-        section: 'Quick Actions',
-        label: `Switch to ${theme === 'dark' ? 'Daylight (Light)' : 'Obsidian (Dark)'} Theme`,
-        meta: 'Appearance',
-        action: () => onToggleTheme(),
-      },
-    ];
+  // Identifiers the loaded lists do not hold, from the server; debounced, the stale request aborted.
+  useEffect(() => {
+    const q = query.trim();
+    if (!open || !searchIdentifiers || q.length < 2) {
+      setHits([]);
+      return;
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      searchIdentifiers(q, controller.signal)
+        .then((found) => {
+          if (!controller.signal.aborted) setHits(found);
+        })
+        .catch(() => {
+          // The palette still lists the local matches.
+        });
+    }, 200);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [open, query, searchIdentifiers]);
 
+  const items = useMemo(() => {
+    const list: PaletteItem[] = [];
+    for (const view of VIEWS) {
+      const tabs = VIEW_TABS[view.id] ?? [view.home];
+      for (const route of tabs) {
+        const tabbed = tabs.length > 1;
+        list.push({
+          id: `nav-${route}`,
+          section: 'Navigation',
+          label: tabbed ? `${view.label} · ${ROUTES[route].title}` : view.label,
+          meta: ROUTES[route].path,
+          action: () => onNavigate(route),
+        });
+      }
+    }
+    list.push({
+      id: 'act-new-group',
+      section: 'Quick Actions',
+      label: 'Create New Access Group',
+      meta: 'Configure actions & R·C·U·D',
+      action: onNewGroup,
+    });
+    if (onSeedEnterpriseMatrix) {
+      list.push({
+        id: 'act-seed',
+        section: 'Quick Actions',
+        label: 'Load Reference Enterprise Governance Matrix',
+        meta: '5 standard groups + profile mappings',
+        action: onSeedEnterpriseMatrix,
+      });
+    }
+    list.push({
+      id: 'act-theme',
+      section: 'Quick Actions',
+      label: `Switch to ${theme === 'dark' ? 'Light' : 'Dark'} theme`,
+      meta: 'Appearance',
+      action: onToggleTheme,
+    });
+
+    const seen = new Set<string>();
     for (const g of groups) {
+      seen.add(`group:${g.id}`);
       list.push({
         id: `grp-${g.id}`,
         section: 'Access Groups',
         label: g.name,
         // Counted as the Profile ↔ Group matrix counts them: only this server's tools.
         meta: `${(g.allowedActions || []).filter(isKnownMcpAction).length} actions · ${readableGrants(g.objectPermissions).filter(grantsAccess).length} objects`,
-        action: () => onOpenFlyout({ type: 'group', data: g }),
+        action: () => onOpenDrawer({ type: 'group', id: g.id }),
       });
     }
-
-    for (const o of objects.slice(0, 30)) {
+    for (const o of objects) {
+      seen.add(`object:${o.objectName}`);
       list.push({
         id: `obj-${o.objectName}`,
         section: 'Salesforce Objects',
         label: `${o.objectName} (${o.label})`,
         meta: `${o.enabled ? 'Enabled' : 'Disabled'} · ${o.fields.length} fields`,
-        action: () => onOpenFlyout({ type: 'object', data: o }),
+        action: () => onOpenDrawer({ type: 'object', id: o.objectName }),
       });
     }
-
-    for (const p of profiles.slice(0, 30)) {
+    for (const p of profiles) {
+      seen.add(`profile:${p.id}`);
       list.push({
         id: `prof-${p.id}`,
         section: 'Salesforce Profiles',
         label: p.name,
         meta: p.id,
-        action: () => onOpenFlyout({ type: 'profile', data: p }),
+        action: () => onOpenDrawer({ type: 'profile', id: p.id }),
       });
     }
-
-    if (!q) return list.slice(0, 24);
-    return list
-      .filter(
-        (it) =>
-          it.label.toLowerCase().includes(q) ||
-          it.meta.toLowerCase().includes(q) ||
-          it.section.toLowerCase().includes(q)
-      )
-      .slice(0, 24);
-  }, [
-    query,
-    profiles,
-    objects,
-    groups,
-    theme,
-    onNavigateView,
-    onOpenFlyout,
-    onSeedEnterpriseMatrix,
-    onToggleTheme,
-  ]);
-
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        onClose();
-      } else if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        setActiveIndex((i) => (items.length ? (i + 1) % items.length : 0));
-      } else if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        setActiveIndex((i) =>
-          items.length ? (i - 1 + items.length) % items.length : 0
-        );
-      } else if (e.key === 'Enter' && items[activeIndex]) {
-        e.preventDefault();
-        items[activeIndex].action();
-        onClose();
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [open, items, activeIndex, onClose]);
+    for (const hit of hits) {
+      if (seen.has(`${hit.kind}:${hit.id}`)) continue;
+      const action = (): void => {
+        switch (hit.kind) {
+          case 'profile':
+            return onOpenDrawer({ type: 'profile', id: hit.id });
+          case 'object':
+            return onOpenDrawer({ type: 'object', id: hit.id });
+          case 'field':
+            return onOpenDrawer({ type: 'object', id: hit.id.split('.')[0] });
+          case 'group':
+            return onOpenDrawer({ type: 'group', id: hit.id });
+          case 'tool':
+            return onNavigate('simulator', { tool: hit.id });
+          case 'mcp_event':
+            return onNavigate('logs-mcp', { drawer: `mcp:${hit.id}` });
+          case 'admin_event':
+            return onNavigate('logs-admin', { drawer: `audit:${hit.id}` });
+        }
+      };
+      list.push({ id: `hit-${hit.kind}-${hit.id}`, section: HIT_SECTION[hit.kind], label: hit.id, meta: hit.label, action });
+    }
+    return filterPaletteItems(list, query);
+  }, [query, hits, profiles, objects, groups, theme, onNavigate, onOpenDrawer, onNewGroup, onSeedEnterpriseMatrix, onToggleTheme]);
 
   if (!open) return null;
 
+  // The palette closes first and hands focus back, then the command runs (it may open a drawer or a
+  // confirm of its own).
+  const run = (item: PaletteItem) => {
+    modal.close();
+    item.action();
+  };
+
+  const onListKey = (e: React.KeyboardEvent) => {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setActiveIndex((i) => (items.length ? (i + 1) % items.length : 0));
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setActiveIndex((i) => (items.length ? (i - 1 + items.length) % items.length : 0));
+    } else if (e.key === 'Enter' && items[activeIndex]) {
+      e.preventDefault();
+      run(items[activeIndex]);
+    }
+  };
+
+  const activeId = items[activeIndex] ? `${listId}-${activeIndex}` : undefined;
+
   return (
-    <div className="cmdk-scrim" onClick={onClose}>
-      <div className="cmdk-box" onClick={(e) => e.stopPropagation()}>
+    <div className="cmdk-scrim" onClick={modal.close}>
+      <div
+        ref={modal.dialogRef}
+        className="cmdk-box"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Command palette"
+        tabIndex={-1}
+        onClick={(e) => e.stopPropagation()}
+        onKeyDown={onListKey}
+      >
         <div className="cmdk-inp-wrap">
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-          >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
             <circle cx="11" cy="11" r="7" />
             <path d="M20 20l-3.5-3.5" />
           </svg>
           <input
-            autoFocus
+            ref={modal.initialFocusRef}
             className="cmdk-inp"
-            placeholder="Jump to view, profile, SObject, access group, or run command…"
+            role="combobox"
+            aria-expanded="true"
+            aria-controls={listId}
+            aria-activedescendant={activeId}
+            aria-label="Search views, Profiles, SObjects, fields, groups and log events"
+            placeholder="Jump to a view, Profile, SObject, field, access group or log event…"
             value={query}
             onChange={(e) => {
               setQuery(e.target.value);
@@ -281,24 +244,28 @@ export function CommandPalette({
           />
           <span className="kbd">ESC</span>
         </div>
-        <div className="cmdk-list">
+        <div className="cmdk-list" id={listId} role="listbox" aria-label="Results">
           {items.length === 0 ? (
             <div className="empty">No matching views, entities, or commands.</div>
           ) : (
             items.map((it, idx) => {
-              const showSec =
-                idx === 0 || items[idx - 1].section !== it.section;
+              const showSec = idx === 0 || items[idx - 1].section !== it.section;
               return (
                 <React.Fragment key={it.id}>
-                  {showSec && <div className="cmdk-sec">{it.section}</div>}
+                  {showSec && (
+                    <div className="cmdk-sec" role="presentation">
+                      {it.section}
+                    </div>
+                  )}
                   <button
                     type="button"
+                    id={`${listId}-${idx}`}
+                    role="option"
+                    aria-selected={idx === activeIndex}
+                    tabIndex={-1}
                     className={`cmdk-item ${idx === activeIndex ? 'active' : ''}`}
                     onMouseEnter={() => setActiveIndex(idx)}
-                    onClick={() => {
-                      it.action();
-                      onClose();
-                    }}
+                    onClick={() => run(it)}
                   >
                     <span style={{ fontWeight: 500 }}>{it.label}</span>
                     <span className="mono" style={{ color: 'var(--t3)' }}>

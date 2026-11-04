@@ -1,17 +1,5 @@
 import type { PortalAuditResult } from '../security/auditResult.js';
 
-export type NavViewId =
-  | 'dashboard'
-  | 'sf-profiles'
-  | 'sf-objects'
-  | 'matrix-groups'
-  | 'matrix-profile-groups'
-  | 'logs-copilot'
-  | 'logs-portal'
-  | 'settings-auth'
-  | 'settings-salesforce'
-  | 'connect-copilot';
-
 export const AVAILABLE_MCP_ACTIONS = [
   {
     id: 'list_enabled_objects',
@@ -490,3 +478,56 @@ export type PortalUser = PortalUserSummary;
 export type OrgProfilesPullPreview = ProfileSyncDiffPreview;
 export type OrgObjectsSyncPreview = ObjectSyncDiffPreview;
 
+
+/** A sidebar badge whose figure needs a later piece of work: shown disabled, with this reason. */
+export interface UnavailableBadge {
+  available: false;
+  reason: string;
+}
+
+/**
+ * GET /api/admin/summary: what the shell (sidebar badges, header status strip) needs, read with COUNT
+ * queries instead of the whole store. Every figure is a count, a status or an identifier; never a secret.
+ */
+export interface ShellSummary {
+  serverTime: string;
+  policyRevision: number;
+  lastMcpCallAt: string | null;
+  org: {
+    connectionStatus: SalesforceConnectionSettings['connectionStatus'];
+    authMode: SalesforceConnectionSettings['authMode'];
+    connectedOrgId: string;
+    lastConnectedAt: string | null;
+  };
+  counts: {
+    profiles: number;
+    objects: number;
+    enabledObjects: number;
+    fields: number;
+    groups: number;
+    /** Profiles in at least one Access Group. */
+    mappedProfiles: number;
+    portalUsers: number;
+  };
+  missingInOrg: { profiles: number; objects: number; fields: number };
+  badges: {
+    /** DENIED or ERROR calls over the last 24 h, verified traffic only (no simulator runs, no rejected tokens). */
+    mcpDeniedOrError24h: number;
+    /** Portal admin events whose result is FAILED or DENIED, over the last 24 h. */
+    adminFailedOrDenied24h: number;
+    groupWarnings: UnavailableBadge;
+    postureFailing: UnavailableBadge;
+  };
+  setup: { done: number; total: number; steps: Array<{ id: string; label: string; done: boolean }> };
+}
+
+export type SearchHitKind = 'profile' | 'object' | 'field' | 'group' | 'tool' | 'mcp_event' | 'admin_event';
+
+/** GET /api/admin/search: identifiers only, never record data, payloads or settings. */
+export interface SearchHit {
+  kind: SearchHitKind;
+  /** The identifier: Profile ID, SObject API name, Object.Field, group id, tool id or log event id. */
+  id: string;
+  /** A display name for it, where it has one (Profile, SObject or field label, group name). */
+  label: string;
+}

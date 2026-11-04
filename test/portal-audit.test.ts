@@ -60,15 +60,15 @@ describe('the result rule for a row written without one', () => {
 
 describe('portalAuditResult (the Result badge in the audit drawer)', () => {
   test('shows the stored result, whatever the action is called', () => {
-    assert.deepEqual(portalAuditResult({ action: 'GENERATE_SF_JWT_CERT', result: 'DENIED' }), { label: 'DENIED', tone: 'err' });
-    assert.deepEqual(portalAuditResult({ action: 'UPDATE_GROUP', result: 'FAILED' }), { label: 'FAILED', tone: 'err' });
-    assert.deepEqual(portalAuditResult({ action: 'LOGIN_FAILED', result: 'SUCCESS' }), { label: 'SUCCESS', tone: 'ok' });
+    assert.deepEqual(portalAuditResult({ action: 'GENERATE_SF_JWT_CERT', result: 'DENIED' }), { label: 'DENIED', tone: 'denied' });
+    assert.deepEqual(portalAuditResult({ action: 'UPDATE_GROUP', result: 'FAILED' }), { label: 'FAILED', tone: 'error' });
+    assert.deepEqual(portalAuditResult({ action: 'LOGIN_FAILED', result: 'SUCCESS' }), { label: 'SUCCESS', tone: 'allowed' });
   });
 
   test('falls back to the action name for a row without a result', () => {
-    assert.deepEqual(portalAuditResult({ action: 'LOGIN_FAILED' }), { label: 'FAILED', tone: 'err' });
-    assert.deepEqual(portalAuditResult({ action: 'OKTA_LOGIN_DENIED' }), { label: 'DENIED', tone: 'err' });
-    assert.deepEqual(portalAuditResult({ action: 'CONNECT_SALESFORCE_ORG' }), { label: 'SUCCESS', tone: 'ok' });
+    assert.deepEqual(portalAuditResult({ action: 'LOGIN_FAILED' }), { label: 'FAILED', tone: 'error' });
+    assert.deepEqual(portalAuditResult({ action: 'OKTA_LOGIN_DENIED' }), { label: 'DENIED', tone: 'denied' });
+    assert.deepEqual(portalAuditResult({ action: 'CONNECT_SALESFORCE_ORG' }), { label: 'SUCCESS', tone: 'allowed' });
   });
 });
 
@@ -286,7 +286,7 @@ describe('upgrading a database from before the structured audit columns', () => 
     const expected = ['FAILED', 'DENIED', 'SUCCESS'];
     assert.deepEqual(read(store.getPortalAdminLogs(1000)), expected);
     assert.deepEqual(read(store.getPortalAdminLogPage({ limit: 1000 }).rows), expected);
-    assert.deepEqual(ids.map((id) => portalAuditResult(store.getPortalAdminLogs(1000).find((r) => r.id === id)!).tone), ['err', 'err', 'ok']);
+    assert.deepEqual(ids.map((id) => portalAuditResult(store.getPortalAdminLogs(1000).find((r) => r.id === id)!).tone), ['error', 'denied', 'allowed']);
   });
 
   test('an upgraded database ends with the same table as a new one', () => {

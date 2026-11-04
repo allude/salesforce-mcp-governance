@@ -89,6 +89,38 @@ try {
     assert.equal(legacy.status, 404);
   });
 
+  await check('POST :3000/mcp carries the backend\'s own headers, none of the portal page headers', async () => {
+    const direct = await call(backend, '/mcp', { method: 'POST', headers: MCP_HEADERS, body: rpc('tools/list') });
+    const proxied = await call(portal, '/mcp', { method: 'POST', headers: MCP_HEADERS, body: rpc('tools/list') });
+    assert.equal(proxied.status, direct.status);
+    for (const name of ['x-frame-options', 'content-security-policy', 'referrer-policy']) {
+      assert.equal(proxied.headers.get(name), direct.headers.get(name), name);
+    }
+    // No admin session or CSRF check stands in front of Copilot's endpoint: the 401 is the bearer challenge.
+    assert.match(proxied.headers.get('www-authenticate') || '', /^Bearer /);
+  });
+
+  await check('The seven portal views are served with the page security headers', async () => {
+    for (const path of [
+      '/dashboard',
+      '/org/connection',
+      '/access-groups/groups',
+      '/simulator',
+      '/logs/mcp?status=DENIED',
+      '/logs/admin',
+      '/settings/security',
+    ]) {
+      const page = await call(portal, path);
+      assert.equal(page.status, 200, path);
+      assert.match(page.headers.get('content-type') || '', /text\/html/, path);
+      assert.equal(page.headers.get('x-frame-options'), 'DENY', path);
+      assert.match(page.headers.get('content-security-policy') || '', /frame-ancestors 'none'/, path);
+    }
+    const org = await call(portal, '/org');
+    assert.ok([307, 308].includes(org.status), `/org redirects (${org.status})`);
+    assert.match(org.headers.get('location') || '', /\/org\/connection$/);
+  });
+
   await check('GET :3001/ (Express) only serves API routes and redirects browsers to the portal', async () => {
     const res = await call(backend, '/');
     assert.equal(res.status, 302);
@@ -121,6 +153,16 @@ try {
   });
 
   const auth = () => ({ Cookie: cookie, 'X-CSRF-Token': csrf });
+
+  await check('GET :3000/api/admin/summary answers an ETag and 304 when nothing changed', async () => {
+    const first = await call(portal, '/api/admin/summary', { headers: { Cookie: cookie } });
+    assert.equal(first.status, 200);
+    const etag = first.headers.get('etag');
+    assert.ok(etag, 'ETag');
+    assert.equal(typeof first.json.counts.profiles, 'number');
+    const again = await call(portal, '/api/admin/summary', { headers: { Cookie: cookie, 'If-None-Match': etag } });
+    assert.equal(again.status, 304);
+  });
 
   await check('Mutations through the proxy require X-CSRF-Token (403 without it)', async () => {
     const res = await call(portal, '/api/admin/profiles', {

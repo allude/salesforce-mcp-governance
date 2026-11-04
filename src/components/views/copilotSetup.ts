@@ -1,7 +1,7 @@
 import { isSimulatedOrgHost, isUninitialisedMcpTokenHost } from '@/salesforce/simulatedOrg';
+import type { RouteId } from '@/components/shell/routes';
 import type {
   AccessGroup,
-  NavViewId,
   ProfileGroupMapping,
   SalesforceObject,
 } from '@/types/governance';
@@ -86,7 +86,7 @@ export interface ReadinessCheck {
   label: string;
   tone: ReadinessTone;
   detail: string;
-  fix?: { view: NavViewId; label: string };
+  fix?: { view: RouteId; label: string };
 }
 
 function hostnameOf(url: string): string | null {
@@ -148,7 +148,7 @@ export function serverUrlReadiness(serverUrl: string): ReadinessCheck {
 /** The Salesforce host the sign-in URLs point at, which is also where MCP verifies each user's token. */
 export function salesforceHostReadiness(salesforceBase: string): ReadinessCheck {
   const label = 'Salesforce sign-in host';
-  const fix = { view: 'settings-salesforce' as const, label: 'Set MCP token host' };
+  const fix = { view: 'org-connection' as const, label: 'Set MCP token host' };
   const host = hostnameOf(salesforceBase) ?? salesforceBase;
   if (isSimulatedOrgHost(salesforceBase)) {
     return {
@@ -190,7 +190,7 @@ export function profileAccessReadiness(
       label,
       tone: 'err',
       detail: 'No Salesforce Profile is mapped to a group that grants tools, so every Copilot user would see no tools.',
-      fix: { view: 'matrix-profile-groups', label: 'Map Profiles to groups' },
+      fix: { view: 'access-matrix', label: 'Map Profiles to groups' },
     };
   }
   return {
@@ -210,7 +210,7 @@ export function objectReadiness(objects: Pick<SalesforceObject, 'enabled'>[]): R
       label,
       tone: 'warn',
       detail: 'No Salesforce object is enabled, so the tools have nothing to read or change.',
-      fix: { view: 'sf-objects', label: 'Enable objects' },
+      fix: { view: 'org-objects', label: 'Enable objects' },
     };
   }
   return {
@@ -227,7 +227,7 @@ export function objectReadiness(objects: Pick<SalesforceObject, 'enabled'>[]): R
  */
 export function firstCallReadiness(lastMcpCallAt: string | null | undefined, now: number): ReadinessCheck {
   const label = 'Verified MCP call received';
-  const fix = { view: 'logs-copilot' as const, label: 'Open MCP traffic' };
+  const fix = { view: 'logs-mcp' as const, label: 'Open MCP traffic' };
   if (!lastMcpCallAt) {
     return {
       id: 'first-call',

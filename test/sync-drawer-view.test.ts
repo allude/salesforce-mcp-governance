@@ -33,7 +33,6 @@ function renderSyncDrawer(devToolsEnabled: boolean): string {
       onSaveGroup: noop,
       onDeleteGroup: noop,
       devToolsEnabled,
-      onTestMcpCall: noop,
       onRefreshWorkspace: async () => null,
       onLoadGroupHistory: async () => [],
       notify: () => {},

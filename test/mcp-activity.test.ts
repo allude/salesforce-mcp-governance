@@ -74,10 +74,10 @@ describe('mcpActivityStatus', () => {
     });
 
     test('the header passes the server-clock reading, the same one the chart uses', () => {
-      const page = fs.readFileSync(new URL('../src/app/page.tsx', import.meta.url), 'utf8');
-      const call = page.match(/mcpActivityStatus\(([^;]*)\);/);
-      assert.ok(call, 'page.tsx calls mcpActivityStatus');
-      assert.match(call[1], /,\s*clockNow \+ clockOffsetMs\s*$/);
+      const header = fs.readFileSync(new URL('../src/components/shell/Header.tsx', import.meta.url), 'utf8');
+      const call = header.match(/mcpActivityStatus\(([^;]*)\);/);
+      assert.ok(call, 'Header.tsx calls mcpActivityStatus');
+      assert.match(call[1], /,\s*now \+ clockOffsetMs\s*$/);
     });
   });
 });

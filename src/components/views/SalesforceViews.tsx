@@ -13,7 +13,8 @@ import type {
   ObjectSyncDiffPreview,
   RemovalResolutionAction,
 } from '@/types/governance';
-import { formatDateShort } from '@/components/ui/primitives';
+import { Switch, Timestamp } from '@/components/ui/primitives';
+import { useControllable } from '@/components/ui/useControllable';
 import { effectiveGrants, grantsAccess, readableGrants } from '@/rbac/groupGrants';
 import type { FlyoutState } from './FlyoutDrawer';
 import { describeProfileDuplicate, profileSyncNeedsReview } from './profileSyncReview';
@@ -543,7 +544,7 @@ export function SalesforceProfilesView({
                         )}
                       </td>
                       <td className="mono" style={{ color: 'var(--t2)' }}>
-                        {formatDateShort(p.updatedAt)}
+                        <Timestamp iso={p.updatedAt} precision="date" />
                       </td>
                     </tr>
                   );
@@ -580,6 +581,14 @@ interface SalesforceObjectsViewProps {
     removeFields: Array<{ objectName: string; fieldName: string }>;
   }) => Promise<void>;
   onNavigateToOrgConnection: () => void;
+  /** Filters the page keeps in the URL; the free-text search stays local. */
+  routeFilters?: ObjectRouteFilters;
+  onRouteFiltersChange?: (filters: ObjectRouteFilters) => void;
+}
+
+export interface ObjectRouteFilters {
+  status: 'all' | 'enabled' | 'disabled';
+  kind: 'all' | 'std' | 'custom';
 }
 
 export function SalesforceObjectsView({
@@ -595,12 +604,20 @@ export function SalesforceObjectsView({
   onPreviewPullObjectsFromOrg,
   onApplyPullObjectsFromOrg,
   onNavigateToOrgConnection,
+  routeFilters,
+  onRouteFiltersChange,
 }: SalesforceObjectsViewProps) {
   const [q, setQ] = useState('');
-  const [statusFilter, setStatusFilter] = useState<
-    'all' | 'enabled' | 'disabled'
-  >('all');
-  const [kindFilter, setKindFilter] = useState<'all' | 'std' | 'custom'>('all');
+  const [statusFilter, setStatusFilter] = useControllable<ObjectRouteFilters['status']>(
+    routeFilters?.status,
+    routeFilters && onRouteFiltersChange ? (status) => onRouteFiltersChange({ ...routeFilters, status }) : undefined,
+    'all'
+  );
+  const [kindFilter, setKindFilter] = useControllable<ObjectRouteFilters['kind']>(
+    routeFilters?.kind,
+    routeFilters && onRouteFiltersChange ? (kind) => onRouteFiltersChange({ ...routeFilters, kind }) : undefined,
+    'all'
+  );
 
   // Org Object Catalog & Reconciliation Modal state
   const [catalogOpen, setCatalogOpen] = useState(false);
@@ -883,10 +900,10 @@ export function SalesforceObjectsView({
                                   </span>
                                 )}
                               </div>
-                              <button
-                                type="button"
-                                className={`sw ${on ? 'on' : ''}`}
-                                onClick={() => {
+                              <Switch
+                                checked={on}
+                                label={`Select ${c.objectName} to sync`}
+                                onCheckedChange={() => {
                                   if (on) {
                                     setSelectedOrgObjs(
                                       selectedOrgObjs.filter(
@@ -1222,12 +1239,10 @@ export function SalesforceObjectsView({
                       }
                     >
                       <td onClick={(e) => e.stopPropagation()}>
-                        <button
-                          type="button"
-                          className={`sw ${o.enabled ? 'on' : ''}`}
-                          onClick={() =>
-                            onToggleObject(o.objectName, !o.enabled)
-                          }
+                        <Switch
+                          checked={o.enabled}
+                          label={`Enable ${o.objectName} for MCP`}
+                          onCheckedChange={(next) => onToggleObject(o.objectName, next)}
                         />
                       </td>
                       <td className="mono" style={{ fontWeight: 600 }}>
@@ -1271,7 +1286,7 @@ export function SalesforceObjectsView({
                         <span className="tag mono">{o.sourcePath}</span>
                       </td>
                       <td className="mono" style={{ color: 'var(--t2)' }}>
-                        {formatDateShort(o.updatedAt)}
+                        <Timestamp iso={o.updatedAt} precision="date" />
                       </td>
                     </tr>
                   );

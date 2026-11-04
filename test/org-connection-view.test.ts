@@ -21,13 +21,14 @@ import {
 
 describe('connectionStatusBadge', () => {
   test('a changed connection reads as not verified, in neither the connected nor the error colour', () => {
-    assert.deepEqual(connectionStatusBadge('not_verified', ''), { label: 'Not Verified', variant: 'amber' });
+    assert.deepEqual(connectionStatusBadge('not_verified', ''), { label: 'Not Verified', tone: 'error' });
   });
 
   test('the other statuses keep their meaning', () => {
-    assert.deepEqual(connectionStatusBadge('connected', '00D1'), { label: 'Connected (00D1)', variant: 'emerald' });
-    assert.deepEqual(connectionStatusBadge('error', ''), { label: 'Connection Error', variant: 'rose' });
-    assert.deepEqual(connectionStatusBadge('disconnected', ''), { label: 'Not Connected', variant: 'slate' });
+    assert.deepEqual(connectionStatusBadge('connected', '00D1'), { label: 'Connected (00D1)', tone: 'allowed' });
+    // An error is amber (statusTone 'error'), never the rose that means denied.
+    assert.deepEqual(connectionStatusBadge('error', ''), { label: 'Connection Error', tone: 'error' });
+    assert.deepEqual(connectionStatusBadge('disconnected', ''), { label: 'Not Connected', tone: 'neutral' });
   });
 });
 

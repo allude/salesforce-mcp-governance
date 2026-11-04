@@ -1,19 +1,25 @@
 import type { SalesforceConnectionSettings } from '@/types/governance';
+import { statusTone, type StatusTone } from '@/components/ui/statusTone';
 
-/** What the Org Connection header badge shows for each connection status. */
+/**
+ * What OrgStatus (header, sidebar, dashboard and the Org Connection view) shows for each connection
+ * status. The tone comes from statusTone: emerald when connected, amber for an error or a connection
+ * that is not verified, slate when nothing is connected.
+ */
 export function connectionStatusBadge(
   status: SalesforceConnectionSettings['connectionStatus'],
   connectedOrgId: string
-): { label: string; variant: 'emerald' | 'amber' | 'rose' | 'slate' } {
+): { label: string; tone: StatusTone } {
+  const tone = statusTone(status);
   switch (status) {
     case 'connected':
-      return { label: `Connected (${connectedOrgId || 'Active'})`, variant: 'emerald' };
+      return { label: `Connected (${connectedOrgId || 'Active'})`, tone };
     case 'not_verified':
-      return { label: 'Not Verified', variant: 'amber' };
+      return { label: 'Not Verified', tone };
     case 'error':
-      return { label: 'Connection Error', variant: 'rose' };
+      return { label: 'Connection Error', tone };
     default:
-      return { label: 'Not Connected', variant: 'slate' };
+      return { label: 'Not Connected', tone };
   }
 }
 
