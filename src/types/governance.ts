@@ -7,7 +7,8 @@ export type NavViewId =
   | 'logs-copilot'
   | 'logs-portal'
   | 'settings-auth'
-  | 'settings-salesforce';
+  | 'settings-salesforce'
+  | 'connect-copilot';
 
 export const AVAILABLE_MCP_ACTIONS = [
   {
