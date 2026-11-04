@@ -19,6 +19,8 @@ export interface AdminSessionClaims {
 }
 
 const SESSION_COOKIE_NAME = 'sf_mcp_admin_session';
+/** Admin sessions (the JWT and its cookie) last 8 hours from sign-in. */
+const SESSION_TTL_SECONDS = 8 * 60 * 60;
 const OIDC_FLOW_COOKIE_NAME = 'sf_mcp_oidc_flow';
 const SECRET_KEY = new TextEncoder().encode(config.appSecretKey);
 
@@ -28,14 +30,16 @@ const SECRET_KEY = new TextEncoder().encode(config.appSecretKey);
 export async function issueAdminSessionCookie(
   res: Response,
   claims: Omit<AdminSessionClaims, 'csrfToken'>
-): Promise<{ csrfToken: string }> {
+): Promise<{ csrfToken: string; expiresAt: string }> {
   const csrfToken = crypto.randomBytes(24).toString('base64url');
+  const issuedAt = Math.floor(Date.now() / 1000);
+  const expiresAtSeconds = issuedAt + SESSION_TTL_SECONDS;
   const token = await new jose.SignJWT({ ...claims, csrfToken })
     .setProtectedHeader({ alg: 'HS256' })
-    .setIssuedAt()
+    .setIssuedAt(issuedAt)
     .setIssuer('salesforce-mcp-admin')
     .setAudience('salesforce-mcp-admin-portal')
-    .setExpirationTime('8h')
+    .setExpirationTime(expiresAtSeconds)
     .sign(SECRET_KEY);
 
   res.cookie(SESSION_COOKIE_NAME, token, {
@@ -43,19 +47,22 @@ export async function issueAdminSessionCookie(
     secure: config.isProd,
     sameSite: 'lax',
     path: '/',
-    maxAge: 8 * 60 * 60 * 1000, // 8 hours
+    maxAge: SESSION_TTL_SECONDS * 1000, // 8 hours
   });
 
-  return { csrfToken };
+  return { csrfToken, expiresAt: new Date(expiresAtSeconds * 1000).toISOString() };
 }
 
 export function clearAdminSessionCookie(res: Response): void {
   res.clearCookie(SESSION_COOKIE_NAME, { path: '/' });
 }
 
+/** A verified session, with when its JWT expires (ISO-8601), read from the signed `exp` claim. */
+export type VerifiedAdminSession = AdminSessionClaims & { expiresAt: string | null };
+
 export async function verifyAdminSessionFromRequest(
   req: Request
-): Promise<AdminSessionClaims | null> {
+): Promise<VerifiedAdminSession | null> {
   const token = req.cookies?.[SESSION_COOKIE_NAME];
   if (!token) return null;
 
@@ -65,13 +72,14 @@ export async function verifyAdminSessionFromRequest(
       audience: 'salesforce-mcp-admin-portal',
     });
 
-    const claims: AdminSessionClaims = {
+    const claims: VerifiedAdminSession = {
       sub: String(payload.sub || ''),
       email: String(payload.email || ''),
       name: String(payload.name || ''),
       authMethod: (payload.authMethod as 'okta_oidc' | 'local_bootstrap') || 'local_bootstrap',
       groups: Array.isArray(payload.groups) ? (payload.groups as string[]) : [],
       csrfToken: String(payload.csrfToken || ''),
+      expiresAt: typeof payload.exp === 'number' ? new Date(payload.exp * 1000).toISOString() : null,
     };
     // Password sessions end as soon as the portal user is deleted.
     if (claims.authMethod === 'local_bootstrap' && !store.portalUserExists(claims.email)) {

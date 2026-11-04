@@ -508,7 +508,26 @@ describe('Admin REST API', () => {
       assert.equal(res.body.authenticated, true);
       assert.equal(res.body.csrfToken, admin.csrfToken);
       assert.equal(res.body.user.username, 'admin');
-      assert.equal(res.body.user.authMethod, 'local_bootstrap');
+      // The same name /login answers with, so the portal's CSRF retry recognises the same account.
+      assert.equal(res.body.user.authMethod, 'password');
+    });
+
+    it('/login and /session name the same authMethod and the same session expiry, 8 h after sign-in', async () => {
+      const ip = newClientIp();
+      const before = Date.now();
+      const login = await postLogin(ip, BOOTSTRAP_ADMIN);
+      assert.equal(login.status, 200);
+      const cookie = (sessionSetCookie(login) || '').split(';')[0];
+
+      const session = await call({ ip, cookie }, 'GET', '/api/admin/session');
+
+      assert.equal(session.body.user.authMethod, login.body.user.authMethod);
+      assert.equal(typeof login.body.expiresAt, 'string');
+      assert.equal(session.body.expiresAt, login.body.expiresAt);
+      const expiresAt = Date.parse(session.body.expiresAt);
+      assert.ok(Math.abs(expiresAt - (before + 8 * 3_600_000)) < 5_000, `expiresAt ${session.body.expiresAt}`);
+      const signedOut = await call({ ip: newClientIp() }, 'GET', '/api/admin/session');
+      assert.equal(signedOut.body.expiresAt, null);
     });
 
     it('a wrong password or an unknown username gets the same 401 and no session cookie', async () => {
