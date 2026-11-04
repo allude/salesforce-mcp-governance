@@ -2118,4 +2118,435 @@ time {
 .toast-msg {
   flex: 1;
 }
+
+/* ---------------------------------------------------------------------------------------------- */
+/* Portal shell: boot, sign-in, tabs, unsaved-changes bars, skeleton, responsive sidebar          */
+/* ---------------------------------------------------------------------------------------------- */
+.boot {
+  height: 100vh;
+  display: grid;
+  place-items: center;
+  grid-auto-flow: column;
+  gap: 10px;
+  align-content: center;
+  justify-content: center;
+  background: var(--bg);
+  color: var(--t2);
+}
+
+.login-page {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: radial-gradient(circle at 50% 0%, rgba(0, 163, 255, 0.12), transparent 55%), var(--bg);
+}
+
+.login-card {
+  width: 100%;
+  max-width: 430px;
+  box-shadow: var(--shadow-lg);
+}
+
+.login-card .card-h {
+  padding: 16px 20px;
+}
+
+.login-card .card-b {
+  padding: 20px;
+}
+
+.login-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.login-brand h1 {
+  margin: 0;
+}
+
+.login-err {
+  margin-bottom: 14px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--status-error-border);
+  background: var(--status-error-bg);
+  color: var(--status-error);
+  font-size: 12px;
+}
+
+.login-okta,
+.login-submit {
+  width: 100%;
+  padding: 8px 12px;
+  justify-content: center;
+}
+
+.login-note {
+  margin: 6px 0 0;
+  font-size: 11.5px;
+  color: var(--t3);
+}
+
+.login-or {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 14px 0;
+  color: var(--t3);
+  font-size: 11px;
+}
+
+.login-or span:first-child,
+.login-or span:last-child {
+  flex: 1;
+  height: 1px;
+  background: var(--bd);
+}
+
+.login-pass-h {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.org-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.org-status code {
+  font-size: 11px;
+}
+
+.crumb ol {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  min-width: 0;
+}
+
+.crumb li {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  white-space: nowrap;
+}
+
+.top-txt {
+  font-size: 11.5px;
+  color: var(--t3);
+  white-space: nowrap;
+}
+
+.live-chip .btn.sm {
+  padding: 1px 6px;
+  font-size: 10.5px;
+}
+
+.live-chip.fresh-degraded {
+  border-color: var(--status-error-border);
+  background: var(--status-error-bg);
+}
+
+.live-chip.fresh-live {
+  border-color: var(--status-allowed-border);
+}
+
+.live-upd {
+  color: var(--t3);
+}
+
+.vtabs {
+  display: flex;
+  gap: 2px;
+  margin: -4px 0 16px;
+  border-bottom: 1px solid var(--bd);
+}
+
+.vtab {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 12px;
+  font-size: 12.5px;
+  color: var(--t2);
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+
+.vtab:hover {
+  color: var(--tx);
+}
+
+.vtab.on {
+  color: var(--tx);
+  border-bottom-color: var(--ctl-primary);
+  font-weight: 600;
+}
+
+.vtab:focus-visible {
+  outline: 2px solid var(--ctl-primary);
+  outline-offset: -2px;
+}
+
+.vtab .ct {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--t3);
+  font-variant-numeric: tabular-nums;
+}
+
+.draft-bars {
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid var(--bd);
+}
+
+.draft-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 22px;
+  background: var(--status-error-bg);
+  font-size: 12.5px;
+}
+
+.draft-bar + .draft-bar {
+  border-top: 1px solid var(--bd);
+}
+
+.draft-t {
+  font-weight: 600;
+  color: var(--tx);
+  font-variant-numeric: tabular-nums;
+}
+
+.draft-items {
+  flex: 1;
+  color: var(--t2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dlg-list {
+  margin: 0 0 4px;
+  padding-left: 18px;
+  font-size: 12.5px;
+  color: var(--tx);
+}
+
+.session-chip {
+  display: block;
+  margin-top: 2px;
+  font-size: 10.5px;
+  color: var(--t3);
+  font-family: var(--mono);
+}
+
+.sb-signout {
+  width: 100%;
+  justify-content: center;
+  gap: 6px;
+}
+
+.sb-signout svg {
+  width: 13px;
+  height: 13px;
+}
+
+.top .pill,
+.top .live-chip,
+.top .btn,
+.crumb li {
+  white-space: nowrap;
+}
+
+.top-r {
+  flex-shrink: 0;
+}
+
+.crumb {
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* Narrower headers drop the secondary text first: "Updated …", then "Last MCP call", then the
+   palette pill's label (⌘K stays). */
+@media (max-width: 1279px) {
+  .live-upd,
+  .top-txt {
+    display: none;
+  }
+}
+
+@media (max-width: 1023px) {
+  .top .pill > span:first-child:not(.org-status):not(.dot) {
+    display: none;
+  }
+}
+
+.sim-frame {
+  border-style: dashed;
+}
+
+.skel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.skel-h,
+.skel-card,
+.skel-tbl {
+  border-radius: 8px;
+  background: linear-gradient(90deg, var(--pan) 0%, var(--pan2, var(--bd)) 50%, var(--pan) 100%);
+  background-size: 200% 100%;
+  animation: skel 1.2s ease-in-out infinite;
+}
+
+.skel-h {
+  height: 34px;
+  width: 40%;
+}
+
+.skel-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+}
+
+.skel-card {
+  height: 92px;
+}
+
+.skel-tbl {
+  height: 260px;
+}
+
+@keyframes skel {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skel-h,
+  .skel-card,
+  .skel-tbl {
+    animation: none;
+  }
+}
+
+.sb-open,
+.sb-close {
+  display: none;
+}
+
+.sb-scrim {
+  display: none;
+}
+
+/* Under 1280 px the sidebar is an icon rail; labels stay as the links' accessible names. */
+@media (max-width: 1279px) and (min-width: 768px) {
+  .shell {
+    grid-template-columns: 60px 1fr;
+  }
+  .sb .brand-txt,
+  .sb .nav-h,
+  .sb .nav-lbl,
+  .sb .nav-it .ct,
+  .sb .u-meta {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+  .sb .brand {
+    justify-content: center;
+    padding: 14px 0;
+  }
+  .sb .nav-it {
+    justify-content: center;
+    padding: 8px 0;
+  }
+  .sb .nav-it > .dot {
+    position: absolute;
+    top: 6px;
+    right: 10px;
+  }
+  .sb .u-row {
+    justify-content: center;
+  }
+  .sb-signout {
+    padding: 4px 0;
+    font-size: 10.5px;
+  }
+}
+
+/* Under 768 px the sidebar is off-canvas, opened from the header. */
+@media (max-width: 767px) {
+  .shell {
+    grid-template-columns: 1fr;
+  }
+  .sb {
+    position: fixed;
+    inset: 0 auto 0 0;
+    width: 260px;
+    transform: translateX(-100%);
+    transition: transform 0.18s ease;
+    z-index: calc(var(--z-drawer) - 1);
+  }
+  .shell.sb-open .sb {
+    transform: translateX(0);
+  }
+  .shell.sb-open .sb-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    z-index: calc(var(--z-drawer) - 2);
+  }
+  .sb-open,
+  .sb-close {
+    display: inline-flex;
+  }
+  .sb-close {
+    margin-left: auto;
+  }
+  .top {
+    flex-wrap: wrap;
+    height: auto;
+    gap: 8px;
+    padding: 8px 12px;
+  }
+  .main {
+    min-width: 0;
+  }
+  .crumb {
+    flex: 1;
+  }
+  .top-r {
+    flex-wrap: wrap;
+    flex-shrink: 1;
+    justify-content: flex-end;
+    width: 100%;
+  }
+  .top-txt,
+  .top .pill > span:first-child:not(.org-status):not(.dot) {
+    display: none;
+  }
+}
 }
