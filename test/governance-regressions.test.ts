@@ -1,4 +1,4 @@
-import './helpers/env.js';
+import { TEST_ADMIN } from './helpers/env.js';
 // Regression tests for control-plane defects found in the audit: group id collisions, non-atomic
 // profile mappings, revoked objects coming back on re-import, Okta secret/issuer handling,
 // portal-user updates, dashboard totals, Salesforce settings validation and audit-log redaction.
@@ -10,6 +10,7 @@ import { store, stripSensitivePayloadData } from '../src/db/store.js';
 import { startTestServer, loginAsAdmin, adminFetch, mcpRequest, toolResultPayload, type AdminSession, type TestServer } from './helpers/server.js';
 import { installSalesforceMock } from './helpers/salesforceMock.js';
 import { createSimulatorToken } from '../src/salesforce/client.js';
+import { resolveEffectiveProfilePermissions } from '../src/rbac/policyEngine.js';
 
 const tag = () => crypto.randomBytes(4).toString('hex');
 const rawDb = () => new DatabaseSync(process.env.DB_PATH as string);
@@ -87,15 +88,39 @@ describe('Access Groups', () => {
     ]);
   });
 
-  test('POST /groups refuses an Object or field that Salesforce > Objects does not have, naming the entry', async () => {
+  test('POST /groups keeps an Object or field that Salesforce > Objects does not have, and refuses an entry that names none', async () => {
     const objectName = `Known_${tag()}__c`;
     store.upsertObjectWithFields({ objectName, fields: [{ fieldName: 'Id' }, { fieldName: 'Name' }] });
-    const name = `Unknown ${tag()}`;
+    // Kept as typed and reported as not available: it grants nothing while the catalog lacks it.
+    const kept = await postGroup({
+      name: `Unknown ${tag()}`,
+      objectPermissions: [
+        { objectName, canRead: true, allowedFields: ['id', 'Salary__c'] },
+        { objectName: 'Nope__c', canRead: true },
+      ],
+    });
+    assert.equal(kept.status, 200, JSON.stringify(kept.body));
+    assert.deepEqual(
+      kept.body.group.objectPermissions.map((p: { objectName: string; allowedFields: string[] }) => [p.objectName, p.allowedFields]),
+      [
+        [objectName, ['Id', 'Salary__c']],
+        ['Nope__c', []],
+      ]
+    );
+    assert.deepEqual(
+      kept.body.issues.map((i: { name: string; reason: string }) => [i.name, i.reason]),
+      [
+        ['Salary__c', 'field_not_in_catalog'],
+        ['Nope__c', 'object_not_in_catalog'],
+      ]
+    );
+
+    const name = `Malformed ${tag()}`;
     const cases: Array<[unknown, string]> = [
-      [{ objectName: 'Nope__c', canRead: true }, 'objectPermissions[1].objectName: Salesforce > Objects has no Object named "Nope__c".'],
-      [{ objectName, canRead: true, allowedFields: ['Id', 'Salary__c'] }, `objectPermissions[1].allowedFields[1]: Object "${objectName}" has no field named "Salary__c".`],
       [{ objectName, canRead: true, allowedFields: 'Id' }, 'objectPermissions[1].allowedFields must be an array of field API names.'],
       [{ objectName: '  ', canRead: true }, 'objectPermissions[1].objectName must be the API name of an Object.'],
+      [{ objectName: 'Not an API name', canRead: true }, 'objectPermissions[1].objectName: "Not an API name" is not a valid Salesforce object API name.'],
+      [{ objectName, canRead: true, allowedFields: ['Id', 'Bad Field'] }, 'objectPermissions[1].allowedFields[1]: "Bad Field" is not a valid Salesforce field API name.'],
       [['Id'], 'objectPermissions[1] must be an object.'],
     ];
     for (const [entry, error] of cases) {
@@ -282,22 +307,32 @@ describe('Objects', () => {
         { objectName: 'Account', canRead: true, canCreate: false, canUpdate: false, canDelete: false, allowedFields: ['Id'] },
       ],
     });
+    const profileId = `00e${crypto.randomBytes(6).toString('hex')}`.slice(0, 15);
+    store.upsertProfile(profileId, `Payroll profile ${tag()}`);
+    store.setProfileGroups(profileId, [group.id]);
+    const grantsSalary = () => resolveEffectiveProfilePermissions(profileId).objectPermissions.has(objectName);
+    assert.ok(grantsSalary());
 
     const del = await adminFetch(server.baseUrl, session, `/api/admin/objects/${objectName}`, { method: 'DELETE' });
     assert.equal(del.status, 200);
+    // The group keeps the entry, marked as deleted by whom, so admins can see why access stopped.
     const afterDelete = store.getGroups().find((g) => g.id === group.id)!;
-    assert.deepEqual(afterDelete.objectPermissions.map((p) => p.objectName), ['Account']);
+    assert.deepEqual(afterDelete.objectPermissions.map((p) => p.objectName), [objectName, 'Account']);
+    assert.equal(afterDelete.objectPermissions[0].removed?.by, TEST_ADMIN.username);
+    assert.equal(afterDelete.objectPermissions[1].removed, undefined);
     const log = store.getPortalAdminLogs(5).find((l) => l.action === 'DELETE_OBJECT');
     assert.match(log?.details || '', /revoked it from 1 Access Group/);
+    assert.match(store.getGroupHistory(group.id)[0].changes[0], new RegExp(`${objectName} was deleted from Salesforce > Objects`));
 
-    // Re-import the same object from SFDX files: it comes back, but no group grants it.
+    // Re-import the same object from SFDX files: it comes back, but the group's held entry grants nothing.
     const reimport = await adminFetch(server.baseUrl, session, '/api/admin/objects/import-sfdx-files', {
       method: 'POST',
       body: { files: [{ relativePath: `objects/${objectName}/${objectName}.object-meta.xml`, content: '<CustomObject><label>Salary</label></CustomObject>' }] },
     });
     assert.equal(reimport.status, 200);
     assert.ok(store.getObjects().some((o) => o.objectName === objectName));
-    assert.ok(!store.getGroups().find((g) => g.id === group.id)!.objectPermissions.some((p) => p.objectName === objectName));
+    assert.ok(store.getGroups().find((g) => g.id === group.id)!.objectPermissions[0].removed);
+    assert.ok(!grantsSalary());
   });
 
   test('SFDX import through the API uses the object label, not a compact layout label', async () => {

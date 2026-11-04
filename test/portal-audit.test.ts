@@ -545,7 +545,7 @@ describe('the Admin API audit record', () => {
       [`free text ${secret}`, /^objectPermissions\[0\] must be an object\.$/],
       [{ objectName: { value: secret }, canRead: true }, /^objectPermissions\[0\]\.objectName must be the API name of an Object\.$/],
       [{ ...grant('Account', ['Name']), allowedFields: ['Name', 7], sample: secret }, /^objectPermissions\[0\]\.allowedFields\[1\] must be a field API name\.$/],
-      [grant('Account', ['Name', email]), /^objectPermissions\[0\]\.allowedFields\[1\]: Object "Account" has no field named "jane\./],
+      [grant('Account', ['Name', email]), /^objectPermissions\[0\]\.allowedFields\[1\]: "jane\.[0-9a-f]+@example\.com" is not a valid Salesforce field API name\.$/],
     ];
     for (const [entry, error] of refusals) {
       const res = await api('/api/admin/groups', { method: 'POST', body: { name, objectPermissions: [entry] } });

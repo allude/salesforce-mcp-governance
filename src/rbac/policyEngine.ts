@@ -22,7 +22,14 @@ import {
   type SalesforceObject,
   type SalesforceProfile,
 } from '../types/governance.js';
-import { enabledObjectsByLowerName, GRANT_FLAGS, grantsAccess, malformedGrantReason } from './groupGrants.js';
+import {
+  enabledObjectsByLowerName,
+  GRANT_FLAGS,
+  grantsAccess,
+  heldFieldNames,
+  isHeldGrant,
+  malformedGrantReason,
+} from './groupGrants.js';
 
 export { PolicyViolationError } from './policyViolation.js';
 
@@ -228,6 +235,12 @@ function mergeAssignedGroups(
       }
       const objPerm = entry as GroupObjectPermission;
       if (!objPerm.objectName) continue;
+      // Held after the object was deleted from Salesforce > Objects: shown to admins, never granted,
+      // even once the object is imported again, until an admin restores it. Held fields are kept in
+      // `removedFields`, outside `allowedFields`; one that is in both (an older release or a hand edit)
+      // stays held. Id is the exception: the fallback below gives it whether or not the entry holds it,
+      // as it is the key of every record a call returns (and server.ts selects it when no field is).
+      if (isHeldGrant(objPerm)) continue;
       // An entry that grants no CRUD access grants nothing, including its field list. Without this,
       // its fields would be merged only when another group had already granted the object, so the
       // result would depend on the groups' (alphabetical) processing order. A flag grants only when
@@ -263,9 +276,10 @@ function mergeAssignedGroups(
         if (objPerm[flag] === true) provenance.flags[flag].add(grp.id);
       }
 
+      const heldFields = heldFieldNames(objPerm);
       let resolvedAnyField = false;
       for (const f of objPerm.allowedFields || []) {
-        if (!f) continue;
+        if (!f || heldFields.has(f.toLowerCase())) continue;
         const canonical = globalObj.canonicalFieldMap.get(f.toLowerCase());
         if (canonical) {
           existing.allowedFields.add(canonical);

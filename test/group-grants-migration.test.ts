@@ -205,6 +205,80 @@ describe('canonicalization of group grants on upgrade', () => {
     assert.deepEqual(storedGroups(upgraded).grp_pipeline, { grants: STRAY_VARIANT_GRANTS, version: 1 });
   });
 
+  /** A legacy database whose Profile is in one group only, and a copy of it as this release would read it unmigrated. */
+  function legacyWithOnlyGroup(name: string, grants: unknown[]): { upgraded: string; asStored: string } {
+    const upgraded = legacyDatabase(`${name}.sqlite`);
+    withDb(upgraded, (db) => {
+      db.exec('DELETE FROM profile_group_memberships');
+      insertGroup(db, 'grp_only', grants);
+      db.prepare('INSERT INTO profile_group_memberships (profile_id, group_id) VALUES (?, ?)').run(PROFILE_ID, 'grp_only');
+    });
+    const asStored = path.join(testTmpDir, `${name}-as-stored.sqlite`);
+    fs.copyFileSync(upgraded, asStored);
+    withDb(asStored, (db) => db.exec('ALTER TABLE access_groups ADD COLUMN version INTEGER NOT NULL DEFAULT 1'));
+    return { upgraded, asStored };
+  }
+
+  const held = (fieldName?: string) => ({
+    ...(fieldName ? { fieldName } : {}),
+    at: '2026-10-02T00:00:00.000Z',
+    by: 'admin',
+  });
+
+  test('a held entry stays as stored, and live entries for its Object merge without it', () => {
+    // As a release with held grants but no version column could leave it: Account deleted from
+    // Salesforce > Objects and added again, so its first entry is held, and two live entries in other
+    // spellings, each holding a field deleted from it.
+    const HELD_ENTRY = { objectName: 'account', canRead: true, canUpdate: true, allowedFields: ['ID', 'Secret__c'], removed: held() };
+    const { upgraded, asStored } = legacyWithOnlyGroup('legacy-groups-held', [
+      HELD_ENTRY,
+      { objectName: 'ACCOUNT', canRead: true, allowedFields: ['name'], removedFields: [held('Fax')] },
+      { objectName: 'account', canRead: true, allowedFields: ['phone'], removedFields: [held('Website'), held('fax')] },
+    ]);
+
+    const before = bootAndResolve(asStored);
+    const after = bootAndResolve(upgraded);
+    assert.deepEqual(after, before);
+    const account = (after as { objects: Array<{ objectName: string; canUpdate: boolean; allowedFields: string[] }> }).objects.find(
+      (o) => o.objectName === 'Account'
+    );
+    assert.equal(account?.canUpdate, false);
+    assert.deepEqual(account?.allowedFields, ['Name', 'Phone']);
+    assert.deepEqual(storedGroups(upgraded).grp_only, {
+      grants: [
+        HELD_ENTRY,
+        {
+          objectName: 'Account',
+          canRead: true,
+          canCreate: false,
+          canUpdate: false,
+          canDelete: false,
+          allowedFields: ['Name', 'Phone'],
+          removedFields: [held('Fax'), held('Website')],
+        },
+      ],
+      version: 2,
+    });
+  });
+
+  test('an Object whose entries hold a field one of them grants keeps its entries as stored', () => {
+    // Merged, the entry would hold Phone, so the upgrade would take away the Phone the second entry gives.
+    const STORED = [
+      { objectName: 'ACCOUNT', canRead: true, allowedFields: ['name'], removedFields: [held('Phone')] },
+      { objectName: 'account', canRead: true, allowedFields: ['phone'] },
+    ];
+    const { upgraded, asStored } = legacyWithOnlyGroup('legacy-groups-held-and-granted', STORED);
+
+    const before = bootAndResolve(asStored);
+    const after = bootAndResolve(upgraded);
+    assert.deepEqual(after, before);
+    const account = (after as { objects: Array<{ objectName: string; allowedFields: string[] }> }).objects.find(
+      (o) => o.objectName === 'Account'
+    );
+    assert.deepEqual(account?.allowedFields, ['Name', 'Phone']);
+    assert.deepEqual(storedGroups(upgraded).grp_only, { grants: STORED, version: 1 });
+  });
+
   test('runs once: a case variant written after the upgrade is left alone', () => {
     const dbPath = legacyDatabase('legacy-groups-once.sqlite');
     bootAndResolve(dbPath);

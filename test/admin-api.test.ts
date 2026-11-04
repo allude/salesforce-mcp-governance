@@ -1323,10 +1323,15 @@ describe('Admin REST API', () => {
       await mutate(admin, 'DELETE', `/api/admin/objects/${objectName}`, undefined, 'DELETE_OBJECT');
       await assertReloadConflict();
 
-      // Saved without a version, the same draft is checked against Salesforce > Objects as it is now.
-      const refused = await call(admin, 'POST', '/api/admin/groups', loaded);
-      assert.equal(refused.status, 400);
-      assert.match(refused.body.error, /^objectPermissions\[0\]\.objectName: Salesforce > Objects has no Object named /);
+      // Saved without a version, the same draft lists the held Object live, which would restore it
+      // unseen: a restore needs the version the client loaded, so it is the reload 409 too.
+      const mark = auditMark();
+      const current = store.getGroups().find((g) => g.id === loaded.id);
+      const unversioned = await call(admin, 'POST', '/api/admin/groups', loaded);
+      assert.equal(unversioned.status, 409, JSON.stringify(unversioned.body));
+      assert.match(unversioned.body.error, /restoring one needs the version of the group that was loaded/);
+      assert.deepEqual(store.getGroups().find((g) => g.id === loaded.id), current);
+      assertNotAudited(mark, admin.ip);
     });
 
     it('POST /groups answers a draft loaded before an older release changed the group with the reload 409', async (t) => {

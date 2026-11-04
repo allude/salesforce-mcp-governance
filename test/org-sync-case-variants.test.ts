@@ -160,7 +160,8 @@ describe('an object the org no longer has', () => {
 
     assert.equal(objectNamed(upper), undefined);
     assert.equal(objectNamed(lower), undefined);
-    assert.deepEqual(permissionsOf(group.id), []);
+    // Revoked, but kept on the group as not available for an admin to review.
+    assert.deepEqual(permissionsOf(group.id).map((p) => [p.objectName, Boolean(p.removed)]), [[upper, true]]);
     assert.deepEqual(summary.affected.objectsRemoved.sort(), [upper, lower].sort());
     assert.deepEqual(summary.affected.objectsKeptMissing, []);
     assert.deepEqual(summary.affected.groupsLosingGrants, [group.name]);

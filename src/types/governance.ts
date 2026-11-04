@@ -118,6 +118,12 @@ export interface SalesforceObject {
   updatedAt: string;
 }
 
+/** When something was deleted from Salesforce > Objects, and the admin who deleted it. */
+export interface CatalogRemoval {
+  at: string;
+  by: string;
+}
+
 export interface GroupObjectPermission {
   objectName: string;
   canRead: boolean;
@@ -125,6 +131,14 @@ export interface GroupObjectPermission {
   canUpdate: boolean;
   canDelete: boolean;
   allowedFields: string[]; // Field API names from SalesforceObjectField
+  /**
+   * Set when the object was deleted from Salesforce > Objects. The entry stays on the group so admins
+   * can see what it granted, and it grants nothing, even after the object is imported again, until an
+   * admin restores it.
+   */
+  removed?: CatalogRemoval;
+  /** Granted fields deleted from Salesforce > Objects, kept the same way: they grant nothing until restored. */
+  removedFields?: Array<CatalogRemoval & { fieldName: string }>;
 }
 
 /** The longest Access Group name and description POST /groups accepts, after trimming. */
@@ -135,11 +149,45 @@ export interface AccessGroup {
   id: string;
   name: string;
   description: string;
-  allowedActions: string[]; // McpActionId[]
+  allowedActions: string[]; // McpActionId[], plus any ID this server has no tool for (kept and shown as not available)
   objectPermissions: GroupObjectPermission[];
   /** 1 when created, +1 on every saved change. POST /groups refuses an update built from another version. */
   version: number;
   updatedAt: string;
+}
+
+/** What a group grants, without its identity: what history keeps and an XML file holds. */
+export type AccessGroupSnapshot = Pick<AccessGroup, 'name' | 'description' | 'allowedActions' | 'objectPermissions'>;
+
+/** Where a change to a group came from. */
+export type AccessGroupChangeSource =
+  | 'editor' // the drawer's switches
+  | 'xml_editor' // the drawer's XML view
+  | 'xml_import' // an imported XML file
+  | 'version_restore' // a version loaded from the group's history
+  | 'objects' // Salesforce > Objects (delete, enable, disable)
+  | 'org_sync' // Object sync from the Salesforce org
+  | 'sample_data';
+
+export const ACCESS_GROUP_EDIT_SOURCES = ['editor', 'xml_editor', 'xml_import', 'version_restore'] as const;
+
+export interface AccessGroupHistoryEntry {
+  id: string;
+  groupId: string;
+  /** The group's name when this happened. */
+  groupName: string;
+  timestamp: string;
+  adminUsername: string;
+  authMethod: string;
+  /** `catalog`: something the group grants changed in Salesforce > Objects, not the group itself. */
+  kind: 'created' | 'updated' | 'deleted' | 'catalog';
+  source: AccessGroupChangeSource;
+  /** The file an import came from, or which version a restore loaded. '' otherwise. */
+  sourceDetail: string;
+  /** One line per change, for people to read. */
+  changes: string[];
+  /** The group after the change; for a deletion, the group as it was. */
+  snapshot: AccessGroupSnapshot;
 }
 
 export interface ProfileGroupMapping {

@@ -37,9 +37,11 @@ import { parseObjectSyncPayload, parseProfileSyncPayload, type PayloadResult } f
 import { LogPageQueryError, parseMcpLogPageQuery, parsePortalLogPageQuery } from './logPageQuery.js';
 import { groupAuditFields, groupUpdateDiff } from './groupAuditDiff.js';
 import { parseGroupObjectPermissions, parseGroupSaveRequest } from './groupPayload.js';
+import { restoresHeldGrant } from '../rbac/groupGrants.js';
 import { isSalesforceId, salesforceIdsMatch } from '../salesforce/ids.js';
 import { assertNotSimulatedOrgHost } from '../salesforce/simulatedOrg.js';
 import type { AccessGroup, SalesforceConnectionSettings } from '../types/governance.js';
+import { groupAvailabilityIssues, type GroupAvailabilityIssue } from '../groups/groupGrants.js';
 import {
   decisionLogStatus,
   evaluatePolicy,
@@ -920,13 +922,39 @@ adminRouter.post('/objects', (req: Request, res: Response) => {
 
   const actor = getAdminInfo(req);
   const result = changeWithAuditEntry(
-    () =>
-      store.upsertObjectWithFields({
-        objectName: store.resolveObjectName(String(objectName)),
+    () => {
+      const name = store.resolveObjectName(String(objectName));
+      const wasEnabled = new Map(
+        (store.getObjects().find((o) => o.objectName === name)?.fields ?? []).map((f) => [f.fieldName.toLowerCase(), f.enabled])
+      );
+      const saved = store.upsertObjectWithFields({
+        objectName: name,
         label: label ? String(label) : undefined,
         // The missing-in-org flag belongs to org sync, so a client cannot set or clear it here.
         fields: Array.isArray(fields) ? fields.map(({ missingInOrg: _ignored, ...field }) => field) : undefined,
-      }),
+      });
+      // A field this save enabled or disabled changes what groups granting it give, as the field toggle
+      // does, so it is noted in their history in the same transaction. A field it adds changes nothing.
+      for (const enabled of [true, false]) {
+        const toggled = saved.fields
+          .filter((f) => f.enabled === enabled && wasEnabled.get(f.fieldName.toLowerCase()) === !enabled)
+          .map((f) => f.fieldName);
+        if (toggled.length === 0) continue;
+        store.recordCatalogChangeOnGroups({
+          objectName: saved.objectName,
+          fieldNames: toggled,
+          describe: (granted) => {
+            const names = granted.map((f) => `${saved.objectName}.${f}`).join(', ');
+            const one = granted.length === 1;
+            return enabled
+              ? `${names} ${one ? 'was' : 'were'} enabled in Salesforce > Objects, so this group grants ${one ? 'it' : 'them'} again.`
+              : `${names} ${one ? 'was' : 'were'} disabled in Salesforce > Objects, so this group's ${one ? 'grant on it is' : 'grants on them are'} not available until enabled.`;
+          },
+          change: { actor, source: 'objects' },
+        });
+      }
+      return saved;
+    },
     (saved) =>
       store.recordPortalAdminLog({
         adminUsername: actor.username,
@@ -958,10 +986,22 @@ adminRouter.put('/objects/:objectName/toggle', (req: Request, res: Response) => 
   const objectName = String(req.params.objectName);
   const { enabled } = req.body || {};
   const actor = getAdminInfo(req);
-  // The toggle and its audit entry share one transaction: a toggled Object can never go unlogged.
+  // The toggle, the notes it leaves in the history of the groups it affects and its audit entry share
+  // one transaction: a toggled Object can never go unlogged.
   const updated = runInTransaction(() => {
+    const wasEnabled = store.getObjects().find((o) => o.objectName === objectName)?.enabled;
     const toggled = store.toggleObject(objectName, Boolean(enabled));
     if (!toggled) return null;
+    if (wasEnabled !== undefined && wasEnabled !== toggled.enabled) {
+      store.recordCatalogChangeOnGroups({
+        objectName,
+        describe: () =>
+          toggled.enabled
+            ? `${objectName} was enabled in Salesforce > Objects, so this group's grant on it is in force again.`
+            : `${objectName} was disabled in Salesforce > Objects, so this group's grant on it is not available until it is enabled.`,
+        change: { actor, source: 'objects' },
+      });
+    }
     store.recordPortalAdminLog({
       adminUsername: actor.username,
       authMethod: actor.authMethod,
@@ -998,10 +1038,26 @@ adminRouter.put(
     const fieldName = String(req.params.fieldName);
     const { enabled } = req.body || {};
     const actor = getAdminInfo(req);
-    // The toggle and its audit entry share one transaction: a toggled field can never go unlogged.
+    // The toggle, the notes it leaves in the history of the groups it affects and its audit entry share
+    // one transaction: a toggled field can never go unlogged.
     const updated = runInTransaction(() => {
+      const wasEnabled = store
+        .getObjects()
+        .find((o) => o.objectName === objectName)
+        ?.fields.find((f) => f.fieldName === fieldName)?.enabled;
       const toggled = store.toggleObjectField(objectName, fieldName, Boolean(enabled));
       if (!toggled) return null;
+      if (wasEnabled !== undefined && wasEnabled !== Boolean(enabled)) {
+        store.recordCatalogChangeOnGroups({
+          objectName,
+          fieldNames: [fieldName],
+          describe: () =>
+            enabled
+              ? `${objectName}.${fieldName} was enabled in Salesforce > Objects, so this group grants it again.`
+              : `${objectName}.${fieldName} was disabled in Salesforce > Objects, so this group's grant on it is not available until it is enabled.`,
+          change: { actor, source: 'objects' },
+        });
+      }
       store.recordPortalAdminLog({
         adminUsername: actor.username,
         authMethod: actor.authMethod,
@@ -1035,13 +1091,25 @@ adminRouter.put(
     const objectName = String(req.params.objectName);
     const { enabled } = req.body || {};
     const actor = getAdminInfo(req);
-    // One transaction with its audit entry, so every field changes or none does, as one policy
-    // revision, and the change can never go unlogged.
+    // One transaction with the notes it leaves in group history and its audit entry, so every field
+    // changes or none does, as one policy revision, and the change can never go unlogged.
     const targetObj = runInTransaction(() => {
       const found = store.getObjects().find((o) => o.objectName === objectName);
       if (!found) return undefined;
+      const changedFields = found.fields.filter((f) => f.enabled !== Boolean(enabled)).map((f) => f.fieldName);
       for (const f of found.fields) {
         store.toggleObjectField(objectName, f.fieldName, Boolean(enabled));
+      }
+      if (changedFields.length > 0) {
+        store.recordCatalogChangeOnGroups({
+          objectName,
+          fieldNames: changedFields,
+          describe: (granted) =>
+            enabled
+              ? `All fields of ${objectName} were enabled in Salesforce > Objects, so this group grants ${granted.join(', ')} again.`
+              : `All fields of ${objectName} were disabled in Salesforce > Objects, so this group's grants on ${granted.join(', ')} are not available until they are enabled.`,
+          change: { actor, source: 'objects' },
+        });
       }
       store.recordPortalAdminLog({
         adminUsername: actor.username,
@@ -1075,30 +1143,35 @@ adminRouter.delete(
     const objectName = String(req.params.objectName);
     const fieldName = String(req.params.fieldName);
     const actor = getAdminInfo(req);
-    // The delete, the grants it revokes and its audit entry share one transaction.
-    const updated = runInTransaction(() => {
-      const remaining = store.deleteObjectField(objectName, fieldName);
-      if (!remaining) return null;
+    // The delete, the grants it holds, the notes in the history of those groups and its audit entry
+    // share one transaction. The entry names the groups that actually lost a grant.
+    const deleted = runInTransaction(() => {
+      const result = store.deleteObjectFieldAndReport(objectName, fieldName, actor);
+      if (!result) return null;
       store.recordPortalAdminLog({
         adminUsername: actor.username,
         authMethod: actor.authMethod,
         action: 'DELETE_FIELD',
         target: `${objectName}.${fieldName}`,
-        details: `Deleted field "${objectName}.${fieldName}" from MCP Server object schema.`,
+        details: `Deleted field "${objectName}.${fieldName}" from MCP Server object schema${
+          result.revokedGroups.length > 0
+            ? ` and revoked it from ${result.revokedGroups.length} Access Group(s), which keep it as not available: ${result.revokedGroups.join(', ')}`
+            : ''
+        }.`,
         ipAddress: actor.ip,
         correlationId: actor.correlationId,
         targetType: 'field',
         targetId: `${objectName}.${fieldName}`,
       });
-      return remaining;
+      return result;
     });
-    if (!updated) {
+    if (!deleted) {
       res.status(404).json({ error: `Field '${objectName}.${fieldName}' not found.` });
       return;
     }
 
     res.json({
-      object: updated,
+      object: deleted.object,
       objects: store.getObjects(),
     });
   }
@@ -1107,11 +1180,13 @@ adminRouter.delete(
 adminRouter.delete('/objects/:objectName', (req: Request, res: Response) => {
   const objectName = String(req.params.objectName);
   const actor = getAdminInfo(req);
-  // The delete, the grants it revokes and its audit entry share one transaction. The entry names the
-  // groups that actually lost a grant: none while a case variant of the Object remains.
+  // The delete, the grants it holds, the notes in the history of those groups and its audit entry share
+  // one transaction. The entry names the groups that actually lost a grant: none while a case variant
+  // of the Object remains.
   const deleted = runInTransaction(() => {
-    const { deleted: removed, revokedGroups } = store.deleteObjectRevokingGrants(objectName);
-    if (!removed) return false;
+    const result = store.deleteObjectAndReport(objectName, actor);
+    if (!result) return false;
+    const { revokedGroups } = result;
     store.recordPortalAdminLog({
       adminUsername: actor.username,
       authMethod: actor.authMethod,
@@ -1119,7 +1194,7 @@ adminRouter.delete('/objects/:objectName', (req: Request, res: Response) => {
       target: `Object: ${objectName}`,
       details: `Deleted Salesforce Object "${objectName}" and its fields from the MCP Server${
         revokedGroups.length > 0
-          ? ` and revoked it from ${revokedGroups.length} Access Group(s): ${revokedGroups.join(', ')}`
+          ? ` and revoked it from ${revokedGroups.length} Access Group(s), which keep it as not available: ${revokedGroups.join(', ')}`
           : ''
       }.`,
       ipAddress: actor.ip,
@@ -1268,7 +1343,7 @@ adminRouter.post('/objects/pull-apply', (req: Request, res: Response) => {
   try {
     // The audit entry shares the transaction: an applied change can never go unlogged.
     summary = runInTransaction(() => {
-      const applied = store.applyObjectsSyncFromOrg(parsed.value);
+      const applied = store.applyObjectsSyncFromOrg({ ...parsed.value, actor });
       store.recordPortalAdminLog({
         adminUsername: actor.username,
         authMethod: actor.authMethod,
@@ -1281,7 +1356,7 @@ adminRouter.post('/objects/pull-apply', (req: Request, res: Response) => {
           namesClause('Removed objects', applied.affected.objectsRemoved) +
           namesClause('Removed fields', applied.affected.fieldsRemoved) +
           namesClause('Kept as missing', [...applied.affected.objectsKeptMissing, ...applied.affected.fieldsKeptMissing]) +
-          namesClause('Access Groups that lost grants', applied.affected.groupsLosingGrants),
+          namesClause('Access Groups that lost grants (kept there as not available)', applied.affected.groupsLosingGrants),
         ipAddress: actor.ip,
         correlationId: actor.correlationId,
       });
@@ -1305,12 +1380,14 @@ adminRouter.post('/objects/pull-apply', (req: Request, res: Response) => {
 // ============================================================================
 /**
  * POST /api/admin/groups
- * Creates a group (no id) or updates the group with `id` (404 when there is none). The grants are
- * checked against Salesforce > Objects and stored in the catalog's spelling (see groupPayload.ts).
+ * Creates a group (no id) or updates the group with `id` (404 when there is none). Object, field and
+ * MCP action names this server does not have are kept and reported as not available (`issues`) rather
+ * than refused, so a group imported from another server, or one whose Object was deleted, keeps what it
+ * names for an admin to review; names it has are stored in the catalog's spelling (see groupPayload.ts).
+ * `source` says which editor (or import) the save came from, for the group's history.
  * An update that sends `expectedVersion` is refused with 409 when the group has changed since, so a
- * stale editor cannot undo a change it never saw. That check comes before the grants are checked:
- * deleting an Object or field revokes it from its groups (a new version), and the draft of an editor
- * that loaded the group earlier still names it, which must read as the reload 409, not a 400.
+ * stale editor cannot undo a change it never saw. That check comes before the grants are checked, so a
+ * stale draft always reads as the reload 409. An update that restores a held grant must send it.
  */
 adminRouter.post('/groups', (req: Request, res: Response) => {
   const parsed = parseGroupSaveRequest(req.body || {});
@@ -1321,10 +1398,12 @@ adminRouter.post('/groups', (req: Request, res: Response) => {
   const request = parsed.value;
 
   const actor = getAdminInfo(req);
-  let outcome: { saved: AccessGroup } | { status: 400 | 404 | 409; body: Record<string, unknown> };
+  let outcome:
+    | { saved: AccessGroup; issues: GroupAvailabilityIssue[] }
+    | { status: 400 | 404 | 409; body: Record<string, unknown> };
   try {
-    // The checks against the stored groups, the change and its audit entry share one transaction:
-    // a saved group can never go unlogged, nor be saved over a version the client did not load.
+    // The checks against the stored groups, the change, its history and its audit entry share one
+    // transaction: a saved group can never go unlogged, nor be saved over a version the client did not load.
     outcome = runInTransaction(() => {
       const groups = store.getGroups();
       const before = request.id ? groups.find((g) => g.id === request.id) : undefined;
@@ -1344,6 +1423,18 @@ adminRouter.post('/groups', (req: Request, res: Response) => {
       if (!grants.ok) {
         return { status: 400 as const, body: { error: grants.error } };
       }
+      // Restoring a held grant gives back access deleted from Salesforce > Objects, so it must come from
+      // a client that loaded the group as it is now: a draft from before the deletion lists the grant
+      // live and would otherwise restore it unseen. The portal always sends expectedVersion.
+      if (before && request.expectedVersion === undefined && restoresHeldGrant(before.objectPermissions, grants.value)) {
+        return {
+          status: 409 as const,
+          body: {
+            error: `Access Group "${before.name}" holds grants deleted from Salesforce > Objects, and restoring one needs the version of the group that was loaded (expectedVersion), so nothing was saved. Reload it and try again.`,
+            group: before,
+          },
+        };
+      }
       // Names are unique ignoring case. A group that keeps its own name may still share it with a
       // case variant an older version allowed, so that neither becomes impossible to save.
       const nameTaken =
@@ -1353,22 +1444,38 @@ adminRouter.post('/groups', (req: Request, res: Response) => {
         return { status: 409 as const, body: { error: `An Access Group named "${request.name}" already exists.` } };
       }
 
-      const group = store.upsertGroup({
-        id: before?.id,
-        name: request.name,
-        description: request.description,
-        allowedActions: request.allowedActions,
-        objectPermissions: grants.value,
-      });
+      const group = store.upsertGroup(
+        {
+          id: before?.id,
+          name: request.name,
+          description: request.description,
+          allowedActions: request.allowedActions,
+          objectPermissions: grants.value,
+        },
+        { actor, source: request.source, sourceDetail: request.sourceDetail }
+      );
       // A save that changes nothing keeps its version (see upsertGroup), and is still logged: its diff is empty.
       const unchanged = before !== undefined && group.version === before.version;
-      const saved = `Access Group "${group.name}" (${group.allowedActions.length} MCP actions, ${
+      const issues = groupAvailabilityIssues(group, store.getObjects());
+      const unavailable = issues.filter((i) => i.status === 'unavailable').length;
+      const broken = issues.length - unavailable;
+      const via =
+        request.source === 'xml_import'
+          ? ` from XML${request.sourceDetail ? ` (${request.sourceDetail})` : ''}`
+          : request.source === 'xml_editor'
+            ? ' in the XML editor'
+            : request.source === 'version_restore'
+              ? ' from an earlier version in its history'
+              : '';
+      const saved = `Access Group "${group.name}"${via} (${group.allowedActions.length} MCP actions, ${
         group.objectPermissions.length
-      } objects configured)`;
+      } objects configured${unavailable > 0 ? `, ${unavailable} not available` : ''}${
+        broken > 0 ? `, ${broken} broken` : ''
+      })`;
       store.recordPortalAdminLog({
         adminUsername: actor.username,
         authMethod: actor.authMethod,
-        action: before ? 'UPDATE_GROUP' : 'CREATE_GROUP',
+        action: request.source === 'xml_import' ? 'IMPORT_GROUP_XML' : before ? 'UPDATE_GROUP' : 'CREATE_GROUP',
         target: `Group: ${group.name}`,
         details: !before ? `Created ${saved}.` : unchanged ? `Saved ${saved} without changes.` : `Updated ${saved}.`,
         ipAddress: actor.ip,
@@ -1377,7 +1484,7 @@ adminRouter.post('/groups', (req: Request, res: Response) => {
         targetId: group.id,
         diff: before ? groupUpdateDiff(before, group) : { after: groupAuditFields(group) },
       });
-      return { saved: group };
+      return { saved: group, issues };
     });
   } catch (err: any) {
     if (/UNIQUE constraint failed: access_groups\.name/.test(String(err?.message))) {
@@ -1394,22 +1501,23 @@ adminRouter.post('/groups', (req: Request, res: Response) => {
   res.json({
     group: outcome.saved,
     groups: store.getGroups(),
+    issues: outcome.issues,
   });
 });
 
 adminRouter.delete('/groups/:id', (req: Request, res: Response) => {
   const id = String(req.params.id);
   const actor = getAdminInfo(req);
-  // The delete and its audit entry share one transaction: a deleted group can never go unlogged.
+  // The delete, its history and its audit entry share one transaction: a deleted group can never go unlogged.
   const deleted = runInTransaction(() => {
-    const existing = store.getGroups().find((g) => g.id === id);
+    const existing = store.getGroup(id);
     if (!existing) return false;
     // Deleting the group also ends its memberships (ON DELETE CASCADE), so the diff names those Profiles.
     const profileIds = store
       .getProfileGroupMappings()
       .filter((m) => m.groupIds.includes(id))
       .map((m) => m.profileId);
-    if (!store.deleteGroup(id)) return false;
+    if (!store.deleteGroup(id, { actor, source: 'editor' })) return false;
     store.recordPortalAdminLog({
       adminUsername: actor.username,
       authMethod: actor.authMethod,
@@ -1484,6 +1592,21 @@ function membershipChangeClauses(added: string[], removed: string[]): string {
     namesClause('Added', added, MEMBERSHIP_NAMES_LOGGED) + namesClause('Removed', removed, MEMBERSHIP_NAMES_LOGGED)
   );
 }
+
+/**
+ * GET /api/admin/groups/:id/history
+ * The group's changes, newest first: edits, imports and restores, and changes in Salesforce > Objects
+ * to what it grants. Still readable after the group is deleted.
+ */
+adminRouter.get('/groups/:id/history', (req: Request, res: Response) => {
+  const id = String(req.params.id);
+  const history = store.getGroupHistory(id);
+  if (history.length === 0 && !store.getGroup(id)) {
+    res.status(404).json({ error: 'Group not found.' });
+    return;
+  }
+  res.json({ history });
+});
 
 /**
  * PUT /api/admin/profile-groups/:profileId
@@ -2397,14 +2520,15 @@ adminRouter.post('/workspace/seed-sample', (req: Request, res: Response) => {
       }
 
       for (const g of sampleGroups) {
-        // A grant for an Object the catalog does not have could not be saved through POST /groups either.
+        // Grants only for Objects the catalog has: one it lacks would only show as not available.
         const objectPermissions = g.objectPermissions.flatMap((p) => {
           const found = catalogObject(p.objectName);
           return found ? [{ ...p, objectName: found.objectName }] : [];
         });
         const sample = { ...g, objectPermissions };
-        if (store.getGroups().some((existing) => existing.id === g.id)) store.upsertGroup(sample);
-        else store.createGroup(sample);
+        const change = { actor, source: 'sample_data' as const };
+        if (store.getGroups().some((existing) => existing.id === g.id)) store.upsertGroup(sample, change);
+        else store.createGroup(sample, change);
       }
 
       // Assign profiles to groups

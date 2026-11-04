@@ -2,10 +2,12 @@ import './helpers/env.js';
 // The readers of stored Access Group grants outside policy evaluation: the field and Object deletes
 // (Admin API and org sync), which revoke grants, and the org sync preview, which names the groups a
 // removal affects. A database from an older version can hold entries malformedGrantReason refuses and
-// columns that do not parse. None of these readers may fail on them. A revocation takes the Object or
-// field from every entry that names the Object as text, malformed ones included: an older release run
-// on the database after a rollback reads some of those as grants, and its own revocation removed them.
-// It rewrites nothing else, and only a readable grant names its group in an audit entry or a preview.
+// columns that do not parse. None of these readers may fail on them. A revocation holds the Object or
+// field on every entry that names the Object as text, malformed ones included (`removed` on the entry,
+// the field moved to `removedFields`): an older release run on the database after a rollback reads some
+// of those as grants, and every release since holding was added skips a held entry and never reads a
+// held field. It rewrites nothing else, records the change in each changed group's history, and only a
+// readable grant names its group in an audit entry or a preview.
 import { after, before, describe, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
@@ -41,19 +43,23 @@ const malformedEntries = (objectName: string): unknown[] => [
   { objectName, canRead: true, allowedFields: [1, 'Secret__c'] },
 ];
 
-/** The malformed entries once Secret__c is deleted: it leaves every allowedFields list naming it. */
-const malformedEntriesWithoutSecret = (objectName: string): unknown[] => [
+/** When a held entry or field was deleted, as these tests compare it: the time is replaced by AT. */
+const REMOVAL = { at: 'AT', by: 'admin' };
+
+/** The malformed entries once Secret__c is deleted: it leaves every allowedFields list naming it, held. */
+const malformedEntriesWithSecretHeld = (objectName: string): unknown[] => [
   null,
   'text',
   [],
   { objectName: 7, canRead: true },
-  { objectName, canRead: 'true', allowedFields: [] },
+  { objectName, canRead: 'true', allowedFields: [], removedFields: [{ fieldName: 'Secret__c', ...REMOVAL }] },
   { objectName, canRead: true, allowedFields: 'Secret__c' },
-  { objectName, canRead: true, allowedFields: [1] },
+  { objectName, canRead: true, allowedFields: [1], removedFields: [{ fieldName: 'Secret__c', ...REMOVAL }] },
 ];
 
-/** The malformed entries once the Object is deleted: those that name it as text go. */
-const malformedEntriesWithoutObject = (): unknown[] => [null, 'text', [], { objectName: 7, canRead: true }];
+/** The malformed entries once the Object is deleted: those that name it as text are held. */
+const malformedEntriesWithObjectHeld = (objectName: string): unknown[] =>
+  malformedEntries(objectName).map((entry, index) => (index < 4 ? entry : { ...(entry as object), removed: REMOVAL }));
 
 const validEntry = (objectName: string) => ({
   objectName,
@@ -63,6 +69,21 @@ const validEntry = (objectName: string) => ({
   canDelete: false,
   allowedFields: ['Id', 'Secret__c'],
 });
+
+/**
+ * A group's stored entries, with each removal's time checked to be a time and replaced by AT, so
+ * entries held by one revocation compare equal however long it took.
+ */
+const storedEntries = (groupId: string): unknown[] =>
+  JSON.parse(storedColumn(groupId).json, (key, value) => {
+    if (key === 'at' && typeof value === 'string') {
+      assert.ok(!Number.isNaN(Date.parse(value)), `a removal time: ${value}`);
+      return 'AT';
+    }
+    return value;
+  });
+
+const latestHistoryKind = (groupId: string) => store.getGroupHistory(groupId, 1)[0]?.kind;
 
 const storedColumn = (groupId: string) =>
   raw.prepare('SELECT object_permissions_json AS json, version FROM access_groups WHERE id = ?').get(groupId) as {
@@ -127,8 +148,8 @@ function arrange(t: TestContext) {
 
 const latestAudit = () => store.getPortalAdminLogs(1)[0];
 
-describe('deleting a field revokes it from every entry naming its Object', () => {
-  test('DELETE /objects/:objectName/fields/:fieldName takes it from malformed entries too, and skips unreadable columns', async (t) => {
+describe('deleting a field holds it on every entry naming its Object', () => {
+  test('DELETE /objects/:objectName/fields/:fieldName holds it on malformed entries too, and skips unreadable columns', async (t) => {
     const fx = arrange(t);
 
     const res = await adminFetch(server.baseUrl, session, `/api/admin/objects/${fx.objectName}/fields/Secret__c`, {
@@ -136,18 +157,21 @@ describe('deleting a field revokes it from every entry naming its Object', () =>
     });
 
     assert.equal(res.status, 200, JSON.stringify(res.body));
-    assert.deepEqual(JSON.parse(storedColumn(fx.mixed.id).json), [
-      ...malformedEntriesWithoutSecret(fx.objectName),
-      { ...validEntry(fx.objectName), allowedFields: ['Id'] },
-    ]);
-    assert.deepEqual(JSON.parse(storedColumn(fx.valid.id).json), [{ ...validEntry(fx.objectName), allowedFields: ['Id'] }]);
-    assert.deepEqual(JSON.parse(storedColumn(fx.malformedOnly.id).json), malformedEntriesWithoutSecret(fx.objectName));
+    const validHeld = { ...validEntry(fx.objectName), allowedFields: ['Id'], removedFields: [{ fieldName: 'Secret__c', ...REMOVAL }] };
+    assert.deepEqual(storedEntries(fx.mixed.id), [...malformedEntriesWithSecretHeld(fx.objectName), validHeld]);
+    assert.deepEqual(storedEntries(fx.valid.id), [validHeld]);
+    assert.deepEqual(storedEntries(fx.malformedOnly.id), malformedEntriesWithSecretHeld(fx.objectName));
     assert.deepEqual(
       [storedColumn(fx.mixed.id).version, storedColumn(fx.valid.id).version, storedColumn(fx.malformedOnly.id).version],
       [fx.mixedVersion + 1, fx.validVersion + 1, fx.malformedOnlyVersion + 1]
     );
+    assert.deepEqual([fx.mixed, fx.valid, fx.malformedOnly].map((g) => latestHistoryKind(g.id)), ['catalog', 'catalog', 'catalog']);
     fx.assertUntouched();
-    assert.equal(latestAudit().action, 'DELETE_FIELD');
+    const audit = latestAudit();
+    assert.equal(audit.action, 'DELETE_FIELD');
+    assert.match(audit.details, /revoked it from 2 Access Group\(s\), which keep it as not available: /);
+    assert.ok(audit.details.includes(fx.mixed.name) && audit.details.includes(fx.valid.name), audit.details);
+    assert.ok(!audit.details.includes(fx.malformedOnly.name), audit.details);
   });
 
   test('POST /objects/pull-apply removing a field does the same, and names only the groups that lost a grant', async (t) => {
@@ -171,38 +195,40 @@ describe('deleting a field revokes it from every entry naming its Object', () =>
     });
 
     assert.equal(res.status, 200, JSON.stringify(res.body));
-    assert.deepEqual(JSON.parse(storedColumn(fx.mixed.id).json), [
-      ...malformedEntriesWithoutSecret(fx.objectName),
-      { ...validEntry(fx.objectName), allowedFields: ['Id'] },
+    assert.deepEqual(storedEntries(fx.mixed.id), [
+      ...malformedEntriesWithSecretHeld(fx.objectName),
+      { ...validEntry(fx.objectName), allowedFields: ['Id'], removedFields: [{ fieldName: 'Secret__c', ...REMOVAL }] },
     ]);
-    assert.deepEqual(JSON.parse(storedColumn(fx.malformedOnly.id).json), malformedEntriesWithoutSecret(fx.objectName));
+    assert.deepEqual(storedEntries(fx.malformedOnly.id), malformedEntriesWithSecretHeld(fx.objectName));
     fx.assertUntouched();
     const audit = latestAudit();
     assert.equal(audit.action, 'SYNC_OBJECTS_FROM_ORG');
-    assert.match(audit.details, new RegExp(`Access Groups that lost grants: .*${fx.mixed.name}`));
-    assert.match(audit.details, new RegExp(`Access Groups that lost grants: .*${fx.valid.name}`));
+    assert.match(audit.details, new RegExp(`Access Groups that lost grants \\(kept there as not available\\): .*${fx.mixed.name}`));
+    assert.match(audit.details, new RegExp(`Access Groups that lost grants \\(kept there as not available\\): .*${fx.valid.name}`));
     assert.doesNotMatch(audit.details, new RegExp(fx.malformedOnly.name));
   });
 });
 
-describe('deleting an Object revokes every entry naming it', () => {
-  test('DELETE /objects/:objectName removes malformed entries naming it too, and its audit entry names the groups that lost a grant', async (t) => {
+describe('deleting an Object holds every entry naming it', () => {
+  test('DELETE /objects/:objectName holds malformed entries naming it too, and its audit entry names the groups that lost a grant', async (t) => {
     const fx = arrange(t);
 
     const res = await adminFetch(server.baseUrl, session, `/api/admin/objects/${fx.objectName}`, { method: 'DELETE' });
 
     assert.equal(res.status, 200, JSON.stringify(res.body));
-    assert.deepEqual(JSON.parse(storedColumn(fx.mixed.id).json), malformedEntriesWithoutObject());
-    assert.deepEqual(JSON.parse(storedColumn(fx.valid.id).json), []);
-    assert.deepEqual(JSON.parse(storedColumn(fx.malformedOnly.id).json), malformedEntriesWithoutObject());
+    const validHeld = { ...validEntry(fx.objectName), removed: REMOVAL };
+    assert.deepEqual(storedEntries(fx.mixed.id), [...malformedEntriesWithObjectHeld(fx.objectName), validHeld]);
+    assert.deepEqual(storedEntries(fx.valid.id), [validHeld]);
+    assert.deepEqual(storedEntries(fx.malformedOnly.id), malformedEntriesWithObjectHeld(fx.objectName));
     assert.deepEqual(
       [storedColumn(fx.mixed.id).version, storedColumn(fx.valid.id).version, storedColumn(fx.malformedOnly.id).version],
       [fx.mixedVersion + 1, fx.validVersion + 1, fx.malformedOnlyVersion + 1]
     );
+    assert.deepEqual([fx.mixed, fx.valid, fx.malformedOnly].map((g) => latestHistoryKind(g.id)), ['catalog', 'catalog', 'catalog']);
     fx.assertUntouched();
     const audit = latestAudit();
     assert.equal(audit.action, 'DELETE_OBJECT');
-    assert.match(audit.details, /revoked it from 2 Access Group\(s\): /);
+    assert.match(audit.details, /revoked it from 2 Access Group\(s\), which keep it as not available: /);
     assert.ok(audit.details.includes(fx.mixed.name) && audit.details.includes(fx.valid.name), audit.details);
     assert.ok(!audit.details.includes(fx.malformedOnly.name), audit.details);
   });
@@ -220,9 +246,10 @@ describe('deleting an Object revokes every entry naming it', () => {
     });
 
     assert.equal(res.status, 200, JSON.stringify(res.body));
-    assert.deepEqual(JSON.parse(storedColumn(fx.mixed.id).json), malformedEntriesWithoutObject());
-    assert.deepEqual(JSON.parse(storedColumn(fx.valid.id).json), []);
-    assert.deepEqual(JSON.parse(storedColumn(fx.malformedOnly.id).json), malformedEntriesWithoutObject());
+    const validHeld = { ...validEntry(fx.objectName), removed: REMOVAL };
+    assert.deepEqual(storedEntries(fx.mixed.id), [...malformedEntriesWithObjectHeld(fx.objectName), validHeld]);
+    assert.deepEqual(storedEntries(fx.valid.id), [validHeld]);
+    assert.deepEqual(storedEntries(fx.malformedOnly.id), malformedEntriesWithObjectHeld(fx.objectName));
     fx.assertUntouched();
     assert.doesNotMatch(latestAudit().details, new RegExp(fx.malformedOnly.name));
   });

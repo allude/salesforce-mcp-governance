@@ -3,13 +3,12 @@
 // as they were sent, so each grant is rebuilt here from the keys a grant has, as the policy engine
 // reads it. Anything else stored with it never reaches the log.
 import { SALESFORCE_API_NAME_PATTERN } from '../db/importers.js';
-import { malformedGrantReason } from '../rbac/groupGrants.js';
-import { AVAILABLE_MCP_ACTIONS, type AccessGroup } from '../types/governance.js';
+import { MCP_ACTION_ID_PATTERN } from '../groups/groupGrants.js';
+import { isHeldGrant, malformedGrantReason } from '../rbac/groupGrants.js';
+import type { AccessGroup } from '../types/governance.js';
 
 /** The longest group name or description a diff keeps. A longer one is cut, and the diff lists it under truncated. */
 export const GROUP_AUDIT_TEXT_LIMIT = 1_000;
-
-const KNOWN_ACTION_IDS = new Set<string>(AVAILABLE_MCP_ACTIONS.map((action) => action.id));
 
 interface AuditedGrant {
   objectName: string;
@@ -18,6 +17,10 @@ interface AuditedGrant {
   canUpdate: boolean;
   canDelete: boolean;
   allowedFields: string[];
+  /** Set on an entry held as deleted from Salesforce > Objects: it grants nothing until restored. */
+  held?: true;
+  /** The fields the entry holds as deleted: they grant nothing until restored. */
+  heldFields?: string[];
 }
 
 interface AuditedGroup {
@@ -35,12 +38,18 @@ const auditedName = (value: string) =>
 
 /**
  * A grant as the policy engine reads it, or null for an entry that grants nothing whatever it holds:
- * one the engine skips as malformed, or one that names no object.
+ * one the engine skips as malformed, or one that names no object. An entry held as deleted is marked
+ * `held`, and the fields an entry holds are listed by name, so restoring or removing them shows.
  */
 function auditedGrant(entry: unknown): AuditedGrant | null {
   if (malformedGrantReason(entry) !== null) return null;
   const grant = entry as Record<string, unknown> & { objectName: string; allowedFields?: string[] };
   if (!grant.objectName) return null;
+  const heldFields = (Array.isArray(grant.removedFields) ? grant.removedFields : []).flatMap((held) =>
+    held && typeof held === 'object' && typeof (held as { fieldName?: unknown }).fieldName === 'string'
+      ? [auditedName((held as { fieldName: string }).fieldName)]
+      : []
+  );
   return {
     objectName: auditedName(grant.objectName),
     // A flag grants only when it is exactly true; an absent one is false.
@@ -49,6 +58,8 @@ function auditedGrant(entry: unknown): AuditedGrant | null {
     canUpdate: grant.canUpdate === true,
     canDelete: grant.canDelete === true,
     allowedFields: (grant.allowedFields ?? []).map(auditedName),
+    ...(isHeldGrant(entry) ? { held: true as const } : {}),
+    ...(heldFields.length > 0 ? { heldFields } : {}),
   };
 }
 
@@ -64,8 +75,10 @@ export function groupAuditFields(group: AccessGroup): AuditedGroup {
   const fields: AuditedGroup = {
     name: text('name'),
     description: text('description'),
+    // An ID this server has no tool for is kept by POST /groups and logged by name like a known one;
+    // stored text that is no ID at all is logged by its length only.
     allowedActions: (Array.isArray(group.allowedActions) ? group.allowedActions : []).map((id) =>
-      KNOWN_ACTION_IDS.has(id) ? id : `<invalid:len=${String(id).length}>`
+      typeof id === 'string' && MCP_ACTION_ID_PATTERN.test(id) ? id : `<invalid:len=${String(id).length}>`
     ),
     objectPermissions: (Array.isArray(group.objectPermissions) ? group.objectPermissions : [])
       .map(auditedGrant)

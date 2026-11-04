@@ -97,6 +97,7 @@ function renderDrawer(
       devToolsEnabled: true,
       onTestMcpCall: noop,
       onRefreshWorkspace: async () => null,
+      onLoadGroupHistory: async () => [],
       notify: () => {},
     })
   );
@@ -134,7 +135,7 @@ describe('portal summaries of stored groups', () => {
 
   test('the Access Groups table shows no Object for a group whose only entries are skipped', () => {
     const html = renderToStaticMarkup(
-      createElement(AccessGroupsView, { groups, objects, profiles, mappings, onOpenFlyout: () => {} })
+      createElement(AccessGroupsView, { groups, objects, profiles, mappings, onOpenFlyout: () => {}, notify: () => {} })
     );
     assert.ok(rowWith(html, 'Legacy Grants').includes('No objects configured'));
     assert.ok(!rowWith(html, 'Contact Readers').includes('No objects configured'));

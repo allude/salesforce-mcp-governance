@@ -41,6 +41,56 @@ export function malformedGrantReason(entry: unknown): string | null {
   return null;
 }
 
+/**
+ * Whether a stored entry is held: its Object was deleted from Salesforce > Objects, so it stays on the
+ * group for admins to see, restore or remove, and grants nothing, even once the Object is imported
+ * again, until an admin restores it. Any value but false, null or undefined holds it, as it does for
+ * the release that added holding, so an entry is never read as live because its marker is odd.
+ */
+export function isHeldGrant(entry: unknown): boolean {
+  return Boolean(entry && typeof entry === 'object' && (entry as { removed?: unknown }).removed);
+}
+
+/**
+ * The fields an entry holds as deleted from Salesforce > Objects (`removedFields`), lower-cased. Held
+ * fields grant nothing, even once they are back in the catalog, until an admin restores them. A held
+ * field that names no field (an older release or a hand edit) is skipped.
+ */
+export function heldFieldNames(entry: Pick<GroupObjectPermission, 'removedFields'>): Set<string> {
+  const held: unknown[] = Array.isArray(entry.removedFields) ? entry.removedFields : [];
+  return new Set(
+    held.flatMap((field) =>
+      field && typeof field === 'object' && typeof (field as { fieldName?: unknown }).fieldName === 'string'
+        ? [(field as { fieldName: string }).fieldName.toLowerCase()]
+        : []
+    )
+  );
+}
+
+/**
+ * Whether saving `next` over a group's `stored` entries restores something held: an entry held as
+ * deleted from Salesforce > Objects that `next` lists live for its Object, or a held field (in
+ * `removedFields`) that a live entry of `next` grants again. Entries the policy engine cannot read are
+ * skipped, as they hold nothing it reads.
+ */
+export function restoresHeldGrant(stored: readonly unknown[], next: readonly GroupObjectPermission[]): boolean {
+  const liveNext = new Map<string, GroupObjectPermission>();
+  for (const grant of next) {
+    if (!isHeldGrant(grant)) liveNext.set(grant.objectName.toLowerCase(), grant);
+  }
+  return stored.some((entry) => {
+    if (malformedGrantReason(entry) !== null) return false;
+    const grant = entry as GroupObjectPermission;
+    const live = liveNext.get(grant.objectName.toLowerCase());
+    if (!live) return false;
+    if (isHeldGrant(grant)) return true;
+    const granted = new Set((live.allowedFields ?? []).map((field) => field.toLowerCase()));
+    return (Array.isArray(grant.removedFields) ? grant.removedFields : []).some(
+      (held) => held && typeof held.fieldName === 'string' && granted.has(held.fieldName.toLowerCase())
+    );
+  });
+}
+
 /** A flag grants only when it is exactly true. */
 export function grantsAccess(grant: Pick<GroupObjectPermission, (typeof GRANT_FLAGS)[number]>): boolean {
   return GRANT_FLAGS.some((flag) => grant[flag] === true);
@@ -48,16 +98,17 @@ export function grantsAccess(grant: Pick<GroupObjectPermission, (typeof GRANT_FL
 
 /**
  * A stored group's entries as the policy engine reads them, for the portal's summaries of stored
- * groups: the entries it skips (see malformedGrantReason) and those naming no Object are left out,
- * and each flag is true only when it is stored as exactly true. So no summary shows access that /mcp
- * does not give.
+ * groups: the entries it skips (see malformedGrantReason), held ones (isHeldGrant) and those naming
+ * no Object are left out, each flag is true only when it is stored as exactly true, and a field the
+ * entry holds (heldFieldNames) is not listed as granted. So no summary shows access that /mcp does not give.
  */
 export function readableGrants(entries: readonly unknown[] | undefined): GroupObjectPermission[] {
   if (!Array.isArray(entries)) return [];
   return entries.flatMap((entry) => {
-    if (malformedGrantReason(entry) !== null) return [];
+    if (malformedGrantReason(entry) !== null || isHeldGrant(entry)) return [];
     const grant = entry as Partial<GroupObjectPermission> & { objectName: string };
     if (!grant.objectName) return [];
+    const held = heldFieldNames(grant);
     return [
       {
         objectName: grant.objectName,
@@ -65,7 +116,7 @@ export function readableGrants(entries: readonly unknown[] | undefined): GroupOb
         canCreate: grant.canCreate === true,
         canUpdate: grant.canUpdate === true,
         canDelete: grant.canDelete === true,
-        allowedFields: grant.allowedFields ?? [],
+        allowedFields: (grant.allowedFields ?? []).filter((field) => !held.has(field.toLowerCase())),
       },
     ];
   });
@@ -140,6 +191,9 @@ export function uniqueIgnoringCase(names: readonly string[]): string[] {
  * field names in Salesforce > Objects) spells it. The merged entry then gives what its entries gave,
  * with one exception no stored list can avoid: an entry whose fields all exist but are disabled gives
  * Id only until one of them is enabled, and merged it gives no Id for them, so it can only grant less.
+ * The merged entry holds every field its entries hold (`removedFields`), and a field one entry grants
+ * and another holds stays held. Callers never pass a held entry (isHeldGrant) with others for its
+ * Object: merged, it would grant what it holds.
  */
 export function mergeGrants(
   grants: readonly GroupObjectPermission[],
@@ -160,6 +214,13 @@ export function mergeGrants(
         (grant.canRead === true || grant.canCreate === true || grant.canUpdate === true) &&
         !(grant.allowedFields ?? []).some((field) => catalogField(field) !== null)
     );
+    const removedFields: NonNullable<GroupObjectPermission['removedFields']> = [];
+    for (const held of same.flatMap((grant) => (Array.isArray(grant.removedFields) ? grant.removedFields : []))) {
+      if (!held || typeof held !== 'object' || typeof held.fieldName !== 'string') continue;
+      if (removedFields.some((f) => f.fieldName.toLowerCase() === held.fieldName.toLowerCase())) continue;
+      removedFields.push(held);
+    }
+    const isHeld = (field: string) => removedFields.some((f) => f.fieldName.toLowerCase() === field.toLowerCase());
     return {
       objectName: same[0].objectName,
       canRead: same.some((grant) => grant.canRead === true),
@@ -169,7 +230,8 @@ export function mergeGrants(
       allowedFields: uniqueIgnoringCase([
         ...(granting.length > 0 ? granting : same).flatMap((grant) => grant.allowedFields ?? []),
         ...(fallsBackToId && idField ? [idField] : []),
-      ]),
+      ]).filter((field) => !isHeld(field)),
+      ...(removedFields.length > 0 ? { removedFields } : {}),
     };
   });
 }

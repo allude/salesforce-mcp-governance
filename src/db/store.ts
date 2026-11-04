@@ -26,7 +26,11 @@ import {
   ObjectSyncDiffPreview,
   PortalUserSummary,
   AVAILABLE_MCP_ACTIONS,
+  AccessGroupChangeSource,
+  AccessGroupHistoryEntry,
+  AccessGroupSnapshot,
 } from '../types/governance.js';
+import { describeGroupChanges } from '../groups/groupGrants.js';
 import {
   PulledOrgObjectMetadata,
   inspectCertificatePem,
@@ -37,6 +41,7 @@ import { isSimulatedOrgHost, isUninitialisedMcpTokenHost } from '../salesforce/s
 import { soqlSkeleton } from '../mcp/soqlGuard.js';
 import { auditResultFromAction, PORTAL_AUDIT_RESULTS, type PortalAuditResult } from '../security/auditResult.js';
 import {
+  isHeldGrant,
   malformedGrantReason,
   mergeGrants,
   readableGrants,
@@ -111,11 +116,63 @@ export function runInTransaction<T>(fn: () => T): T {
   }
 }
 
+/** Who made a change, as group history records it. */
+export interface GroupChangeActor {
+  username: string;
+  authMethod: string;
+}
+
+/** A change made without an admin request, e.g. by a test or a script calling the store directly. */
+const SYSTEM_ACTOR: GroupChangeActor = { username: 'system', authMethod: 'system' };
+
+/** How an edit, import or catalog change is recorded in a group's history. */
+export interface GroupChange {
+  actor: GroupChangeActor;
+  source: AccessGroupChangeSource;
+  sourceDetail?: string;
+}
+
+function snapshotOf(group: AccessGroupSnapshot): AccessGroupSnapshot {
+  return {
+    name: group.name,
+    description: group.description,
+    allowedActions: group.allowedActions,
+    objectPermissions: group.objectPermissions,
+  };
+}
+
+function insertGroupHistory(entry: {
+  groupId: string;
+  kind: AccessGroupHistoryEntry['kind'];
+  change: GroupChange;
+  changes: string[];
+  snapshot: AccessGroupSnapshot;
+  timestamp?: string;
+}) {
+  db.prepare(`
+    INSERT INTO access_group_history (
+      id, group_id, group_name, timestamp, admin_username, auth_method, kind, source, source_detail, changes_json, snapshot_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    `gh_${crypto.randomBytes(10).toString('hex')}`,
+    entry.groupId,
+    entry.snapshot.name,
+    entry.timestamp || new Date().toISOString(),
+    entry.change.actor.username,
+    entry.change.actor.authMethod,
+    entry.kind,
+    entry.change.source,
+    (entry.change.sourceDetail || '').slice(0, 300),
+    JSON.stringify(entry.changes),
+    JSON.stringify(snapshotOf(entry.snapshot))
+  );
+}
+
 /**
  * A group's stored entries for a revocation: the entries of the column, or null when it does not hold
- * a list. Revocation leaves such a column as stored, and every entry malformedGrantReason refuses that
- * does not name the revoked Object as text (see namesObjectAsText): the policy engine grants nothing for
- * them, and rewriting them would lose what an operator may still want to recover by hand.
+ * a list. Revocation leaves such a column as stored, and every entry that does not name the revoked
+ * Object as text (see namesObjectAsText): rewriting them would lose what an operator may still want to
+ * recover by hand.
  */
 function storedEntriesForRevocation(json: string): unknown[] | null {
   const entries = parseStoredJson(json);
@@ -124,10 +181,10 @@ function storedEntriesForRevocation(json: string): unknown[] | null {
 
 /**
  * Whether a stored entry, readable or not, names `objectName` as text, ignoring case. A revocation
- * removes the Object or field from every such entry, malformed ones included: this release grants
- * nothing for those, but an older release run on the database after a rollback reads one such as
- * `canRead: "false"` as a grant, and its own revocation removed them, so a deleted and re-imported
- * Object or field would otherwise get that access back there.
+ * holds the Object or field on every such entry, malformed ones included: this release grants nothing
+ * for those, but an older release run on the database after a rollback reads one such as
+ * `canRead: "false"` as a grant. Every release since holding was added skips a held entry and never
+ * reads a held field, so a deleted and re-imported Object or field cannot get that access back there.
  */
 function namesObjectAsText(entry: unknown, objectName: string): boolean {
   if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
@@ -136,13 +193,55 @@ function namesObjectAsText(entry: unknown, objectName: string): boolean {
 }
 
 /**
- * Deletes a field and revokes it from every Access Group, reporting which groups lost it.
- * While a case variant still exists the grants still refer to it and stay. A malformed entry that
- * names the Object loses the field too, from an allowedFields list, but its group is not reported:
- * it granted nothing. Other malformed entries and unreadable columns are skipped (see
- * storedEntriesForRevocation).
+ * Rewrites the stored object entries of every Access Group with `rewrite` (null leaves a group alone),
+ * raises the version of each group it changes, and records the change in that group's history. A
+ * column that holds no list is left alone (see storedEntriesForRevocation). Returns the names of the
+ * groups `rewrite` says lost a grant.
  */
-function deleteFieldAndRevokeGrants(objName: string, fldName: string): { deleted: boolean; revokedGroups: string[] } {
+function rewriteGroupGrants(
+  rewrite: (entries: unknown[]) => { entries: unknown[]; lostGrant: boolean } | null,
+  historyLine: string,
+  change: GroupChange,
+  now: string
+): string[] {
+  const rows = db.prepare('SELECT * FROM access_groups').all() as any[];
+  const updateGroup = db.prepare(
+    'UPDATE access_groups SET object_permissions_json = ?, version = version + 1, updated_at = ? WHERE id = ?'
+  );
+  const revokedGroups: string[] = [];
+  for (const row of rows) {
+    const entries = storedEntriesForRevocation(row.object_permissions_json);
+    if (!entries) continue;
+    const next = rewrite(entries);
+    if (!next) continue;
+    updateGroup.run(JSON.stringify(next.entries), now, row.id);
+    insertGroupHistory({
+      groupId: row.id,
+      kind: 'catalog',
+      change,
+      changes: [historyLine],
+      snapshot: { ...groupFromRow(row), objectPermissions: next.entries as GroupObjectPermission[] },
+      timestamp: now,
+    });
+    if (next.lostGrant) revokedGroups.push(row.name);
+  }
+  return revokedGroups;
+}
+
+/**
+ * Deletes a field and revokes it from every Access Group, reporting which groups lost it. A group
+ * keeps the field, held in `removedFields`, so admins can see it is gone and why, but a held field
+ * grants nothing, even when a later sync brings it back, until an admin restores it.
+ * While a case variant still exists the grants still refer to it and stay. A malformed entry that
+ * names the Object has the field held too, out of its allowedFields list, but its group is not
+ * reported: it granted nothing, and nor did a held entry. Other entries and unreadable columns are
+ * left as stored (see storedEntriesForRevocation).
+ */
+function deleteFieldAndRevokeGrants(
+  objName: string,
+  fldName: string,
+  change: GroupChange
+): { deleted: boolean; revokedGroups: string[] } {
   return runInTransaction(() => {
     const res = db
       .prepare('DELETE FROM sf_object_fields WHERE object_name = ? AND field_name = ?')
@@ -156,49 +255,49 @@ function deleteFieldAndRevokeGrants(objName: string, fldName: string): { deleted
     if (variantRemains) return { deleted: true, revokedGroups: [] };
 
     const now = new Date().toISOString();
-    const rows = db.prepare('SELECT id, name, object_permissions_json FROM access_groups').all() as Array<{
-      id: string;
-      name: string;
-      object_permissions_json: string;
-    }>;
-    const updateGroup = db.prepare(
-      'UPDATE access_groups SET object_permissions_json = ?, version = version + 1, updated_at = ? WHERE id = ?'
+    const removal = { at: now, by: change.actor.username };
+    const isField = (f: unknown) => typeof f === 'string' && f.toLowerCase() === fldName.toLowerCase();
+    const revokedGroups = rewriteGroupGrants(
+      (entries) => {
+        let changed = false;
+        let lostGrant = false;
+        const kept = entries.map((entry) => {
+          if (!namesObjectAsText(entry, objName)) return entry;
+          const p = entry as Record<string, unknown>;
+          if (!Array.isArray(p.allowedFields)) return entry;
+          const granted = p.allowedFields.find(isField) as string | undefined;
+          if (granted === undefined) return entry;
+          changed = true;
+          const held: unknown[] = Array.isArray(p.removedFields) ? p.removedFields : [];
+          const alreadyHeld = held.some((f) => isField((f as { fieldName?: unknown } | null)?.fieldName));
+          // A field the entry also holds (an older release or a hand edit) granted nothing already.
+          if (malformedGrantReason(entry) === null && !isHeldGrant(entry) && !alreadyHeld) lostGrant = true;
+          return {
+            ...p,
+            allowedFields: p.allowedFields.filter((f) => !isField(f)),
+            removedFields: alreadyHeld ? held : [...held, { fieldName: granted, ...removal }],
+          };
+        });
+        return changed ? { entries: kept, lostGrant } : null;
+      },
+      `${objName}.${fldName} was deleted from Salesforce > Objects. It stays on this group as not available and grants nothing until an admin restores it.`,
+      change,
+      now
     );
-    const revokedGroups: string[] = [];
-    for (const row of rows) {
-      const entries = storedEntriesForRevocation(row.object_permissions_json);
-      if (!entries) continue;
-      let changed = false;
-      let lostGrant = false;
-      const kept = entries.map((entry) => {
-        if (!namesObjectAsText(entry, objName)) return entry;
-        const p = entry as Record<string, unknown>;
-        if (!Array.isArray(p.allowedFields)) return entry;
-        const allowedFields = p.allowedFields.filter(
-          (f) => typeof f !== 'string' || f.toLowerCase() !== fldName.toLowerCase()
-        );
-        if (allowedFields.length === p.allowedFields.length) return entry;
-        changed = true;
-        if (malformedGrantReason(entry) === null) lostGrant = true;
-        return { ...p, allowedFields };
-      });
-      if (changed) {
-        updateGroup.run(JSON.stringify(kept), now, row.id);
-        if (lostGrant) revokedGroups.push(row.name);
-      }
-    }
     return { deleted: true, revokedGroups };
   });
 }
 
 /**
  * Deletes an Object and its fields and revokes it from every Access Group, reporting which groups
- * lost it. Grants match objects case-insensitively; while a case variant (e.g. 'Account' after
- * deleting a stray 'account') still exists, the grants still refer to it and must stay. A malformed
- * entry that names the Object goes too, but its group is not reported: it granted nothing. Other
- * malformed entries and unreadable columns are skipped (see storedEntriesForRevocation).
+ * lost it. A group keeps each entry that names it, marked `removed`, so admins can see what it granted
+ * and why it stopped, but the entry grants nothing, even if the object is imported again, until an
+ * admin restores it. Grants match objects case-insensitively; while a case variant (e.g. 'Account'
+ * after deleting a stray 'account') still exists, the grants still refer to it and must stay. A
+ * malformed entry that names the Object is held too, but its group is not reported: it granted
+ * nothing. Other entries and unreadable columns are left as stored (see storedEntriesForRevocation).
  */
-function deleteObjectAndRevokeGrants(objectName: string): { deleted: boolean; revokedGroups: string[] } {
+function deleteObjectAndRevokeGrants(objectName: string, change: GroupChange): { deleted: boolean; revokedGroups: string[] } {
   return runInTransaction(() => {
     const res = db.prepare('DELETE FROM sf_objects WHERE object_name = ?').run(objectName);
     if (res.changes === 0) return { deleted: false, revokedGroups: [] };
@@ -208,26 +307,48 @@ function deleteObjectAndRevokeGrants(objectName: string): { deleted: boolean; re
     if (variantRemains) return { deleted: true, revokedGroups: [] };
 
     const now = new Date().toISOString();
-    const rows = db.prepare('SELECT id, name, object_permissions_json FROM access_groups').all() as Array<{
-      id: string;
-      name: string;
-      object_permissions_json: string;
-    }>;
-    const updateGroup = db.prepare(
-      'UPDATE access_groups SET object_permissions_json = ?, version = version + 1, updated_at = ? WHERE id = ?'
+    const revokedGroups = rewriteGroupGrants(
+      (entries) => {
+        let changed = false;
+        let lostGrant = false;
+        const kept = entries.map((entry) => {
+          if (!namesObjectAsText(entry, objectName) || isHeldGrant(entry)) return entry;
+          changed = true;
+          if (malformedGrantReason(entry) === null) lostGrant = true;
+          // `removed` goes before `removedFields`, as POST /groups stores an entry, so saving the group
+          // unedited stores the same JSON and keeps its version.
+          const { removedFields, ...rest } = entry as Record<string, unknown>;
+          return {
+            ...rest,
+            removed: { at: now, by: change.actor.username },
+            ...(removedFields !== undefined ? { removedFields } : {}),
+          };
+        });
+        return changed ? { entries: kept, lostGrant } : null;
+      },
+      `${objectName} was deleted from Salesforce > Objects. It stays on this group as not available and grants nothing until an admin restores it.`,
+      change,
+      now
     );
-    const revokedGroups: string[] = [];
-    for (const row of rows) {
-      const entries = storedEntriesForRevocation(row.object_permissions_json);
-      if (!entries) continue;
-      const revoked = entries.filter((entry) => namesObjectAsText(entry, objectName));
-      if (revoked.length > 0) {
-        updateGroup.run(JSON.stringify(entries.filter((entry) => !namesObjectAsText(entry, objectName))), now, row.id);
-        if (revoked.some((entry) => malformedGrantReason(entry) === null)) revokedGroups.push(row.name);
-      }
-    }
     return { deleted: true, revokedGroups };
   });
+}
+
+/**
+ * A stored group as every reader gets it. A list column that does not parse reads as an empty list (see
+ * storedGroupList); its entries are as stored, so the policy engine, which skips what it cannot read,
+ * decides what they grant.
+ */
+function groupFromRow(r: any): AccessGroup {
+  return {
+    id: r.id,
+    name: r.name,
+    description: r.description,
+    allowedActions: storedGroupList(r.id, 'allowed_actions_json', r.allowed_actions_json),
+    objectPermissions: storedGroupList(r.id, 'object_permissions_json', r.object_permissions_json),
+    version: Number(r.version),
+    updatedAt: r.updated_at,
+  };
 }
 
 /**
@@ -412,6 +533,22 @@ db.exec(`
     FOREIGN KEY (profile_id) REFERENCES sf_profiles(id) ON DELETE CASCADE,
     FOREIGN KEY (group_id) REFERENCES access_groups(id) ON DELETE CASCADE
   );
+
+  -- No foreign key: a group's history outlives the group, so its deletion stays reviewable.
+  CREATE TABLE IF NOT EXISTS access_group_history (
+    id TEXT PRIMARY KEY,
+    group_id TEXT NOT NULL,
+    group_name TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    admin_username TEXT NOT NULL,
+    auth_method TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_detail TEXT NOT NULL DEFAULT '',
+    changes_json TEXT NOT NULL DEFAULT '[]',
+    snapshot_json TEXT NOT NULL DEFAULT '{}'
+  );
+  CREATE INDEX IF NOT EXISTS idx_access_group_history_group ON access_group_history (group_id);
 
   CREATE TABLE IF NOT EXISTS mcp_copilot_logs (${LOG_TABLE_COLUMNS.mcp_copilot_logs});
 
@@ -652,9 +789,10 @@ function canonicalGroupGrants(
   fieldNamesOf: (objectName: string) => readonly string[]
 ): unknown[] | null {
   const out: unknown[] = [];
-  const slots = new Map<string, { index: number; grants: GroupObjectPermission[] }>();
+  const slots = new Map<string, Array<{ index: number; stored: unknown; grant: GroupObjectPermission }>>();
   for (const entry of entries) {
-    if (malformedGrantReason(entry) !== null) {
+    // A held entry stays as stored: merged into a live entry, it would grant what it holds.
+    if (malformedGrantReason(entry) !== null || isHeldGrant(entry)) {
       out.push(entry);
       continue;
     }
@@ -673,18 +811,33 @@ function canonicalGroupGrants(
         : {}),
     };
     const key = objectName.toLowerCase();
-    const slot = slots.get(key);
-    if (slot) {
-      slot.grants.push(renamed);
-    } else {
-      slots.set(key, { index: out.length, grants: [renamed] });
-      out.push(renamed);
+    slots.set(key, [...(slots.get(key) ?? []), { index: out.length, stored: entry, grant: renamed }]);
+    out.push(renamed);
+  }
+  const dropped = new Set<number>();
+  for (const same of slots.values()) {
+    if (same.length === 1) continue;
+    // A merged entry keeps a field held when any of its entries holds it, so an entry that grants a
+    // field another entry holds would lose it here: such an Object's entries are left as stored.
+    const held = new Set(
+      same.flatMap(({ grant }) =>
+        (Array.isArray(grant.removedFields) ? grant.removedFields : []).flatMap((f) =>
+          f && typeof f === 'object' && typeof f.fieldName === 'string' ? [f.fieldName.toLowerCase()] : []
+        )
+      )
+    );
+    if (same.some(({ grant }) => (grant.allowedFields ?? []).some((name) => held.has(name.toLowerCase())))) {
+      for (const { index, stored } of same) out[index] = stored;
+      continue;
     }
+    out[same[0].index] = mergeGrants(
+      same.map(({ grant }) => grant),
+      fieldNamesOf
+    )[0];
+    for (const { index } of same.slice(1)) dropped.add(index);
   }
-  for (const { index, grants } of slots.values()) {
-    if (grants.length > 1) out[index] = mergeGrants(grants, fieldNamesOf)[0];
-  }
-  return JSON.stringify(out) === JSON.stringify(entries) ? null : out;
+  const canonical = out.filter((_, index) => !dropped.has(index));
+  return JSON.stringify(canonical) === JSON.stringify(entries) ? null : canonical;
 }
 
 /**
@@ -698,6 +851,10 @@ function canonicalGroupGrants(
  * An older version could also store one Object as two rows, 'Opportunity' and 'opportunity'. The engine
  * reads the enabled one, which an admin can change, so a merge could take the Id an entry gives from the
  * fields of a row the engine does not read: the entries for such an Object are left as stored.
+ *
+ * A release with held grants (`removed`, `removedFields`) but no version column can be upgraded too.
+ * Held entries are never renamed or merged, and an Object whose entries hold a field one of them grants
+ * is left as stored, since the merged entry would hold it.
  */
 function addGroupVersionAndCanonicalizeGrants() {
   runInTransaction(() => {
@@ -770,6 +927,17 @@ function parseStoredJson(json: string): unknown {
   } catch {
     return undefined;
   }
+}
+
+/** Whether two stored JSON columns hold the same value, with object keys in any order. */
+function sameStoredJson(a: string, b: string): boolean {
+  const [left, right] = [parseStoredJson(a), parseStoredJson(b)];
+  if (left === undefined || right === undefined) return false;
+  const sortedKeys = (_key: string, value: unknown) =>
+    value && typeof value === 'object' && !Array.isArray(value)
+      ? Object.fromEntries(Object.entries(value).sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0)))
+      : value;
+  return JSON.stringify(left, sortedKeys) === JSON.stringify(right, sortedKeys);
 }
 
 function runSchemaMigrations() {
@@ -2135,26 +2303,78 @@ export const store = {
 
   /**
    * Deletes a field and revokes it from every Access Group, so a later sync that brings the field
-   * back does not silently restore access an admin removed. Returns null when there is no such field.
+   * back does not silently restore access an admin removed. Groups keep it, shown as not available.
+   * Returns null when there is no such field.
    */
-  deleteObjectField(objectName: string, fieldName: string): SalesforceObject | null {
+  deleteObjectField(objectName: string, fieldName: string, actor: GroupChangeActor = SYSTEM_ACTOR): SalesforceObject | null {
+    return this.deleteObjectFieldAndReport(objectName, fieldName, actor)?.object || null;
+  },
+
+  /** As deleteObjectField, also naming the groups the field was revoked from. */
+  deleteObjectFieldAndReport(
+    objectName: string,
+    fieldName: string,
+    actor: GroupChangeActor
+  ): { object: SalesforceObject; revokedGroups: string[] } | null {
     const objName = objectName.trim();
     const fldName = fieldName.trim();
-    if (!deleteFieldAndRevokeGrants(objName, fldName).deleted) return null;
-    return this.getObjects().find((o) => o.objectName === objName) || null;
+    const result = deleteFieldAndRevokeGrants(objName, fldName, { actor, source: 'objects' });
+    if (!result.deleted) return null;
+    const object = this.getObjects().find((o) => o.objectName === objName);
+    return object ? { object, revokedGroups: result.revokedGroups } : null;
   },
 
   /**
    * Deletes an Object and its fields, and revokes it from every Access Group, so re-importing the
-   * object later (e.g. an SFDX re-sync) does not silently restore access an admin removed.
+   * object later (e.g. an SFDX re-sync) does not silently restore access an admin removed. Groups
+   * keep it, shown as not available.
    */
-  deleteObject(objectName: string): boolean {
-    return deleteObjectAndRevokeGrants(objectName).deleted;
+  deleteObject(objectName: string, actor: GroupChangeActor = SYSTEM_ACTOR): boolean {
+    return this.deleteObjectAndReport(objectName, actor) !== null;
   },
 
-  /** deleteObject, also naming the Access Groups that lost the Object, for its audit entry. */
-  deleteObjectRevokingGrants(objectName: string): { deleted: boolean; revokedGroups: string[] } {
-    return deleteObjectAndRevokeGrants(objectName);
+  /** As deleteObject, also naming the groups the object was revoked from. Null when not found. */
+  deleteObjectAndReport(objectName: string, actor: GroupChangeActor): { revokedGroups: string[] } | null {
+    const result = deleteObjectAndRevokeGrants(objectName, { actor, source: 'objects' });
+    return result.deleted ? { revokedGroups: result.revokedGroups } : null;
+  },
+
+  /**
+   * Notes, in the history of every group granting the object (or, with `fieldNames`, one of those
+   * fields), a change made in Salesforce > Objects, such as disabling it: the group is unchanged but
+   * what it grants is not. Entries held as deleted are skipped, as they grant nothing either way.
+   * Returns the names of the groups told.
+   */
+  recordCatalogChangeOnGroups(input: {
+    objectName: string;
+    fieldNames?: string[];
+    describe: (grantedFields: string[]) => string;
+    change: GroupChange;
+  }): string[] {
+    const told: string[] = [];
+    const now = new Date().toISOString();
+    const wanted = input.fieldNames ? new Set(input.fieldNames.map((f) => f.toLowerCase())) : null;
+    runInTransaction(() => {
+      for (const group of this.getGroups()) {
+        // As the policy engine reads the group: held and malformed entries grant nothing either way.
+        const perm = readableGrants(group.objectPermissions).find(
+          (p) => p.objectName.toLowerCase() === input.objectName.toLowerCase()
+        );
+        if (!perm) continue;
+        const granted = wanted ? (perm.allowedFields || []).filter((f) => wanted.has(f.toLowerCase())) : [];
+        if (wanted && granted.length === 0) continue;
+        insertGroupHistory({
+          groupId: group.id,
+          kind: 'catalog',
+          change: input.change,
+          changes: [input.describe(granted)],
+          snapshot: group,
+          timestamp: now,
+        });
+        told.push(group.name);
+      }
+    });
+    return told;
   },
 
   /**
@@ -2221,6 +2441,7 @@ export const store = {
                 readableGrants(g.objectPermissions).some(
                   (op) =>
                     op.objectName.toLowerCase() === pulled.objectName.toLowerCase() &&
+                    !op.removed &&
                     op.allowedFields.some(
                       (af) => af.toLowerCase() === lf.fieldName.toLowerCase()
                     )
@@ -2285,6 +2506,8 @@ export const store = {
     }>;
     removeObjectNames: string[];
     removeFields: Array<{ objectName: string; fieldName: string }>;
+    /** The admin applying the sync, for the history of the groups it changes. */
+    actor?: GroupChangeActor;
   }): {
     objectsUpserted: number;
     fieldsUpserted: number;
@@ -2309,6 +2532,7 @@ export const store = {
         (f) => `${f.objectName.toLowerCase()}.${f.fieldName.toLowerCase()}`
       )
     );
+    const change: GroupChange = { actor: input.actor || SYSTEM_ACTOR, source: 'org_sync' };
     return runInTransaction(() => {
       let fieldsUpserted = 0;
       const lostGrants = new Set<string>();
@@ -2330,7 +2554,7 @@ export const store = {
           for (const variant of variants) {
             if (removeObjSet.has(variant.objectName.toLowerCase())) {
               // Grants are revoked with the last variant: until then they still refer to a row.
-              const result = deleteObjectAndRevokeGrants(variant.objectName);
+              const result = deleteObjectAndRevokeGrants(variant.objectName, change);
               if (result.deleted) {
                 affected.objectsRemoved.push(variant.objectName);
                 result.revokedGroups.forEach((g) => lostGrants.add(g));
@@ -2340,6 +2564,14 @@ export const store = {
                 'UPDATE sf_objects SET missing_in_org = 1, updated_at = ? WHERE object_name = ?'
               ).run(new Date().toISOString(), variant.objectName);
               affected.objectsKeptMissing.push(variant.objectName);
+              if (!variant.missingInOrg) {
+                this.recordCatalogChangeOnGroups({
+                  objectName: variant.objectName,
+                  describe: () =>
+                    `Org sync found ${variant.objectName} missing from the Salesforce org and kept it, flagged. This group still grants it, but calls to it fail.`,
+                  change,
+                });
+              }
             }
           }
           continue;
@@ -2389,7 +2621,7 @@ export const store = {
               const key = `${variant.objectName.toLowerCase()}.${lf.fieldName.toLowerCase()}`;
               const qualifiedName = `${variant.objectName}.${lf.fieldName}`;
               if (removeFieldSet.has(key)) {
-                const result = deleteFieldAndRevokeGrants(variant.objectName, lf.fieldName);
+                const result = deleteFieldAndRevokeGrants(variant.objectName, lf.fieldName, change);
                 if (result.deleted) {
                   affected.fieldsRemoved.push(qualifiedName);
                   result.revokedGroups.forEach((g) => lostGrants.add(g));
@@ -2399,6 +2631,15 @@ export const store = {
                   'UPDATE sf_object_fields SET missing_in_org = 1 WHERE object_name = ? AND field_name = ?'
                 ).run(variant.objectName, lf.fieldName);
                 affected.fieldsKeptMissing.push(qualifiedName);
+                if (!lf.missingInOrg) {
+                  this.recordCatalogChangeOnGroups({
+                    objectName: variant.objectName,
+                    fieldNames: [lf.fieldName],
+                    describe: () =>
+                      `Org sync found ${qualifiedName} missing from the Salesforce org and kept it, flagged. This group still grants it, but queries using it fail.`,
+                    change,
+                  });
+                }
               }
             }
           }
@@ -2423,85 +2664,169 @@ export const store = {
   // ============================================================================
   getGroups(): AccessGroup[] {
     const rows = db.prepare('SELECT * FROM access_groups ORDER BY name ASC').all() as any[];
-    return rows.map((r) => ({
-      id: r.id,
-      name: r.name,
-      description: r.description,
-      allowedActions: storedGroupList(r.id, 'allowed_actions_json', r.allowed_actions_json),
-      objectPermissions: storedGroupList(r.id, 'object_permissions_json', r.object_permissions_json),
-      version: Number(r.version),
-      updatedAt: r.updated_at,
-    }));
+    return rows.map(groupFromRow);
+  },
+
+  getGroup(id: string): AccessGroup | null {
+    const row = db.prepare('SELECT * FROM access_groups WHERE id = ?').get(id);
+    return row ? groupFromRow(row) : null;
   },
 
   /**
    * Creates a group. A create is a plain INSERT, so it can never collide with (and silently
    * overwrite) another group. A new group gets a random id; `id` is for the sample matrix and tests,
-   * which need a fixed one.
+   * which need a fixed one. With `change`, the creation is recorded in the group's history in the
+   * same transaction.
    */
-  createGroup(input: GroupWrite & { id?: string }): AccessGroup {
+  createGroup(input: GroupWrite & { id?: string }, change?: GroupChange): AccessGroup {
     const id =
       input.id?.trim() ||
       `grp_${input.name
         .trim()
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '_')}_${crypto.randomBytes(6).toString('hex')}`;
-    db.prepare(`
-      INSERT INTO access_groups (id, name, description, allowed_actions_json, object_permissions_json, updated_at, version)
-      VALUES (?, ?, ?, ?, ?, ?, 1)
-    `).run(
-      id,
-      input.name.trim(),
-      (input.description || '').trim(),
-      JSON.stringify(input.allowedActions || []),
-      JSON.stringify(input.objectPermissions || []),
-      new Date().toISOString()
-    );
-    return this.getGroups().find((g) => g.id === id)!;
+    return runInTransaction(() => {
+      const now = new Date().toISOString();
+      db.prepare(`
+        INSERT INTO access_groups (id, name, description, allowed_actions_json, object_permissions_json, updated_at, version)
+        VALUES (?, ?, ?, ?, ?, ?, 1)
+      `).run(
+        id,
+        input.name.trim(),
+        (input.description || '').trim(),
+        JSON.stringify(input.allowedActions || []),
+        JSON.stringify(input.objectPermissions || []),
+        now
+      );
+      const saved = this.getGroup(id)!;
+      if (change) {
+        insertGroupHistory({
+          groupId: id,
+          kind: 'created',
+          change,
+          changes: describeGroupChanges(null, saved),
+          snapshot: saved,
+          timestamp: now,
+        });
+      }
+      return saved;
+    });
   },
 
   /**
    * Creates a group when no id is given and updates the group with the given id, whose version then
-   * goes up by one. A save that would store exactly what is stored writes nothing, so its version and
+   * goes up by one. A save that would store what is stored (the same text, and the same JSON in the list
+   * columns, with object keys in any order) writes nothing, so its version and
    * updatedAt stay and an editor that loaded that version can still save. An id no group has is
-   * refused: it never creates a group.
+   * refused: it never creates a group. With `change`, the save is recorded in the group's history in
+   * the same transaction. A save from the editors that changes nothing it grants is not recorded; an
+   * import or restore always is, so the history shows the file or version was applied.
    */
-  upsertGroup(input: GroupWrite & { id?: string }): AccessGroup {
+  upsertGroup(input: GroupWrite & { id?: string }, change?: GroupChange): AccessGroup {
     const requestedId = input.id?.trim();
-    if (!requestedId) return this.createGroup(input);
+    if (!requestedId) return this.createGroup(input, change);
 
-    const next = {
-      name: input.name.trim(),
-      description: (input.description || '').trim(),
-      allowed_actions_json: JSON.stringify(input.allowedActions || []),
-      object_permissions_json: JSON.stringify(input.objectPermissions || []),
-    };
-    const stored = db
-      .prepare('SELECT name, description, allowed_actions_json, object_permissions_json FROM access_groups WHERE id = ?')
-      .get(requestedId) as typeof next | undefined;
-    if (!stored) throw new Error(`Unknown Access Group id: ${requestedId}`);
-    const unchanged = (Object.keys(next) as Array<keyof typeof next>).every((column) => stored[column] === next[column]);
-    if (!unchanged) {
-      db.prepare(`
-        UPDATE access_groups SET
-          name = ?, description = ?, allowed_actions_json = ?, object_permissions_json = ?,
-          version = version + 1, updated_at = ?
-        WHERE id = ?
-      `).run(
-        next.name,
-        next.description,
-        next.allowed_actions_json,
-        next.object_permissions_json,
-        new Date().toISOString(),
-        requestedId
+    return runInTransaction(() => {
+      const next = {
+        name: input.name.trim(),
+        description: (input.description || '').trim(),
+        allowed_actions_json: JSON.stringify(input.allowedActions || []),
+        object_permissions_json: JSON.stringify(input.objectPermissions || []),
+      };
+      const stored = db
+        .prepare('SELECT name, description, allowed_actions_json, object_permissions_json FROM access_groups WHERE id = ?')
+        .get(requestedId) as typeof next | undefined;
+      if (!stored) throw new Error(`Unknown Access Group id: ${requestedId}`);
+      const previous = this.getGroup(requestedId)!;
+      const now = new Date().toISOString();
+      // A list column that holds the same JSON with its keys in another order (an entry a revocation
+      // rewrote) is unchanged too: such a save changes nothing, so it keeps the version. The name and
+      // description are text, compared as they are.
+      const unchanged = (Object.keys(next) as Array<keyof typeof next>).every(
+        (column) =>
+          stored[column] === next[column] ||
+          (column.endsWith('_json') && sameStoredJson(stored[column], next[column]))
       );
-    }
-    return this.getGroups().find((g) => g.id === requestedId)!;
+      if (!unchanged) {
+        db.prepare(`
+          UPDATE access_groups SET
+            name = ?, description = ?, allowed_actions_json = ?, object_permissions_json = ?,
+            version = version + 1, updated_at = ?
+          WHERE id = ?
+        `).run(
+          next.name,
+          next.description,
+          next.allowed_actions_json,
+          next.object_permissions_json,
+          now,
+          requestedId
+        );
+      }
+      const saved = this.getGroup(requestedId)!;
+      if (change) {
+        const changes = describeGroupChanges(previous, saved);
+        const isEdit = change.source === 'editor' || change.source === 'xml_editor';
+        if (changes.length > 0 || !isEdit) {
+          insertGroupHistory({
+            groupId: saved.id,
+            kind: 'updated',
+            change,
+            changes: changes.length > 0 ? changes : ['Nothing the group grants changed.'],
+            snapshot: saved,
+            timestamp: now,
+          });
+        }
+      }
+      return saved;
+    });
   },
 
-  deleteGroup(id: string): boolean {
-    // In a transaction, so the group and the memberships its delete cascades to are one policy revision.
-    return runInTransaction(() => db.prepare('DELETE FROM access_groups WHERE id = ?').run(id).changes > 0);
+  /**
+   * Deletes a group. In a transaction, so the group and the memberships its delete cascades to are one
+   * policy revision. With `change`, its history records the deletion and what the group held.
+   */
+  deleteGroup(id: string, change?: GroupChange): boolean {
+    return runInTransaction(() => {
+      const existing = this.getGroup(id);
+      if (db.prepare('DELETE FROM access_groups WHERE id = ?').run(id).changes === 0 || !existing) return false;
+      if (change) {
+        insertGroupHistory({
+          groupId: id,
+          kind: 'deleted',
+          change,
+          changes: [`Deleted the group "${existing.name}".`],
+          snapshot: existing,
+        });
+      }
+      return true;
+    });
+  },
+
+  /**
+   * A group's history, newest first. It is kept after the group is deleted. A column that does not
+   * parse reads as no changes, or an empty snapshot, so no reader fails on it.
+   */
+  getGroupHistory(groupId: string, limit = 200): AccessGroupHistoryEntry[] {
+    const rows = db
+      .prepare('SELECT * FROM access_group_history WHERE group_id = ? ORDER BY rowid DESC LIMIT ?')
+      .all(groupId, Math.max(1, Math.min(limit, 1000))) as any[];
+    return rows.map((r) => {
+      const changes = parseStoredJson(r.changes_json);
+      const snapshot = parseStoredJson(r.snapshot_json || '{}');
+      return {
+        id: r.id,
+        groupId: r.group_id,
+        groupName: r.group_name,
+        timestamp: r.timestamp,
+        adminUsername: r.admin_username,
+        authMethod: r.auth_method,
+        kind: r.kind,
+        source: r.source,
+        sourceDetail: r.source_detail,
+        changes: Array.isArray(changes) ? changes.filter((line): line is string => typeof line === 'string') : [],
+        snapshot: (snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot) ? snapshot : {}) as AccessGroupSnapshot,
+      };
+    });
   },
 
   getProfileGroupMappings(): ProfileGroupMapping[] {
