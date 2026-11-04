@@ -1478,3 +1478,154 @@ pre.code {
 [data-theme='dark'] .divide-slate-200 > :not([hidden]) ~ :not([hidden]) {
   border-color: var(--bd) !important;
 }
+
+/* Access group editor: notices, XML view and history */
+.notice {
+  border: 1px solid var(--bd);
+  border-radius: 6px;
+  padding: 9px 11px;
+  margin-bottom: 14px;
+  font-size: 12px;
+  background: var(--pan2);
+  color: var(--t2);
+}
+
+.notice.warn {
+  background: var(--warn-d);
+  border-color: rgba(251, 191, 36, 0.35);
+}
+
+.notice.err {
+  background: var(--err-d);
+  border-color: rgba(248, 113, 113, 0.35);
+}
+
+.notice.acc {
+  background: var(--acc-d);
+  border-color: rgba(0, 163, 255, 0.35);
+}
+
+.notice-t {
+  color: var(--tx);
+  font-weight: 500;
+}
+
+.notice-s {
+  color: var(--t2);
+  font-weight: 400;
+  font-size: 11.5px;
+}
+
+.notice-l {
+  list-style: none;
+  margin: 8px 0 4px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.notice-l li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.notice-k {
+  font-size: 11px;
+  color: var(--t3);
+}
+
+.notice-m {
+  flex-basis: 100%;
+  font-size: 11.5px;
+  color: var(--t2);
+}
+
+textarea.inp.xml-ed {
+  min-height: 420px;
+  line-height: 1.5;
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+  tab-size: 2;
+}
+
+textarea.inp.xml-ed.bad {
+  border-color: var(--err);
+}
+
+.xml-hint {
+  font-size: 11px;
+  color: var(--t3);
+  margin-top: 6px;
+}
+
+.chk-row.held {
+  background: rgba(251, 191, 36, 0.04);
+}
+
+.fld-na {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+}
+
+.hist {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.hist-it {
+  border: 1px solid var(--bd);
+  border-radius: 6px;
+  padding: 9px 11px;
+  background: var(--bg);
+}
+
+.hist-h {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.hist-when {
+  margin-left: auto;
+  color: var(--t2);
+}
+
+.hist-who {
+  font-size: 11.5px;
+  color: var(--t2);
+  margin-top: 5px;
+}
+
+.hist-c {
+  margin: 6px 0 0;
+  padding-left: 16px;
+  font-size: 12px;
+  color: var(--tx);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.hist-a {
+  display: flex;
+  gap: 4px;
+  margin-top: 6px;
+  margin-left: -8px;
+}
+
+pre.code.hist-x {
+  margin-top: 6px;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre;
+  word-break: normal;
+}

@@ -1,4 +1,4 @@
-import './helpers/env.js';
+import { TEST_ADMIN } from './helpers/env.js';
 // Regression tests for control-plane defects found in the audit: group id collisions, non-atomic
 // profile mappings, revoked objects coming back on re-import, Okta secret/issuer handling,
 // portal-user updates, dashboard totals, Salesforce settings validation and audit-log redaction.
@@ -10,6 +10,7 @@ import { store, stripSensitivePayloadData } from '../src/db/store.js';
 import { startTestServer, loginAsAdmin, adminFetch, mcpRequest, toolResultPayload, type AdminSession, type TestServer } from './helpers/server.js';
 import { installSalesforceMock } from './helpers/salesforceMock.js';
 import { createSimulatorToken } from '../src/salesforce/client.js';
+import { resolveEffectiveProfilePermissions } from '../src/rbac/policyEngine.js';
 
 const tag = () => crypto.randomBytes(4).toString('hex');
 const rawDb = () => new DatabaseSync(process.env.DB_PATH as string);
@@ -95,22 +96,32 @@ describe('Objects', () => {
         { objectName: 'Account', canRead: true, canCreate: false, canUpdate: false, canDelete: false, allowedFields: ['Id'] },
       ],
     });
+    const profileId = `00e${crypto.randomBytes(6).toString('hex')}`.slice(0, 15);
+    store.upsertProfile(profileId, `Payroll profile ${tag()}`);
+    store.setProfileGroups(profileId, [group.id]);
+    const grantsSalary = () => resolveEffectiveProfilePermissions(profileId).objectPermissions.has(objectName);
+    assert.ok(grantsSalary());
 
     const del = await adminFetch(server.baseUrl, session, `/api/admin/objects/${objectName}`, { method: 'DELETE' });
     assert.equal(del.status, 200);
+    // The group keeps the entry, marked as deleted by whom, so admins can see why access stopped.
     const afterDelete = store.getGroups().find((g) => g.id === group.id)!;
-    assert.deepEqual(afterDelete.objectPermissions.map((p) => p.objectName), ['Account']);
+    assert.deepEqual(afterDelete.objectPermissions.map((p) => p.objectName), [objectName, 'Account']);
+    assert.equal(afterDelete.objectPermissions[0].removed?.by, TEST_ADMIN.username);
+    assert.equal(afterDelete.objectPermissions[1].removed, undefined);
     const log = store.getPortalAdminLogs(5).find((l) => l.action === 'DELETE_OBJECT');
     assert.match(log?.details || '', /revoked it from 1 Access Group/);
+    assert.match(store.getGroupHistory(group.id)[0].changes[0], new RegExp(`${objectName} was deleted from Salesforce > Objects`));
 
-    // Re-import the same object from SFDX files: it comes back, but no group grants it.
+    // Re-import the same object from SFDX files: it comes back, but the group's held entry grants nothing.
     const reimport = await adminFetch(server.baseUrl, session, '/api/admin/objects/import-sfdx-files', {
       method: 'POST',
       body: { files: [{ relativePath: `objects/${objectName}/${objectName}.object-meta.xml`, content: '<CustomObject><label>Salary</label></CustomObject>' }] },
     });
     assert.equal(reimport.status, 200);
     assert.ok(store.getObjects().some((o) => o.objectName === objectName));
-    assert.ok(!store.getGroups().find((g) => g.id === group.id)!.objectPermissions.some((p) => p.objectName === objectName));
+    assert.ok(store.getGroups().find((g) => g.id === group.id)!.objectPermissions[0].removed);
+    assert.ok(!grantsSalary());
   });
 
   test('SFDX import through the API uses the object label, not a compact layout label', async () => {
