@@ -18,7 +18,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from 'node:sqlite';
 import { testTmpDir } from './helpers/env.js';
-import { store, parseSfdxFilesToObjects } from '../src/db/store.js';
+import { store, parseSfdxFilesToObjects, MembershipChangeError } from '../src/db/store.js';
 import type { SalesforceConnectionSettings } from '../src/types/governance.js';
 
 const BOOTSTRAP_USERNAME = 'admin';
@@ -293,6 +293,7 @@ describe('store: SQLite initialisation', () => {
     'portal_admin_logs',
     'okta_config',
     'sf_connection_settings',
+    'policy_state',
   ];
 
   test('creates every table of the schema block', () => {
@@ -309,7 +310,7 @@ describe('store: SQLite initialisation', () => {
   });
 
   test('seeds exactly one row (id 1) in each settings singleton table', () => {
-    for (const table of ['okta_config', 'sf_connection_settings']) {
+    for (const table of ['okta_config', 'sf_connection_settings', 'policy_state']) {
       assert.deepEqual(
         rawAll<{ id: number }>(`SELECT id FROM ${table}`).map((r) => Number(r.id)),
         [1],
@@ -685,6 +686,90 @@ describe('store: groups and profile-group mappings', () => {
     assert.equal(groups.some((g) => g.name === `Store Group ${suffix}`), false, 'no copy under the old name');
   });
 
+  test('a group starts at version 1 and every update that changes it adds one', (t) => {
+    const created = newGroup('Store versions');
+    t.after(() => store.deleteGroup(created.id));
+    assert.equal(created.version, 1);
+    const once = store.upsertGroup({ ...created, description: 'changed' });
+    const twice = store.upsertGroup({ ...once, allowedActions: ['soql_query'] });
+    assert.deepEqual([once.version, twice.version], [2, 3]);
+    assert.equal(rawGet<{ version: number }>('SELECT version FROM access_groups WHERE id = ?', created.id)?.version, 3);
+  });
+
+  test('an update that stores what is stored writes nothing: the version and updatedAt stay', (t) => {
+    const created = newGroup('Store unchanged');
+    t.after(() => store.deleteGroup(created.id));
+    const changed = store.upsertGroup({
+      ...created,
+      allowedActions: ['soql_query'],
+      objectPermissions: [
+        { objectName: 'Account', canRead: true, canCreate: false, canUpdate: false, canDelete: false, allowedFields: ['Id'] },
+      ],
+    });
+    // The name and description are stored trimmed, so surrounding spaces change nothing either.
+    const again = store.upsertGroup({ ...changed, name: ` ${changed.name} `, description: `${changed.description} ` });
+    assert.equal(again.version, changed.version);
+    assert.equal(again.updatedAt, changed.updatedAt);
+    assert.deepEqual(again, changed);
+
+    // Any one column that differs is a change.
+    const renamed = store.upsertGroup({ ...again, name: `${again.name} renamed` });
+    assert.equal(renamed.version, changed.version + 1);
+    const regranted = store.upsertGroup({ ...renamed, objectPermissions: [] });
+    assert.equal(regranted.version, changed.version + 2);
+  });
+
+  test('upsertGroup refuses an id no group has instead of creating a group under it', () => {
+    const id = `grp_unknown_${uid()}`;
+    assert.throws(
+      () => store.upsertGroup({ id, name: `Store unknown ${uid()}`, allowedActions: [], objectPermissions: [] }),
+      new RegExp(`Unknown Access Group id: ${id}`)
+    );
+    assert.equal(rawCount('SELECT COUNT(*) AS n FROM access_groups WHERE id = ?', id), 0);
+  });
+
+  test('createGroup takes a fixed id for sample data, but never overwrites the group that has it', (t) => {
+    const id = `grp-fixed-${uid()}`;
+    const created = store.createGroup({ id, name: `Store fixed ${uid()}`, allowedActions: ['soql_query'], objectPermissions: [] });
+    t.after(() => store.deleteGroup(id));
+    assert.deepEqual([created.id, created.version], [id, 1]);
+    assert.throws(
+      () => store.createGroup({ id, name: `Store fixed ${uid()}`, allowedActions: [], objectPermissions: [] }),
+      /UNIQUE constraint failed: access_groups\.id/
+    );
+    assert.deepEqual(store.getGroups().find((g) => g.id === id), created);
+  });
+
+  test('revoking a deleted field or object from a group counts as an update of that group', (t) => {
+    const objectName = `StoreRevoke_${uid()}__c`;
+    store.upsertObjectWithFields({ objectName, fields: [{ fieldName: 'Id' }, { fieldName: 'Gone__c' }] });
+    const group = store.upsertGroup({
+      name: `Store revoke ${uid()}`,
+      allowedActions: [],
+      objectPermissions: [{ objectName, canRead: true, canCreate: false, canUpdate: false, canDelete: false, allowedFields: ['Id', 'Gone__c'] }],
+    });
+    t.after(() => store.deleteGroup(group.id));
+    const versionOf = () => store.getGroups().find((g) => g.id === group.id)!.version;
+
+    store.deleteObjectField(objectName, 'Gone__c');
+    assert.equal(versionOf(), 2);
+    store.deleteObject(objectName);
+    assert.equal(versionOf(), 3);
+  });
+
+  test('a group column that does not parse reads as an empty list, so no reader fails on it', (t) => {
+    const group = newGroup('Store unreadable');
+    t.after(() => store.deleteGroup(group.id));
+    const warn = t.mock.method(console, 'warn', () => {});
+    raw.prepare(`UPDATE access_groups SET object_permissions_json = '[{"objectName":', allowed_actions_json = '{}' WHERE id = ?`).run(group.id);
+
+    const read = store.getGroups().find((g) => g.id === group.id)!;
+    assert.deepEqual([read.objectPermissions, read.allowedActions], [[], []]);
+    store.getGroups();
+    assert.equal(warn.mock.callCount(), 2, 'one warning per group and column');
+    assert.ok(!String(warn.mock.calls[0].arguments[0]).includes('objectName'));
+  });
+
   test('upsertGroup round-trips allowedActions and objectPermissions through JSON', (t) => {
     const allowedActions = ['list_enabled_objects', 'soql_query', 'get_record', 'create_record'];
     const objectPermissions = [
@@ -794,6 +879,92 @@ describe('store: groups and profile-group mappings', () => {
     );
     assert.deepEqual(groupIdsOf(profileId), [previous.id], 'a rejected update must leave the previous mapping intact');
   });
+
+  test('applyMembershipDelta adds and removes only the memberships it names', (t) => {
+    const profileId = `00eDLT${uid()}`;
+    const kept = newGroup('Store delta kept');
+    const removed = newGroup('Store delta removed');
+    const added = newGroup('Store delta added');
+    t.after(() => {
+      store.deleteProfile(profileId);
+      for (const g of [kept, removed, added]) store.deleteGroup(g.id);
+    });
+    store.upsertProfile(profileId, 'Store delta profile');
+    store.setProfileGroups(profileId, [kept.id, removed.id]);
+
+    const change = store.applyMembershipDelta(profileId, { add: [added.id, added.id], remove: [removed.id] });
+
+    assert.deepEqual(change.added, [added.id]);
+    assert.deepEqual(change.removed, [removed.id]);
+    assert.deepEqual([...change.mapping.groupIds].sort(), [kept.id, added.id].sort());
+    assert.deepEqual(groupIdsOf(profileId), [kept.id, added.id].sort());
+
+    // Repeating it changes nothing and reports nothing.
+    const again = store.applyMembershipDelta(profileId, { add: [added.id], remove: [removed.id] });
+    assert.deepEqual({ added: again.added, removed: again.removed }, { added: [], removed: [] });
+    assert.deepEqual(groupIdsOf(profileId), [kept.id, added.id].sort());
+  });
+
+  test('applyMembershipDelta rejects an unknown group id or one id both added and removed, changing nothing', (t) => {
+    const profileId = `00eDLX${uid()}`;
+    const previous = newGroup('Store delta previous');
+    const next = newGroup('Store delta next');
+    t.after(() => {
+      store.deleteProfile(profileId);
+      store.deleteGroup(previous.id);
+      store.deleteGroup(next.id);
+    });
+    store.upsertProfile(profileId, 'Store delta validation');
+    store.setProfileGroups(profileId, [previous.id]);
+    const missing = `grp_missing_${uid()}`;
+
+    assert.throws(
+      () => store.applyMembershipDelta(profileId, { add: [next.id, missing], remove: [previous.id] }),
+      (err: Error) => err instanceof MembershipChangeError && err.message.includes(missing)
+    );
+    assert.throws(
+      () => store.applyMembershipDelta(profileId, { add: [next.id], remove: [next.id] }),
+      MembershipChangeError
+    );
+    assert.throws(
+      () => store.applyMembershipDelta(`00eDLX${uid()}`, { add: [next.id], remove: [] }),
+      /Unknown Profile id/
+    );
+    assert.deepEqual(groupIdsOf(profileId), [previous.id], 'a rejected delta must leave the mapping intact');
+  });
+
+  test('applyGroupMembershipDelta adds and removes many Profiles of one group and leaves other groups alone', (t) => {
+    const [first, second, third] = [`00eGDA${uid()}`, `00eGDB${uid()}`, `00eGDC${uid()}`];
+    const group = newGroup('Store group delta');
+    const other = newGroup('Store group delta other');
+    t.after(() => {
+      for (const id of [first, second, third]) store.deleteProfile(id);
+      store.deleteGroup(group.id);
+      store.deleteGroup(other.id);
+    });
+    for (const id of [first, second, third]) store.upsertProfile(id, `Store group delta ${id}`);
+    store.setProfileGroups(first, [group.id, other.id]);
+    store.setProfileGroups(second, [other.id]);
+
+    const change = store.applyGroupMembershipDelta(group.id, { add: [second, third], remove: [first] });
+
+    assert.deepEqual([...change.added].sort(), [second, third].sort());
+    assert.deepEqual(change.removed, [first]);
+    assert.deepEqual([...change.membership.profileIds].sort(), [second, third].sort());
+    assert.deepEqual(groupIdsOf(first), [other.id]);
+    assert.deepEqual(groupIdsOf(second), [group.id, other.id].sort());
+    assert.deepEqual(groupIdsOf(third), [group.id]);
+
+    assert.throws(
+      () => store.applyGroupMembershipDelta(group.id, { add: [first, `00eGDX${uid()}`], remove: [] }),
+      /Unknown Profile id/
+    );
+    assert.throws(
+      () => store.applyGroupMembershipDelta(`grp_missing_${uid()}`, { add: [first], remove: [] }),
+      MembershipChangeError
+    );
+    assert.deepEqual(groupIdsOf(first), [other.id], 'a rejected delta must leave the mapping intact');
+  });
 });
 
 // =============================================================================================
@@ -801,7 +972,8 @@ describe('store: groups and profile-group mappings', () => {
 // =============================================================================================
 describe('store: audit logs', () => {
   type CopilotLogInput = Parameters<typeof store.recordCopilotMcpLog>[0];
-  const copilotLog = (overrides: Partial<CopilotLogInput> = {}): CopilotLogInput => ({
+  // Rows written here carry no decision.
+  const copilotLog = (overrides: Partial<Omit<CopilotLogInput, 'decision' | 'policySnapshot'>> = {}): CopilotLogInput => ({
     sfUsername: `rep.${uid()}@acme.example.com`,
     profileId: `00eLOG${uid()}`,
     profileName: 'Store Test Profile',
@@ -857,7 +1029,7 @@ describe('store: audit logs', () => {
 
     assert.deepEqual(first, newer);
     assert.deepEqual(second, older);
-    const { id, timestamp, sanitizedRequestPayload, sanitizedResponseSummary, ...fields } = first;
+    const { id, timestamp, seq, sanitizedRequestPayload, sanitizedResponseSummary, ...fields } = first;
     assert.deepEqual(fields, {
       sfUsername: newerInput.sfUsername,
       profileId: newerInput.profileId,
@@ -867,23 +1039,42 @@ describe('store: audit logs', () => {
       targetObject: newerInput.targetObject,
       status: newerInput.status,
       latencyMs: newerInput.latencyMs,
+      // Written without a decision or timings: every one of those reads as not recorded.
+      kind: 'real',
+      decision: null,
+      decisionStage: '',
+      decisionCode: '',
+      assignedGroupIds: [],
+      decidingGroupIds: [],
+      policyRevision: null,
+      callerProfileId: '',
+      matchedProfileId: '',
+      matchMethod: '',
+      verificationMs: null,
+      totalMs: null,
     });
+    assert.equal(seq, Number(older.seq) + 1, 'seq is the write order');
     assert.ok(id && id !== older.id, 'each entry gets its own id');
     assert.ok(!Number.isNaN(Date.parse(timestamp)) && timestamp >= older.timestamp);
     assert.deepEqual(JSON.parse(sanitizedRequestPayload), { objectName: 'Account', limit: 10 });
     assert.deepEqual(JSON.parse(sanitizedResponseSummary), { totalSize: 0, done: true });
   });
 
-  test('sanitizing redacts every SOQL string literal but keeps the query shape', () => {
+  test('sanitizing keeps the SOQL query shape but replaces every literal with a typed placeholder', () => {
     const { request, storedText } = recordAndReadStored({
-      soql: "SELECT Id, Name FROM Account WHERE Name = 'Acme Secret Corp' AND Owner.Email LIKE '%ceo@acme.example%' LIMIT 5",
+      soql:
+        "SELECT Id, Name FROM Account WHERE Name LIKE 'Acme Secret Corp%' AND AnnualRevenue > 9876543.21 " +
+        'AND NumberOfEmployees = -4242 AND CloseDate = 2031-07-19 AND LastModifiedDate < 2031-07-19T08:15:00Z ' +
+        'AND CreatedDate = LAST_N_DAYS:4711 AND IsDeleted = false AND ParentId != null LIMIT 5',
     });
 
     assert.equal(
       request.soql,
-      "SELECT Id, Name FROM Account WHERE Name = '[REDACTED]' AND Owner.Email LIKE '[REDACTED]' LIMIT 5"
+      'SELECT Id, Name FROM Account WHERE Name LIKE <string> AND AnnualRevenue > <number> ' +
+        'AND NumberOfEmployees = <number> AND CloseDate = <date> AND LastModifiedDate < <datetime> ' +
+        'AND CreatedDate = LAST_N_DAYS:<number> AND IsDeleted = <boolean> AND ParentId != <null> LIMIT <number>'
     );
-    assertNotStored(storedText, ['Acme Secret Corp', 'ceo@acme.example']);
+    assertNotStored(storedText, ['Acme Secret Corp', '9876543', '4242', '2031-07-19', '08:15', '4711']);
   });
 
   test('sanitizing redacts SOQL string literals that contain escaped quotes', () => {
@@ -893,7 +1084,28 @@ describe('store: audit logs', () => {
     });
 
     assertNotStored(storedText, ['Malley-Secret', 'jane.doe@acme.example']);
-    assert.equal(request.soql, "SELECT Id FROM Contact WHERE LastName = '[REDACTED]' AND Email = '[REDACTED]'");
+    assert.equal(request.soql, 'SELECT Id FROM Contact WHERE LastName = <string> AND Email = <string>');
+  });
+
+  test('sanitizing stores a fixed placeholder, and none of the text, for SOQL the tokenizer cannot read', () => {
+    for (const soql of [
+      // The tokenizer reads no relationship paths, so the dot stops it.
+      "SELECT Id FROM Account WHERE Owner.Email LIKE '%ceo@acme.example%'",
+      "SELECT Id FROM Contact WHERE LastName = 'Unterminated-Secret",
+      'SELECT Id FROM Contact WHERE Phone = 555#867#5309',
+    ]) {
+      const { request, storedText } = recordAndReadStored({ soql });
+
+      assert.equal(request.soql, '<unparseable soql>', soql);
+      assertNotStored(storedText, ['ceo@acme.example', 'Unterminated-Secret', '555', 'SELECT']);
+    }
+  });
+
+  test('sanitizing applies safe keys only at the top level, so a fields map keeps no value', () => {
+    const { request, storedText } = recordAndReadStored({ fields: { status: '555-867-5309', limit: 'ACCT-99812' } });
+
+    assert.deepEqual(request, { fields: { status: '<REDACTED:string>', limit: '<REDACTED:string>' } });
+    assertNotStored(storedText, ['555-867-5309', 'ACCT-99812']);
   });
 
   test('sanitizing replaces non-safe primitive values with their type', () => {
@@ -963,6 +1175,67 @@ describe('store: audit logs', () => {
     assert.deepEqual(recordAndReadStored(payload).request, payload);
   });
 
+  test('sanitizing keeps a top-level tool or object name only when its column would store it', () => {
+    // Each value passes the structural-token check, so only the column's own check keeps it out.
+    const { request, storedText } = recordAndReadStored({
+      objectName: '555-867-5309',
+      object: 'Owner.Email',
+      sobject: ['ACCT-99812'],
+      tool: 'drop_all_tables',
+      toolName: 4155550100,
+    });
+
+    assert.deepEqual(request, {
+      objectName: '<invalid:len=12>',
+      object: '<invalid:len=11>',
+      sobject: { _type: 'Array', count: 1, sampleStructure: '<REDACTED:string>' },
+      tool: '<invalid:len=15>',
+      toolName: '<REDACTED:number>',
+    });
+    assertNotStored(storedText, ['555-867-5309', 'Owner.Email', 'ACCT-99812', 'drop_all_tables', '4155550100']);
+  });
+
+  /** The tool_name and target_object columns of a stored Copilot log row. */
+  function storedNames(id: string): [string, string] {
+    const row = rawGet<{ tool_name: string; target_object: string }>(
+      'SELECT tool_name, target_object FROM mcp_copilot_logs WHERE id = ?',
+      id
+    );
+    assert.ok(row, 'the log row is stored');
+    return [row.tool_name, row.target_object];
+  }
+
+  test('a tool name outside the catalog and a target object that is not an API name are stored by length only', () => {
+    const calls: Array<[string, string]> = [
+      ['Jane Doe 555-867-5309', "Account WHERE Email = 'jane.doe@acme.example'"],
+      ['drop_all_tables', 'Owner.Email'],
+      // The policy engine matches tool names exactly, so a case variant is not a catalog tool either.
+      ['SOQL_QUERY', '555-867-5309'],
+    ];
+    for (const [toolName, targetObject] of calls) {
+      const entry = store.recordCopilotMcpLog(copilotLog({ toolName, targetObject, status: 'DENIED' }));
+      const expected = [`<invalid:len=${toolName.length}>`, `<invalid:len=${targetObject.length}>`];
+
+      assert.deepEqual(storedNames(entry.id), expected);
+      assert.deepEqual([entry.toolName, entry.targetObject], expected, 'the returned entry matches the stored row');
+    }
+  });
+
+  test('catalog tools, mcp_authenticate, API names and the no-object "*" are stored as given', () => {
+    const calls: Array<[string, string]> = [
+      ['soql_query', 'Account'],
+      ['delete_record', 'Invoice_Line__c'],
+      ['list_enabled_objects', '*'],
+      ['mcp_authenticate', '*'],
+      ['describe_object', ''],
+    ];
+    for (const [toolName, targetObject] of calls) {
+      const entry = store.recordCopilotMcpLog(copilotLog({ toolName, targetObject }));
+
+      assert.deepEqual(storedNames(entry.id), [toolName, targetObject]);
+    }
+  });
+
   test('recordPortalAdminLog persists the entry and defaults the IP address to 127.0.0.1', () => {
     const adminUsername = `store-admin-${uid()}`;
     const withoutIp = store.recordPortalAdminLog({
@@ -985,7 +1258,7 @@ describe('store: audit logs', () => {
 
     assert.deepEqual(first, withIp);
     assert.deepEqual(second, withoutIp);
-    const { id, timestamp, ...fields } = second;
+    const { id, timestamp, correlationId, ...fields } = second;
     assert.deepEqual(fields, {
       adminUsername,
       authMethod: 'password',
@@ -993,8 +1266,12 @@ describe('store: audit logs', () => {
       target: 'Store tests',
       details: 'IP address not given',
       ipAddress: '127.0.0.1',
+      result: 'SUCCESS',
+      targetType: '',
+      targetId: '',
+      diff: null,
     });
-    assert.ok(id && !Number.isNaN(Date.parse(timestamp)));
+    assert.ok(id && !Number.isNaN(Date.parse(timestamp)) && correlationId);
     assert.equal(first.ipAddress, '203.0.113.7');
     assert.equal(
       rawGet<{ ip_address: string }>('SELECT ip_address FROM portal_admin_logs WHERE id = ?', withoutIp.id)?.ip_address,

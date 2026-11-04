@@ -1,5 +1,12 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { runInTransaction, SIMULATE_MCP_CALL_ACTION, store } from '../db/store.js';
+import crypto from 'node:crypto';
+import {
+  MembershipChangeError,
+  runInTransaction,
+  SIMULATE_MCP_CALL_ACTION,
+  store,
+  type MembershipDelta,
+} from '../db/store.js';
 import { parseProfilesCsv, parseSfdxFilesToObjects } from '../db/importers.js';
 import {
   requireAdminAuth,
@@ -9,6 +16,7 @@ import {
   effectiveOktaRedirectUri,
   verifyAdminSessionFromRequest,
 } from '../security/adminAuth.js';
+import { PORTAL_PASSWORD_MIN_LENGTH } from '../security/passwordPolicy.js';
 import {
   createSimulatorToken,
   resolveSalesforceUserFromToken,
@@ -24,18 +32,26 @@ import {
   fetchObjectsMetadataFromOrgSession,
   SalesforceOrgTokenSession,
 } from '../salesforce/jwtConnection.js';
-import { config } from '../config.js';
-import { parseObjectSyncPayload, parseProfileSyncPayload } from './orgSyncPayload.js';
+import { config, KNOWN_DEFAULT_PASSWORDS } from '../config.js';
+import { parseObjectSyncPayload, parseProfileSyncPayload, type PayloadResult } from './orgSyncPayload.js';
 import { LogPageQueryError, parseMcpLogPageQuery, parsePortalLogPageQuery } from './logPageQuery.js';
+import { groupAuditFields, groupUpdateDiff } from './groupAuditDiff.js';
+import { parseGroupObjectPermissions, parseGroupSaveRequest } from './groupPayload.js';
+import { restoresHeldGrant } from '../rbac/groupGrants.js';
 import { isSalesforceId, salesforceIdsMatch } from '../salesforce/ids.js';
 import { assertNotSimulatedOrgHost } from '../salesforce/simulatedOrg.js';
-import { ACCESS_GROUP_EDIT_SOURCES } from '../types/governance.js';
-import type { AccessGroupChangeSource, SalesforceConnectionSettings } from '../types/governance.js';
-import { groupAvailabilityIssues, normalizeMcpActions, normalizeObjectPermissions } from '../groups/groupGrants.js';
+import type { AccessGroup, SalesforceConnectionSettings } from '../types/governance.js';
+import { groupAvailabilityIssues, type GroupAvailabilityIssue } from '../groups/groupGrants.js';
 import {
-  evaluateMcpToolCall,
+  decisionLogStatus,
+  evaluatePolicy,
+  evaluateToolAccess,
+  loadPolicySnapshot,
+  policyEvaluationResult,
   resolveEffectiveProfilePermissions,
 } from '../rbac/policyEngine.js';
+import { targetObjectArgument } from '../mcp/toolArguments.js';
+import { elapsedMs } from '../mcp/server.js';
 
 export const adminRouter = Router();
 
@@ -220,16 +236,56 @@ const asyncRoute =
     handler(req, res).catch(next);
   };
 
+/**
+ * Runs a change and its audit entry in one transaction, for a change that may refuse its input. A
+ * refusal (an error `change` throws) rolls back whatever the change wrote and is returned as `{ error }`,
+ * for the route to answer as before. An entry `record` cannot write rolls the change back too, but is
+ * thrown, so the request ends in a 500 and the change can never go unlogged. A change that cannot
+ * refuse its input runs in runInTransaction directly.
+ */
+function changeWithAuditEntry<T>(change: () => T, record: (changed: T) => void): { value: T } | { error: any } {
+  let recording = false;
+  try {
+    return {
+      value: runInTransaction(() => {
+        const value = change();
+        recording = true;
+        record(value);
+        return value;
+      }),
+    };
+  } catch (error) {
+    if (recording) throw error;
+    return { error };
+  }
+}
+
+/**
+ * The id that ties together every Portal Admin log row one Admin API request writes. It is made here,
+ * once per request, and never taken from the client, so a caller cannot file its rows under another
+ * request's id. The response carries it as X-Correlation-Id.
+ */
+function correlationIdFor(res: Response): string {
+  if (typeof res.locals.correlationId !== 'string') {
+    res.locals.correlationId = crypto.randomUUID();
+    if (!res.headersSent) res.setHeader('X-Correlation-Id', res.locals.correlationId);
+  }
+  return res.locals.correlationId;
+}
+
 function getAdminInfo(req: Request): {
   username: string;
   authMethod: 'password' | 'okta_sso';
   ip: string;
+  correlationId: string | undefined;
 } {
   const session = (req as any).adminSession;
   return {
     username: session?.email || 'admin',
     authMethod: session?.authMethod === 'okta_oidc' ? 'okta_sso' : 'password',
     ip: req.ip || '127.0.0.1',
+    // Also reached before this router runs (a sync body the JSON parser refused), hence made on demand.
+    correlationId: req.res ? correlationIdFor(req.res) : undefined,
   };
 }
 
@@ -253,6 +309,7 @@ function recordSyncFailure(req: Request, action: string, target: string, reason:
     target,
     details: `Sync from Salesforce Org failed and changed nothing: ${reason.slice(0, 500)}`,
     ipAddress: actor.ip,
+    correlationId: actor.correlationId,
   });
 }
 
@@ -264,6 +321,12 @@ export function recordObjectSyncFailure(req: Request, reason: string): void {
 function recordProfileSyncFailure(req: Request, reason: string): void {
   recordSyncFailure(req, 'SYNC_PROFILES_FROM_ORG_FAILED', SYNC_PROFILES_TARGET, reason);
 }
+
+// First, so that every Admin API response names its request, the signed-out ones included.
+adminRouter.use((_req: Request, res: Response, next: NextFunction) => {
+  correlationIdFor(res);
+  next();
+});
 
 /**
  * GET /api/admin/session
@@ -326,6 +389,7 @@ adminRouter.post('/login', asyncRoute(async (req: Request, res: Response) => {
       target: 'Portal Auth',
       details: `Failed password login attempt for username "${attemptedUsername}".`,
       ipAddress: req.ip || '127.0.0.1',
+      correlationId: correlationIdFor(res),
     });
     res.status(401).json({ error: 'Invalid username or password.' });
     return;
@@ -346,6 +410,7 @@ adminRouter.post('/login', asyncRoute(async (req: Request, res: Response) => {
     target: 'Portal Auth',
     details: `User "${verifiedUser.username}" (${verifiedUser.role}) signed in with username and password.`,
     ipAddress: req.ip || '127.0.0.1',
+    correlationId: correlationIdFor(res),
   });
 
   res.json({
@@ -373,6 +438,7 @@ adminRouter.post('/logout', asyncRoute(async (req: Request, res: Response) => {
       target: 'Portal Auth',
       details: `User "${session.email}" signed out of the portal.`,
       ipAddress: req.ip || '127.0.0.1',
+      correlationId: correlationIdFor(res),
     });
   }
   clearAdminSessionCookie(res);
@@ -432,6 +498,8 @@ adminRouter.get('/overview', (_req: Request, res: Response) => {
     objects,
     groups,
     profileGroupMappings,
+    // Read in the same tick as the four lists above, so it is the revision they show.
+    policyRevision: store.getPolicyRevision(),
     copilotLogs,
     mcpActivity: store.getCopilotMcpActivityFigures(now),
     mcpTraffic: store.getCopilotMcpTrafficSeries(now),
@@ -520,7 +588,29 @@ adminRouter.post('/profiles', (req: Request, res: Response) => {
     }
   }
 
-  const result = store.upsertProfile(String(id), String(name));
+  const actor = getAdminInfo(req);
+  // The save and its audit entry share one transaction: a saved Profile can never go unlogged. A
+  // refused rename changes nothing and is answered with 409 below, unlogged as before.
+  const result = runInTransaction(() => {
+    const saved = store.upsertProfile(String(id), String(name));
+    if (saved.nameKept) return saved;
+    store.recordPortalAdminLog({
+      adminUsername: actor.username,
+      authMethod: actor.authMethod,
+      action: saved.action === 'inserted' ? 'CREATE_PROFILE' : 'UPDATE_PROFILE',
+      target: `Profile: ${saved.profile.name} (${saved.profile.id})`,
+      details: `${
+        saved.action === 'inserted' ? 'Added new' : 'Updated existing'
+      } Salesforce Profile "${saved.profile.name}" with ID "${saved.profile.id}".${
+        saved.previousId ? ` Its ID was upgraded from "${saved.previousId}", keeping its Access Groups.` : ''
+      }`,
+      ipAddress: actor.ip,
+      correlationId: actor.correlationId,
+      targetType: 'profile',
+      targetId: saved.profile.id,
+    });
+    return saved;
+  });
   if (result.nameKept) {
     const forms = store
       .getProfiles()
@@ -531,19 +621,6 @@ adminRouter.post('/profiles', (req: Request, res: Response) => {
     });
     return;
   }
-  const actor = getAdminInfo(req);
-  store.recordPortalAdminLog({
-    adminUsername: actor.username,
-    authMethod: actor.authMethod,
-    action: result.action === 'inserted' ? 'CREATE_PROFILE' : 'UPDATE_PROFILE',
-    target: `Profile: ${result.profile.name} (${result.profile.id})`,
-    details: `${
-      result.action === 'inserted' ? 'Added new' : 'Updated existing'
-    } Salesforce Profile "${result.profile.name}" with ID "${result.profile.id}".${
-      result.previousId ? ` Its ID was upgraded from "${result.previousId}", keeping its Access Groups.` : ''
-    }`,
-    ipAddress: actor.ip,
-  });
 
   res.json({
     profile: result.profile,
@@ -577,19 +654,24 @@ adminRouter.post('/profiles/import-csv', (req: Request, res: Response) => {
     return;
   }
 
-  const summary = store.importProfilesFromCsvRows(parsedRows);
   const actor = getAdminInfo(req);
-  store.recordPortalAdminLog({
-    adminUsername: actor.username,
-    authMethod: actor.authMethod,
-    action: 'IMPORT_PROFILES_CSV',
-    target: 'Salesforce > Profiles',
-    details: `Imported ${parsedRows.length} profile rows from CSV (${summary.inserted} added, ${summary.updated} updated; ${summary.total} total profiles).${
-      summary.idsUpgraded ? ` ${summary.idsUpgraded} upgraded to their 18-character ID, keeping Access Groups.` : ''
-    }${
-      summary.namesKept ? ` ${summary.namesKept} kept their name because they are stored under two ID forms.` : ''
-    }`,
-    ipAddress: actor.ip,
+  // The import and its audit entry share one transaction: imported rows can never go unlogged.
+  const summary = runInTransaction(() => {
+    const imported = store.importProfilesFromCsvRows(parsedRows);
+    store.recordPortalAdminLog({
+      adminUsername: actor.username,
+      authMethod: actor.authMethod,
+      action: 'IMPORT_PROFILES_CSV',
+      target: 'Salesforce > Profiles',
+      details: `Imported ${parsedRows.length} profile rows from CSV (${imported.inserted} added, ${imported.updated} updated; ${imported.total} total profiles).${
+        imported.idsUpgraded ? ` ${imported.idsUpgraded} upgraded to their 18-character ID, keeping Access Groups.` : ''
+      }${
+        imported.namesKept ? ` ${imported.namesKept} kept their name because they are stored under two ID forms.` : ''
+      }`,
+      ipAddress: actor.ip,
+      correlationId: actor.correlationId,
+    });
+    return imported;
   });
 
   res.json({
@@ -600,22 +682,28 @@ adminRouter.post('/profiles/import-csv', (req: Request, res: Response) => {
 
 adminRouter.delete('/profiles/:id', (req: Request, res: Response) => {
   const id = String(req.params.id);
-  const existing = store.getProfileById(id);
-  const deleted = store.deleteProfile(id);
+  const actor = getAdminInfo(req);
+  // The delete and its audit entry share one transaction: a deleted Profile can never go unlogged.
+  const deleted = runInTransaction(() => {
+    const existing = store.getProfileById(id);
+    if (!store.deleteProfile(id)) return false;
+    store.recordPortalAdminLog({
+      adminUsername: actor.username,
+      authMethod: actor.authMethod,
+      action: 'DELETE_PROFILE',
+      target: `Profile: ${existing?.name || id} (${id})`,
+      details: `Deleted Salesforce Profile "${existing?.name || id}" (${id}).`,
+      ipAddress: actor.ip,
+      correlationId: actor.correlationId,
+      targetType: 'profile',
+      targetId: id.trim(),
+    });
+    return true;
+  });
   if (!deleted) {
     res.status(404).json({ error: 'Profile not found.' });
     return;
   }
-
-  const actor = getAdminInfo(req);
-  store.recordPortalAdminLog({
-    adminUsername: actor.username,
-    authMethod: actor.authMethod,
-    action: 'DELETE_PROFILE',
-    target: `Profile: ${existing?.name || id} (${id})`,
-    details: `Deleted Salesforce Profile "${existing?.name || id}" (${id}).`,
-    ipAddress: actor.ip,
-  });
 
   res.json({ profiles: store.getProfiles() });
 });
@@ -713,6 +801,7 @@ adminRouter.post('/profiles/pull-apply', (req: Request, res: Response) => {
           namesClause('Access granted by merging duplicates', applied.affected.accessGranted) +
           namesClause('Duplicate rows left unchanged because their groups differ', applied.affected.duplicatesUnresolved),
         ipAddress: actor.ip,
+        correlationId: actor.correlationId,
       });
       return applied;
     });
@@ -755,15 +844,20 @@ adminRouter.post('/objects/import-sfdx-files', (req: Request, res: Response) => 
     return;
   }
 
-  const summary = store.importObjectsFromParsedSfdx(parsed);
   const actor = getAdminInfo(req);
-  store.recordPortalAdminLog({
-    adminUsername: actor.username,
-    authMethod: actor.authMethod,
-    action: 'IMPORT_SFDX_OBJECTS_FOLDER',
-    target: 'Salesforce > Objects',
-    details: `Imported ${summary.objectsImported} Salesforce Objects and ${summary.fieldsImported} Fields from uploaded SFDX objects folder.`,
-    ipAddress: actor.ip,
+  // The import and its audit entry share one transaction: imported Objects can never go unlogged.
+  const summary = runInTransaction(() => {
+    const imported = store.importObjectsFromParsedSfdx(parsed);
+    store.recordPortalAdminLog({
+      adminUsername: actor.username,
+      authMethod: actor.authMethod,
+      action: 'IMPORT_SFDX_OBJECTS_FOLDER',
+      target: 'Salesforce > Objects',
+      details: `Imported ${imported.objectsImported} Salesforce Objects and ${imported.fieldsImported} Fields from uploaded SFDX objects folder.`,
+      ipAddress: actor.ip,
+      correlationId: actor.correlationId,
+    });
+    return imported;
   });
 
   res.json({
@@ -774,9 +868,14 @@ adminRouter.post('/objects/import-sfdx-files', (req: Request, res: Response) => 
 
 /**
  * POST /api/admin/objects/import-local-folder
- * Reads a local SFDX `force-app/main/default/objects` directory path on the server
+ * Development only: reads a local SFDX `force-app/main/default/objects` directory path on the server.
+ * Refused in production, where it would read any directory the server process can.
  */
 adminRouter.post('/objects/import-local-folder', (req: Request, res: Response) => {
+  if (config.isProd) {
+    res.status(403).json({ error: 'Importing from a server folder is only available outside production.' });
+    return;
+  }
   const { folderPath } = req.body || {};
   if (!folderPath || typeof folderPath !== 'string') {
     res.status(400).json({
@@ -785,25 +884,29 @@ adminRouter.post('/objects/import-local-folder', (req: Request, res: Response) =
     return;
   }
 
-  try {
-    const summary = store.importObjectsFromLocalDiskFolder(folderPath);
-    const actor = getAdminInfo(req);
-    store.recordPortalAdminLog({
-      adminUsername: actor.username,
-      authMethod: actor.authMethod,
-      action: 'SYNC_LOCAL_SFDX_FOLDER',
-      target: summary.resolvedPath,
-      details: `Synced ${summary.objectsImported} Objects and ${summary.fieldsImported} Fields from local SFDX directory "${summary.resolvedPath}".`,
-      ipAddress: actor.ip,
-    });
-
-    res.json({
-      summary,
-      objects: store.getObjects(),
-    });
-  } catch (err: any) {
-    res.status(400).json({ error: err.message || 'Failed to read folder path.' });
+  const actor = getAdminInfo(req);
+  const result = changeWithAuditEntry(
+    () => store.importObjectsFromLocalDiskFolder(folderPath),
+    (summary) =>
+      store.recordPortalAdminLog({
+        adminUsername: actor.username,
+        authMethod: actor.authMethod,
+        action: 'SYNC_LOCAL_SFDX_FOLDER',
+        target: summary.resolvedPath,
+        details: `Synced ${summary.objectsImported} Objects and ${summary.fieldsImported} Fields from local SFDX directory "${summary.resolvedPath}".`,
+        ipAddress: actor.ip,
+        correlationId: actor.correlationId,
+      })
+  );
+  if ('error' in result) {
+    res.status(400).json({ error: result.error?.message || 'Failed to read folder path.' });
+    return;
   }
+
+  res.json({
+    summary: result.value,
+    objects: store.getObjects(),
+  });
 });
 
 /**
@@ -817,31 +920,61 @@ adminRouter.post('/objects', (req: Request, res: Response) => {
     return;
   }
 
-  let saved;
-  try {
-    saved = store.upsertObjectWithFields({
-      objectName: store.resolveObjectName(String(objectName)),
-      label: label ? String(label) : undefined,
-      // The missing-in-org flag belongs to org sync, so a client cannot set or clear it here.
-      fields: Array.isArray(fields) ? fields.map(({ missingInOrg: _ignored, ...field }) => field) : undefined,
-    });
-  } catch (err: any) {
-    res.status(400).json({ error: err?.message || 'Invalid object.' });
+  const actor = getAdminInfo(req);
+  const result = changeWithAuditEntry(
+    () => {
+      const name = store.resolveObjectName(String(objectName));
+      const wasEnabled = new Map(
+        (store.getObjects().find((o) => o.objectName === name)?.fields ?? []).map((f) => [f.fieldName.toLowerCase(), f.enabled])
+      );
+      const saved = store.upsertObjectWithFields({
+        objectName: name,
+        label: label ? String(label) : undefined,
+        // The missing-in-org flag belongs to org sync, so a client cannot set or clear it here.
+        fields: Array.isArray(fields) ? fields.map(({ missingInOrg: _ignored, ...field }) => field) : undefined,
+      });
+      // A field this save enabled or disabled changes what groups granting it give, as the field toggle
+      // does, so it is noted in their history in the same transaction. A field it adds changes nothing.
+      for (const enabled of [true, false]) {
+        const toggled = saved.fields
+          .filter((f) => f.enabled === enabled && wasEnabled.get(f.fieldName.toLowerCase()) === !enabled)
+          .map((f) => f.fieldName);
+        if (toggled.length === 0) continue;
+        store.recordCatalogChangeOnGroups({
+          objectName: saved.objectName,
+          fieldNames: toggled,
+          describe: (granted) => {
+            const names = granted.map((f) => `${saved.objectName}.${f}`).join(', ');
+            const one = granted.length === 1;
+            return enabled
+              ? `${names} ${one ? 'was' : 'were'} enabled in Salesforce > Objects, so this group grants ${one ? 'it' : 'them'} again.`
+              : `${names} ${one ? 'was' : 'were'} disabled in Salesforce > Objects, so this group's ${one ? 'grant on it is' : 'grants on them are'} not available until enabled.`;
+          },
+          change: { actor, source: 'objects' },
+        });
+      }
+      return saved;
+    },
+    (saved) =>
+      store.recordPortalAdminLog({
+        adminUsername: actor.username,
+        authMethod: actor.authMethod,
+        action: 'UPSERT_OBJECT',
+        target: `Object: ${saved.objectName}`,
+        details: `Saved Salesforce Object "${saved.objectName}" (${saved.fields.length} fields).`,
+        ipAddress: actor.ip,
+        correlationId: actor.correlationId,
+        targetType: 'object',
+        targetId: saved.objectName,
+      })
+  );
+  if ('error' in result) {
+    res.status(400).json({ error: result.error?.message || 'Invalid object.' });
     return;
   }
 
-  const actor = getAdminInfo(req);
-  store.recordPortalAdminLog({
-    adminUsername: actor.username,
-    authMethod: actor.authMethod,
-    action: 'UPSERT_OBJECT',
-    target: `Object: ${saved.objectName}`,
-    details: `Saved Salesforce Object "${saved.objectName}" (${saved.fields.length} fields).`,
-    ipAddress: actor.ip,
-  });
-
   res.json({
-    object: saved,
+    object: result.value,
     objects: store.getObjects(),
   });
 });
@@ -853,10 +986,13 @@ adminRouter.put('/objects/:objectName/toggle', (req: Request, res: Response) => 
   const objectName = String(req.params.objectName);
   const { enabled } = req.body || {};
   const actor = getAdminInfo(req);
-  const wasEnabled = store.getObjects().find((o) => o.objectName === objectName)?.enabled;
+  // The toggle, the notes it leaves in the history of the groups it affects and its audit entry share
+  // one transaction: a toggled Object can never go unlogged.
   const updated = runInTransaction(() => {
+    const wasEnabled = store.getObjects().find((o) => o.objectName === objectName)?.enabled;
     const toggled = store.toggleObject(objectName, Boolean(enabled));
-    if (toggled && wasEnabled !== undefined && wasEnabled !== toggled.enabled) {
+    if (!toggled) return null;
+    if (wasEnabled !== undefined && wasEnabled !== toggled.enabled) {
       store.recordCatalogChangeOnGroups({
         objectName,
         describe: () =>
@@ -866,23 +1002,25 @@ adminRouter.put('/objects/:objectName/toggle', (req: Request, res: Response) => 
         change: { actor, source: 'objects' },
       });
     }
+    store.recordPortalAdminLog({
+      adminUsername: actor.username,
+      authMethod: actor.authMethod,
+      action: 'TOGGLE_OBJECT',
+      target: `Object: ${objectName}`,
+      details: `Toggled Salesforce Object "${objectName}" ${
+        toggled.enabled ? 'ON (Enabled)' : 'OFF (Disabled)'
+      }.`,
+      ipAddress: actor.ip,
+      correlationId: actor.correlationId,
+      targetType: 'object',
+      targetId: toggled.objectName,
+    });
     return toggled;
   });
   if (!updated) {
     res.status(404).json({ error: `Object '${objectName}' not found.` });
     return;
   }
-
-  store.recordPortalAdminLog({
-    adminUsername: actor.username,
-    authMethod: actor.authMethod,
-    action: 'TOGGLE_OBJECT',
-    target: `Object: ${objectName}`,
-    details: `Toggled Salesforce Object "${objectName}" ${
-      updated.enabled ? 'ON (Enabled)' : 'OFF (Disabled)'
-    }.`,
-    ipAddress: actor.ip,
-  });
 
   res.json({
     object: updated,
@@ -900,13 +1038,16 @@ adminRouter.put(
     const fieldName = String(req.params.fieldName);
     const { enabled } = req.body || {};
     const actor = getAdminInfo(req);
-    const wasEnabled = store
-      .getObjects()
-      .find((o) => o.objectName === objectName)
-      ?.fields.find((f) => f.fieldName === fieldName)?.enabled;
+    // The toggle, the notes it leaves in the history of the groups it affects and its audit entry share
+    // one transaction: a toggled field can never go unlogged.
     const updated = runInTransaction(() => {
+      const wasEnabled = store
+        .getObjects()
+        .find((o) => o.objectName === objectName)
+        ?.fields.find((f) => f.fieldName === fieldName)?.enabled;
       const toggled = store.toggleObjectField(objectName, fieldName, Boolean(enabled));
-      if (toggled && wasEnabled !== undefined && wasEnabled !== Boolean(enabled)) {
+      if (!toggled) return null;
+      if (wasEnabled !== undefined && wasEnabled !== Boolean(enabled)) {
         store.recordCatalogChangeOnGroups({
           objectName,
           fieldNames: [fieldName],
@@ -917,23 +1058,25 @@ adminRouter.put(
           change: { actor, source: 'objects' },
         });
       }
+      store.recordPortalAdminLog({
+        adminUsername: actor.username,
+        authMethod: actor.authMethod,
+        action: 'TOGGLE_FIELD',
+        target: `${objectName}.${fieldName}`,
+        details: `Toggled field "${objectName}.${fieldName}" ${
+          enabled ? 'ON (Enabled)' : 'OFF (Disabled)'
+        }.`,
+        ipAddress: actor.ip,
+        correlationId: actor.correlationId,
+        targetType: 'field',
+        targetId: `${objectName}.${fieldName}`,
+      });
       return toggled;
     });
     if (!updated) {
       res.status(404).json({ error: `Field '${fieldName}' on object '${objectName}' not found.` });
       return;
     }
-
-    store.recordPortalAdminLog({
-      adminUsername: actor.username,
-      authMethod: actor.authMethod,
-      action: 'TOGGLE_FIELD',
-      target: `${objectName}.${fieldName}`,
-      details: `Toggled field "${objectName}.${fieldName}" ${
-        enabled ? 'ON (Enabled)' : 'OFF (Disabled)'
-      }.`,
-      ipAddress: actor.ip,
-    });
 
     res.json({
       object: updated,
@@ -947,18 +1090,14 @@ adminRouter.put(
   (req: Request, res: Response) => {
     const objectName = String(req.params.objectName);
     const { enabled } = req.body || {};
-    const targetObj = store
-      .getObjects()
-      .find((o) => o.objectName === objectName);
-    if (!targetObj) {
-      res.status(404).json({ error: `Object '${objectName}' not found.` });
-      return;
-    }
-
     const actor = getAdminInfo(req);
-    const changedFields = targetObj.fields.filter((f) => f.enabled !== Boolean(enabled)).map((f) => f.fieldName);
-    runInTransaction(() => {
-      for (const f of targetObj.fields) {
+    // One transaction with the notes it leaves in group history and its audit entry, so every field
+    // changes or none does, as one policy revision, and the change can never go unlogged.
+    const targetObj = runInTransaction(() => {
+      const found = store.getObjects().find((o) => o.objectName === objectName);
+      if (!found) return undefined;
+      const changedFields = found.fields.filter((f) => f.enabled !== Boolean(enabled)).map((f) => f.fieldName);
+      for (const f of found.fields) {
         store.toggleObjectField(objectName, f.fieldName, Boolean(enabled));
       }
       if (changedFields.length > 0) {
@@ -972,18 +1111,25 @@ adminRouter.put(
           change: { actor, source: 'objects' },
         });
       }
+      store.recordPortalAdminLog({
+        adminUsername: actor.username,
+        authMethod: actor.authMethod,
+        action: 'BULK_TOGGLE_FIELDS',
+        target: `Object: ${objectName}`,
+        details: `Toggled all ${found.fields.length} fields on "${objectName}" ${
+          enabled ? 'ON (Enabled)' : 'OFF (Disabled)'
+        }.`,
+        ipAddress: actor.ip,
+        correlationId: actor.correlationId,
+        targetType: 'object',
+        targetId: found.objectName,
+      });
+      return found;
     });
-
-    store.recordPortalAdminLog({
-      adminUsername: actor.username,
-      authMethod: actor.authMethod,
-      action: 'BULK_TOGGLE_FIELDS',
-      target: `Object: ${objectName}`,
-      details: `Toggled all ${targetObj.fields.length} fields on "${objectName}" ${
-        enabled ? 'ON (Enabled)' : 'OFF (Disabled)'
-      }.`,
-      ipAddress: actor.ip,
-    });
+    if (!targetObj) {
+      res.status(404).json({ error: `Object '${objectName}' not found.` });
+      return;
+    }
 
     res.json({
       objects: store.getObjects(),
@@ -997,24 +1143,32 @@ adminRouter.delete(
     const objectName = String(req.params.objectName);
     const fieldName = String(req.params.fieldName);
     const actor = getAdminInfo(req);
-    const deleted = store.deleteObjectFieldAndReport(objectName, fieldName, actor);
+    // The delete, the grants it holds, the notes in the history of those groups and its audit entry
+    // share one transaction. The entry names the groups that actually lost a grant.
+    const deleted = runInTransaction(() => {
+      const result = store.deleteObjectFieldAndReport(objectName, fieldName, actor);
+      if (!result) return null;
+      store.recordPortalAdminLog({
+        adminUsername: actor.username,
+        authMethod: actor.authMethod,
+        action: 'DELETE_FIELD',
+        target: `${objectName}.${fieldName}`,
+        details: `Deleted field "${objectName}.${fieldName}" from MCP Server object schema${
+          result.revokedGroups.length > 0
+            ? ` and revoked it from ${result.revokedGroups.length} Access Group(s), which keep it as not available: ${result.revokedGroups.join(', ')}`
+            : ''
+        }.`,
+        ipAddress: actor.ip,
+        correlationId: actor.correlationId,
+        targetType: 'field',
+        targetId: `${objectName}.${fieldName}`,
+      });
+      return result;
+    });
     if (!deleted) {
       res.status(404).json({ error: `Field '${objectName}.${fieldName}' not found.` });
       return;
     }
-
-    store.recordPortalAdminLog({
-      adminUsername: actor.username,
-      authMethod: actor.authMethod,
-      action: 'DELETE_FIELD',
-      target: `${objectName}.${fieldName}`,
-      details: `Deleted field "${objectName}.${fieldName}" from MCP Server object schema${
-        deleted.revokedGroups.length > 0
-          ? ` and revoked it from ${deleted.revokedGroups.length} Access Group(s), which keep it as not available: ${deleted.revokedGroups.join(', ')}`
-          : ''
-      }.`,
-      ipAddress: actor.ip,
-    });
 
     res.json({
       object: deleted.object,
@@ -1026,25 +1180,34 @@ adminRouter.delete(
 adminRouter.delete('/objects/:objectName', (req: Request, res: Response) => {
   const objectName = String(req.params.objectName);
   const actor = getAdminInfo(req);
-  const deleted = store.deleteObjectAndReport(objectName, actor);
+  // The delete, the grants it holds, the notes in the history of those groups and its audit entry share
+  // one transaction. The entry names the groups that actually lost a grant: none while a case variant
+  // of the Object remains.
+  const deleted = runInTransaction(() => {
+    const result = store.deleteObjectAndReport(objectName, actor);
+    if (!result) return false;
+    const { revokedGroups } = result;
+    store.recordPortalAdminLog({
+      adminUsername: actor.username,
+      authMethod: actor.authMethod,
+      action: 'DELETE_OBJECT',
+      target: `Object: ${objectName}`,
+      details: `Deleted Salesforce Object "${objectName}" and its fields from the MCP Server${
+        revokedGroups.length > 0
+          ? ` and revoked it from ${revokedGroups.length} Access Group(s), which keep it as not available: ${revokedGroups.join(', ')}`
+          : ''
+      }.`,
+      ipAddress: actor.ip,
+      correlationId: actor.correlationId,
+      targetType: 'object',
+      targetId: objectName,
+    });
+    return true;
+  });
   if (!deleted) {
     res.status(404).json({ error: `Object '${objectName}' not found.` });
     return;
   }
-
-  const { revokedGroups } = deleted;
-  store.recordPortalAdminLog({
-    adminUsername: actor.username,
-    authMethod: actor.authMethod,
-    action: 'DELETE_OBJECT',
-    target: `Object: ${objectName}`,
-    details: `Deleted Salesforce Object "${objectName}" and its fields from the MCP Server${
-      revokedGroups.length > 0
-        ? ` and revoked it from ${revokedGroups.length} Access Group(s), which keep it as not available: ${revokedGroups.join(', ')}`
-        : ''
-    }.`,
-    ipAddress: actor.ip,
-  });
 
   res.json({ objects: store.getObjects() });
 });
@@ -1195,6 +1358,7 @@ adminRouter.post('/objects/pull-apply', (req: Request, res: Response) => {
           namesClause('Kept as missing', [...applied.affected.objectsKeptMissing, ...applied.affected.fieldsKeptMissing]) +
           namesClause('Access Groups that lost grants (kept there as not available)', applied.affected.groupsLosingGrants),
         ipAddress: actor.ip,
+        correlationId: actor.correlationId,
       });
       return applied;
     });
@@ -1214,118 +1378,220 @@ adminRouter.post('/objects/pull-apply', (req: Request, res: Response) => {
 // ============================================================================
 // 3. ACCESS MATRIX -> GROUPS & PROFILE-GROUP MATRIX
 // ============================================================================
-/** The detail an edit's history keeps: the file an import came from, or the version a restore loaded. */
-const MAX_SOURCE_DETAIL = 300;
-
 /**
  * POST /api/admin/groups
- * Creates or updates a group. Object, field and MCP action names that this server does not have are
- * kept and reported as not available rather than rejected, so a group imported from another server,
- * or one whose object was deleted, keeps what it names for an admin to review. `source` says which
- * editor (or import) the save came from, for the group's history.
+ * Creates a group (no id) or updates the group with `id` (404 when there is none). Object, field and
+ * MCP action names this server does not have are kept and reported as not available (`issues`) rather
+ * than refused, so a group imported from another server, or one whose Object was deleted, keeps what it
+ * names for an admin to review; names it has are stored in the catalog's spelling (see groupPayload.ts).
+ * `source` says which editor (or import) the save came from, for the group's history.
+ * An update that sends `expectedVersion` is refused with 409 when the group has changed since, so a
+ * stale editor cannot undo a change it never saw. That check comes before the grants are checked, so a
+ * stale draft always reads as the reload 409. An update that restores a held grant must send it.
  */
 adminRouter.post('/groups', (req: Request, res: Response) => {
-  const { id, name, description, allowedActions, objectPermissions, source, sourceDetail } = req.body || {};
-  if (!name || !String(name).trim()) {
-    res.status(400).json({ error: 'Group name is required.' });
+  const parsed = parseGroupSaveRequest(req.body || {});
+  if (!parsed.ok) {
+    res.status(400).json({ error: parsed.error });
     return;
   }
-
-  const actions = normalizeMcpActions(allowedActions);
-  if (!actions.ok) {
-    res.status(400).json({ error: actions.error });
-    return;
-  }
-  const perms = normalizeObjectPermissions(objectPermissions);
-  if (!perms.ok) {
-    res.status(400).json({ error: perms.error });
-    return;
-  }
-  const changeSource: AccessGroupChangeSource = (ACCESS_GROUP_EDIT_SOURCES as readonly string[]).includes(source)
-    ? source
-    : 'editor';
+  const request = parsed.value;
 
   const actor = getAdminInfo(req);
-  const isUpdate = Boolean(id && store.getGroup(String(id)));
-  let saved;
+  let outcome:
+    | { saved: AccessGroup; issues: GroupAvailabilityIssue[] }
+    | { status: 400 | 404 | 409; body: Record<string, unknown> };
   try {
-    saved = store.upsertGroup(
-      {
-        id: id ? String(id) : undefined,
-        name: String(name),
-        description: description ? String(description) : '',
-        allowedActions: actions.value,
-        objectPermissions: perms.value,
-      },
-      {
-        actor,
-        source: changeSource,
-        sourceDetail: typeof sourceDetail === 'string' ? sourceDetail.slice(0, MAX_SOURCE_DETAIL) : '',
+    // The checks against the stored groups, the change, its history and its audit entry share one
+    // transaction: a saved group can never go unlogged, nor be saved over a version the client did not load.
+    outcome = runInTransaction(() => {
+      const groups = store.getGroups();
+      const before = request.id ? groups.find((g) => g.id === request.id) : undefined;
+      if (request.id && !before) {
+        return { status: 404 as const, body: { error: 'Group not found.' } };
       }
-    );
+      if (before && request.expectedVersion !== undefined && request.expectedVersion !== before.version) {
+        return {
+          status: 409 as const,
+          body: {
+            error: `Access Group "${before.name}" changed since it was loaded, so nothing was saved. Reload it and try again.`,
+            group: before,
+          },
+        };
+      }
+      const grants = parseGroupObjectPermissions(request.objectPermissions);
+      if (!grants.ok) {
+        return { status: 400 as const, body: { error: grants.error } };
+      }
+      // Restoring a held grant gives back access deleted from Salesforce > Objects, so it must come from
+      // a client that loaded the group as it is now: a draft from before the deletion lists the grant
+      // live and would otherwise restore it unseen. The portal always sends expectedVersion.
+      if (before && request.expectedVersion === undefined && restoresHeldGrant(before.objectPermissions, grants.value)) {
+        return {
+          status: 409 as const,
+          body: {
+            error: `Access Group "${before.name}" holds grants deleted from Salesforce > Objects, and restoring one needs the version of the group that was loaded (expectedVersion), so nothing was saved. Reload it and try again.`,
+            group: before,
+          },
+        };
+      }
+      // Names are unique ignoring case. A group that keeps its own name may still share it with a
+      // case variant an older version allowed, so that neither becomes impossible to save.
+      const nameTaken =
+        before?.name !== request.name &&
+        groups.some((g) => g.id !== before?.id && g.name.toLowerCase() === request.name.toLowerCase());
+      if (nameTaken) {
+        return { status: 409 as const, body: { error: `An Access Group named "${request.name}" already exists.` } };
+      }
+
+      const group = store.upsertGroup(
+        {
+          id: before?.id,
+          name: request.name,
+          description: request.description,
+          allowedActions: request.allowedActions,
+          objectPermissions: grants.value,
+        },
+        { actor, source: request.source, sourceDetail: request.sourceDetail }
+      );
+      // A save that changes nothing keeps its version (see upsertGroup), and is still logged: its diff is empty.
+      const unchanged = before !== undefined && group.version === before.version;
+      const issues = groupAvailabilityIssues(group, store.getObjects());
+      const unavailable = issues.filter((i) => i.status === 'unavailable').length;
+      const broken = issues.length - unavailable;
+      const via =
+        request.source === 'xml_import'
+          ? ` from XML${request.sourceDetail ? ` (${request.sourceDetail})` : ''}`
+          : request.source === 'xml_editor'
+            ? ' in the XML editor'
+            : request.source === 'version_restore'
+              ? ' from an earlier version in its history'
+              : '';
+      const saved = `Access Group "${group.name}"${via} (${group.allowedActions.length} MCP actions, ${
+        group.objectPermissions.length
+      } objects configured${unavailable > 0 ? `, ${unavailable} not available` : ''}${
+        broken > 0 ? `, ${broken} broken` : ''
+      })`;
+      store.recordPortalAdminLog({
+        adminUsername: actor.username,
+        authMethod: actor.authMethod,
+        action: request.source === 'xml_import' ? 'IMPORT_GROUP_XML' : before ? 'UPDATE_GROUP' : 'CREATE_GROUP',
+        target: `Group: ${group.name}`,
+        details: !before ? `Created ${saved}.` : unchanged ? `Saved ${saved} without changes.` : `Updated ${saved}.`,
+        ipAddress: actor.ip,
+        correlationId: actor.correlationId,
+        targetType: 'group',
+        targetId: group.id,
+        diff: before ? groupUpdateDiff(before, group) : { after: groupAuditFields(group) },
+      });
+      return { saved: group, issues };
+    });
   } catch (err: any) {
     if (/UNIQUE constraint failed: access_groups\.name/.test(String(err?.message))) {
-      res.status(409).json({ error: `An Access Group named "${String(name).trim()}" already exists.` });
+      res.status(409).json({ error: `An Access Group named "${request.name}" already exists.` });
       return;
     }
     throw err;
   }
 
-  const issues = groupAvailabilityIssues(saved, store.getObjects());
-  const unavailable = issues.filter((i) => i.status === 'unavailable').length;
-  const broken = issues.length - unavailable;
-  const via =
-    changeSource === 'xml_import'
-      ? ` from XML${sourceDetail ? ` (${String(sourceDetail).slice(0, MAX_SOURCE_DETAIL)})` : ''}`
-      : changeSource === 'xml_editor'
-        ? ' in the XML editor'
-        : changeSource === 'version_restore'
-          ? ' from an earlier version in its history'
-          : '';
-  store.recordPortalAdminLog({
-    adminUsername: actor.username,
-    authMethod: actor.authMethod,
-    action: changeSource === 'xml_import' ? 'IMPORT_GROUP_XML' : isUpdate ? 'UPDATE_GROUP' : 'CREATE_GROUP',
-    target: `Group: ${saved.name}`,
-    details: `${isUpdate ? 'Updated' : 'Created'} Access Group "${saved.name}"${via} (${
-      saved.allowedActions.length
-    } MCP actions, ${saved.objectPermissions.length} objects configured${
-      unavailable > 0 ? `, ${unavailable} not available` : ''
-    }${broken > 0 ? `, ${broken} broken` : ''}).`,
-    ipAddress: actor.ip,
-  });
-
+  if ('status' in outcome) {
+    res.status(outcome.status).json(outcome.body);
+    return;
+  }
   res.json({
-    group: saved,
+    group: outcome.saved,
     groups: store.getGroups(),
-    issues,
+    issues: outcome.issues,
   });
 });
 
 adminRouter.delete('/groups/:id', (req: Request, res: Response) => {
   const id = String(req.params.id);
-  const existing = store.getGroup(id);
   const actor = getAdminInfo(req);
-  const deleted = store.deleteGroup(id, { actor, source: 'editor' });
+  // The delete, its history and its audit entry share one transaction: a deleted group can never go unlogged.
+  const deleted = runInTransaction(() => {
+    const existing = store.getGroup(id);
+    if (!existing) return false;
+    // Deleting the group also ends its memberships (ON DELETE CASCADE), so the diff names those Profiles.
+    const profileIds = store
+      .getProfileGroupMappings()
+      .filter((m) => m.groupIds.includes(id))
+      .map((m) => m.profileId);
+    if (!store.deleteGroup(id, { actor, source: 'editor' })) return false;
+    store.recordPortalAdminLog({
+      adminUsername: actor.username,
+      authMethod: actor.authMethod,
+      action: 'DELETE_GROUP',
+      target: `Group: ${existing.name}`,
+      details: `Deleted Access Group "${existing.name}".`,
+      ipAddress: actor.ip,
+      correlationId: actor.correlationId,
+      targetType: 'group',
+      targetId: id,
+      diff: { before: { ...groupAuditFields(existing), profileIds } },
+    });
+    return true;
+  });
   if (!deleted) {
     res.status(404).json({ error: 'Group not found.' });
     return;
   }
-
-  store.recordPortalAdminLog({
-    adminUsername: actor.username,
-    authMethod: actor.authMethod,
-    action: 'DELETE_GROUP',
-    target: `Group: ${existing?.name || id}`,
-    details: `Deleted Access Group "${existing?.name || id}".`,
-    ipAddress: actor.ip,
-  });
 
   res.json({
     groups: store.getGroups(),
     profileGroupMappings: store.getProfileGroupMappings(),
   });
 });
+
+const MEMBERSHIP_NAMES_LOGGED = 50;
+
+const isIdList = (value: unknown): value is string[] =>
+  Array.isArray(value) && value.every((id) => typeof id === 'string');
+
+/** Reads `{ add, remove }`: either may be left out, but not both. */
+function parseMembershipDelta(body: Record<string, any>, missing: string): PayloadResult<MembershipDelta> {
+  const { add, remove } = body;
+  if (add === undefined && remove === undefined) return { ok: false, error: missing };
+  if (add !== undefined && !isIdList(add)) return { ok: false, error: 'add must be an array of ids.' };
+  if (remove !== undefined && !isIdList(remove)) return { ok: false, error: 'remove must be an array of ids.' };
+  return { ok: true, value: { add: add ?? [], remove: remove ?? [] } };
+}
+
+type ProfileGroupsRequest = { delta: MembershipDelta } | { groupIds: string[]; expectedGroupIds: string[] };
+
+/** Reads the PUT body: `{ add, remove }`, or a full replacement `{ groupIds, expectedGroupIds }`. */
+function parseProfileGroupsRequest(body: Record<string, any>): PayloadResult<ProfileGroupsRequest> {
+  if (body.groupIds === undefined) {
+    const delta = parseMembershipDelta(body, 'Send { add, remove } or { groupIds, expectedGroupIds }.');
+    return delta.ok ? { ok: true, value: { delta: delta.value } } : delta;
+  }
+  if (body.add !== undefined || body.remove !== undefined) {
+    return { ok: false, error: 'Send either { add, remove } or { groupIds, expectedGroupIds }, not both.' };
+  }
+  if (!isIdList(body.groupIds)) return { ok: false, error: 'groupIds must be an array of group ids.' };
+  if (!isIdList(body.expectedGroupIds)) {
+    return {
+      ok: false,
+      error:
+        'A full replacement needs expectedGroupIds, the group ids it was built from. Use { add, remove } to change single memberships.',
+    };
+  }
+  return { ok: true, value: { groupIds: body.groupIds, expectedGroupIds: body.expectedGroupIds } };
+}
+
+const sameIdSet = (a: string[], b: string[]) => {
+  const left = new Set(a);
+  const right = new Set(b);
+  return left.size === right.size && [...left].every((id) => right.has(id));
+};
+
+/** The audit text for what a membership request changed, which may be nothing. */
+function membershipChangeClauses(added: string[], removed: string[]): string {
+  if (added.length === 0 && removed.length === 0) return ' Nothing changed.';
+  return (
+    namesClause('Added', added, MEMBERSHIP_NAMES_LOGGED) + namesClause('Removed', removed, MEMBERSHIP_NAMES_LOGGED)
+  );
+}
 
 /**
  * GET /api/admin/groups/:id/history
@@ -1344,15 +1610,17 @@ adminRouter.get('/groups/:id/history', (req: Request, res: Response) => {
 
 /**
  * PUT /api/admin/profile-groups/:profileId
- * Assigns one or more Groups to a Salesforce Profile
+ * Changes the Groups mapped to a Salesforce Profile. `{ add, remove }` changes only the memberships it
+ * names. A full replacement `{ groupIds }` must carry the `expectedGroupIds` it was built from and is
+ * refused with 409 if the stored groups differ, so a stale screen cannot re-grant a revoked group.
  */
 adminRouter.put(
   '/profile-groups/:profileId',
   (req: Request, res: Response) => {
     const profileId = String(req.params.profileId);
-    const { groupIds } = req.body || {};
-    if (!Array.isArray(groupIds)) {
-      res.status(400).json({ error: 'groupIds array is required.' });
+    const parsed = parseProfileGroupsRequest(req.body || {});
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
       return;
     }
 
@@ -1362,39 +1630,118 @@ adminRouter.put(
       return;
     }
 
-    let updated;
+    const request = parsed.value;
+    const actor = getAdminInfo(req);
+    let outcome: ReturnType<typeof store.applyMembershipDelta> | { conflict: string[] };
     try {
-      updated = store.setProfileGroups(
-        profileId,
-        groupIds.map((g) => String(g))
-      );
+      // The check against the stored groups, the change and its audit entry share one transaction.
+      outcome = runInTransaction(() => {
+        let delta: MembershipDelta;
+        if ('delta' in request) {
+          delta = request.delta;
+        } else {
+          const stored = store.getProfileGroupIds(profile.id);
+          if (!sameIdSet(stored, request.expectedGroupIds)) return { conflict: stored };
+          delta = {
+            add: request.groupIds.filter((gid) => !stored.includes(gid)),
+            remove: stored.filter((gid) => !request.groupIds.includes(gid)),
+          };
+        }
+        const change = store.applyMembershipDelta(profile.id, delta);
+        const allGroups = store.getGroups();
+        const groupName = (gid: string) => allGroups.find((g) => g.id === gid)?.name || gid;
+        const groupNames = change.mapping.groupIds.map(groupName);
+        store.recordPortalAdminLog({
+          adminUsername: actor.username,
+          authMethod: actor.authMethod,
+          action: 'UPDATE_PROFILE_GROUPS',
+          target: `Profile: ${profile.name} (${profile.id})`,
+          details:
+            `Mapped Profile "${profile.name}" to Groups: [${
+              groupNames.length > 0 ? groupNames.join(', ') : 'None'
+            }].` + membershipChangeClauses(change.added.map(groupName), change.removed.map(groupName)),
+          ipAddress: actor.ip,
+          correlationId: actor.correlationId,
+          targetType: 'profile',
+          targetId: profile.id,
+          diff: { added: change.added, removed: change.removed },
+        });
+        return change;
+      });
     } catch (err: any) {
-      res.status(400).json({ error: err?.message || 'Invalid groupIds.' });
+      if (!(err instanceof MembershipChangeError)) throw err;
+      res.status(400).json({ error: err.message });
       return;
     }
-    const allGroups = store.getGroups();
-    const groupNames = updated.groupIds.map(
-      (gid) => allGroups.find((g) => g.id === gid)?.name || gid
-    );
 
-    const actor = getAdminInfo(req);
-    store.recordPortalAdminLog({
-      adminUsername: actor.username,
-      authMethod: actor.authMethod,
-      action: 'UPDATE_PROFILE_GROUPS',
-      target: `Profile: ${profile.name} (${profile.id})`,
-      details: `Mapped Profile "${profile.name}" to Groups: [${
-        groupNames.length > 0 ? groupNames.join(', ') : 'None'
-      }].`,
-      ipAddress: actor.ip,
-    });
-
+    if ('conflict' in outcome) {
+      res.status(409).json({
+        error: `The Groups of Profile "${profile.name}" changed since this list was loaded, so nothing was saved. Reload and try again.`,
+        mapping: { profileId: profile.id, groupIds: outcome.conflict },
+      });
+      return;
+    }
     res.json({
-      mapping: updated,
+      mapping: outcome.mapping,
       profileGroupMappings: store.getProfileGroupMappings(),
     });
   }
 );
+
+/**
+ * POST /api/admin/groups/:id/profiles
+ * Adds Profiles to and removes Profiles from one Access Group (`{ add, remove }`, Profile ids). Every
+ * other membership stays as it is.
+ */
+adminRouter.post('/groups/:id/profiles', (req: Request, res: Response) => {
+  const id = String(req.params.id);
+  const parsed = parseMembershipDelta(req.body || {}, 'Send { add, remove } with Profile ids.');
+  if (!parsed.ok) {
+    res.status(400).json({ error: parsed.error });
+    return;
+  }
+
+  const group = store.getGroups().find((g) => g.id === id);
+  if (!group) {
+    res.status(404).json({ error: 'Group not found.' });
+    return;
+  }
+
+  const actor = getAdminInfo(req);
+  let change: ReturnType<typeof store.applyGroupMembershipDelta>;
+  try {
+    change = runInTransaction(() => {
+      const applied = store.applyGroupMembershipDelta(group.id, parsed.value);
+      const profileNames = new Map(store.getProfiles().map((p) => [p.id, p.name]));
+      const profileLabel = (pid: string) => `${profileNames.get(pid) || pid} (${pid})`;
+      const count = applied.membership.profileIds.length;
+      store.recordPortalAdminLog({
+        adminUsername: actor.username,
+        authMethod: actor.authMethod,
+        action: 'UPDATE_PROFILE_GROUPS',
+        target: `Group: ${group.name}`,
+        details:
+          `Access Group "${group.name}" is mapped to ${count} Profile${count === 1 ? '' : 's'}.` +
+          membershipChangeClauses(applied.added.map(profileLabel), applied.removed.map(profileLabel)),
+        ipAddress: actor.ip,
+        correlationId: actor.correlationId,
+        targetType: 'group',
+        targetId: group.id,
+        diff: { added: applied.added, removed: applied.removed },
+      });
+      return applied;
+    });
+  } catch (err: any) {
+    if (!(err instanceof MembershipChangeError)) throw err;
+    res.status(400).json({ error: err.message });
+    return;
+  }
+
+  res.json({
+    membership: change.membership,
+    profileGroupMappings: store.getProfileGroupMappings(),
+  });
+});
 
 // ============================================================================
 // 4. SETTINGS (Okta SSO, Salesforce Connection, Portal Users, Test MCP Call)
@@ -1407,15 +1754,22 @@ adminRouter.put('/okta', (req: Request, res: Response) => {
       return;
     }
   }
-  const updated = store.updateOktaConfig(req.body || {});
   const actor = getAdminInfo(req);
-  store.recordPortalAdminLog({
-    adminUsername: actor.username,
-    authMethod: actor.authMethod,
-    action: 'UPDATE_OKTA_SSO',
-    target: `Okta SSO (${updated.oktaDomain || 'Disabled'})`,
-    details: `Updated Okta SSO configuration (Enabled: ${updated.enabled}, Domain: ${updated.oktaDomain}).`,
-    ipAddress: actor.ip,
+  // The save and its audit entry share one transaction: an Okta change can never go unlogged.
+  const updated = runInTransaction(() => {
+    const saved = store.updateOktaConfig(req.body || {});
+    store.recordPortalAdminLog({
+      adminUsername: actor.username,
+      authMethod: actor.authMethod,
+      action: 'UPDATE_OKTA_SSO',
+      target: `Okta SSO (${saved.oktaDomain || 'Disabled'})`,
+      details: `Updated Okta SSO configuration (Enabled: ${saved.enabled}, Domain: ${saved.oktaDomain}).`,
+      ipAddress: actor.ip,
+      correlationId: actor.correlationId,
+      targetType: 'settings',
+      targetId: 'okta',
+    });
+    return saved;
   });
   res.json({ oktaSettings: updated });
 });
@@ -1429,25 +1783,28 @@ adminRouter.put('/sf-settings', (req: Request, res: Response) => {
     return;
   }
 
-  let saved;
-  try {
-    saved = saveSalesforceSettings(input);
-  } catch (err: any) {
+  const actor = getAdminInfo(req);
+  const result = changeWithAuditEntry(
+    () => saveSalesforceSettings(input),
+    ({ before, updated, privateKeyReplaced }) =>
+      store.recordPortalAdminLog({
+        adminUsername: actor.username,
+        authMethod: actor.authMethod,
+        action: 'UPDATE_SF_SETTINGS',
+        target: 'Salesforce Org Connection',
+        details: `Updated Salesforce Org connection settings (Mode: ${updated.authMode}, Login URL: ${updated.loginUrl}, User: ${updated.username || 'Not set'}, OrgId: ${updated.expectedOrgId || 'Any'}, Instance: ${updated.instanceUrl}). ${auditChanges(before, updated, privateKeyReplaced)}`,
+        ipAddress: actor.ip,
+        correlationId: actor.correlationId,
+        targetType: 'settings',
+        targetId: 'salesforce_connection',
+      })
+  );
+  if ('error' in result) {
     // e.g. a private key that cannot be parsed
-    res.status(400).json({ error: err?.message || 'Invalid Salesforce settings.' });
+    res.status(400).json({ error: result.error?.message || 'Invalid Salesforce settings.' });
     return;
   }
-  const { updated } = saved;
-  const actor = getAdminInfo(req);
-  store.recordPortalAdminLog({
-    adminUsername: actor.username,
-    authMethod: actor.authMethod,
-    action: 'UPDATE_SF_SETTINGS',
-    target: 'Salesforce Org Connection',
-    details: `Updated Salesforce Org connection settings (Mode: ${updated.authMode}, Login URL: ${updated.loginUrl}, User: ${updated.username || 'Not set'}, OrgId: ${updated.expectedOrgId || 'Any'}, Instance: ${updated.instanceUrl}). ${auditChanges(saved.before, updated, saved.privateKeyReplaced)}`,
-    ipAddress: actor.ip,
-  });
-  res.json({ sfSettings: updated });
+  res.json({ sfSettings: result.value.updated });
 });
 
 /**
@@ -1455,58 +1812,71 @@ adminRouter.put('/sf-settings', (req: Request, res: Response) => {
  * Generates a 2048-bit RSA Private Key + self-signed X.509 Certificate (.crt) for Salesforce Connected App JWT flow.
  */
 adminRouter.post('/sf-settings/generate-cert', (req: Request, res: Response) => {
-  try {
-    const { commonName, confirmReplaceUndecryptableKey } = req.body || {};
-    const actor = getAdminInfo(req);
-    const current = store.getSalesforceSettings();
-    // Restoring APP_SECRET_KEY can still recover this key until it is overwritten, so the portal's
-    // warning is not enough: only a caller that says it knows may destroy it.
-    const replacesUndecryptableKey = current.privateKeyUndecryptable;
-    if (replacesUndecryptableKey && confirmReplaceUndecryptableKey !== true) {
-      store.recordPortalAdminLog({
-        adminUsername: actor.username,
-        authMethod: actor.authMethod,
-        action: 'GENERATE_SF_JWT_CERT_DENIED',
-        target: 'Salesforce JWT Certificate',
-        details: 'Refused to overwrite a stored private key that cannot be decrypted: the request did not confirm it.',
-        ipAddress: actor.ip,
-      });
-      res.status(409).json({
-        error:
-          'The stored private key cannot be decrypted with the current APP_SECRET_KEY. Restoring that key could recover it, and generating a new one destroys it. Set confirmReplaceUndecryptableKey to replace it anyway.',
-        sfSettings: current,
-      });
-      return;
-    }
-    const bundle = generateSelfSignedCertificateBundle(
-      commonName ? String(commonName) : 'Salesforce MCP Metadata Sync'
-    );
-    const { before, updated, privateKeyReplaced } = saveSalesforceSettings({
-      privateKeyPem: bundle.privateKeyPem,
-      certificatePem: bundle.certificatePem,
-      certFingerprint: bundle.fingerprintSha256,
-    });
-
+  const { commonName, confirmReplaceUndecryptableKey } = req.body || {};
+  const actor = getAdminInfo(req);
+  const current = store.getSalesforceSettings();
+  // Restoring APP_SECRET_KEY can still recover this key until it is overwritten, so the portal's
+  // warning is not enough: only a caller that says it knows may destroy it.
+  const replacesUndecryptableKey = current.privateKeyUndecryptable;
+  if (replacesUndecryptableKey && confirmReplaceUndecryptableKey !== true) {
     store.recordPortalAdminLog({
       adminUsername: actor.username,
       authMethod: actor.authMethod,
-      action: 'GENERATE_SF_JWT_CERT',
+      action: 'GENERATE_SF_JWT_CERT_DENIED',
       target: 'Salesforce JWT Certificate',
-      details: `Generated new 2048-bit RSA Private Key & X.509 Certificate (SHA-256: ${bundle.fingerprintSha256.slice(0, 23)}...) for Salesforce Connected App. ${auditChanges(before, updated, privateKeyReplaced)} undecryptableKeyDestroyed: ${replacesUndecryptableKey}.`,
+      details: 'Refused to overwrite a stored private key that cannot be decrypted: the request did not confirm it.',
       ipAddress: actor.ip,
+      correlationId: actor.correlationId,
+      targetType: 'settings',
+      targetId: 'salesforce_connection',
     });
-
-    res.json({
-      sfSettings: updated,
-      certificatePem: bundle.certificatePem,
-      fingerprintSha256: bundle.fingerprintSha256,
-      validTo: bundle.validTo,
+    res.status(409).json({
+      error:
+        'The stored private key cannot be decrypted with the current APP_SECRET_KEY. Restoring that key could recover it, and generating a new one destroys it. Set confirmReplaceUndecryptableKey to replace it anyway.',
+      sfSettings: current,
     });
-  } catch (err: any) {
-    res.status(400).json({
-      error: err.message || 'Failed to generate X.509 certificate.',
-    });
+    return;
   }
+
+  let bundle: ReturnType<typeof generateSelfSignedCertificateBundle>;
+  try {
+    bundle = generateSelfSignedCertificateBundle(commonName ? String(commonName) : 'Salesforce MCP Metadata Sync');
+  } catch (err: any) {
+    res.status(400).json({ error: err?.message || 'Failed to generate X.509 certificate.' });
+    return;
+  }
+  // The new key, the certificate and their audit entry share one transaction: a replaced key can never go unlogged.
+  const result = changeWithAuditEntry(
+    () =>
+      saveSalesforceSettings({
+        privateKeyPem: bundle.privateKeyPem,
+        certificatePem: bundle.certificatePem,
+        certFingerprint: bundle.fingerprintSha256,
+      }),
+    ({ before, updated, privateKeyReplaced }) =>
+      store.recordPortalAdminLog({
+        adminUsername: actor.username,
+        authMethod: actor.authMethod,
+        action: 'GENERATE_SF_JWT_CERT',
+        target: 'Salesforce JWT Certificate',
+        details: `Generated new 2048-bit RSA Private Key & X.509 Certificate (SHA-256: ${bundle.fingerprintSha256.slice(0, 23)}...) for Salesforce Connected App. ${auditChanges(before, updated, privateKeyReplaced)} undecryptableKeyDestroyed: ${replacesUndecryptableKey}.`,
+        ipAddress: actor.ip,
+        correlationId: actor.correlationId,
+        targetType: 'settings',
+        targetId: 'salesforce_connection',
+      })
+  );
+  if ('error' in result) {
+    res.status(400).json({ error: result.error?.message || 'Failed to generate X.509 certificate.' });
+    return;
+  }
+
+  res.json({
+    sfSettings: result.value.updated,
+    certificatePem: bundle.certificatePem,
+    fingerprintSha256: bundle.fingerprintSha256,
+    validTo: bundle.validTo,
+  });
 });
 
 /**
@@ -1526,6 +1896,9 @@ adminRouter.post(
         target: 'Salesforce Org Connection',
         details: `Salesforce JWT connection failed: ${errMsg} ${changes}`,
         ipAddress: actor.ip,
+        correlationId: actor.correlationId,
+        targetType: 'settings',
+        targetId: 'salesforce_connection',
       });
 
     let input: SalesforceSettingsInput;
@@ -1547,45 +1920,67 @@ adminRouter.post(
 
     const stored = store.getSalesforceSettingsWithSecrets();
     const replacesKey = Boolean(input.privateKeyPem?.trim());
+    // The token exchange is network I/O, so it runs outside any transaction. Only what is saved after
+    // it, with its audit entry, shares one.
+    let session: SalesforceOrgTokenSession | undefined;
+    let errMsg = '';
     try {
-      const session = await connectToSalesforceOrgViaJwt({
+      session = await connectToSalesforceOrgViaJwt({
         ...stored,
         ...input,
         privateKeyPem: replacesKey ? (input.privateKeyPem as string) : stored.privateKeyPem,
         privateKeyUndecryptable: replacesKey ? false : stored.privateKeyUndecryptable,
       });
-
-      // A save made during the exchange was not what got verified.
-      if (store.getSalesforceSettings().updatedAt !== stored.updatedAt) {
-        throw new Error('Salesforce settings changed while connecting. Connect again to verify them.');
-      }
-      const updated = store.saveVerifiedSalesforceConnection(input, session);
-      const privateKeyReplaced = replacesKey && input.privateKeyPem !== stored.privateKeyPem;
-
-      store.recordPortalAdminLog({
-        adminUsername: actor.username,
-        authMethod: actor.authMethod,
-        action: 'CONNECT_SALESFORCE_ORG',
-        target: `Salesforce Org (${session.orgId})`,
-        details: `Connected to Salesforce Org "${session.orgId}" at ${session.instanceUrl} as "${session.username}" via ${
-          session.authMode === 'simulated'
-            ? 'Simulated JWT Org'
-            : 'OAuth 2.0 JWT Bearer'
-        }. ${auditChanges(stored, updated, privateKeyReplaced)}`,
-        ipAddress: actor.ip,
-      });
-
-      res.json({
-        connected: true,
-        sfSettings: updated,
-      });
     } catch (err: any) {
-      const errMsg = err.message || 'Failed to connect to Salesforce Org.';
-      // With a stored key that cannot be decrypted nothing was tried, so this is no verdict on the
-      // submitted settings. They are saved for the retry once APP_SECRET_KEY is restored; the key stays.
-      const unverifiable = stored.privateKeyUndecryptable && !replacesKey;
+      errMsg = err?.message || 'Failed to connect to Salesforce Org.';
+    }
+
+    if (session) {
+      const verified = session;
+      const saved = changeWithAuditEntry(
+        () => {
+          // A save made during the exchange was not what got verified.
+          if (store.getSalesforceSettings().updatedAt !== stored.updatedAt) {
+            throw new Error('Salesforce settings changed while connecting. Connect again to verify them.');
+          }
+          return store.saveVerifiedSalesforceConnection(input, verified);
+        },
+        (updated) => {
+          const privateKeyReplaced = replacesKey && input.privateKeyPem !== stored.privateKeyPem;
+          store.recordPortalAdminLog({
+            adminUsername: actor.username,
+            authMethod: actor.authMethod,
+            action: 'CONNECT_SALESFORCE_ORG',
+            target: `Salesforce Org (${verified.orgId})`,
+            details: `Connected to Salesforce Org "${verified.orgId}" at ${verified.instanceUrl} as "${verified.username}" via ${
+              verified.authMode === 'simulated'
+                ? 'Simulated JWT Org'
+                : 'OAuth 2.0 JWT Bearer'
+            }. ${auditChanges(stored, updated, privateKeyReplaced)}`,
+            ipAddress: actor.ip,
+            correlationId: actor.correlationId,
+            targetType: 'settings',
+            targetId: 'salesforce_connection',
+          });
+        }
+      );
+      if ('value' in saved) {
+        res.json({
+          connected: true,
+          sfSettings: saved.value,
+        });
+        return;
+      }
+      errMsg = saved.error?.message || 'Failed to connect to Salesforce Org.';
+    }
+
+    // With a stored key that cannot be decrypted nothing was tried, so this is no verdict on the
+    // submitted settings. They are saved for the retry once APP_SECRET_KEY is restored; the key stays.
+    const unverifiable = stored.privateKeyUndecryptable && !replacesKey;
+    // The failed status, any settings saved for the retry and the audit entry share one transaction.
+    const updated = runInTransaction(() => {
       if (unverifiable) saveSalesforceSettings(input);
-      const updated = store.updateSalesforceSettings({
+      const failed = store.updateSalesforceSettings({
         connectionStatus: 'error',
         lastError: errMsg,
       });
@@ -1604,14 +1999,15 @@ adminRouter.post(
           });
       logFailure(
         errMsg,
-        `${auditChanges(stored, updated, false)} Not saved: ${attempted}. privateKeySubmitted: ${replacesKey}.`
+        `${auditChanges(stored, failed, false)} Not saved: ${attempted}. privateKeySubmitted: ${replacesKey}.`
       );
+      return failed;
+    });
 
-      res.status(400).json({
-        error: errMsg,
-        sfSettings: updated,
-      });
-    }
+    res.status(400).json({
+      error: errMsg,
+      sfSettings: updated,
+    });
   })
 );
 
@@ -1620,16 +2016,22 @@ adminRouter.post(
  * Disconnects the active Salesforce Org metadata connection.
  */
 adminRouter.post('/sf-settings/disconnect', (req: Request, res: Response) => {
-  const updated = store.updateSalesforceSettings({ ...NO_CONNECTED_ORG, connectionStatus: 'disconnected' });
-
   const actor = getAdminInfo(req);
-  store.recordPortalAdminLog({
-    adminUsername: actor.username,
-    authMethod: actor.authMethod,
-    action: 'DISCONNECT_SALESFORCE_ORG',
-    target: 'Salesforce Org Connection',
-    details: 'Disconnected Salesforce Org metadata sync connection.',
-    ipAddress: actor.ip,
+  // The disconnect and its audit entry share one transaction: it can never go unlogged.
+  const updated = runInTransaction(() => {
+    const disconnected = store.updateSalesforceSettings({ ...NO_CONNECTED_ORG, connectionStatus: 'disconnected' });
+    store.recordPortalAdminLog({
+      adminUsername: actor.username,
+      authMethod: actor.authMethod,
+      action: 'DISCONNECT_SALESFORCE_ORG',
+      target: 'Salesforce Org Connection',
+      details: 'Disconnected Salesforce Org metadata sync connection.',
+      ipAddress: actor.ip,
+      correlationId: actor.correlationId,
+      targetType: 'settings',
+      targetId: 'salesforce_connection',
+    });
+    return disconnected;
   });
 
   res.json({ sfSettings: updated });
@@ -1641,22 +2043,38 @@ adminRouter.post('/portal-users', (req: Request, res: Response) => {
     res.status(400).json({ error: 'Username and password are required.' });
     return;
   }
-
-  const saved = store.upsertPortalUser({
-    username: String(username),
-    displayName: displayName ? String(displayName) : undefined,
-    password: String(password),
-    role: role ? String(role) : undefined,
-  });
+  // Startup refuses a production database holding a publicly known password, so one saved here
+  // would stop the next boot.
+  const newPassword = String(password);
+  if (newPassword.length < PORTAL_PASSWORD_MIN_LENGTH) {
+    res.status(400).json({ error: `The password must be at least ${PORTAL_PASSWORD_MIN_LENGTH} characters.` });
+    return;
+  }
+  if (config.isProd && KNOWN_DEFAULT_PASSWORDS.includes(newPassword)) {
+    res.status(400).json({ error: 'That password is publicly known and cannot be used in production.' });
+    return;
+  }
 
   const actor = getAdminInfo(req);
-  store.recordPortalAdminLog({
-    adminUsername: actor.username,
-    authMethod: actor.authMethod,
-    action: 'UPSERT_PORTAL_USER',
-    target: `Portal User: ${saved.username}`,
-    details: `Created or updated portal administrator "${saved.username}" (${saved.role}).`,
-    ipAddress: actor.ip,
+  // The save and its audit entry share one transaction: an account change can never go unlogged.
+  runInTransaction(() => {
+    const saved = store.upsertPortalUser({
+      username: String(username),
+      displayName: displayName ? String(displayName) : undefined,
+      password: newPassword,
+      role: role ? String(role) : undefined,
+    });
+    store.recordPortalAdminLog({
+      adminUsername: actor.username,
+      authMethod: actor.authMethod,
+      action: 'UPSERT_PORTAL_USER',
+      target: `Portal User: ${saved.username}`,
+      details: `Created or updated portal administrator "${saved.username}" (${saved.role}).`,
+      ipAddress: actor.ip,
+      correlationId: actor.correlationId,
+      targetType: 'portal_user',
+      targetId: saved.username,
+    });
   });
 
   res.json({ portalUsers: store.getPortalUsers() });
@@ -1664,39 +2082,61 @@ adminRouter.post('/portal-users', (req: Request, res: Response) => {
 
 adminRouter.delete('/portal-users/:username', (req: Request, res: Response) => {
   const username = String(req.params.username);
-  try {
-    if (!store.deletePortalUser(username)) {
-      res.status(404).json({ error: `Portal user '${username}' not found.` });
-      return;
+  const actor = getAdminInfo(req);
+  const result = changeWithAuditEntry(
+    () => {
+      // The row is filed under the stored username, as the create was, whatever spelling the URL used.
+      const storedUsername = store.findPortalUsername(username);
+      return storedUsername !== undefined && store.deletePortalUser(storedUsername) ? storedUsername : undefined;
+    },
+    (storedUsername) => {
+      if (storedUsername === undefined) return;
+      store.recordPortalAdminLog({
+        adminUsername: actor.username,
+        authMethod: actor.authMethod,
+        action: 'DELETE_PORTAL_USER',
+        target: `Portal User: ${username}`,
+        details: `Deleted portal user "${username}".`,
+        ipAddress: actor.ip,
+        correlationId: actor.correlationId,
+        targetType: 'portal_user',
+        targetId: storedUsername,
+      });
     }
-    const actor = getAdminInfo(req);
-    store.recordPortalAdminLog({
-      adminUsername: actor.username,
-      authMethod: actor.authMethod,
-      action: 'DELETE_PORTAL_USER',
-      target: `Portal User: ${username}`,
-      details: `Deleted portal user "${username}".`,
-      ipAddress: actor.ip,
-    });
-    res.json({ portalUsers: store.getPortalUsers() });
-  } catch (err: any) {
-    res.status(400).json({ error: err.message });
+  );
+  if ('error' in result) {
+    // e.g. the last remaining administrator
+    res.status(400).json({ error: result.error?.message });
+    return;
   }
+  if (result.value === undefined) {
+    res.status(404).json({ error: `Portal user '${username}' not found.` });
+    return;
+  }
+  res.json({ portalUsers: store.getPortalUsers() });
 });
 
 /**
  * POST /api/admin/test-mcp-access
  * Allows testing what a given Profile ID can do based on its current Profile Group Matrix
  */
-adminRouter.post('/test-mcp-access', async (req: Request, res: Response) => {
+adminRouter.post('/test-mcp-access', asyncRoute(async (req: Request, res: Response) => {
+  let simulation: Awaited<ReturnType<typeof simulateMcpAccess>>;
   try {
-    await runMcpAccessSimulation(req, res);
+    simulation = await simulateMcpAccess(req);
   } catch (err: any) {
     res.status(400).json({ error: err?.message || 'Simulation failed.' });
+    return;
   }
-});
+  // The MCP log row and the audit entry naming the acting admin share one transaction, so neither is
+  // ever written without the other. One that cannot be written ends the request in a 500.
+  runInTransaction(simulation.record);
+  res.json(simulation.body);
+}));
 
-async function runMcpAccessSimulation(req: Request, res: Response): Promise<void> {
+/** Evaluates a simulated call. Its log rows are written by `record`, its answer is `body`. */
+async function simulateMcpAccess(req: Request): Promise<{ record: () => void; body: Record<string, unknown> }> {
+  const startedAt = performance.now();
   const { profileId, toolName, targetObject, samplePayload, username } =
     req.body || {};
   const profile = store.getProfileById(String(profileId || ''));
@@ -1707,60 +2147,88 @@ async function runMcpAccessSimulation(req: Request, res: Response): Promise<void
   });
 
   const user = await resolveSalesforceUserFromToken(simToken);
+  const snapshot = loadPolicySnapshot();
   const effective = resolveEffectiveProfilePermissions(
     user.profileId,
-    user.profileName
+    user.profileName,
+    snapshot
   );
-  const evaluation = evaluateMcpToolCall(
-    user,
-    String(toolName || 'list_enabled_objects'),
-    targetObject ? String(targetObject) : undefined
-  );
+  // A sample payload is evaluated as the call's arguments, so the field, WHERE and argument checks
+  // apply as on /mcp. Without one, only the tool and the Object are checked. The Object is targetObject
+  // when it is given, whatever the payload names, so the logged target is always the one decided on;
+  // the payload's objectName counts only without one.
+  const simulatedTool = String(toolName || 'list_enabled_objects');
+  const hasSamplePayload = Boolean(samplePayload && typeof samplePayload === 'object' && !Array.isArray(samplePayload));
+  const args: Record<string, unknown> = {
+    ...(hasSamplePayload ? samplePayload : {}),
+    ...(targetObject ? { objectName: String(targetObject) } : {}),
+  };
+  const simulatedTarget = targetObjectArgument(args);
+  const decision = hasSamplePayload
+    ? evaluatePolicy(user, simulatedTool, args, snapshot)
+    : evaluateToolAccess(user, simulatedTool, targetObject ? String(targetObject) : undefined, snapshot);
+  const { decision: _decision, ...evaluation } = policyEvaluationResult(decision);
+  const status = decisionLogStatus(decision);
 
-  // Also record this test call into the Copilot MCP log (with sensitive data stripped!)
-  store.recordCopilotMcpLog({
-    simulated: true,
-    sfUsername: user.username,
-    profileId: user.profileId,
-    profileName: effective.profileName,
-    matchedGroups: evaluation.matchedGroups,
-    toolName: String(toolName || 'list_enabled_objects'),
-    targetObject: String(targetObject || '*'),
-    status: evaluation.permitted ? 'ALLOWED' : 'DENIED',
-    latencyMs: Math.floor(18 + Math.random() * 65),
-    rawRequestPayload: samplePayload || {
-      objectName: targetObject || '*',
-      tool: toolName,
-    },
-    rawResponseSummary: {
-      permitted: evaluation.permitted,
-      reason: evaluation.reason,
-      allowedFields: evaluation.allowedFields,
-    },
-  });
-
-  // The MCP row only shows the simulated name, so this row is what ties it to the acting admin.
   const actor = getAdminInfo(req);
-  store.recordPortalAdminLog({
-    adminUsername: actor.username,
-    authMethod: actor.authMethod,
-    action: SIMULATE_MCP_CALL_ACTION,
-    target: `Profile: ${effective.profileName} (${effective.profileId})`,
-    details: `Simulated ${String(toolName || 'list_enabled_objects')} on ${String(targetObject || '*')} as "${user.username}": ${evaluation.permitted ? 'ALLOWED' : 'DENIED'}. A 15-minute simulator token was issued.`,
-    ipAddress: actor.ip,
-  });
-
-  res.json({
-    simulatorBearerToken: simToken,
-    evaluation,
-    effectivePermissions: {
-      profileId: effective.profileId,
+  const record = () => {
+    // Also record this test call into the Copilot MCP log (with sensitive data stripped!), with its
+    // decision and how long the simulation took. No bearer token was verified for it.
+    store.recordCopilotMcpLog({
+      simulated: true,
+      sfUsername: user.username,
+      profileId: user.profileId,
       profileName: effective.profileName,
-      assignedGroups: effective.assignedGroups,
-      allowedActions: Array.from(effective.allowedActions),
+      matchedGroups: evaluation.matchedGroups,
+      toolName: simulatedTool,
+      targetObject: simulatedTarget,
+      status,
+      decision,
+      policySnapshot: snapshot,
+      totalMs: elapsedMs(startedAt),
+      rawRequestPayload: samplePayload || {
+        objectName: targetObject || '*',
+        tool: toolName,
+      },
+      rawResponseSummary: {
+        permitted: evaluation.permitted,
+        reason: evaluation.reason,
+        allowedFields: evaluation.allowedFields,
+      },
+    });
+
+    // The MCP row only shows the simulated name, so this row is what ties it to the acting admin.
+    store.recordPortalAdminLog({
+      adminUsername: actor.username,
+      authMethod: actor.authMethod,
+      action: SIMULATE_MCP_CALL_ACTION,
+      target: `Profile: ${effective.profileName} (${effective.profileId})`,
+      details: `Simulated ${simulatedTool} on ${simulatedTarget} as "${user.username}": ${status}.${config.isProd ? '' : ' A 15-minute simulator token was issued.'}`,
+      ipAddress: actor.ip,
+      correlationId: actor.correlationId,
+    });
+  };
+
+  return {
+    record,
+    body: {
+      // /mcp refuses simulator tokens in production, so none is handed out there.
+      ...(config.isProd ? {} : { simulatorBearerToken: simToken }),
+      evaluation,
+      decision,
+      effectivePermissions: {
+        profileId: effective.profileId,
+        profileName: effective.profileName,
+        assignedGroups: effective.assignedGroups,
+        allowedActions: Array.from(effective.allowedActions),
+      },
     },
-  });
+  };
 }
+
+/** The 409 of the sample matrix while a sample group holds another sample group's exact name. */
+const SAMPLE_NAME_HELD_BY_SAMPLE =
+  'A sample group cannot take its name, because another Access Group has it, so no sample data was loaded. Rename that group, then load the sample data again.';
 
 /**
  * POST /api/admin/workspace/seed-sample
@@ -1775,11 +2243,15 @@ adminRouter.post('/workspace/seed-sample', (req: Request, res: Response) => {
   }
   const actor = getAdminInfo(req);
   const existingObjects = store.getObjects();
+  // Matched case-insensitively, and saved under the catalog's spelling, as POST /groups would save them.
+  const catalogObject = (objName: string) =>
+    existingObjects.find((o) => o.objectName.toLowerCase() === objName.toLowerCase());
   const objFieldNames = (objName: string, exclude: string[] = []): string[] => {
-    const found = existingObjects.find((o) => o.objectName === objName);
+    const found = catalogObject(objName);
     if (!found) return [];
+    const excluded = new Set(exclude.map((name) => name.toLowerCase()));
     return found.fields
-      .filter((f) => f.enabled && !exclude.includes(f.fieldName))
+      .filter((f) => f.enabled && !excluded.has(f.fieldName.toLowerCase()))
       .map((f) => f.fieldName);
   };
 
@@ -1798,11 +2270,6 @@ adminRouter.post('/workspace/seed-sample', (req: Request, res: Response) => {
     { id: '00e5g000001J0yVAAS', name: 'Partner Community User' },
     { id: '00e5g000001K2zWAAS', name: 'Integration Bot (Copilot)' },
   ];
-  for (const p of baseProfiles) {
-    if (!store.getProfileById(p.id)) {
-      store.upsertProfile(p.id, p.name);
-    }
-  }
 
   // Upsert the 5 reference Enterprise Access Groups
   const sampleGroups = [
@@ -2026,47 +2493,95 @@ adminRouter.post('/workspace/seed-sample', (req: Request, res: Response) => {
     },
   ];
 
-  const seedActor = getAdminInfo(req);
-  for (const g of sampleGroups) {
-    store.upsertGroup(g, { actor: seedActor, source: 'sample_data' });
-  }
+  const sampleIds = new Set(sampleGroups.map((g) => g.id));
+  let conflict: string | undefined;
+  try {
+    // One transaction with its audit entry, so loading the matrix is all or nothing, one policy
+    // revision, and never unlogged.
+    conflict = runInTransaction(() => {
+      // Group names are unique ignoring case, and a sample group always takes its own name. Another
+      // group using one is refused before anything is written, rather than renamed or duplicated. So is
+      // a sample group renamed to another one's exact name, whichever of the two is saved first.
+      for (const sample of sampleGroups) {
+        const groups = store.getGroups();
+        const taken = groups.find((g) => !sampleIds.has(g.id) && g.name.toLowerCase() === sample.name.toLowerCase());
+        if (taken) {
+          return `Access Group "${taken.name}" already uses the name of the sample group "${sample.name}", so no sample data was loaded. Rename or delete that group, then load the sample data again.`;
+        }
+        if (groups.some((g) => sampleIds.has(g.id) && g.id !== sample.id && g.name === sample.name)) {
+          return SAMPLE_NAME_HELD_BY_SAMPLE;
+        }
+      }
 
-  // Assign profiles to groups
-  const allProfiles = store.getProfiles();
-  const findProf = (id: string, nameFragment: string) =>
-    allProfiles.find((p) => p.id === id) ||
-    allProfiles.find((p) =>
-      p.name.toLowerCase().includes(nameFragment.toLowerCase())
-    );
+      for (const p of baseProfiles) {
+        if (!store.getProfileById(p.id)) {
+          store.upsertProfile(p.id, p.name);
+        }
+      }
 
-  const mappingsToApply: Array<{ id?: string; groups: string[] }> = [
-    { id: findProf('00e5g000001A9xLAAS', 'System Administrator')?.id, groups: ['grp-admin'] },
-    { id: findProf('00e5g000001B2k9AAC', 'Enterprise Sales AE')?.id, groups: ['grp-sales-ro', 'grp-sales-rw'] },
-    { id: findProf('00e5g000001B2kAAAS', 'Sales Development')?.id, groups: ['grp-sales-ro'] },
-    { id: findProf('00e5g000001C4mQAAQ', 'Sales Operations')?.id, groups: ['grp-sales-ro', 'grp-revops'] },
-    { id: findProf('00e5g000001D8pRAAU', 'Customer Support Tier 1')?.id, groups: ['grp-svc-cases'] },
-    { id: findProf('00e5g000001D8pSAAU', 'Customer Support Escalations')?.id, groups: ['grp-svc-cases', 'grp-sales-ro'] },
-    { id: findProf('00e5g000001E1vWAAS', 'Solutions Engineer')?.id, groups: ['grp-sales-ro'] },
-    { id: findProf('00e5g000001F7nZAAS', 'Marketing')?.id, groups: ['grp-sales-ro'] },
-    { id: findProf('00e5g000001G3qTAAS', 'Finance')?.id, groups: ['grp-revops'] },
-    { id: findProf('00e5g000001H9wUAAS', 'Read-Only')?.id, groups: ['grp-sales-ro'] },
-    { id: findProf('00e5g000001K2zWAAS', 'Integration Bot')?.id, groups: ['grp-sales-rw', 'grp-svc-cases'] },
-  ];
+      for (const g of sampleGroups) {
+        // Grants only for Objects the catalog has: one it lacks would only show as not available.
+        const objectPermissions = g.objectPermissions.flatMap((p) => {
+          const found = catalogObject(p.objectName);
+          return found ? [{ ...p, objectName: found.objectName }] : [];
+        });
+        const sample = { ...g, objectPermissions };
+        const change = { actor, source: 'sample_data' as const };
+        if (store.getGroups().some((existing) => existing.id === g.id)) store.upsertGroup(sample, change);
+        else store.createGroup(sample, change);
+      }
 
-  for (const m of mappingsToApply) {
-    if (m.id) {
-      store.setProfileGroups(m.id, m.groups);
+      // Assign profiles to groups
+      const allProfiles = store.getProfiles();
+      const findProf = (id: string, nameFragment: string) =>
+        allProfiles.find((p) => p.id === id) ||
+        allProfiles.find((p) =>
+          p.name.toLowerCase().includes(nameFragment.toLowerCase())
+        );
+
+      const mappingsToApply: Array<{ id?: string; groups: string[] }> = [
+        { id: findProf('00e5g000001A9xLAAS', 'System Administrator')?.id, groups: ['grp-admin'] },
+        { id: findProf('00e5g000001B2k9AAC', 'Enterprise Sales AE')?.id, groups: ['grp-sales-ro', 'grp-sales-rw'] },
+        { id: findProf('00e5g000001B2kAAAS', 'Sales Development')?.id, groups: ['grp-sales-ro'] },
+        { id: findProf('00e5g000001C4mQAAQ', 'Sales Operations')?.id, groups: ['grp-sales-ro', 'grp-revops'] },
+        { id: findProf('00e5g000001D8pRAAU', 'Customer Support Tier 1')?.id, groups: ['grp-svc-cases'] },
+        { id: findProf('00e5g000001D8pSAAU', 'Customer Support Escalations')?.id, groups: ['grp-svc-cases', 'grp-sales-ro'] },
+        { id: findProf('00e5g000001E1vWAAS', 'Solutions Engineer')?.id, groups: ['grp-sales-ro'] },
+        { id: findProf('00e5g000001F7nZAAS', 'Marketing')?.id, groups: ['grp-sales-ro'] },
+        { id: findProf('00e5g000001G3qTAAS', 'Finance')?.id, groups: ['grp-revops'] },
+        { id: findProf('00e5g000001H9wUAAS', 'Read-Only')?.id, groups: ['grp-sales-ro'] },
+        { id: findProf('00e5g000001K2zWAAS', 'Integration Bot')?.id, groups: ['grp-sales-rw', 'grp-svc-cases'] },
+      ];
+
+      for (const m of mappingsToApply) {
+        if (m.id) {
+          store.setProfileGroups(m.id, m.groups);
+        }
+      }
+
+      store.recordPortalAdminLog({
+        adminUsername: actor.username,
+        authMethod: actor.authMethod,
+        action: 'SEED_ENTERPRISE_MATRIX',
+        target: 'Access Matrix & Governance Policy',
+        details: `Loaded reference Enterprise Governance Matrix (${sampleGroups.length} Access Groups and Profile-to-Group mappings).`,
+        ipAddress: actor.ip,
+        correlationId: actor.correlationId,
+      });
+      return undefined;
+    });
+  } catch (err: any) {
+    // The check above refuses every name a save could collide on; this keeps the answer if one still does.
+    if (/UNIQUE constraint failed: access_groups\.name/.test(String(err?.message))) {
+      res.status(409).json({ error: SAMPLE_NAME_HELD_BY_SAMPLE });
+      return;
     }
+    throw err;
   }
-
-  store.recordPortalAdminLog({
-    adminUsername: actor.username,
-    authMethod: actor.authMethod,
-    action: 'SEED_ENTERPRISE_MATRIX',
-    target: 'Access Matrix & Governance Policy',
-    details: `Loaded reference Enterprise Governance Matrix (${sampleGroups.length} Access Groups and Profile-to-Group mappings).`,
-    ipAddress: actor.ip,
-  });
+  if (conflict) {
+    res.status(409).json({ error: conflict });
+    return;
+  }
 
   res.json({
     profiles: store.getProfiles(),

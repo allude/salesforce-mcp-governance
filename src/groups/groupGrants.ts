@@ -11,6 +11,7 @@ import type {
   SalesforceObject,
 } from '../types/governance.ts';
 import { SALESFORCE_API_NAME_PATTERN } from '../db/importers.ts';
+import { malformedGrantReason } from '../rbac/groupGrants.ts';
 
 /**
  * What an MCP action ID may look like. A group may name an ID this server has no tool for (an XML
@@ -149,6 +150,48 @@ function removalClause(removal: CatalogRemoval): string {
   return `${by}${on}`;
 }
 
+/** When and by whom something held was deleted, as text, whatever form the stored marker has. */
+function removalText(raw: unknown): CatalogRemoval {
+  const source = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+  const text = (value: unknown) => (typeof value === 'string' ? value : '');
+  return { at: text(source.at), by: text(source.by) };
+}
+
+/**
+ * A group as stored, as the readers here take it (availability issues, history lines, XML of a history
+ * version): the MCP action IDs that are text, and the entries the policy engine can read (see
+ * malformedGrantReason), held ones included, each with a field list, only the held fields that name a
+ * field, and when and by whom each was held as text. An older release could store entries the engine
+ * skips, an entry with no field list, or held markers in another shape. They grant nothing, so they are
+ * left out (or read as text), and no reader fails on them.
+ */
+export function describableGroup<T extends Pick<AccessGroupSnapshot, 'allowedActions' | 'objectPermissions'>>(group: T): T {
+  const actions: unknown[] = Array.isArray(group.allowedActions) ? group.allowedActions : [];
+  const entries: unknown[] = Array.isArray(group.objectPermissions) ? group.objectPermissions : [];
+  return {
+    ...group,
+    allowedActions: actions.filter((id): id is string => typeof id === 'string'),
+    objectPermissions: entries.flatMap((entry) => {
+      if (malformedGrantReason(entry) !== null) return [];
+      const perm = entry as GroupObjectPermission;
+      const removedFields = (Array.isArray(perm.removedFields) ? (perm.removedFields as unknown[]) : []).flatMap((held) =>
+        held && typeof held === 'object' && typeof (held as { fieldName?: unknown }).fieldName === 'string'
+          ? [{ fieldName: (held as { fieldName: string }).fieldName, ...removalText(held) }]
+          : []
+      );
+      const { removed, removedFields: _stored, ...rest } = perm;
+      return [
+        {
+          ...rest,
+          allowedFields: perm.allowedFields ?? [],
+          ...(removed ? { removed: removalText(removed) } : {}),
+          ...(removedFields.length > 0 ? { removedFields } : {}),
+        },
+      ];
+    }),
+  };
+}
+
 /** The catalog row for a name, matched as Salesforce matches API names. An exact spelling wins. */
 function findByName<T>(rows: readonly T[], name: string, nameOf: (row: T) => string): T | undefined {
   return rows.find((row) => nameOf(row) === name) || rows.find((row) => nameOf(row).toLowerCase() === name.toLowerCase());
@@ -157,11 +200,13 @@ function findByName<T>(rows: readonly T[], name: string, nameOf: (row: T) => str
 /**
  * Everything in a group that grants nothing on this server, or names something Salesforce no longer
  * has, in the group's own order. An object that is not available is reported once, not per field.
+ * The group may be one as stored (see describableGroup).
  */
 export function groupAvailabilityIssues(
-  group: Pick<AccessGroupSnapshot, 'allowedActions' | 'objectPermissions'>,
+  stored: Pick<AccessGroupSnapshot, 'allowedActions' | 'objectPermissions'>,
   objects: readonly SalesforceObject[]
 ): GroupAvailabilityIssue[] {
+  const group = describableGroup(stored);
   const issues: GroupAvailabilityIssue[] = [];
   for (const id of group.allowedActions || []) {
     if (isKnownMcpAction(id)) continue;
@@ -304,8 +349,11 @@ function describeObjectChanges(before: GroupObjectPermission, after: GroupObject
 /**
  * The changes from `before` to `after`, one line each. With no `before`, the group was created and
  * every line describes what it was created with. Empty when nothing that grants access changed.
+ * Either group may be one as stored (see describableGroup).
  */
-export function describeGroupChanges(before: AccessGroupSnapshot | null, after: AccessGroupSnapshot): string[] {
+export function describeGroupChanges(storedBefore: AccessGroupSnapshot | null, storedAfter: AccessGroupSnapshot): string[] {
+  const before = storedBefore && describableGroup(storedBefore);
+  const after = describableGroup(storedAfter);
   if (!before) {
     return [
       after.allowedActions.length > 0 ? `MCP actions: ${list(after.allowedActions)}.` : 'No MCP actions.',

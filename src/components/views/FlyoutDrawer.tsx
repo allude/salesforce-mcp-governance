@@ -6,8 +6,10 @@ import { DEFAULT_SIMULATED_USERNAME, trafficBurstCalls } from './simulatedTraffi
 import {
   downloadTextFile,
   draftSaveSource,
+  groupDraftContent,
   groupXmlFileName,
   nameForImportedCopy,
+  reloadedGroup,
   removeEntryField,
   removeObjectEntry,
   restoreHeldField,
@@ -15,13 +17,26 @@ import {
   savedAccessGroup,
   setAvailableFields,
   splitMcpActions,
+  staleGroupFromError,
   type AccessGroupDraft,
   type AccessGroupDraftOrigin,
+  type WorkspaceSnapshot,
 } from './accessGroupDraft';
 import { GroupHistoryPanel, GroupIssueList, GroupXmlPanel } from './GroupEditorPanels';
 import { accessGroupToXml, parseAccessGroupXml } from '@/groups/groupXml';
 import { describeGroupChanges, groupAvailabilityIssues, isKnownMcpAction } from '@/groups/groupGrants';
 import { isSalesforceId } from '@/salesforce/ids';
+import {
+  effectiveGrants,
+  grantsAccess,
+  isHeldGrant,
+  malformedGrantReason,
+  readableGrants,
+} from '@/rbac/groupGrants';
+import {
+  ACCESS_GROUP_DESCRIPTION_MAX_LENGTH,
+  ACCESS_GROUP_NAME_MAX_LENGTH,
+} from '@/types/governance';
 import type {
   SalesforceProfile,
   SalesforceObject,
@@ -86,6 +101,10 @@ interface FlyoutDrawerProps {
     files: Array<{ relativePath: string; content: string }>
   ) => Promise<void>;
   onOpenOrgObjectCatalogModal?: () => void;
+  /**
+   * Saves the draft. An update sends the draft's `version` (the one the drawer loaded) as
+   * expectedVersion, from whichever view or source, so a group changed since is not overwritten.
+   */
   onSaveGroup: (
     group: AccessGroupDraft & { source: AccessGroupChangeSource; sourceDetail: string }
   ) => Promise<AccessGroup | void>;
@@ -100,7 +119,8 @@ interface FlyoutDrawerProps {
     username?: string;
     samplePayload?: Record<string, unknown>;
   }) => Promise<any>;
-  onRefreshWorkspace: () => Promise<void>;
+  /** Reloads the workspace; answers the groups and Objects it read, or null when it could not. */
+  onRefreshWorkspace: () => Promise<WorkspaceSnapshot | null>;
   notify: (msg: string, isError?: boolean) => void;
 }
 
@@ -174,6 +194,12 @@ export function FlyoutDrawer({
 
   // Group drawer state. The Visual and XML views edit the same draft; Save sends it from either.
   const [grpDraft, setGrpDraft] = useState<AccessGroupDraft | null>(null);
+  // What the stored group holds that POST /groups would refuse: left out of the draft, so saving removes it.
+  const [droppedActions, setDroppedActions] = useState<string[]>([]);
+  const [droppedGrants, setDroppedGrants] = useState<string[]>([]);
+  const [grpSaveError, setGrpSaveError] = useState('');
+  // The server's copy when a save was refused because the group changed since the drawer loaded it.
+  const [grpConflict, setGrpConflict] = useState<AccessGroup | null>(null);
   const [expandedObj, setExpandedObj] = useState<string | null>(null);
   const [grpTab, setGrpTab] = useState<'visual' | 'xml' | 'history'>('visual');
   const [xmlText, setXmlText] = useState('');
@@ -198,6 +224,50 @@ export function FlyoutDrawer({
   const [simObject, setSimObject] = useState('Opportunity');
   const [simResult, setSimResult] = useState<any>(null);
 
+  /**
+   * Starts the drawer's draft from a group as stored (or from a new group's draft, or from an imported
+   * file's content aimed at a stored group), with its grants checked against `catalog`: the page's
+   * Objects, unless a fresher read of them is given. The draft keeps the group's version, which saving
+   * sends as expectedVersion. What an earlier draft left (a save error, XML edits) is cleared.
+   */
+  const loadGroupDraft = (group: any, catalog: readonly SalesforceObject[] = objects): AccessGroupDraft => {
+    const { dropped, ...content } = groupDraftContent(group, catalog);
+    const draft: AccessGroupDraft = { id: group.id, version: group.version, ...content };
+    setDroppedActions(dropped.actions);
+    setDroppedGrants(dropped.grants);
+    setGrpSaveError('');
+    setGrpConflict(null);
+    setXmlError(null);
+    setXmlNotice(null);
+    setXmlEdited(false);
+    setGrpDraft(draft);
+    return draft;
+  };
+
+  /**
+   * "Reload group" after a refused save, from any view: rebuilds the draft from a fresh read of the
+   * workspace. The draft's edits are gone, an imported file or an earlier version loaded into it included.
+   */
+  const reloadGroupDraft = async (conflict: AccessGroup) => {
+    setBusy(true);
+    try {
+      const reloaded = reloadedGroup(conflict, await onRefreshWorkspace());
+      if ('error' in reloaded) {
+        setGrpSaveError(reloaded.error);
+        return;
+      }
+      const draft = loadGroupDraft(reloaded.group, reloaded.objects);
+      setGrpOrigin(null);
+      setGrpImport(null);
+      setShowPending(false);
+      // The XML view, when open, shows the reloaded group too.
+      setXmlText(accessGroupToXml(draft, { objects: reloaded.objects }));
+      setXmlBaseline(draft);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   useEffect(() => {
     setConfirmDelete(false);
     setFieldQuery('');
@@ -212,25 +282,15 @@ export function FlyoutDrawer({
       setNewProfName('');
       setNewProfError('');
     } else if (flyout.type === 'group' && flyout.data) {
-      // An import opens on the file's content, aimed at the group it matched (or a new one).
+      // An import opens on the file's content, aimed at the group it matched (or a new one). Only a
+      // group this server has can be its target: an update naming any other id is refused (404).
       const imported = flyout.data.importDraft as AccessGroupDraft | undefined;
-      const liveGrp = imported || groups.find((g) => g.id === flyout.data.id) || flyout.data;
-      setGrpDraft({
-        id: imported ? flyout.data.id : liveGrp.id,
-        name: liveGrp.name || '',
-        description: liveGrp.description || '',
-        allowedActions: [...(liveGrp.allowedActions || [])],
-        objectPermissions: (liveGrp.objectPermissions || []).map(
-          (op: GroupObjectPermission) => ({
-            ...op,
-            allowedFields: [...(op.allowedFields || [])],
-          })
-        ),
-      });
+      const stored = groups.find((g) => g.id === flyout.data.id);
+      const target = imported ? stored : undefined;
+      loadGroupDraft(
+        imported ? { ...imported, id: target?.id, version: target?.version } : stored || flyout.data
+      );
       setGrpTab('visual');
-      setXmlError(null);
-      setXmlNotice(null);
-      setXmlEdited(false);
       setExpandedObj(null);
       setShowPending(Boolean(imported));
       setGrpOrigin(imported ? { source: 'xml_import', detail: flyout.data.importFileName || '' } : null);
@@ -238,8 +298,8 @@ export function FlyoutDrawer({
         imported
           ? {
               fileName: flyout.data.importFileName || 'the file',
-              matchedBy: flyout.data.importMatchedBy || null,
-              targetName: groups.find((g) => g.id === flyout.data.id)?.name || '',
+              matchedBy: target ? flyout.data.importMatchedBy || null : null,
+              targetName: target?.name || '',
             }
           : null
       );
@@ -318,8 +378,9 @@ export function FlyoutDrawer({
       setXmlError({ message: parsed.error, line: parsed.line });
       return;
     }
+    // The file's id is never sent: the draft stays aimed at the group it was loaded for, at its version.
     const { id: fileId, ...content } = parsed.group;
-    setGrpDraft({ ...content, id: grpDraft.id });
+    setGrpDraft({ ...content, id: grpDraft.id, version: grpDraft.version });
     setXmlError(null);
     setXmlEdited(true);
     setXmlNotice(
@@ -339,21 +400,29 @@ export function FlyoutDrawer({
 
   const loadGroupVersion = (entry: AccessGroupHistoryEntry) => {
     if (!grpDraft) return;
-    setGrpDraft({
-      id: grpDraft.id,
+    // Restoring saves over the version the drawer loaded, not the one in history. The version is read
+    // like a stored group (see groupDraftContent). The notice of what saving removes stays about the
+    // group as stored now; what the version held that a save would refuse is left out, and said so.
+    const [storedActions, storedGrants] = [droppedActions, droppedGrants];
+    const { dropped } = groupDraftContent(entry.snapshot, objects);
+    loadGroupDraft({
+      ...entry.snapshot,
       name: entry.snapshot.name || grpDraft.name,
-      description: entry.snapshot.description || '',
-      allowedActions: [...(entry.snapshot.allowedActions || [])],
-      objectPermissions: (entry.snapshot.objectPermissions || []).map((op) => ({
-        ...op,
-        allowedFields: [...(op.allowedFields || [])],
-      })),
+      id: grpDraft.id,
+      version: grpDraft.version,
     });
+    setDroppedActions(storedActions);
+    setDroppedGrants(storedGrants);
     setGrpOrigin({ source: 'version_restore', detail: `Version of ${entry.timestamp} by ${entry.adminUsername}` });
     setGrpImport(null);
     setShowPending(true);
     setGrpTab('visual');
-    notify('Loaded an earlier version into the editor. Review it, then Save to restore it.');
+    const leftOut = [...dropped.actions, ...dropped.grants];
+    notify(
+      `Loaded an earlier version into the editor.${
+        leftOut.length > 0 ? ` It also held ${leftOut.join(', ')}, which grant nothing and are left out.` : ''
+      } Review it, then Save to restore it.`
+    );
   };
 
   const computeEffectiveAccess = (profileId: string) => {
@@ -366,12 +435,10 @@ export function FlyoutDrawer({
     > = {};
 
     for (const g of assignedGroups) {
+      // As the policy engine reads them, so this never shows access /mcp does not give: only this
+      // server's tools, and no held, malformed, missing or disabled Object.
       (g.allowedActions || []).filter(isKnownMcpAction).forEach((a) => actions.add(a));
-      for (const op of g.objectPermissions || []) {
-        // As at /mcp: a held entry, or one whose object is not in the catalog or is disabled, grants nothing.
-        if (op.removed) continue;
-        const objCfg = objects.find((o) => sameName(o.objectName, op.objectName));
-        if (!objCfg || !objCfg.enabled) continue;
+      for (const op of effectiveGrants(g.objectPermissions, objects)) {
         if (!objMap[op.objectName]) {
           objMap[op.objectName] = { R: false, C: false, U: false, D: false };
         }
@@ -666,7 +733,9 @@ export function FlyoutDrawer({
     } · ${liveObject.fields.length} fields`;
   } else if (flyout.type === 'sync') {
     title = 'Sync Salesforce objects';
-    subtitle = 'SFDX XML folder · Local server path · Salesforce Org Pull';
+    subtitle = devToolsEnabled
+      ? 'SFDX XML folder · Local server path · Salesforce Org Pull'
+      : 'SFDX XML folder · Salesforce Org Pull';
   } else if (flyout.type === 'group' && grpDraft) {
     title = grpDraft.name || 'New Access Group';
     subtitle = `Access group · ${grpDraft.id || 'unsaved'}`;
@@ -1105,18 +1174,20 @@ export function FlyoutDrawer({
 
               {(() => {
                 const usedBy = groups.filter((g) =>
-                  g.objectPermissions?.some(
+                  readableGrants(g.objectPermissions).some(
                     (op) =>
                       op.objectName === liveObject.objectName &&
-                      !op.removed &&
-                      (op.canRead ||
-                        op.canCreate ||
-                        op.canUpdate ||
-                        op.canDelete)
+                      grantsAccess(op)
                   )
                 );
+                // Entries an older release stored malformed are skipped: they hold nothing.
                 const heldBy = groups.filter((g) =>
-                  g.objectPermissions?.some((op) => sameName(op.objectName, liveObject.objectName) && op.removed)
+                  (g.objectPermissions || []).some(
+                    (op) =>
+                      malformedGrantReason(op) === null &&
+                      isHeldGrant(op) &&
+                      sameName(op.objectName, liveObject.objectName)
+                  )
                 );
                 return (
                   <div className="sec">
@@ -1163,8 +1234,10 @@ export function FlyoutDrawer({
                     ) : (
                       <div className="chk-list">
                         {usedBy.map((g) => {
-                          const op = g.objectPermissions.find(
-                            (p) => p.objectName === liveObject.objectName
+                          const op = readableGrants(g.objectPermissions).find(
+                            (p) =>
+                              p.objectName === liveObject.objectName &&
+                              grantsAccess(p)
                           );
                           return (
                             <div
@@ -1421,44 +1494,47 @@ export function FlyoutDrawer({
                 )}
               </div>
 
-              <div className="sec">
-                <div className="sec-h">
-                  <span className="sec-t">2. Sync from local server path</span>
-                </div>
-                <div style={{ display: 'flex', gap: 8 }}>
-                  <input
-                    className="inp mono"
-                    value={sfdxPath}
-                    onChange={(e) => setSfdxPath(e.target.value)}
-                  />
-                  <button
-                    type="button"
-                    className="btn"
-                    disabled={busy}
-                    onClick={async () => {
-                      setBusy(true);
-                      try {
-                        await onSyncSfdxPath(sfdxPath);
-                        onClose();
-                      } catch {
-                        // The error toast is already showing; stay here so the admin can retry.
-                      } finally {
-                        setBusy(false);
-                      }
-                    }}
-                  >
-                    Sync path
-                  </button>
-                </div>
-                <pre className="code" style={{ marginTop: 8 }}>{`curl -X POST http://localhost:3001/api/admin/objects/import-local-folder \\
+              {/* The API refuses this in production, where it would read any folder the server can. */}
+              {devToolsEnabled && (
+                <div className="sec">
+                  <div className="sec-h">
+                    <span className="sec-t">2. Sync from local server path</span>
+                  </div>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <input
+                      className="inp mono"
+                      value={sfdxPath}
+                      onChange={(e) => setSfdxPath(e.target.value)}
+                    />
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={busy}
+                      onClick={async () => {
+                        setBusy(true);
+                        try {
+                          await onSyncSfdxPath(sfdxPath);
+                          onClose();
+                        } catch {
+                          // The error toast is already showing; stay here so the admin can retry.
+                        } finally {
+                          setBusy(false);
+                        }
+                      }}
+                    >
+                      Sync path
+                    </button>
+                  </div>
+                  <pre className="code" style={{ marginTop: 8 }}>{`curl -X POST http://localhost:3001/api/admin/objects/import-local-folder \\
   -H "Content-Type: application/json" \\
   -d '{"folderPath":"${sfdxPath}"}'`}</pre>
-              </div>
+                </div>
+              )}
 
               <div className="sec">
                 <div className="sec-h">
                   <span className="sec-t">
-                    3. Pull from connected Salesforce org
+                    {devToolsEnabled ? 3 : 2}. Pull from connected Salesforce org
                   </span>
                   {sfSettings?.connectionStatus === 'connected' ? (
                     <span className="tag ok">
@@ -1556,6 +1632,23 @@ export function FlyoutDrawer({
                 </div>
               </div>
 
+              {grpSaveError && (
+                // The toast fades; this stays until the next save or reload, in every view.
+                <div className="hint" role="alert" style={{ color: 'var(--err)', marginBottom: 8 }}>
+                  {grpSaveError}{' '}
+                  {grpConflict && (
+                    <button
+                      type="button"
+                      className="btn sm"
+                      disabled={busy}
+                      onClick={() => reloadGroupDraft(grpConflict)}
+                    >
+                      Reload group
+                    </button>
+                  )}
+                </div>
+              )}
+
               {grpImport && (
                 <div className="notice acc">
                   <div className="notice-t">
@@ -1579,6 +1672,7 @@ export function FlyoutDrawer({
                         setGrpDraft({
                           ...grpDraft,
                           id: undefined,
+                          version: undefined,
                           name: nameForImportedCopy(groups, grpDraft.name),
                         });
                         setGrpImport({ ...grpImport, matchedBy: null });
@@ -1621,6 +1715,20 @@ export function FlyoutDrawer({
 
               {grpTab !== 'history' && <GroupIssueList issues={grpIssues} />}
 
+              {grpTab !== 'history' && (droppedActions.length > 0 || droppedGrants.length > 0) && (
+                // Left out of the draft because POST /groups would refuse them. Names this server does
+                // not have are kept instead, and listed as not available.
+                <div className="notice warn">
+                  <div className="notice-t">Saving removes what cannot be read</div>
+                  <div className="notice-s">
+                    This group also holds{' '}
+                    <span className="mono">{[...droppedActions, ...droppedGrants].join(', ')}</span>, which
+                    cannot be read as an MCP action ID or an object entry. They grant nothing and are not
+                    shown here. Saving removes them.
+                  </div>
+                </div>
+              )}
+
               {grpTab === 'xml' && (
                 <GroupXmlPanel
                   xmlText={xmlText}
@@ -1655,6 +1763,7 @@ export function FlyoutDrawer({
                   <input
                     className="inp"
                     value={grpDraft.name}
+                    maxLength={ACCESS_GROUP_NAME_MAX_LENGTH}
                     onChange={(e) =>
                       setGrpDraft({ ...grpDraft, name: e.target.value })
                     }
@@ -1665,6 +1774,7 @@ export function FlyoutDrawer({
                   <input
                     className="inp"
                     value={grpDraft.description}
+                    maxLength={ACCESS_GROUP_DESCRIPTION_MAX_LENGTH}
                     onChange={(e) =>
                       setGrpDraft({ ...grpDraft, description: e.target.value })
                     }
@@ -2350,8 +2460,8 @@ export function FlyoutDrawer({
                   <dd className="mono">{flyout.data.ipAddress}</dd>
                   <dt>Result</dt>
                   <dd>
-                    <span className={`tag ${portalAuditResult(String(flyout.data.action)).tone}`}>
-                      {portalAuditResult(String(flyout.data.action)).label}
+                    <span className={`tag ${portalAuditResult(flyout.data).tone}`}>
+                      {portalAuditResult(flyout.data).label}
                     </span>
                   </dd>
                 </dl>
@@ -2511,7 +2621,7 @@ export function FlyoutDrawer({
                         }}
                       >
                         Signed Simulator Bearer Token (for{' '}
-                        <span className="mono">POST /api/mcp</span>):
+                        <span className="mono">POST /mcp</span>):
                       </div>
                       <pre className="code">
                         {simResult.simulatorBearerToken}
@@ -2688,11 +2798,16 @@ export function FlyoutDrawer({
                 title={xmlError ? 'Fix or discard the XML error first' : undefined}
                 onClick={async () => {
                   setBusy(true);
+                  setGrpSaveError('');
+                  setGrpConflict(null);
                   try {
                     await onSaveGroup({ ...grpDraft, ...draftSaveSource(grpOrigin, xmlEdited) });
                     onClose();
-                  } catch {
-                    // The error toast is already showing; stay here so the admin can retry.
+                  } catch (err: any) {
+                    // The toast is showing too; stay here so the admin can read it and retry, or reload
+                    // the group when it changed elsewhere since this drawer loaded it.
+                    setGrpSaveError(err?.message || 'The group could not be saved.');
+                    setGrpConflict(staleGroupFromError(err));
                   } finally {
                     setBusy(false);
                   }

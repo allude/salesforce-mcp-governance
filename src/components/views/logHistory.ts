@@ -70,28 +70,20 @@ export function newestSeq(rows: Array<{ seq?: number }>): number {
  * page and null once the oldest row has been read. `loadedTop` is the newest seq the loaded pages
  * cover, recorded when the first page is read (0 for a log that was empty then): the pages run
  * unbroken from that row down to the cursor, and only /overview rows can stand in for newer ones.
- * `cleared` is set by Clear log, which empties only the view, until rows come back into it.
  */
 export interface OlderRowsState<T> {
   older: T[];
   cursor: number | null | undefined;
   loadedTop: number | undefined;
-  cleared: boolean;
 }
 
 export function emptyOlderRows<T>(): OlderRowsState<T> {
-  return { older: [], cursor: undefined, loadedTop: undefined, cleared: false };
-}
-
-/** The state after Clear log: no loaded pages, and a view the toolbar calls cleared. */
-export function clearedOlderRows<T>(): OlderRowsState<T> {
-  return { ...emptyOlderRows<T>(), cleared: true };
+  return { older: [], cursor: undefined, loadedTop: undefined };
 }
 
 /**
  * The state after one "Load older": the next pages older than the cursor that add a row the view
  * does not hold. From an empty state this reads down from the newest row of the log and records it.
- * Rows read into a cleared view refill it, so it is no longer called cleared.
  */
 export async function loadOlderRows<T extends { id: string; seq?: number }>(
   readPage: ReadLogPage<T>,
@@ -106,7 +98,6 @@ export async function loadOlderRows<T extends { id: string; seq?: number }>(
     older: mergeNewestFirst(state.older, page.rows),
     cursor: page.nextBefore,
     loadedTop: state.cursor === undefined ? newestSeq(page.rows) : state.loadedTop,
-    cleared: state.cleared && page.rows.length === 0,
   };
 }
 

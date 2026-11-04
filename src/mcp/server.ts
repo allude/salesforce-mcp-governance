@@ -7,13 +7,23 @@ import {
   VerifiedSalesforceUser,
   salesforceRestRequest,
 } from '../salesforce/client.js';
-import { assertSafeSoqlWhereClause } from './soqlGuard.js';
-import { SALESFORCE_API_NAME_PATTERN } from '../db/importers.js';
 import {
-  PolicyViolationError,
-  evaluateMcpToolCall,
+  API_NAME_PATTERN,
+  FIELD_VALUES_MESSAGE,
+  RECORD_ID_MESSAGE,
+  fieldValuesArgument,
+  loggedTargetObject,
+  recordIdArgument,
+  selectedFieldNames,
+  whereClauseArgument,
+} from './toolArguments.js';
+import {
+  decisionLogStatus,
+  evaluatePolicy,
   getVisibleToolsForUser,
+  loadPolicySnapshot,
   resolveEffectiveProfilePermissions,
+  type PolicyDecision,
 } from '../rbac/policyEngine.js';
 import { store } from '../db/store.js';
 import type { McpActionId } from '../types/governance.js';
@@ -104,45 +114,73 @@ export const TOOL_INPUT_SCHEMAS: Record<McpActionId, object> = {
   },
 };
 
-const RECORD_ID_PATTERN = /^[a-zA-Z0-9]{15}(?:[a-zA-Z0-9]{3})?$/;
-const API_NAME_PATTERN = SALESFORCE_API_NAME_PATTERN;
-
+// evaluatePolicy has refused a call whose record id or field values these would refuse. They still
+// throw rather than pass an unchecked value into a URL or a request body.
 function requireRecordId(args: Record<string, any>): string {
-  const recordId = typeof args.recordId === 'string' ? args.recordId.trim() : '';
-  if (!RECORD_ID_PATTERN.test(recordId)) {
-    throw new Error('recordId must be a 15 or 18-character Salesforce Record ID.');
-  }
+  const recordId = recordIdArgument(args);
+  if (recordId === null) throw new Error(RECORD_ID_MESSAGE);
   return recordId;
 }
 
-/** Field names must all be in the Profile's allowlist (case-insensitive). */
-function assertFieldsAllowed(
-  fieldNames: string[],
-  allowedFields: string[],
-  objectName: string,
-  profileName: string
-): void {
-  // Names stored before API-name validation existed are re-checked, since they go into SOQL/URLs.
-  const permittedSet = new Set(
-    allowedFields.filter((f) => API_NAME_PATTERN.test(f)).map((f) => f.toLowerCase())
-  );
-  const disallowed = fieldNames.filter((f) => !permittedSet.has(f.toLowerCase()));
-  if (disallowed.length > 0) {
-    throw new PolicyViolationError(
-      `Fields [${disallowed.join(', ')}] on ${objectName} are not permitted for Profile '${profileName}'.`
-    );
-  }
-}
-
 function requireFieldValues(args: Record<string, any>): Record<string, unknown> {
-  const fields = args.fields;
-  if (!fields || typeof fields !== 'object' || Array.isArray(fields) || Object.keys(fields).length === 0) {
-    throw new Error('fields must be an object of field names to values.');
-  }
-  return fields as Record<string, unknown>;
+  const fields = fieldValuesArgument(args);
+  if (fields === null) throw new Error(FIELD_VALUES_MESSAGE);
+  return fields;
 }
 
-export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server {
+/**
+ * What the caller is told about a refused call, and the log row's summary of it. A refused tool or
+ * Object (anything decided before the CRUD check passed, a missing or malformed objectName included)
+ * names the Profile; a refused field or WHERE filter does not; a malformed argument, or a policy that
+ * could not be evaluated, is a plain error.
+ */
+function refusalPayload(
+  decision: PolicyDecision,
+  toolName: string,
+  targetObject: string,
+  user: VerifiedSalesforceUser
+): { body: Record<string, unknown>; summary: Record<string, unknown> } {
+  const { code, reason } = decision;
+  if (code === 'FIELD_NOT_PERMITTED' || code === 'WHERE_FIELD_NOT_PERMITTED') {
+    return {
+      body: { error: 'ACCESS_DENIED', tool: toolName, targetObject, reason },
+      summary: { error: 'ACCESS_DENIED', reason },
+    };
+  }
+  const passedCrud = decision.steps.some((s) => s.stage === 'crud' && s.result === 'pass');
+  if (decision.outcome === 'error' || (code === 'INPUT_INVALID' && passedCrud)) {
+    return { body: { error: reason }, summary: { error: reason } };
+  }
+  return {
+    body: {
+      error: 'ACCESS_DENIED',
+      tool: toolName,
+      targetObject,
+      profileId: user.profileId,
+      profileName: user.profileName,
+      reason,
+    },
+    summary: { error: 'ACCESS_DENIED', reason },
+  };
+}
+
+/** When the HTTP request a server answers arrived, and how long its bearer token took to verify. */
+export interface McpRequestTiming {
+  /** performance.now() at receipt. Every tools/call row's totalMs runs from here to that call's row. */
+  receivedAt: number;
+  verificationMs: number;
+}
+
+/** Whole milliseconds since `since` (a performance.now() reading), rounded up and at least 1, as latency always was. */
+export function elapsedMs(since: number): number {
+  return Math.max(1, Math.ceil(performance.now() - since));
+}
+
+/**
+ * One MCP server per HTTP request, scoped to its verified caller. With `timing`, each tools/call row is
+ * timed from the request's receipt and records the token verification; without it, from the call itself.
+ */
+export function createUserScopedMcpServer(user: VerifiedSalesforceUser, timing?: McpRequestTiming): Server {
   const server = new Server(
     {
       name: 'salesforce-governance-mcp-server',
@@ -172,29 +210,40 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
 
   // 2. tools/call — Enforce Profile -> Group -> Object/Field permissions and log with stripped PII
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const startTime = Date.now();
+    const receivedAt = timing?.receivedAt ?? performance.now();
     const toolName = request.params.name;
     const args = (request.params.arguments || {}) as Record<string, any>;
-    const targetObject = args.objectName ? String(args.objectName) : '*';
+    // Read so that it cannot throw: evaluatePolicy decides an objectName that cannot be read, and the
+    // call writes its row like any other.
+    const targetObject = loggedTargetObject(args);
 
-    const evaluation = evaluateMcpToolCall(user, toolName, targetObject);
-    if (!evaluation.permitted) {
-      const latencyMs = Math.max(1, Date.now() - startTime);
+    // One snapshot per call: the decision and the handler below act on the same policy.
+    const snapshot = loadPolicySnapshot();
+    const decision = evaluatePolicy(user, toolName, args, snapshot);
+    const matchedGroups = decision.assignedGroups.map((g) => g.name);
+    // What every row of this call records besides its outcome: the decision, the snapshot it was made from
+    // (its names are checked against that, not the tables as they stand when the row is written) and the
+    // timings, each row's total measured when it is written.
+    const decided = () => ({
+      decision,
+      policySnapshot: snapshot,
+      verificationMs: timing?.verificationMs,
+      totalMs: elapsedMs(receivedAt),
+    });
+    if (decision.outcome !== 'allowed') {
+      const refusal = refusalPayload(decision, toolName, targetObject, user);
       store.recordCopilotMcpLog({
         sfUsername: user.username,
         simulated: user.simulated,
         profileId: user.profileId,
         profileName: user.profileName,
-        matchedGroups: evaluation.matchedGroups,
+        matchedGroups,
         toolName,
         targetObject,
-        status: 'DENIED',
-        latencyMs,
+        status: decisionLogStatus(decision),
+        ...decided(),
         rawRequestPayload: args,
-        rawResponseSummary: {
-          error: 'ACCESS_DENIED',
-          reason: evaluation.reason,
-        },
+        rawResponseSummary: refusal.summary,
       });
 
       return {
@@ -202,18 +251,7 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
         content: [
           {
             type: 'text',
-            text: JSON.stringify(
-              {
-                error: 'ACCESS_DENIED',
-                tool: toolName,
-                targetObject,
-                profileId: user.profileId,
-                profileName: user.profileName,
-                reason: evaluation.reason,
-              },
-              null,
-              2
-            ),
+            text: JSON.stringify(refusal.body, null, 2),
           },
         ],
       };
@@ -222,7 +260,8 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
     try {
       const effective = resolveEffectiveProfilePermissions(
         user.profileId,
-        user.profileName
+        user.profileName,
+        snapshot
       );
       let responsePayload: Record<string, unknown> = {};
 
@@ -244,8 +283,10 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
           objects,
         };
       } else {
-        // Every other tool is object-scoped; the policy engine returned the canonical object name.
-        const objectName = evaluation.objectName || targetObject;
+        // Every other tool is object-scoped. evaluatePolicy returned the canonical object name and
+        // checked it, the record id, the field names and the WHERE clause; this check stays so that no
+        // unchecked name can reach SOQL or a REST path.
+        const objectName = decision.objectName || targetObject;
         if (!API_NAME_PATTERN.test(objectName)) {
           throw new Error(`Object '${objectName}' is not a valid Salesforce API name.`);
         }
@@ -269,22 +310,12 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
               canUpdate: objPerm?.canUpdate || false,
               canDelete: objPerm?.canDelete || false,
             },
-            allowedFields: evaluation.allowedFields,
-            activeOrgFields: evaluation.allowedFields.filter((f) => !isMissingInOrg(f)),
+            allowedFields: decision.allowedFields,
+            activeOrgFields: decision.allowedFields.filter((f) => !isMissingInOrg(f)),
           };
         } else if (toolName === 'soql_query') {
-          const requestedFields: string[] = Array.isArray(args.fields)
-            ? args.fields.map(String)
-            : evaluation.allowedFields.filter((f) => API_NAME_PATTERN.test(f));
-          assertFieldsAllowed(requestedFields, evaluation.allowedFields, objectName, effective.profileName);
-
-          const whereClause =
-            typeof args.whereClause === 'string' && args.whereClause.trim()
-              ? args.whereClause.trim()
-              : '';
-          if (whereClause) {
-            assertSafeSoqlWhereClause(whereClause, evaluation.allowedFields);
-          }
+          const requestedFields = selectedFieldNames(args, decision.allowedFields);
+          const whereClause = whereClauseArgument(args);
 
           const ignoredMissingFields = requestedFields.filter(isMissingInOrg);
           let activeFields = requestedFields.filter((f) => !isMissingInOrg(f));
@@ -322,10 +353,7 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
           };
         } else if (toolName === 'get_record') {
           const recordId = requireRecordId(args);
-          const requestedFields: string[] = Array.isArray(args.fields)
-            ? args.fields.map(String)
-            : evaluation.allowedFields.filter((f) => API_NAME_PATTERN.test(f));
-          assertFieldsAllowed(requestedFields, evaluation.allowedFields, objectName, effective.profileName);
+          const requestedFields = selectedFieldNames(args, decision.allowedFields);
           const activeFields = requestedFields.filter((f) => !isMissingInOrg(f));
           const fieldList = activeFields.length > 0 ? activeFields : ['Id'];
 
@@ -344,7 +372,6 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
         } else if (toolName === 'create_record' || toolName === 'update_record') {
           const recordId = toolName === 'update_record' ? requireRecordId(args) : undefined;
           const fieldValues = requireFieldValues(args);
-          assertFieldsAllowed(Object.keys(fieldValues), evaluation.allowedFields, objectName, effective.profileName);
 
           const ignoredMissingFields = Object.keys(fieldValues).filter(isMissingInOrg);
           const activeValues = Object.fromEntries(
@@ -386,17 +413,16 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
         }
       }
 
-      const latencyMs = Math.max(1, Date.now() - startTime);
       store.recordCopilotMcpLog({
         sfUsername: user.username,
         simulated: user.simulated,
         profileId: effective.profileId,
         profileName: effective.profileName,
-        matchedGroups: evaluation.matchedGroups,
+        matchedGroups,
         toolName,
         targetObject,
         status: 'ALLOWED',
-        latencyMs,
+        ...decided(),
         rawRequestPayload: args,
         rawResponseSummary: responsePayload,
       });
@@ -410,22 +436,20 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
         ],
       };
     } catch (err: any) {
-      const latencyMs = Math.max(1, Date.now() - startTime);
-      const denied = err instanceof PolicyViolationError;
+      // The policy allowed the call, so what failed is the call itself: Salesforce, or an org that no
+      // longer has any of the fields it writes.
       store.recordCopilotMcpLog({
         sfUsername: user.username,
         simulated: user.simulated,
         profileId: user.profileId,
         profileName: user.profileName,
-        matchedGroups: evaluation.matchedGroups,
+        matchedGroups,
         toolName,
         targetObject,
-        status: denied ? 'DENIED' : 'ERROR',
-        latencyMs,
+        status: 'ERROR',
+        ...decided(),
         rawRequestPayload: args,
-        rawResponseSummary: denied
-          ? { error: 'ACCESS_DENIED', reason: err.message }
-          : { error: err.message || 'Execution error' },
+        rawResponseSummary: { error: err.message || 'Execution error' },
       });
 
       return {
@@ -433,13 +457,7 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
         content: [
           {
             type: 'text',
-            text: JSON.stringify(
-              denied
-                ? { error: 'ACCESS_DENIED', tool: toolName, targetObject, reason: err.message }
-                : { error: err.message },
-              null,
-              2
-            ),
+            text: JSON.stringify({ error: err.message }, null, 2),
           },
         ],
       };

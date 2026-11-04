@@ -8,7 +8,7 @@ import type {
 } from '@/types/governance';
 import type { GroupAvailabilityIssue } from '@/groups/groupGrants';
 import { accessGroupToXml } from '@/groups/groupXml';
-import { downloadTextFile, groupXmlFileName } from './accessGroupDraft';
+import { downloadTextFile, groupDraftContent, groupXmlFileName } from './accessGroupDraft';
 
 /** Larger files are not an Access Group: a group with every field of every object is far smaller. */
 export const MAX_GROUP_XML_BYTES = 512 * 1024;
@@ -269,7 +269,12 @@ export function GroupHistoryPanel({ groupId, loadHistory, objects, onLoadVersion
         {entries.map((entry, index) => {
           const kind = KIND_TAG[entry.kind] || KIND_TAG.updated;
           const isOpen = openId === entry.id;
-          const xml = isOpen ? accessGroupToXml(entry.snapshot, { objects }) : '';
+          // A version is kept as the group was stored; its XML is the group as "Load this version" reads it.
+          const versionXml = () => {
+            const { dropped: _dropped, ...version } = groupDraftContent(entry.snapshot, objects);
+            return accessGroupToXml(version, { objects });
+          };
+          const xml = isOpen ? versionXml() : '';
           return (
             <div className="hist-it" key={entry.id}>
               <div className="hist-h">
@@ -299,8 +304,8 @@ export function GroupHistoryPanel({ groupId, loadHistory, objects, onLoadVersion
                   className="btn gh sm"
                   onClick={() =>
                     downloadTextFile(
-                      accessGroupToXml(entry.snapshot, { objects }),
-                      groupXmlFileName(`${entry.snapshot.name}-${entry.timestamp.slice(0, 19).replace(/[:T]/g, '-')}`)
+                      versionXml(),
+                      groupXmlFileName(`${entry.snapshot.name || ''}-${entry.timestamp.slice(0, 19).replace(/[:T]/g, '-')}`)
                     )
                   }
                 >

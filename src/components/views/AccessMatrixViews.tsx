@@ -12,7 +12,8 @@ import type { FlyoutState } from './FlyoutDrawer';
 import { importTargetFor, newAccessGroupDraft } from './accessGroupDraft';
 import { readGroupXmlFile } from './GroupEditorPanels';
 import { parseAccessGroupXml } from '@/groups/groupXml';
-import { groupAvailabilityIssues } from '@/groups/groupGrants';
+import { groupAvailabilityIssues, isKnownMcpAction } from '@/groups/groupGrants';
+import { effectiveGrants, grantsAccess, malformedGrantReason, readableGrants } from '@/rbac/groupGrants';
 
 // ============================================================================
 // 1. ACCESS GROUPS VIEW
@@ -189,11 +190,19 @@ export function AccessGroupsView({
                   const assignedCount = profiles.filter((p) =>
                     getProfileGroupIds(p.id).includes(g.id)
                   ).length;
-                  const activeObjPerms = (g.objectPermissions || []).filter(
-                    (op) =>
-                      op.canRead || op.canCreate || op.canUpdate || op.canDelete
+                  // As the policy engine reads them, so this never shows access /mcp does not give.
+                  const activeObjPerms = readableGrants(g.objectPermissions).filter(grantsAccess);
+                  // Held entries count as not available here; an entry an older release stored
+                  // malformed is skipped, as it names nothing to show.
+                  const issues = groupAvailabilityIssues(
+                    {
+                      allowedActions: g.allowedActions || [],
+                      objectPermissions: (g.objectPermissions || []).filter(
+                        (entry) => malformedGrantReason(entry) === null
+                      ),
+                    },
+                    objects
                   );
-                  const issues = groupAvailabilityIssues(g, objects);
                   const unavailableCount = issues.filter((i) => i.status === 'unavailable').length;
                   const brokenCount = issues.length - unavailableCount;
                   const objectIssue = (objectName: string) =>
@@ -410,13 +419,11 @@ export function ProfileGroupMatrixView({
     const actSet = new Set<string>();
     const objSet = new Set<string>();
     for (const g of assigned) {
-      (g.allowedActions || []).forEach((a) => actSet.add(a));
-      for (const op of g.objectPermissions || []) {
-        const objMeta = objects.find((o) => o.objectName === op.objectName);
-        if (objMeta && !objMeta.enabled) continue;
-        if (op.canRead || op.canCreate || op.canUpdate || op.canDelete) {
-          objSet.add(op.objectName);
-        }
+      // As the policy engine reads them, so this never counts access /mcp does not give: only this
+      // server's tools, and no held, malformed, missing or disabled Object.
+      (g.allowedActions || []).filter(isKnownMcpAction).forEach((a) => actSet.add(a));
+      for (const op of effectiveGrants(g.objectPermissions, objects)) {
+        objSet.add(op.objectName);
       }
     }
     return {
@@ -546,8 +553,8 @@ export function ProfileGroupMatrixView({
                         textTransform: 'none',
                       }}
                     >
-                      {(g.allowedActions || []).length} actions ·{' '}
-                      {(g.objectPermissions || []).length} objects
+                      {(g.allowedActions || []).filter(isKnownMcpAction).length} actions ·{' '}
+                      {readableGrants(g.objectPermissions).filter(grantsAccess).length} objects
                     </div>
                   </th>
                 ))}

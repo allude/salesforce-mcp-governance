@@ -135,13 +135,27 @@ describe('edits are recorded', () => {
 });
 
 describe('what a save must look like', () => {
-  test('object entries with names that are not API names, or listed twice, are rejected', async () => {
+  test('object entries with names that are not API names are rejected; an Object listed twice is merged, unless one entry is held', async () => {
     const bad = await postGroup({ name: `Bad ${tag()}`, objectPermissions: [read("Account' OR 1=1", ['Id'])] });
     assert.equal(bad.status, 400);
     assert.match(bad.body.error, /not a valid Salesforce object API name/);
-    const twice = await postGroup({ name: `Twice ${tag()}`, objectPermissions: [read('Account', ['Id']), read('ACCOUNT', ['Id'])] });
-    assert.equal(twice.status, 400);
-    assert.match(twice.body.error, /listed more than once/);
+    // Live entries for one Object, in any case, are merged into one, as an older version may have stored them.
+    const twice = await postGroup({
+      name: `Twice ${tag()}`,
+      objectPermissions: [read('Account', ['Id']), read('ACCOUNT', ['Name'], { canRead: false, canUpdate: true })],
+    });
+    assert.equal(twice.status, 200, JSON.stringify(twice.body));
+    assert.deepEqual(twice.body.group.objectPermissions, [
+      { ...read('Account', ['Id', 'Name']), canUpdate: true },
+    ]);
+    // A held entry cannot be merged: it would grant again what it holds.
+    const removed = { at: '2026-11-01T00:00:00.000Z', by: 'someone' };
+    const heldTwice = await postGroup({
+      name: `Held twice ${tag()}`,
+      objectPermissions: [read('Account', ['Id'], { removed }), read('account', ['Id'])],
+    });
+    assert.equal(heldTwice.status, 400);
+    assert.match(heldTwice.body.error, /listed more than once, and one of its entries is held as deleted/);
   });
 
   test('an object this server does not have is kept and reported, not dropped', async () => {
@@ -180,13 +194,70 @@ describe('deleting from Salesforce > Objects keeps the grant on the group, not a
     store.upsertObjectWithFields({ objectName, fields: [{ fieldName: 'Id' }, { fieldName: 'Amount__c' }] });
     assert.ok(!granted()?.allowedFields.has('Amount__c'), 'the field is back but the grant is not');
 
+    // A restore needs the version the group was loaded at, as the portal sends it.
+    const unversioned = await postGroup({ ...store.getGroup(group.id)!, objectPermissions: [read(objectName, ['Id', 'Amount__c'])] });
+    assert.equal(unversioned.status, 409);
+    assert.ok(!granted()?.allowedFields.has('Amount__c'));
     const restored = await postGroup({
       ...store.getGroup(group.id)!,
+      expectedVersion: store.getGroup(group.id)!.version,
       objectPermissions: [read(objectName, ['Id', 'Amount__c'])],
     });
     assert.equal(restored.status, 200);
     assert.ok(granted()?.allowedFields.has('Amount__c'));
     assert.deepEqual((await historyOf(group.id))[0].changes, [`${objectName} fields restored: Amount__c.`]);
+  });
+
+  test('a field an entry lists both as granted and as held stays held; a held Id is still given as its records\' key', async () => {
+    const both = seed(['Id', 'Amount__c']);
+    // As a hand edit could leave it: Amount__c both granted and held.
+    store.upsertGroup({
+      ...both.group,
+      objectPermissions: [read(both.objectName, ['Id', 'Amount__c'], { removedFields: [{ fieldName: 'Amount__c', at: '', by: 'x' }] })],
+    });
+    assert.deepEqual([...(both.granted()?.allowedFields ?? [])], ['Id']);
+
+    // Id deleted and imported again: held, but every record a call returns carries its Id (a query that
+    // selects no granted field selects Id), so the entry still gives it, as one that names no field does.
+    const { objectName, group, granted } = seed(['Id']);
+    assert.equal((await api(`/objects/${objectName}/fields/Id`, 'DELETE')).status, 200);
+    assert.deepEqual(store.getGroup(group.id)!.objectPermissions[0].removedFields?.map((f) => f.fieldName), ['Id']);
+    store.upsertObjectWithFields({ objectName, fields: [{ fieldName: 'Id' }] });
+    assert.deepEqual([...(granted()?.allowedFields ?? [])], ['Id']);
+  });
+
+  test('a new name or description that reads as the same JSON is still a change', async () => {
+    const created = await postGroup({ name: `2024${tag().replace(/\D/g, '')}`, description: '', allowedActions: [] });
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    const group = created.body.group;
+    const renamed = await postGroup({ ...group, name: `${group.name}.0`, description: '[]', expectedVersion: group.version });
+    assert.equal(renamed.status, 200, JSON.stringify(renamed.body));
+    assert.equal(renamed.body.group.name, `${group.name}.0`);
+    assert.equal(renamed.body.group.description, '[]');
+    assert.equal(renamed.body.group.version, group.version + 1);
+  });
+
+  test('deleting a field an entry already holds names no group that lost a grant', async () => {
+    const { group, objectName } = seed(['Id', 'Amount__c']);
+    // As a hand edit could leave it: Amount__c both listed and held, so it grants nothing already.
+    store.upsertGroup({
+      ...group,
+      objectPermissions: [read(objectName, ['Id', 'Amount__c'], { removedFields: [{ fieldName: 'Amount__c', at: '', by: 'x' }] })],
+    });
+    assert.equal((await api(`/objects/${objectName}/fields/Amount__c`, 'DELETE')).status, 200);
+    assert.doesNotMatch(store.getPortalAdminLogs(1)[0].details, /revoked it from/);
+    assert.deepEqual(store.getGroup(group.id)!.objectPermissions[0].allowedFields, ['Id']);
+  });
+
+  test('a group whose field and then Object were deleted, saved unedited, keeps its version', async () => {
+    const { group, objectName } = seed(['Id', 'Name', 'Amount__c']);
+    await api(`/objects/${objectName}/fields/Amount__c`, 'DELETE');
+    await api(`/objects/${objectName}`, 'DELETE');
+    const held = store.getGroup(group.id)!;
+    assert.ok(held.objectPermissions[0].removed && held.objectPermissions[0].removedFields?.length === 1);
+    const res = await postGroup({ ...held, expectedVersion: held.version });
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(res.body.group.version, held.version);
   });
 
   test('org sync removing an object holds it the same way, naming the admin who applied the sync', async () => {
@@ -223,6 +294,30 @@ describe('changes in Salesforce > Objects to what a group grants are noted in it
     await api(`/objects/${objectName}/fields/Amount__c/toggle`, 'PUT', { enabled: false });
     assert.match((await historyOf(group.id))[0].changes[0], /Amount__c was disabled/);
     assert.deepEqual(await historyOf(other.id), [], 'the group that does not grant the field is not told');
+  });
+
+  test('enabling or disabling fields by saving the Object is noted like a toggle, and adding one is not', async () => {
+    const { group, objectName, granted } = seed(['Id', 'Amount__c', 'Stage__c']);
+    const before = (await historyOf(group.id)).length;
+    const off = await api('/objects', 'POST', {
+      objectName,
+      fields: [{ fieldName: 'Amount__c', enabled: false }, { fieldName: 'Stage__c', enabled: false }, { fieldName: 'New__c' }],
+    });
+    assert.equal(off.status, 200, JSON.stringify(off.body));
+    assert.ok(!granted()?.allowedFields.has('Amount__c'));
+    let entries = await historyOf(group.id);
+    assert.equal(entries.length, before + 1);
+    assert.equal(entries[0].kind, 'catalog');
+    assert.equal(entries[0].source, 'objects');
+    assert.equal(
+      entries[0].changes[0],
+      `${objectName}.Amount__c, ${objectName}.Stage__c were disabled in Salesforce > Objects, so this group's grants on them are not available until enabled.`
+    );
+
+    await api('/objects', 'POST', { objectName, fields: [{ fieldName: 'Amount__c', enabled: true }, { fieldName: 'Stage__c', enabled: false }] });
+    entries = await historyOf(group.id);
+    assert.equal(entries.length, before + 2);
+    assert.equal(entries[0].changes[0], `${objectName}.Amount__c was enabled in Salesforce > Objects, so this group grants it again.`);
   });
 
   test('org sync flagging an object missing from the org is noted once', async () => {

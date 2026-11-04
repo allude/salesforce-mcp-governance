@@ -67,20 +67,231 @@ describe('Access Groups', () => {
     assert.match(dup.body.error, /already exists/);
   });
 
+  const postGroup = (body: Record<string, unknown>) =>
+    adminFetch(server.baseUrl, session, '/api/admin/groups', { method: 'POST', body });
+  const groupNamed = (name: string) => store.getGroups().filter((g) => g.name.toLowerCase() === name.toLowerCase());
+
+  test("POST /groups refuses a flag that is not a boolean, so {canRead: 'false'} can no longer grant Read", async () => {
+    const objectName = `Flags_${tag()}__c`;
+    store.upsertObjectWithFields({ objectName, fields: [{ fieldName: 'Id' }] });
+    for (const value of ['false', 'true', 1, 0, null]) {
+      const name = `Flags ${tag()}`;
+      const res = await postGroup({ name, objectPermissions: [{ objectName, canRead: value, allowedFields: ['Id'] }] });
+      assert.equal(res.status, 400, JSON.stringify(value));
+      assert.equal(res.body.error, 'objectPermissions[0].canRead must be true or false.');
+      assert.deepEqual(groupNamed(name), []);
+    }
+    const absent = await postGroup({ name: `Flags ${tag()}`, objectPermissions: [{ objectName, canRead: true }] });
+    assert.equal(absent.status, 200, JSON.stringify(absent.body));
+    assert.deepEqual(absent.body.group.objectPermissions, [
+      { objectName, canRead: true, canCreate: false, canUpdate: false, canDelete: false, allowedFields: [] },
+    ]);
+  });
+
+  test('POST /groups keeps an Object or field that Salesforce > Objects does not have, and refuses an entry that names none', async () => {
+    const objectName = `Known_${tag()}__c`;
+    store.upsertObjectWithFields({ objectName, fields: [{ fieldName: 'Id' }, { fieldName: 'Name' }] });
+    // Kept as typed and reported as not available: it grants nothing while the catalog lacks it.
+    const kept = await postGroup({
+      name: `Unknown ${tag()}`,
+      objectPermissions: [
+        { objectName, canRead: true, allowedFields: ['id', 'Salary__c'] },
+        { objectName: 'Nope__c', canRead: true },
+      ],
+    });
+    assert.equal(kept.status, 200, JSON.stringify(kept.body));
+    assert.deepEqual(
+      kept.body.group.objectPermissions.map((p: { objectName: string; allowedFields: string[] }) => [p.objectName, p.allowedFields]),
+      [
+        [objectName, ['Id', 'Salary__c']],
+        ['Nope__c', []],
+      ]
+    );
+    assert.deepEqual(
+      kept.body.issues.map((i: { name: string; reason: string }) => [i.name, i.reason]),
+      [
+        ['Salary__c', 'field_not_in_catalog'],
+        ['Nope__c', 'object_not_in_catalog'],
+      ]
+    );
+
+    const name = `Malformed ${tag()}`;
+    const cases: Array<[unknown, string]> = [
+      [{ objectName, canRead: true, allowedFields: 'Id' }, 'objectPermissions[1].allowedFields must be an array of field API names.'],
+      [{ objectName: '  ', canRead: true }, 'objectPermissions[1].objectName must be the API name of an Object.'],
+      [{ objectName: 'Not an API name', canRead: true }, 'objectPermissions[1].objectName: "Not an API name" is not a valid Salesforce object API name.'],
+      [{ objectName, canRead: true, allowedFields: ['Id', 'Bad Field'] }, 'objectPermissions[1].allowedFields[1]: "Bad Field" is not a valid Salesforce field API name.'],
+      [['Id'], 'objectPermissions[1] must be an object.'],
+    ];
+    for (const [entry, error] of cases) {
+      const res = await postGroup({ name, objectPermissions: [{ objectName, canRead: true }, entry] });
+      assert.deepEqual([res.status, res.body.error], [400, error]);
+    }
+    const notAList = await postGroup({ name, objectPermissions: { objectName } });
+    assert.deepEqual([notAList.status, notAList.body.error], [400, 'objectPermissions must be an array.']);
+    assert.deepEqual(groupNamed(name), []);
+  });
+
+  test('POST /groups stores grants in the catalog spelling and merges entries that name one Object in any case', async () => {
+    const objectName = `Merge_${tag()}__c`;
+    const disabled = `Off_${tag()}__c`;
+    store.upsertObjectWithFields({ objectName, fields: [{ fieldName: 'Id' }, { fieldName: 'Name' }, { fieldName: 'Secret__c' }] });
+    store.upsertObjectWithFields({ objectName: disabled, enabled: false, fields: [{ fieldName: 'Id' }] });
+    const res = await postGroup({
+      name: `Merge ${tag()}`,
+      allowedActions: ['soql_query', 'update_record'],
+      objectPermissions: [
+        { objectName: objectName.toLowerCase(), canRead: true, allowedFields: ['id', 'ID'] },
+        { objectName: ` ${disabled} `, canRead: true, allowedFields: ['Id'] },
+        { objectName: objectName.toUpperCase(), canUpdate: true, allowedFields: ['NAME', 'Id'] },
+        // Grants nothing, so the policy engine never read its fields: merging must not add them.
+        { objectName, allowedFields: ['Secret__c'] },
+      ],
+    });
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.deepEqual(res.body.group.objectPermissions, [
+      { objectName, canRead: true, canCreate: false, canUpdate: true, canDelete: false, allowedFields: ['Id', 'Name'] },
+      // A disabled Object is accepted: enabling it later brings the grant back.
+      { objectName: disabled, canRead: true, canCreate: false, canUpdate: false, canDelete: false, allowedFields: ['Id'] },
+    ]);
+  });
+
+  test('POST /groups keeps the Id that an entry naming no field gave, when it merges that entry with another', async () => {
+    const objectName = `MergeId_${tag()}__c`;
+    store.upsertObjectWithFields({ objectName, fields: [{ fieldName: 'Id' }, { fieldName: 'Name' }] });
+    const res = await postGroup({
+      name: `Merge Id ${tag()}`,
+      allowedActions: ['soql_query'],
+      objectPermissions: [
+        // On its own, the policy engine reads this entry as Read on Id.
+        { objectName: objectName.toLowerCase(), canRead: true },
+        { objectName, canUpdate: true, allowedFields: ['Name'] },
+      ],
+    });
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.deepEqual(res.body.group.objectPermissions, [
+      { objectName, canRead: true, canCreate: false, canUpdate: true, canDelete: false, allowedFields: ['Name', 'Id'] },
+    ]);
+  });
+
+  test('POST /groups trims and caps the name and keeps names unique ignoring case', async () => {
+    const base = `Unique ${tag()}`;
+    const created = await postGroup({ name: `  ${base}  ` });
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    assert.equal(created.body.group.name, base);
+
+    for (const name of ['', '   ', 42]) {
+      const res = await postGroup({ name });
+      assert.deepEqual([res.status, res.body.error], [400, 'Group name is required.'], JSON.stringify(name));
+    }
+    const tooLong = await postGroup({ name: 'x'.repeat(81) });
+    assert.deepEqual([tooLong.status, tooLong.body.error], [400, 'The group name must be at most 80 characters.']);
+    const atLimit = await postGroup({ name: `${tag()}${'x'.repeat(72)}` });
+    assert.equal(atLimit.status, 200, JSON.stringify(atLimit.body));
+
+    const variant = await postGroup({ name: base.toUpperCase() });
+    assert.deepEqual([variant.status, variant.body.error], [409, `An Access Group named "${base.toUpperCase()}" already exists.`]);
+    const other = await postGroup({ name: `Other ${tag()}` });
+    const rename = await postGroup({ ...other.body.group, name: base.toLowerCase() });
+    assert.equal(rename.status, 409);
+    assert.deepEqual(groupNamed(base).map((g) => g.id), [created.body.group.id]);
+
+    // A group may change the case of its own name.
+    const recased = await postGroup({ ...created.body.group, name: base.toLowerCase() });
+    assert.equal(recased.status, 200, JSON.stringify(recased.body));
+    assert.equal(recased.body.group.name, base.toLowerCase());
+  });
+
+  test('a group an older version stored next to a case variant of its name can still be saved under that name', async () => {
+    const base = `Legacy Name ${tag()}`;
+    const kept = store.upsertGroup({ name: base, allowedActions: [], objectPermissions: [] });
+    store.upsertGroup({ name: base.toUpperCase(), allowedActions: [], objectPermissions: [] });
+    const res = await postGroup({ ...kept, expectedVersion: kept.version, description: 'Still editable' });
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(res.body.group.description, 'Still editable');
+  });
+
+  test('POST /groups with an unknown id answers 404, and the store refuses to create a group for one', async () => {
+    const id = `grp_from_another_tab_${tag()}`;
+    const res = await postGroup({ id, name: `Ghost ${tag()}` });
+    assert.deepEqual([res.status, res.body], [404, { error: 'Group not found.' }]);
+    assert.throws(
+      () => store.upsertGroup({ id, name: `Ghost ${tag()}`, allowedActions: [], objectPermissions: [] }),
+      new RegExp(`Unknown Access Group id: ${id}`)
+    );
+    assert.ok(!store.getGroups().some((g) => g.id === id));
+  });
+
+  test('POST /groups refuses a malformed expectedVersion, id or description (400)', async () => {
+    const group = store.upsertGroup({ name: `Shape ${tag()}`, allowedActions: [], objectPermissions: [] });
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ ...group, expectedVersion: '1' }, /expectedVersion must be/],
+      [{ ...group, expectedVersion: 0 }, /expectedVersion must be/],
+      [{ ...group, expectedVersion: 1.5 }, /expectedVersion must be/],
+      [{ ...group, id: 7 }, /id must be/],
+      [{ ...group, description: ['x'] }, /description must be text/],
+    ];
+    for (const [body, error] of cases) {
+      const res = await postGroup(body);
+      assert.equal(res.status, 400, JSON.stringify(body));
+      assert.match(res.body.error, error);
+    }
+    assert.deepEqual(store.getGroups().find((g) => g.id === group.id), group);
+  });
+
   test('PUT /profile-groups with an unknown group id is rejected and leaves the existing mapping intact', async () => {
     const profileId = `00e${crypto.randomBytes(6).toString('hex')}`.slice(0, 15);
     store.upsertProfile(profileId, `Profile ${tag()}`);
     const group = store.upsertGroup({ name: `Keep ${tag()}`, allowedActions: ['soql_query'], objectPermissions: [] });
+    const other = store.upsertGroup({ name: `Other ${tag()}`, allowedActions: ['soql_query'], objectPermissions: [] });
     store.setProfileGroups(profileId, [group.id]);
 
-    const res = await adminFetch(server.baseUrl, session, `/api/admin/profile-groups/${profileId}`, {
+    for (const body of [
+      { add: [other.id, 'grp_deleted_in_another_tab'], remove: [group.id] },
+      { groupIds: [other.id, 'grp_deleted_in_another_tab'], expectedGroupIds: [group.id] },
+    ]) {
+      const res = await adminFetch(server.baseUrl, session, `/api/admin/profile-groups/${profileId}`, {
+        method: 'PUT',
+        body,
+      });
+      assert.equal(res.status, 400, JSON.stringify(body));
+      assert.match(res.body.error, /grp_deleted_in_another_tab/);
+      const mapping = store.getProfileGroupMappings().find((m) => m.profileId === profileId);
+      assert.deepEqual(mapping?.groupIds, [group.id]);
+    }
+  });
+
+  test('a stale tab cannot re-grant a group another tab removed', async () => {
+    const profileId = `00e${crypto.randomBytes(6).toString('hex')}`.slice(0, 15);
+    store.upsertProfile(profileId, `Profile ${tag()}`);
+    const revoked = store.upsertGroup({ name: `Revoked ${tag()}`, allowedActions: ['soql_query'], objectPermissions: [] });
+    const kept = store.upsertGroup({ name: `Kept ${tag()}`, allowedActions: ['soql_query'], objectPermissions: [] });
+    const toggled = store.upsertGroup({ name: `Toggled ${tag()}`, allowedActions: ['soql_query'], objectPermissions: [] });
+    store.setProfileGroups(profileId, [revoked.id, kept.id]);
+    const groupsOf = () =>
+      [...(store.getProfileGroupMappings().find((m) => m.profileId === profileId)?.groupIds || [])].sort();
+    const url = `/api/admin/profile-groups/${profileId}`;
+    // Both tabs loaded the matrix while the Profile had [revoked, kept].
+    const staleTab = await loginAsAdmin(server.baseUrl);
+    const staleView = [revoked.id, kept.id];
+
+    const removal = await adminFetch(server.baseUrl, session, url, { method: 'PUT', body: { remove: [revoked.id] } });
+    assert.equal(removal.status, 200);
+    assert.deepEqual(groupsOf(), [kept.id]);
+
+    // The stale tab toggles a different group on. Only that membership is sent.
+    const toggle = await adminFetch(server.baseUrl, staleTab, url, { method: 'PUT', body: { add: [toggled.id] } });
+    assert.equal(toggle.status, 200);
+    assert.deepEqual(groupsOf(), [kept.id, toggled.id].sort(), 'the removed group must stay removed');
+
+    // A full replacement built from the stale view is refused instead of re-granting the group.
+    const replacement = await adminFetch(server.baseUrl, staleTab, url, {
       method: 'PUT',
-      body: { groupIds: [group.id, 'grp_deleted_in_another_tab'] },
+      body: { groupIds: [...staleView, toggled.id], expectedGroupIds: staleView },
     });
-    assert.equal(res.status, 400);
-    assert.match(res.body.error, /grp_deleted_in_another_tab/);
-    const mapping = store.getProfileGroupMappings().find((m) => m.profileId === profileId);
-    assert.deepEqual(mapping?.groupIds, [group.id]);
+    assert.equal(replacement.status, 409);
+    assert.deepEqual([...replacement.body.mapping.groupIds].sort(), [kept.id, toggled.id].sort());
+    assert.deepEqual(groupsOf(), [kept.id, toggled.id].sort());
   });
 });
 
@@ -289,7 +500,36 @@ describe('Audit-log redaction', () => {
     assert.deepEqual(stripped.fieldNames, ['Id', 'Name']);
     assert.equal(stripped.id, '001000000000001AAA');
     assert.equal(stripped.objectName, 'Account');
-    assert.equal(stripped.toolName, '<REDACTED:string>');
+    // Stored as the tool_name column stores a name outside the catalog.
+    assert.equal(stripped.toolName, '<invalid:len=20>');
+  });
+
+  test('a key that is not a Salesforce API name is stored by its length, at every level, and keys never collide', () => {
+    // Parsed, as /mcp receives it, so that __proto__ is a key of its own.
+    const stripped = stripSensitivePayloadData(
+      JSON.parse(`{
+        "objectName": "Contact",
+        "fields": {
+          "jane.doe@example.com 555-12-3456": "x",
+          "john.roe@example.com 555-98-7654": "y",
+          "LastName": "Doe",
+          "__proto__": { "polluted": true }
+        },
+        "Jane Doe <jane@example.com>": "z",
+        "nested": [{ "ssn 123-45-6789": 1 }]
+      }`)
+    ) as Record<string, any>;
+    const text = JSON.stringify(stripped);
+    for (const leaked of ['jane', 'john', '555', 'Jane', 'ssn', '123-45']) assert.ok(!text.includes(leaked), text);
+    assert.deepEqual(stripped.fields, {
+      '<invalid:len=32>': '<REDACTED:string>',
+      '<invalid:len=32>#2': '<REDACTED:string>',
+      LastName: '<REDACTED:string>',
+      '<invalid:len=9>': { polluted: '<REDACTED:boolean>' },
+    });
+    assert.equal(Object.getPrototypeOf(stripped.fields), Object.prototype);
+    assert.equal(stripped['<invalid:len=27>'], '<REDACTED:string>');
+    assert.deepEqual(stripped.nested.sampleStructure, { '<invalid:len=15>': '<REDACTED:number>' });
   });
 });
 
@@ -348,6 +588,32 @@ describe('Simulator tokens on tools/call', () => {
 
     assert.deepEqual(sf.calls, [], 'a simulator token must never be sent to Salesforce');
     assert.deepEqual(sf.nonSalesforceCalls, []);
+  });
+});
+
+describe('Malformed stored grants', () => {
+  test('a stored entry the engine cannot read is skipped, so tools/call answers instead of failing', async (t) => {
+    const sf = installSalesforceMock();
+    t.after(() => sf.restore());
+    const objectName = `Legacy_${tag()}__c`;
+    const { profileId, profileName } = seedReadablePolicy(objectName);
+    const group = store.getGroups().find((g) => store.getProfileGroupIds(profileId).includes(g.id))!;
+    // As an older version stored it: an objectName that is not text on an entry that grants Read, which
+    // the engine used to call toLowerCase on, so tools/call threw before the call was logged.
+    store.upsertGroup({ ...group, objectPermissions: [{ objectName: 7, canRead: true }, ...group.objectPermissions] as never });
+    const token = createSimulatorToken({ profileId, profileName });
+    const warnings: string[] = [];
+    t.mock.method(console, 'warn', (message: unknown) => warnings.push(String(message)));
+
+    const query = await mcpRequest(server.baseUrl, token, 'tools/call', { name: 'soql_query', arguments: { objectName, fields: ['Id'] } });
+    assert.equal(query.status, 200);
+    assert.notEqual(query.body.result.isError, true, JSON.stringify(query.body));
+    const row = store.getCopilotMcpLogs(5).find((r) => r.profileId === profileId);
+    assert.equal(row?.status, 'ALLOWED');
+    assert.ok(
+      warnings.some((w) => w.includes(`Access Group ${group.id}: object entry 0 is skipped`) && w.includes('objectName is not text')),
+      JSON.stringify(warnings)
+    );
   });
 });
 

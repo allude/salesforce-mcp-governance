@@ -58,6 +58,53 @@ export class SalesforceUnavailableError extends Error {
   }
 }
 
+/** What the /mcp log records for a token that failed verification (see tokenRejectionCode). */
+export type TokenRejectionCode = 'TOKEN_INVALID' | 'ORG_LOCK_VIOLATION' | 'INSTANCE_NOT_ALLOWED';
+
+/**
+ * The token itself is refused: missing or malformed, answered 401 (or another failure that is not an
+ * outage) by Salesforce, with a userinfo answer that cannot be read, or a simulator token that is
+ * forged, expired or offered in production.
+ */
+export class TokenInvalidError extends Error {
+  readonly code = 'TOKEN_INVALID';
+  constructor(message: string) {
+    super(message);
+    this.name = 'TokenInvalidError';
+  }
+}
+
+/** The token's org is not the one the Org ID lock allows. */
+export class OrgLockViolationError extends Error {
+  readonly code = 'ORG_LOCK_VIOLATION';
+  constructor() {
+    super('Salesforce org is not permitted by the Org ID lock');
+    this.name = 'OrgLockViolationError';
+  }
+}
+
+/**
+ * A Salesforce instance URL is refused (validateSalesforceInstanceUrl: not parseable, not HTTPS, with
+ * credentials or a port, not a DNS name, or outside SALESFORCE_ALLOWED_DOMAINS; or the simulated host),
+ * so no token is sent to it.
+ */
+export class InstanceNotAllowedError extends Error {
+  readonly code = 'INSTANCE_NOT_ALLOWED';
+  constructor(message: string) {
+    super(message);
+    this.name = 'InstanceNotAllowedError';
+  }
+}
+
+/**
+ * The code a failed verification is logged with: a typed refusal's own. Anything else that stopped the
+ * token from verifying (an answer of a shape no check expected) is a refused token too.
+ */
+export function tokenRejectionCode(err: unknown): TokenRejectionCode {
+  if (err instanceof OrgLockViolationError || err instanceof InstanceNotAllowedError) return err.code;
+  return 'TOKEN_INVALID';
+}
+
 const isAbort = (err: unknown) => err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError');
 
 /** fetch with the verification timeout; a timeout or network failure is SalesforceUnavailableError. */
@@ -70,14 +117,14 @@ async function fetchForVerification(url: string, headers: Record<string, string>
 }
 
 /**
- * Reads a JSON body. A body that arrived but is not JSON is Salesforce's answer; a timeout or a
- * connection lost while reading it is not a verdict either.
+ * Reads a JSON body. A body that arrived but is not JSON is Salesforce's answer, and the token is
+ * refused with the parser's message; a timeout or a connection lost while reading it is not a verdict.
  */
 async function readVerificationJson(res: Response): Promise<any> {
   try {
     return await res.json();
   } catch (err) {
-    if (err instanceof SyntaxError) throw err;
+    if (err instanceof SyntaxError) throw new TokenInvalidError(err.message);
     throw new SalesforceUnavailableError(isAbort(err) ? 'timed out' : 'not reachable');
   }
 }
@@ -87,6 +134,11 @@ const SIMULATOR_TOKEN_TTL_SECONDS = 15 * 60;
 const SIMULATED_IDENTITY_PREFIX = 'simulated:';
 const SIMULATED_NAME_MAX_LENGTH = 64;
 const DEFAULT_SIMULATED_NAME = 'test-user';
+
+/** Whether a bearer token claims to be an Admin Simulator token. Its signature is not checked here. */
+export function isSimulatorToken(bearerToken: string): boolean {
+  return bearerToken.startsWith(SIMULATOR_TOKEN_PREFIX);
+}
 
 /**
  * Validates that a Salesforce instance URL belongs to an allowed Salesforce domain
@@ -98,27 +150,27 @@ export function validateSalesforceInstanceUrl(rawUrl: string): string {
   try {
     parsed = new URL(rawUrl);
   } catch {
-    throw new Error('Invalid Salesforce instance URL');
+    throw new InstanceNotAllowedError('Invalid Salesforce instance URL');
   }
 
   // The bearer token goes to this host, so plain HTTP is refused in every environment.
   if (parsed.protocol !== 'https:') {
-    throw new Error('Salesforce instance URL must use HTTPS');
+    throw new InstanceNotAllowedError('Salesforce instance URL must use HTTPS');
   }
   if (parsed.username || parsed.password) {
-    throw new Error('Salesforce instance URL must not contain credentials');
+    throw new InstanceNotAllowedError('Salesforce instance URL must not contain credentials');
   }
   // Salesforce serves on 443 only (which URL parsing drops); another port on an allowed host could
   // only hang or reach something that is not Salesforce.
   if (parsed.port) {
-    throw new Error('Salesforce instance URL must not name a port other than 443');
+    throw new InstanceNotAllowedError('Salesforce instance URL must not name a port other than 443');
   }
 
   const host = parsed.hostname.toLowerCase();
   // URL parsing keeps characters such as `"` and `%` in hosts; the origin is later written into
   // headers, so only plain DNS labels are accepted.
   if (!/^[a-z0-9-]+(\.[a-z0-9-]+)*$/.test(host)) {
-    throw new Error('Salesforce instance host is not a valid DNS name');
+    throw new InstanceNotAllowedError('Salesforce instance host is not a valid DNS name');
   }
   const allowed = config.salesforce.allowedDomains.some((domain) =>
     domain.startsWith('.')
@@ -126,7 +178,7 @@ export function validateSalesforceInstanceUrl(rawUrl: string): string {
       : host === domain
   );
   if (!allowed) {
-    throw new Error(`Salesforce instance host '${host}' is not in SALESFORCE_ALLOWED_DOMAINS`);
+    throw new InstanceNotAllowedError(`Salesforce instance host '${host}' is not in SALESFORCE_ALLOWED_DOMAINS`);
   }
 
   return parsed.origin;
@@ -151,11 +203,20 @@ export function salesforceAuthorizationBase(): string {
 
 export { salesforceIdsMatch };
 
+/** Refuses the simulated host anywhere a bearer token would be sent, as an instance that is not allowed. */
+function refuseSimulatedTokenHost(url: string): void {
+  try {
+    assertNotSimulatedOrgHost(url, 'Salesforce instance URL');
+  } catch (err) {
+    throw new InstanceNotAllowedError(err instanceof Error ? err.message : String(err));
+  }
+}
+
 /** Rejects identities from any org other than the configured one when the Org ID lock is on. */
 function enforceOrgIdLock(organizationId: string): void {
   const { enforceOrgIdLock, expectedOrgId } = store.getSalesforceSettings();
   if (enforceOrgIdLock && expectedOrgId && !salesforceIdsMatch(organizationId, expectedOrgId)) {
-    throw new Error('Salesforce org is not permitted by the Org ID lock');
+    throw new OrgLockViolationError();
   }
 }
 
@@ -247,7 +308,7 @@ export async function resolveSalesforceUserFromToken(
   instanceUrlHint?: string
 ): Promise<VerifiedSalesforceUser> {
   if (!bearerToken) {
-    throw new Error('Missing Salesforce Bearer token');
+    throw new TokenInvalidError('Missing Salesforce Bearer token');
   }
 
   // 1. Check if this is an Admin Simulator token for testing RBAC policies locally
@@ -258,11 +319,11 @@ export async function resolveSalesforceUserFromToken(
   }
 
   if (!isPlausibleBearerToken(bearerToken)) {
-    throw new Error('Malformed Salesforce Bearer token');
+    throw new TokenInvalidError('Malformed Salesforce Bearer token');
   }
 
   // The caller's real token goes to the hint on a cache miss, and the allowlist alone admits the simulated host.
-  if (instanceUrlHint) assertNotSimulatedOrgHost(instanceUrlHint, 'Salesforce instance URL');
+  if (instanceUrlHint) refuseSimulatedTokenHost(instanceUrlHint);
 
   const tokenHash = hashToken(bearerToken);
   const cached = identityCache.get(tokenHash);
@@ -279,13 +340,13 @@ export async function resolveSalesforceUserFromToken(
   // A stored instance URL can name the simulated host too (a database saved before the hostname match,
   // or SALESFORCE_LOGIN_URL seeded with it), and the allowlist admits it, so both hosts the token may
   // reach are checked here, before it is sent anywhere.
-  assertNotSimulatedOrgHost(baseLoginUrl, 'Salesforce instance URL');
+  refuseSimulatedTokenHost(baseLoginUrl);
   const fallbackInstanceUrl = validateSalesforceInstanceUrl(sfSettings.instanceUrl || baseLoginUrl);
-  assertNotSimulatedOrgHost(fallbackInstanceUrl, 'Salesforce instance URL');
+  refuseSimulatedTokenHost(fallbackInstanceUrl);
 
   const rejectionKey = `${tokenHash}|${baseLoginUrl}`;
   const refuseIfRecentlyRejected = () => {
-    if (wasRecentlyRejected(rejectionKey)) throw new Error('Salesforce token verification failed (HTTP 401)');
+    if (wasRecentlyRejected(rejectionKey)) throw new TokenInvalidError('Salesforce token verification failed (HTTP 401)');
   };
   refuseIfRecentlyRejected();
 
@@ -331,14 +392,14 @@ async function verifyWithSalesforce(
       throw new SalesforceUnavailableError(`HTTP ${userInfoRes.status}`);
     }
     if (userInfoRes.status === 401) rememberRejectedToken(rejectionKey);
-    throw new Error(`Salesforce token verification failed (HTTP ${userInfoRes.status})`);
+    throw new TokenInvalidError(`Salesforce token verification failed (HTTP ${userInfoRes.status})`);
   }
 
   const userInfo = await readVerificationJson(userInfoRes);
   const userId: string = userInfo.user_id;
   const orgId: string = userInfo.organization_id;
   if (typeof userId !== 'string' || !userId || typeof orgId !== 'string' || !orgId) {
-    throw new Error('Salesforce userinfo response is missing user_id or organization_id');
+    throw new TokenInvalidError('Salesforce userinfo response is missing user_id or organization_id');
   }
   enforceOrgIdLock(orgId);
 
@@ -347,11 +408,17 @@ async function verifyWithSalesforce(
   if (userInfo.urls?.custom_domain) {
     instanceUrl = validateSalesforceInstanceUrl(userInfo.urls.custom_domain);
   } else if (userInfo.urls?.rest) {
-    const restOrigin = new URL(userInfo.urls.rest).origin;
+    let restOrigin: string;
+    try {
+      restOrigin = new URL(userInfo.urls.rest).origin;
+    } catch (err) {
+      // Not a URL at all: an answer that cannot be read, with the parser's message as before.
+      throw new TokenInvalidError(err instanceof Error ? err.message : 'Invalid URL');
+    }
     instanceUrl = validateSalesforceInstanceUrl(restOrigin);
   }
   // The profile lookup and every later tool call send the token here.
-  assertNotSimulatedOrgHost(instanceUrl, 'Salesforce instance URL');
+  refuseSimulatedTokenHost(instanceUrl);
 
   // 3. Query the User's ProfileId and Profile.Name via Salesforce REST API
   const apiVersion = storedApiVersion || config.salesforce.apiVersion;
@@ -550,20 +617,20 @@ export function createSimulatorToken(params: {
 function verifySimulatorToken(token: string): VerifiedSalesforceUser {
   const [encoded, signature, ...rest] = token.slice(SIMULATOR_TOKEN_PREFIX.length).split('.');
   if (!encoded || !signature || rest.length > 0) {
-    throw new Error('Invalid simulator token');
+    throw new TokenInvalidError('Invalid simulator token');
   }
   if (!timingSafeStringEqual(signature, signSimulatorPayload(encoded))) {
-    throw new Error('Invalid simulator token signature');
+    throw new TokenInvalidError('Invalid simulator token signature');
   }
 
   let decoded: any;
   try {
     decoded = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
   } catch {
-    throw new Error('Invalid simulator token');
+    throw new TokenInvalidError('Invalid simulator token');
   }
   if (typeof decoded?.exp !== 'number' || decoded.exp * 1000 <= Date.now()) {
-    throw new Error('Simulator token has expired');
+    throw new TokenInvalidError('Simulator token has expired');
   }
 
   return {

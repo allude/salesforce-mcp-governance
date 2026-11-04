@@ -6,6 +6,8 @@ import type {
   SalesforceObjectConfig,
   AccessGroup,
 } from '@/types/governance';
+import { isKnownMcpAction } from '@/groups/groupGrants';
+import { grantsAccess, readableGrants } from '@/rbac/groupGrants';
 import type { FlyoutState } from './FlyoutDrawer';
 import { newAccessGroupDraft } from './accessGroupDraft';
 
@@ -181,7 +183,8 @@ export function CommandPalette({
         id: `grp-${g.id}`,
         section: 'Access Groups',
         label: g.name,
-        meta: `${g.allowedActions.length} actions · ${g.objectPermissions.length} objects`,
+        // Counted as the Profile ↔ Group matrix counts them: only this server's tools.
+        meta: `${(g.allowedActions || []).filter(isKnownMcpAction).length} actions · ${readableGrants(g.objectPermissions).filter(grantsAccess).length} objects`,
         action: () => onOpenFlyout({ type: 'group', data: g }),
       });
     }

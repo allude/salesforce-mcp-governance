@@ -15,6 +15,7 @@ import type {
   SalesforceConnectionSettings,
 } from '@/types/governance';
 import { MCP_TOOL_CATALOG, formatShortTime } from '@/components/ui/primitives';
+import { PORTAL_PASSWORD_MIN_LENGTH } from '@/security/passwordPolicy';
 import type { FlyoutState } from './FlyoutDrawer';
 import { realTraffic } from './simulatedTraffic';
 import { portalAuditCsv, trafficLogCsv } from './csvExport';
@@ -27,7 +28,6 @@ import {
   LOG_EXPORT_PAGE_ROWS,
   exportCutMessage,
   exportFileName,
-  clearedOlderRows,
   emptyOlderRows,
   heldLogGaps,
   loadOlderRows,
@@ -771,14 +771,9 @@ function useOlderLogRows<T extends { id: string; seq?: number }>(
 ) {
   const [state, setState] = useState<OlderRowsState<T>>(emptyOlderRows);
   const [loading, setLoading] = useState(false);
-  // Bumped by clear and each read, so a page that lands after a clear or reload does not bring back what they dropped.
+  // Bumped by each read, so only the pages of the newest read are kept.
   const generation = React.useRef(0);
   const held = useMemo(() => mergeNewestFirst(logs, state.older), [logs, state.older]);
-
-  // A refresh that brings rows back refills a cleared view.
-  React.useEffect(() => {
-    if (logs.length > 0) setState((prev) => (prev.cleared ? { ...prev, cleared: false } : prev));
-  }, [logs]);
 
   const read = async (from: OlderRowsState<T>) => {
     if (loading || from.cursor === null) return;
@@ -786,8 +781,7 @@ function useOlderLogRows<T extends { id: string; seq?: number }>(
     setLoading(true);
     try {
       const next = await loadOlderRows((before, limit) => fetchPage({ before, limit }), from, logs);
-      // A refresh may have refilled the view while the pages were read.
-      if (run === generation.current) setState((prev) => ({ ...next, cleared: prev.cleared && next.cleared }));
+      if (run === generation.current) setState(next);
     } catch (err) {
       onNotify(`Could not load older rows: ${err instanceof Error ? err.message : String(err)}`, true);
     } finally {
@@ -798,22 +792,14 @@ function useOlderLogRows<T extends { id: string; seq?: number }>(
   const loadOlder = () => read(state);
   const reload = () => read(emptyOlderRows<T>());
 
-  /** Clear log: drops the loaded pages, and the view is called cleared until rows come back. */
-  const clear = () => {
-    generation.current += 1;
-    setState(clearedOlderRows<T>());
-  };
-
   return {
     held,
     older: state.older,
     cursor: state.cursor,
     loadedTop: state.loadedTop,
-    cleared: state.cleared,
     loading,
     loadOlder,
     reload,
-    clear,
   };
 }
 
@@ -907,7 +893,6 @@ interface CopilotMcpLogsViewProps {
   caps: OverviewLogCaps['copilotLogs'];
   fetchLogPage: FetchLogPage<CopilotMcpLogEntry>;
   onNotify: (msg: string, isError?: boolean) => void;
-  onClearLogs: () => Promise<void>;
   onOpenFlyout: (flyout: FlyoutState) => void;
 }
 
@@ -919,7 +904,6 @@ export function CopilotMcpLogsView({
   caps,
   fetchLogPage,
   onNotify,
-  onClearLogs,
   onOpenFlyout,
 }: CopilotMcpLogsViewProps) {
   const [q, setQ] = useState(initialSearch);
@@ -947,25 +931,15 @@ export function CopilotMcpLogsView({
   const exportCsv = () =>
     exportRows(trafficRouteQuery(filters), (r) => trafficRowMatches(r, filters), trafficLogCsv, 'mcp-traffic-log');
 
-  // Clearing empties only this view until the next refresh or Load older refills it, which the
-  // toolbar must not call an empty log.
-  const clearLogs = async () => {
-    history.clear();
-    await onClearLogs();
-  };
-
   const kinds = trafficLogKinds(caps);
-  const cleared = history.cleared;
-  const gap = !cleared && heldLogGaps({ overview: logs, loadedTop: history.loadedTop, kinds }).length > 0;
-  const heldText = cleared
-    ? 'view cleared until the next refresh'
-    : describeHeldLogs({
-        overview: logs,
-        older: history.older,
-        cursor: history.cursor,
-        kinds,
-        loadedTop: history.loadedTop,
-      });
+  const gap = heldLogGaps({ overview: logs, loadedTop: history.loadedTop, kinds }).length > 0;
+  const heldText = describeHeldLogs({
+    overview: logs,
+    older: history.older,
+    cursor: history.cursor,
+    kinds,
+    loadedTop: history.loadedTop,
+  });
 
   return (
     <div>
@@ -988,11 +962,6 @@ export function CopilotMcpLogsView({
           <button type="button" className="btn" onClick={exportCsv} disabled={exporting}>
             {exporting ? 'Exporting…' : 'Export CSV'}
           </button>
-          {history.held.length > 0 && (
-            <button type="button" className="btn dng" onClick={clearLogs}>
-              Clear log
-            </button>
-          )}
         </div>
       </div>
 
@@ -1387,7 +1356,6 @@ interface PortalAuthSettingsViewProps {
     username: string;
     displayName?: string;
     password: string;
-    role: string;
   }) => Promise<void>;
   onDeletePortalUser: (username: string) => Promise<void>;
 }
@@ -1406,8 +1374,10 @@ export function PortalAuthSettingsView({
   const [newUsername, setNewUsername] = useState('');
   const [newDisplayName, setNewDisplayName] = useState('');
   const [newPassword, setNewPassword] = useState('');
-  const [newRole, setNewRole] = useState('Security Admin');
+  // Why the last Create administrator failed; the toast fades, this stays until the form is edited.
+  const [createUserError, setCreateUserError] = useState('');
   const [busy, setBusy] = useState(false);
+  const newPasswordTooShort = newPassword.length < PORTAL_PASSWORD_MIN_LENGTH;
 
   // The live poll delivers a new settings object every few seconds. Only a real change reaches the
   // form, and never over unsaved edits.
@@ -1568,7 +1538,8 @@ export function PortalAuthSettingsView({
             <div>
               <div className="card-t">Portal Administrators</div>
               <div className="card-s">
-                Local password accounts (scrypt hashed)
+                Local password accounts (scrypt hashed). Every administrator
+                has full access.
               </div>
             </div>
             <span className="tag mono">{portalUsers.length} users</span>
@@ -1580,8 +1551,9 @@ export function PortalAuthSettingsView({
                   <div>
                     <div style={{ fontWeight: 500 }}>
                       {u.displayName}{' '}
+                      {/* Roles are not enforced yet, so a stored role would claim limits that do not exist. */}
                       <span className="tag" style={{ marginLeft: 4 }}>
-                        {u.role}
+                        Full admin
                       </span>
                     </div>
                     <div className="mono" style={{ color: 'var(--t3)' }}>
@@ -1618,52 +1590,66 @@ export function PortalAuthSettingsView({
                 className="inp"
                 placeholder="Username (e.g. secops)"
                 value={newUsername}
-                onChange={(e) => setNewUsername(e.target.value)}
+                onChange={(e) => {
+                  setNewUsername(e.target.value);
+                  setCreateUserError('');
+                }}
               />
               <input
                 className="inp"
                 placeholder="Display name"
                 value={newDisplayName}
-                onChange={(e) => setNewDisplayName(e.target.value)}
+                onChange={(e) => {
+                  setNewDisplayName(e.target.value);
+                  setCreateUserError('');
+                }}
               />
-              <input
-                type="password"
-                className="inp"
-                placeholder="Password"
-                value={newPassword}
-                onChange={(e) => setNewPassword(e.target.value)}
-              />
-              <select
-                className="inp"
-                value={newRole}
-                onChange={(e) => setNewRole(e.target.value)}
-              >
-                <option value="Super Admin">Super Admin</option>
-                <option value="Security Admin">Security Admin</option>
-                <option value="RevOps Admin">RevOps Admin</option>
-                <option value="Read-Only Auditor">Read-Only Auditor</option>
-              </select>
+              <div className="fld" style={{ gridColumn: '1 / -1', marginBottom: 0 }}>
+                <input
+                  type="password"
+                  className="inp"
+                  placeholder="Password"
+                  value={newPassword}
+                  onChange={(e) => {
+                    setNewPassword(e.target.value);
+                    setCreateUserError('');
+                  }}
+                  aria-invalid={newPassword !== '' && newPasswordTooShort}
+                />
+                <div
+                  className="hint"
+                  style={newPassword !== '' && newPasswordTooShort ? { color: 'var(--err)' } : undefined}
+                >
+                  At least {PORTAL_PASSWORD_MIN_LENGTH} characters.
+                </div>
+              </div>
             </div>
-            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 10 }}>
+              {createUserError && (
+                <span role="alert" style={{ marginRight: 'auto', fontSize: 11, color: 'var(--err)' }}>
+                  {createUserError}
+                </span>
+              )}
               <button
                 type="button"
                 className="btn pri"
-                disabled={busy || !newUsername.trim() || !newPassword.trim()}
+                disabled={busy || !newUsername.trim() || newPasswordTooShort}
                 onClick={async () => {
                   setBusy(true);
+                  setCreateUserError('');
                   try {
                     await onCreatePortalUser({
                       username: newUsername.trim(),
                       // Omitted when blank so updating an existing user's password keeps their display name
                       displayName: newDisplayName.trim() || undefined,
                       password: newPassword,
-                      role: newRole,
                     });
                     setNewUsername('');
                     setNewDisplayName('');
                     setNewPassword('');
-                  } catch {
-                    // The error toast is already showing; stay here so the admin can retry.
+                  } catch (err: any) {
+                    // The toast is showing too; stay here so the admin can read it and retry.
+                    setCreateUserError(err?.message || 'The administrator could not be saved.');
                   } finally {
                     setBusy(false);
                   }

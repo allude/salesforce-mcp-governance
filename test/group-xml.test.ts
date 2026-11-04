@@ -292,8 +292,8 @@ describe('change lines for history', () => {
 
 describe('the drawer draft', () => {
   const groups: AccessGroup[] = [
-    { id: 'grp_a', name: 'Sales Read', description: '', allowedActions: [], objectPermissions: [], updatedAt: '' },
-    { id: 'grp_b', name: 'Sales Read (imported)', description: '', allowedActions: [], objectPermissions: [], updatedAt: '' },
+    { id: 'grp_a', name: 'Sales Read', description: '', allowedActions: [], objectPermissions: [], version: 1, updatedAt: '' },
+    { id: 'grp_b', name: 'Sales Read (imported)', description: '', allowedActions: [], objectPermissions: [], version: 1, updatedAt: '' },
   ];
 
   test('an import updates the group it came from, else the one with its name, else a new one', () => {

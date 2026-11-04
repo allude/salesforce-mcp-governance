@@ -3,6 +3,12 @@ export function isSalesforceId(id: string): boolean {
   return /^[a-zA-Z0-9]{15}([a-zA-Z0-9]{3})?$/.test((id || '').trim());
 }
 
+/** Whether a value has the shape of a Salesforce Org ID: a Salesforce ID with the `00D` key prefix. */
+export function isSalesforceOrgId(id: string): boolean {
+  const clean = (id || '').trim();
+  return clean.startsWith('00D') && isSalesforceId(clean);
+}
+
 /**
  * What identifies a Salesforce ID. IDs are 15-char case-sensitive or 18-char with a checksum suffix,
  * so the key is the first 15 characters, keeping their case. Anything else is compared whole.

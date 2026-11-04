@@ -18,7 +18,7 @@ import type {
   AccessGroupHistoryEntry,
   NavViewId,
 } from '@/types/governance';
-import type { AccessGroupDraft } from '@/components/views/accessGroupDraft';
+import type { AccessGroupDraft, WorkspaceSnapshot } from '@/components/views/accessGroupDraft';
 import {
   TrafficDashboardView,
   type McpRequestStats,
@@ -267,7 +267,8 @@ export default function AdminPortalPage() {
     void refreshLoginOptions();
   }, [refreshLoginOptions]);
 
-  const fetchWorkspace = useCallback(async () => {
+  /** Reloads the workspace. Answers the groups and Objects it read (one snapshot), or null when it failed. */
+  const fetchWorkspace = useCallback(async (): Promise<WorkspaceSnapshot | null> => {
     try {
       const sentAt = Date.now();
       const res = await fetch('/api/admin/overview', {
@@ -275,9 +276,9 @@ export default function AdminPortalPage() {
       });
       if (res.status === 401) {
         handleSessionExpired();
-        return;
+        return null;
       }
-      if (!res.ok) return;
+      if (!res.ok) return null;
       const data = await readJsonBody(res);
       const receivedAt = Date.now();
       setClockOffsetMs(estimateClockOffsetMs(data.serverTime, sentAt, receivedAt));
@@ -297,8 +298,10 @@ export default function AdminPortalPage() {
       if (data.oktaSettings) setOktaSettings(data.oktaSettings);
       if (data.sfSettings) setSfSettings(data.sfSettings);
       if (data.portalUsers) setPortalUsers(data.portalUsers);
+      return { groups: data.groups || [], objects: data.objects || [] };
     } catch {
       // ignore transient poll error
+      return null;
     }
   }, [handleSessionExpired]);
 
@@ -345,7 +348,11 @@ export default function AdminPortalPage() {
         handleSessionExpired();
       }
       if (!res.ok) {
-        throw new Error(data.error || `Request failed (${res.status})`);
+        // The status and body ride along, for a caller that acts on a particular refusal (a 409 conflict).
+        throw Object.assign(new Error(data.error || `Request failed (${res.status})`), {
+          status: res.status,
+          body: data,
+        });
       }
       return data as T;
     },
@@ -498,8 +505,8 @@ export default function AdminPortalPage() {
     profileId: string,
     groupId: string
   ) => {
-    // One save per Profile at a time: a second click would send a replacement list computed from
-    // stale state, which could silently undo a revocation.
+    // One save per Profile at a time: a second click before the reload would read the same state and
+    // repeat the first toggle instead of reversing it.
     if (savingProfileIds.current.has(profileId)) return;
     savingProfileIds.current.add(profileId);
     try {
@@ -515,18 +522,16 @@ export default function AdminPortalPage() {
     profileId: string,
     groupId: string
   ) => {
-    const existing =
-      mappings.find((m) => m.profileId === profileId)?.groupIds || [];
-    const has = existing.includes(groupId);
-    const nextGroupIds = has
-      ? existing.filter((x) => x !== groupId)
-      : [...existing, groupId];
+    const has = (
+      mappings.find((m) => m.profileId === profileId)?.groupIds || []
+    ).includes(groupId);
 
+    // Only the toggled membership is sent, so a group changed in another tab stays as it was.
     const data = await apiFetch(
       `/api/admin/profile-groups/${encodeURIComponent(profileId)}`,
       {
         method: 'PUT',
-        body: JSON.stringify({ groupIds: nextGroupIds }),
+        body: JSON.stringify(has ? { remove: [groupId] } : { add: [groupId] }),
       }
     );
     if (data.profileGroupMappings) setMappings(data.profileGroupMappings);
@@ -623,12 +628,16 @@ export default function AdminPortalPage() {
     );
   };
 
+  /** Saves a group from the drawer, whichever view (Visual, XML) or source (import, restore) it came from. */
   const handleSaveGroup = async (
     group: AccessGroupDraft & { source: AccessGroupChangeSource; sourceDetail: string }
   ) => {
+    const { version, ...fields } = group;
     const data = await apiFetch('/api/admin/groups', {
       method: 'POST',
-      body: JSON.stringify(group),
+      // An update names the version it was built from, so a group changed elsewhere since is refused
+      // (409, with the current group for the drawer's "Reload group") instead of overwritten.
+      body: JSON.stringify(fields.id ? { ...fields, expectedVersion: version } : fields),
     });
     if (data.groups) setGroups(data.groups);
     await fetchWorkspace();
@@ -1171,7 +1180,8 @@ export default function AdminPortalPage() {
                     ? 'Okta SSO'
                     : 'Password'}
                 </span>
-                <span>· {session.role || 'Admin'}</span>
+                {/* Roles are not enforced yet, so every portal administrator has full access. */}
+                <span>· Full admin</span>
               </div>
             </div>
           </div>
@@ -1377,10 +1387,6 @@ export default function AdminPortalPage() {
               caps={logCaps.copilotLogs}
               fetchLogPage={(query) => apiFetch(logPageUrl('/api/admin/mcp-logs', query))}
               onNotify={notify}
-              onClearLogs={async () => {
-                setCopilotLogs([]);
-                notify('Cleared view buffer');
-              }}
               onOpenFlyout={(f) => setFlyout(f)}
             />
           )}

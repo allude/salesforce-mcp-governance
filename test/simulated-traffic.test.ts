@@ -102,6 +102,63 @@ describe('POST /test-mcp-access', () => {
     );
   });
 
+  test('the row is kind simulated, with its decision and the simulation\'s measured time, and the answer keeps its shape', async (t) => {
+    const { profileId, objectName } = seedProfile();
+    // A slow Profile lookup inside the simulation, so its measured time is known to exceed any made-up one.
+    const slowMs = 120;
+    const getProfileById = store.getProfileById.bind(store);
+    t.mock.method(store, 'getProfileById', (id: string) => {
+      const until = performance.now() + slowMs;
+      while (performance.now() < until);
+      return getProfileById(id);
+    });
+
+    const allowed = await simulate({ profileId, toolName: 'soql_query', targetObject: objectName });
+    const denied = await simulate({ profileId, toolName: 'delete_record', targetObject: objectName });
+
+    for (const res of [allowed, denied]) {
+      assert.equal(res.status, 200, JSON.stringify(res.body));
+      assert.deepEqual(Object.keys(res.body), ['simulatorBearerToken', 'evaluation', 'decision', 'effectivePermissions']);
+    }
+    const [deniedRow, allowedRow] = rowsFor(profileId);
+    const groupIds = store.getProfileGroupIds(profileId);
+    for (const [row, code, stage, deciding] of [
+      [allowedRow, 'ALLOWED', 'crud', groupIds],
+      [deniedRow, 'TOOL_NOT_GRANTED', 'tool_grant', []],
+    ] as const) {
+      assert.equal(row.kind, 'simulated');
+      assert.equal(row.simulated, true);
+      assert.deepEqual([row.decisionCode, row.decisionStage, row.decidingGroupIds], [code, stage, deciding]);
+      assert.equal(row.decision?.code, code);
+      assert.deepEqual(row.assignedGroupIds, groupIds);
+      assert.equal(row.policyRevision, store.getPolicyRevision());
+      assert.deepEqual([row.callerProfileId, row.matchedProfileId, row.matchMethod], [profileId, profileId, 'id']);
+      assert.equal(row.verificationMs, null, 'no bearer token was verified');
+      assert.ok(row.totalMs! >= slowMs, `totalMs ${row.totalMs} is the measured time`);
+      assert.equal(row.latencyMs, row.totalMs);
+    }
+  });
+
+  test('a simulation as a Profile registered under an id that is not a Salesforce id keeps that id as the one matched', async () => {
+    const { profileName, objectName } = seedProfile();
+    const groupIds = store.getProfileGroupIds(store.getProfiles().find((p) => p.name === profileName)!.id);
+    // The CSV import stores any id, as POST /profiles/import-csv does.
+    const registeredId = `SIM_OPS_${tag()}`;
+    store.importProfilesFromCsvRows([{ id: registeredId, name: `Sim Ops ${tag()}` }]);
+    store.setProfileGroups(registeredId, groupIds);
+
+    const res = await simulate({ profileId: registeredId, toolName: 'soql_query', targetObject: objectName });
+
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    const [row] = rowsFor(registeredId);
+    assert.deepEqual([row.kind, row.decisionCode, row.decidingGroupIds], ['simulated', 'ALLOWED', groupIds]);
+    // The id typed for the simulation is not one Salesforce could give; the registry's own id is kept.
+    assert.deepEqual(
+      [row.callerProfileId, row.matchedProfileId, row.matchMethod],
+      [`<invalid:len=${registeredId.length}>`, registeredId, 'id']
+    );
+  });
+
   test('overview returns the marker on rows', async () => {
     const { profileId, objectName } = seedProfile();
     await simulate({ profileId, toolName: 'soql_query', targetObject: objectName });
@@ -126,10 +183,29 @@ describe('POST /test-mcp-access', () => {
     assert.ok(entry.details.includes('simulated:ceo@acme.com'), entry.details);
     assert.ok(entry.details.includes('DENIED'), entry.details);
   });
+
+  test('in production it still evaluates the call but hands out no simulator token', async () => {
+    const { profileId, objectName } = seedProfile();
+    const mutable = config as { isProd: boolean };
+    mutable.isProd = true;
+    let res;
+    try {
+      res = await simulate({ profileId, toolName: 'soql_query', targetObject: objectName });
+    } finally {
+      mutable.isProd = false;
+    }
+
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(res.body.evaluation.permitted, true);
+    assert.equal('simulatorBearerToken' in res.body, false);
+    const entry = store.getPortalAdminLogs(50).find((l) => l.action === 'SIMULATE_MCP_CALL' && l.target.includes(profileId));
+    assert.ok(entry, 'expected a SIMULATE_MCP_CALL row');
+    assert.ok(!entry.details.includes('token'), entry.details);
+  });
 });
 
 describe('/mcp', () => {
-  test('tools/call with a simulator token logs marked rows for allowed, denied and failed calls', async (t) => {
+  test('tools/call with a simulator token logs marked rows for an allowed call and calls denied by tool and by field', async (t) => {
     const sf = installSalesforceMock();
     t.after(() => sf.restore());
     const { profileId, profileName, objectName } = seedProfile();
@@ -137,7 +213,7 @@ describe('/mcp', () => {
 
     await mcpRequest(server.baseUrl, token, 'tools/call', { name: 'soql_query', arguments: { objectName, fields: ['Id'] } });
     await mcpRequest(server.baseUrl, token, 'tools/call', { name: 'delete_record', arguments: { objectName, recordId: '001000000000001AAA' } });
-    // A field outside the grant passes the tool check and is refused during execution, the third log site.
+    // A field outside the grant passes the tool and Object checks and is refused by the field check.
     await mcpRequest(server.baseUrl, token, 'tools/call', { name: 'soql_query', arguments: { objectName, fields: ['Secret__c'] } });
 
     const rows = rowsFor(profileId);

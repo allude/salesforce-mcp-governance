@@ -14,6 +14,8 @@ import {
   ProfileGroupMapping,
   CopilotMcpLogRecord,
   McpActivityFigures,
+  McpLogDecision,
+  McpLogKind,
   McpTrafficRange,
   McpTrafficSeries,
   McpTrafficSlice,
@@ -23,6 +25,7 @@ import {
   ProfileSyncDiffPreview,
   ObjectSyncDiffPreview,
   PortalUserSummary,
+  AVAILABLE_MCP_ACTIONS,
   AccessGroupChangeSource,
   AccessGroupHistoryEntry,
   AccessGroupSnapshot,
@@ -35,6 +38,18 @@ import {
 } from '../salesforce/jwtConnection.js';
 import { salesforceIdKey, salesforceIdsMatch } from '../salesforce/ids.js';
 import { isSimulatedOrgHost, isUninitialisedMcpTokenHost } from '../salesforce/simulatedOrg.js';
+import { soqlSkeleton } from '../mcp/soqlGuard.js';
+import { auditResultFromAction, PORTAL_AUDIT_RESULTS, type PortalAuditResult } from '../security/auditResult.js';
+import {
+  isHeldGrant,
+  malformedGrantReason,
+  mergeGrants,
+  readableGrants,
+  spellingLookup,
+  uniqueIgnoringCase,
+} from '../rbac/groupGrants.js';
+import { decisionLogColumns, policySnapshotCatalog, type GatewayDecision } from '../rbac/decisionLog.js';
+import type { PolicyDecision, PolicySnapshot } from '../rbac/policyEngine.js';
 
 const dbDir = path.dirname(config.dbPath);
 if (!fs.existsSync(dbDir)) {
@@ -43,13 +58,29 @@ if (!fs.existsSync(dbDir)) {
 
 const db = new DatabaseSync(config.dbPath);
 
+// What the policy revision triggers need to know of this connection (see installPolicyRevision):
+// whether runInTransaction has a transaction open and whether it has bumped the revision yet. A TEMP
+// table is never stored, so it starts afresh with every boot, and a rollback restores it as it does
+// everything else.
+db.exec(`
+  CREATE TEMP TABLE policy_txn (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    active INTEGER NOT NULL,
+    bumped INTEGER NOT NULL
+  );
+  INSERT INTO temp.policy_txn (id, active, bumped) VALUES (1, 0, 0);
+`);
+const openPolicyTxn = db.prepare('UPDATE temp.policy_txn SET active = 1, bumped = 0 WHERE id = 1');
+const closePolicyTxn = db.prepare('UPDATE temp.policy_txn SET active = 0, bumped = 0 WHERE id = 1');
+
 let transactionDepth = 0;
 let transactionDoomed = false;
 
 /**
  * Runs `fn` atomically: either every statement in it commits or none does. A nested call joins the
  * open transaction. Its failure dooms the whole transaction, even if an outer step catches the error,
- * so a half-applied inner step can never commit. `fn` must be synchronous.
+ * so a half-applied inner step can never commit. `fn` must be synchronous. However many policy rows
+ * the transaction changes, it raises the policy revision once, and only if it commits.
  */
 export function runInTransaction<T>(fn: () => T): T {
   if (transactionDepth > 0) {
@@ -68,10 +99,12 @@ export function runInTransaction<T>(fn: () => T): T {
   transactionDepth = 1;
   transactionDoomed = false;
   try {
+    openPolicyTxn.run();
     const result = fn();
     if (transactionDoomed) {
       throw new Error('Transaction rolled back: a nested step failed.');
     }
+    closePolicyTxn.run();
     db.exec('COMMIT');
     return result;
   } catch (err) {
@@ -136,41 +169,73 @@ function insertGroupHistory(entry: {
 }
 
 /**
- * Rewrites the object entries of every Access Group with `rewrite` (null leaves a group alone), and
- * records the change in each changed group's history. Returns the names of the changed groups.
+ * A group's stored entries for a revocation: the entries of the column, or null when it does not hold
+ * a list. Revocation leaves such a column as stored, and every entry that does not name the revoked
+ * Object as text (see namesObjectAsText): rewriting them would lose what an operator may still want to
+ * recover by hand.
+ */
+function storedEntriesForRevocation(json: string): unknown[] | null {
+  const entries = parseStoredJson(json);
+  return Array.isArray(entries) ? entries : null;
+}
+
+/**
+ * Whether a stored entry, readable or not, names `objectName` as text, ignoring case. A revocation
+ * holds the Object or field on every such entry, malformed ones included: this release grants nothing
+ * for those, but an older release run on the database after a rollback reads one such as
+ * `canRead: "false"` as a grant. Every release since holding was added skips a held entry and never
+ * reads a held field, so a deleted and re-imported Object or field cannot get that access back there.
+ */
+function namesObjectAsText(entry: unknown, objectName: string): boolean {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+  const named = (entry as Record<string, unknown>).objectName;
+  return typeof named === 'string' && named.toLowerCase() === objectName.toLowerCase();
+}
+
+/**
+ * Rewrites the stored object entries of every Access Group with `rewrite` (null leaves a group alone),
+ * raises the version of each group it changes, and records the change in that group's history. A
+ * column that holds no list is left alone (see storedEntriesForRevocation). Returns the names of the
+ * groups `rewrite` says lost a grant.
  */
 function rewriteGroupGrants(
-  rewrite: (perms: GroupObjectPermission[]) => GroupObjectPermission[] | null,
+  rewrite: (entries: unknown[]) => { entries: unknown[]; lostGrant: boolean } | null,
   historyLine: string,
   change: GroupChange,
   now: string
 ): string[] {
   const rows = db.prepare('SELECT * FROM access_groups').all() as any[];
-  const updateGroup = db.prepare('UPDATE access_groups SET object_permissions_json = ?, updated_at = ? WHERE id = ?');
-  const changedGroups: string[] = [];
+  const updateGroup = db.prepare(
+    'UPDATE access_groups SET object_permissions_json = ?, version = version + 1, updated_at = ? WHERE id = ?'
+  );
+  const revokedGroups: string[] = [];
   for (const row of rows) {
-    const group = groupFromRow(row);
-    const next = rewrite(group.objectPermissions);
+    const entries = storedEntriesForRevocation(row.object_permissions_json);
+    if (!entries) continue;
+    const next = rewrite(entries);
     if (!next) continue;
-    updateGroup.run(JSON.stringify(next), now, row.id);
+    updateGroup.run(JSON.stringify(next.entries), now, row.id);
     insertGroupHistory({
-      groupId: group.id,
+      groupId: row.id,
       kind: 'catalog',
       change,
       changes: [historyLine],
-      snapshot: { ...group, objectPermissions: next },
+      snapshot: { ...groupFromRow(row), objectPermissions: next.entries as GroupObjectPermission[] },
       timestamp: now,
     });
-    changedGroups.push(group.name);
+    if (next.lostGrant) revokedGroups.push(row.name);
   }
-  return changedGroups;
+  return revokedGroups;
 }
 
 /**
  * Deletes a field and revokes it from every Access Group, reporting which groups lost it. A group
  * keeps the field, held in `removedFields`, so admins can see it is gone and why, but a held field
  * grants nothing, even when a later sync brings it back, until an admin restores it.
- * While a case variant still exists the grants still refer to it and stay.
+ * While a case variant still exists the grants still refer to it and stay. A malformed entry that
+ * names the Object has the field held too, out of its allowedFields list, but its group is not
+ * reported: it granted nothing, and nor did a held entry. Other entries and unreadable columns are
+ * left as stored (see storedEntriesForRevocation).
  */
 function deleteFieldAndRevokeGrants(
   objName: string,
@@ -191,23 +256,29 @@ function deleteFieldAndRevokeGrants(
 
     const now = new Date().toISOString();
     const removal = { at: now, by: change.actor.username };
-    const isField = (f: string) => String(f).toLowerCase() === fldName.toLowerCase();
+    const isField = (f: unknown) => typeof f === 'string' && f.toLowerCase() === fldName.toLowerCase();
     const revokedGroups = rewriteGroupGrants(
-      (perms) => {
+      (entries) => {
         let changed = false;
-        const kept = perms.map((p) => {
-          if (String(p.objectName).toLowerCase() !== objName.toLowerCase()) return p;
-          const granted = (p.allowedFields || []).find(isField);
-          if (granted === undefined) return p;
+        let lostGrant = false;
+        const kept = entries.map((entry) => {
+          if (!namesObjectAsText(entry, objName)) return entry;
+          const p = entry as Record<string, unknown>;
+          if (!Array.isArray(p.allowedFields)) return entry;
+          const granted = p.allowedFields.find(isField) as string | undefined;
+          if (granted === undefined) return entry;
           changed = true;
-          const held = p.removedFields || [];
+          const held: unknown[] = Array.isArray(p.removedFields) ? p.removedFields : [];
+          const alreadyHeld = held.some((f) => isField((f as { fieldName?: unknown } | null)?.fieldName));
+          // A field the entry also holds (an older release or a hand edit) granted nothing already.
+          if (malformedGrantReason(entry) === null && !isHeldGrant(entry) && !alreadyHeld) lostGrant = true;
           return {
             ...p,
-            allowedFields: (p.allowedFields || []).filter((f) => !isField(f)),
-            removedFields: held.some((f) => isField(f.fieldName)) ? held : [...held, { fieldName: granted, ...removal }],
+            allowedFields: p.allowedFields.filter((f) => !isField(f)),
+            removedFields: alreadyHeld ? held : [...held, { fieldName: granted, ...removal }],
           };
         });
-        return changed ? kept : null;
+        return changed ? { entries: kept, lostGrant } : null;
       },
       `${objName}.${fldName} was deleted from Salesforce > Objects. It stays on this group as not available and grants nothing until an admin restores it.`,
       change,
@@ -219,10 +290,12 @@ function deleteFieldAndRevokeGrants(
 
 /**
  * Deletes an Object and its fields and revokes it from every Access Group, reporting which groups
- * lost it. A group keeps the entry, marked `removed`, so admins can see what it granted and why it
- * stopped, but the entry grants nothing, even if the object is imported again, until an admin
- * restores it. Grants match objects case-insensitively; while a case variant (e.g. 'Account' after
- * deleting a stray 'account') still exists, the grants still refer to it and must stay.
+ * lost it. A group keeps each entry that names it, marked `removed`, so admins can see what it granted
+ * and why it stopped, but the entry grants nothing, even if the object is imported again, until an
+ * admin restores it. Grants match objects case-insensitively; while a case variant (e.g. 'Account'
+ * after deleting a stray 'account') still exists, the grants still refer to it and must stay. A
+ * malformed entry that names the Object is held too, but its group is not reported: it granted
+ * nothing. Other entries and unreadable columns are left as stored (see storedEntriesForRevocation).
  */
 function deleteObjectAndRevokeGrants(objectName: string, change: GroupChange): { deleted: boolean; revokedGroups: string[] } {
   return runInTransaction(() => {
@@ -235,14 +308,23 @@ function deleteObjectAndRevokeGrants(objectName: string, change: GroupChange): {
 
     const now = new Date().toISOString();
     const revokedGroups = rewriteGroupGrants(
-      (perms) => {
+      (entries) => {
         let changed = false;
-        const kept = perms.map((p) => {
-          if (String(p.objectName).toLowerCase() !== objectName.toLowerCase() || p.removed) return p;
+        let lostGrant = false;
+        const kept = entries.map((entry) => {
+          if (!namesObjectAsText(entry, objectName) || isHeldGrant(entry)) return entry;
           changed = true;
-          return { ...p, removed: { at: now, by: change.actor.username } };
+          if (malformedGrantReason(entry) === null) lostGrant = true;
+          // `removed` goes before `removedFields`, as POST /groups stores an entry, so saving the group
+          // unedited stores the same JSON and keeps its version.
+          const { removedFields, ...rest } = entry as Record<string, unknown>;
+          return {
+            ...rest,
+            removed: { at: now, by: change.actor.username },
+            ...(removedFields !== undefined ? { removedFields } : {}),
+          };
         });
-        return changed ? kept : null;
+        return changed ? { entries: kept, lostGrant } : null;
       },
       `${objectName} was deleted from Salesforce > Objects. It stays on this group as not available and grants nothing until an admin restores it.`,
       change,
@@ -252,58 +334,21 @@ function deleteObjectAndRevokeGrants(objectName: string, change: GroupChange): {
   });
 }
 
+/**
+ * A stored group as every reader gets it. A list column that does not parse reads as an empty list (see
+ * storedGroupList); its entries are as stored, so the policy engine, which skips what it cannot read,
+ * decides what they grant.
+ */
 function groupFromRow(r: any): AccessGroup {
   return {
     id: r.id,
     name: r.name,
     description: r.description,
-    allowedActions: JSON.parse(r.allowed_actions_json || '[]'),
-    objectPermissions: JSON.parse(r.object_permissions_json || '[]'),
+    allowedActions: storedGroupList(r.id, 'allowed_actions_json', r.allowed_actions_json),
+    objectPermissions: storedGroupList(r.id, 'object_permissions_json', r.object_permissions_json),
+    version: Number(r.version),
     updatedAt: r.updated_at,
   };
-}
-
-function writeGroupRow(input: {
-  id?: string;
-  name: string;
-  description?: string;
-  allowedActions: string[];
-  objectPermissions: GroupObjectPermission[];
-}): AccessGroup {
-  const now = new Date().toISOString();
-  const requestedId = input.id?.trim();
-  // New groups get a random id, and a create is a plain INSERT, so it can never collide with
-  // (and silently overwrite) another group. Passing an id updates that group.
-  const id =
-    requestedId ||
-    `grp_${input.name
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '_')}_${crypto.randomBytes(6).toString('hex')}`;
-
-  const insertSql = `
-    INSERT INTO access_groups (id, name, description, allowed_actions_json, object_permissions_json, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?)`;
-  db.prepare(
-    requestedId
-      ? `${insertSql}
-    ON CONFLICT(id) DO UPDATE SET
-      name = excluded.name,
-      description = excluded.description,
-      allowed_actions_json = excluded.allowed_actions_json,
-      object_permissions_json = excluded.object_permissions_json,
-      updated_at = excluded.updated_at`
-      : insertSql
-  ).run(
-    id,
-    input.name.trim(),
-    (input.description || '').trim(),
-    JSON.stringify(input.allowedActions || []),
-    JSON.stringify(input.objectPermissions || []),
-    now
-  );
-
-  return groupFromRow(db.prepare('SELECT * FROM access_groups WHERE id = ?').get(id));
 }
 
 /**
@@ -367,6 +412,66 @@ function readStoredPrivateKey(privateKeyEnc: string): { privateKeyPem: string; u
   }
 }
 
+/** The MCP log user for a bearer token that failed verification, so the caller is unknown. */
+export const UNVERIFIED_CALLER_USERNAME = 'unverified_caller';
+
+type LogTable = 'mcp_copilot_logs' | 'portal_admin_logs';
+
+/**
+ * The two log tables. A new database creates them from these, and rebuildLogTableWithSeq rebuilds an
+ * older one from the same text, so both end with the same table. `seq` is the write order: the order
+ * every reader lists rows in and the paging cursor. On mcp_copilot_logs, the columns after `simulated`
+ * describe how the call was decided and timed; '' (or '[]') and NULL mean "not recorded", which is what
+ * a row written before they existed holds. `kind` is the exception: it is filled in for every row (see
+ * classifyMcpLogKinds), and its default '' exists only so that an older release can still insert.
+ */
+const LOG_TABLE_COLUMNS: Record<LogTable, string> = {
+  mcp_copilot_logs: `
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    timestamp TEXT NOT NULL,
+    sf_username TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    profile_name TEXT NOT NULL,
+    matched_groups_json TEXT NOT NULL DEFAULT '[]',
+    tool_name TEXT NOT NULL,
+    target_object TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL,
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    sanitized_request_payload TEXT NOT NULL DEFAULT '{}',
+    sanitized_response_summary TEXT NOT NULL DEFAULT '{}',
+    simulated INTEGER NOT NULL DEFAULT 0,
+    kind TEXT NOT NULL DEFAULT '',
+    decision_json TEXT NOT NULL DEFAULT '',
+    decision_stage TEXT NOT NULL DEFAULT '',
+    decision_code TEXT NOT NULL DEFAULT '',
+    assigned_group_ids_json TEXT NOT NULL DEFAULT '[]',
+    deciding_group_ids_json TEXT NOT NULL DEFAULT '[]',
+    policy_revision INTEGER,
+    caller_profile_id TEXT NOT NULL DEFAULT '',
+    matched_profile_id TEXT NOT NULL DEFAULT '',
+    match_method TEXT NOT NULL DEFAULT '',
+    verification_ms INTEGER,
+    total_ms INTEGER
+  `,
+  portal_admin_logs: `
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    timestamp TEXT NOT NULL,
+    admin_username TEXT NOT NULL,
+    auth_method TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target TEXT NOT NULL,
+    details TEXT NOT NULL,
+    ip_address TEXT NOT NULL,
+    result TEXT NOT NULL DEFAULT 'SUCCESS',
+    target_type TEXT NOT NULL DEFAULT '',
+    target_id TEXT NOT NULL DEFAULT '',
+    diff_json TEXT NOT NULL DEFAULT '',
+    correlation_id TEXT NOT NULL DEFAULT ''
+  `,
+};
+
 db.exec(`
   PRAGMA journal_mode = WAL;
   PRAGMA foreign_keys = ON;
@@ -417,7 +522,8 @@ db.exec(`
     description TEXT NOT NULL DEFAULT '',
     allowed_actions_json TEXT NOT NULL DEFAULT '[]',
     object_permissions_json TEXT NOT NULL DEFAULT '[]',
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1
   );
 
   CREATE TABLE IF NOT EXISTS profile_group_memberships (
@@ -444,31 +550,9 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_access_group_history_group ON access_group_history (group_id);
 
-  CREATE TABLE IF NOT EXISTS mcp_copilot_logs (
-    id TEXT PRIMARY KEY,
-    timestamp TEXT NOT NULL,
-    sf_username TEXT NOT NULL,
-    profile_id TEXT NOT NULL,
-    profile_name TEXT NOT NULL,
-    matched_groups_json TEXT NOT NULL DEFAULT '[]',
-    tool_name TEXT NOT NULL,
-    target_object TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL,
-    latency_ms INTEGER NOT NULL DEFAULT 0,
-    sanitized_request_payload TEXT NOT NULL DEFAULT '{}',
-    sanitized_response_summary TEXT NOT NULL DEFAULT '{}'
-  );
+  CREATE TABLE IF NOT EXISTS mcp_copilot_logs (${LOG_TABLE_COLUMNS.mcp_copilot_logs});
 
-  CREATE TABLE IF NOT EXISTS portal_admin_logs (
-    id TEXT PRIMARY KEY,
-    timestamp TEXT NOT NULL,
-    admin_username TEXT NOT NULL,
-    auth_method TEXT NOT NULL,
-    action TEXT NOT NULL,
-    target TEXT NOT NULL,
-    details TEXT NOT NULL,
-    ip_address TEXT NOT NULL
-  );
+  CREATE TABLE IF NOT EXISTS portal_admin_logs (${LOG_TABLE_COLUMNS.portal_admin_logs});
 
   CREATE TABLE IF NOT EXISTS okta_config (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -505,6 +589,13 @@ db.exec(`
     sfdx_objects_folder_path TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS policy_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    revision INTEGER NOT NULL DEFAULT 1,
+    uncounted_writes INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+  );
 `);
 
 /** Returns true only when this call added the column. */
@@ -513,6 +604,67 @@ function ensureColumnExists(tableName: string, columnName: string, columnDef: st
   if (cols.some((c) => c.name === columnName)) return false;
   db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnDef}`);
   return true;
+}
+
+/** The tables an /mcp decision is made from. A change to any of their rows is a policy change. */
+const POLICY_TABLES = ['sf_profiles', 'sf_objects', 'sf_object_fields', 'access_groups', 'profile_group_memberships'];
+
+/** Columns of those tables that change without changing the policy: when a row was saved, and how often a group was. */
+const NON_POLICY_COLUMNS = new Set(['updated_at', 'version']);
+
+/**
+ * The policy revision is one counter in policy_state for everything /mcp decides from: Profiles, Objects
+ * and fields, Access Groups and memberships. It starts at 1, on a new database and on one upgraded to
+ * it alike, and never goes down. TEMP triggers on this connection raise it, so whichever store function,
+ * migration or ON DELETE CASCADE changes those rows, nobody has to remember to: an insert, a delete, or
+ * an update that changes a value other than a timestamp or a group's version. Saving the same values
+ * again fires nothing. Inside runInTransaction the first such row raises it, in the same transaction,
+ * and the rest of that transaction does not, so a change and its revision commit or roll back together.
+ * A statement outside a transaction commits by itself, so each row it changes raises it, which is why
+ * store functions that change several rows run in a transaction. Admin sessions, portal users, Okta
+ * and Salesforce connection settings and the logs are in no such table: they never raise it.
+ *
+ * Another connection has no TEMP triggers: an older release run on this database after a rollback, or
+ * a hand edit. So that its changes are not left out, triggers stored in the database add every row they
+ * fire for to uncounted_writes, on any connection, and the TEMP triggers take it away again. They name
+ * no TEMP table (they cannot), so an older release's writes still succeed. Whatever is left when the
+ * store loads was changed without being counted, and raises the revision by one before anything reads it.
+ *
+ * The compared columns are read when the store loads, so this runs after the migrations that add a
+ * column to these tables and before any that changes their rows, which then counts as a change. The
+ * stored triggers are made again each time, so they compare the same columns as the TEMP ones.
+ */
+function installPolicyRevision() {
+  const bump = `BEGIN
+    UPDATE policy_state SET revision = revision + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    WHERE id = 1 AND (SELECT active = 0 OR bumped = 0 FROM temp.policy_txn WHERE id = 1);
+    UPDATE policy_txn SET bumped = 1 WHERE id = 1 AND active = 1;
+    UPDATE policy_state SET uncounted_writes = uncounted_writes - 1 WHERE id = 1;
+  END`;
+  const tally = `BEGIN
+    UPDATE policy_state SET uncounted_writes = uncounted_writes + 1 WHERE id = 1;
+  END`;
+  runInTransaction(() => {
+    const now = new Date().toISOString();
+    db.prepare('INSERT OR IGNORE INTO policy_state (id, revision, updated_at) VALUES (1, 1, ?)').run(now);
+    for (const table of POLICY_TABLES) {
+      const changed = (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
+        .filter((c) => !NON_POLICY_COLUMNS.has(c.name))
+        .map((c) => `OLD."${c.name}" IS NOT NEW."${c.name}"`)
+        .join(' OR ');
+      for (const [event, when] of [['INSERT', ''], ['UPDATE', `WHEN ${changed}`], ['DELETE', '']]) {
+        const suffix = `${table}_${event.toLowerCase()}`;
+        db.exec(`
+          DROP TRIGGER IF EXISTS main.policy_writes_${suffix};
+          CREATE TRIGGER main.policy_writes_${suffix} AFTER ${event} ON ${table} ${when} ${tally};
+          CREATE TEMP TRIGGER policy_revision_${suffix} AFTER ${event} ON ${table} ${when} ${bump};
+        `);
+      }
+    }
+    db.prepare(
+      'UPDATE policy_state SET revision = revision + 1, uncounted_writes = 0, updated_at = ? WHERE id = 1 AND uncounted_writes <> 0'
+    ).run(now);
+  });
 }
 
 /**
@@ -531,10 +683,269 @@ function addSimulatedColumnAndMarkLegacyRows() {
   });
 }
 
+/** The kind of an MCP log row written without one: classifyMcpLogKinds applies the same rule in SQL. */
+function mcpLogKind(simulated: boolean, sfUsername: string): McpLogKind {
+  if (simulated) return 'simulated';
+  return sfUsername === UNVERIFIED_CALLER_USERNAME ? 'rejected' : 'real';
+}
+
+const quoteIdentifier = (name: string) => `"${name.replace(/"/g, '""')}"`;
+
+/**
+ * Gives a log table an explicit write order, `seq INTEGER PRIMARY KEY AUTOINCREMENT`, in place of the
+ * implicit rowid its rows were listed and paged by: VACUUM may renumber the rowids of a table without an
+ * INTEGER PRIMARY KEY, and a column of its own is the order once rows can no longer be rewritten. It runs
+ * only when the column is missing, in one transaction: a new table is created from LOG_TABLE_COLUMNS
+ * (what a new database gets), every row is copied with its rowid as its seq, so the order and every
+ * paging cursor already handed out stay as they were, the old table is dropped, the new one renamed and
+ * the old table's indexes and triggers made again. The copy fires no trigger (the new table has none
+ * yet) and DROP TABLE removes the old one's triggers before its rows, so counts kept by triggers, such
+ * as the traffic rollup's, neither double nor drop. Ids and every other value are copied unchanged, a column the old
+ * table lacks gets its default, and one only the old table has (none a release wrote) is kept.
+ */
+function rebuildLogTableWithSeq(table: LogTable) {
+  runInTransaction(() => {
+    const columnsOf = (name: string) =>
+      db.prepare(`PRAGMA table_info(${quoteIdentifier(name)})`).all() as Array<{ name: string; type: string }>;
+    const oldColumns = columnsOf(table);
+    if (oldColumns.some((c) => c.name === 'seq')) return;
+    // Dropping the table drops its indexes and triggers (the dashboard's traffic rollup keeps its counts
+    // with triggers on mcp_copilot_logs), so both are made again on the rebuilt table.
+    const indexesAndTriggers = (
+      db
+        .prepare(
+          `SELECT sql FROM sqlite_master WHERE type IN ('index', 'trigger') AND tbl_name = ? AND sql IS NOT NULL
+           ORDER BY type = 'trigger'`
+        )
+        .all(table) as Array<{ sql: string }>
+    ).map((row) => row.sql);
+
+    const rebuilt = `${table}__with_seq`;
+    db.exec(`DROP TABLE IF EXISTS ${rebuilt}`);
+    db.exec(`CREATE TABLE ${rebuilt} (${LOG_TABLE_COLUMNS[table]})`);
+    const newNames = new Set(columnsOf(rebuilt).map((c) => c.name));
+    for (const column of oldColumns.filter((c) => !newNames.has(c.name))) {
+      db.exec(`ALTER TABLE ${rebuilt} ADD COLUMN ${quoteIdentifier(column.name)} ${column.type}`);
+    }
+    const copied = oldColumns.map((c) => quoteIdentifier(c.name)).join(', ');
+    db.exec(`INSERT INTO ${rebuilt} (seq, ${copied}) SELECT rowid, ${copied} FROM ${table} ORDER BY rowid`);
+    db.exec(`DROP TABLE ${table}`);
+    db.exec(`ALTER TABLE ${rebuilt} RENAME TO ${table}`);
+    for (const sql of indexesAndTriggers) db.exec(sql);
+  });
+}
+
+/**
+ * Gives every MCP log row without a kind the one its other columns imply (mcpLogKind): a simulator row
+ * is 'simulated', a refused token's row, logged as unverified_caller, 'rejected', and anything else
+ * 'real'. This release writes every row with its kind, so the rows without one are those written before
+ * the column existed and those an older release writes after a rollback; like backfillLegacyAuditResults
+ * it runs on every boot. Only the kind is filled in: their decision, identity and timing columns stay not
+ * recorded.
+ */
+function classifyMcpLogKinds() {
+  db.prepare(
+    `UPDATE mcp_copilot_logs
+     SET kind = CASE WHEN simulated <> 0 THEN 'simulated' WHEN sf_username = ? THEN 'rejected' ELSE 'real' END
+     WHERE kind = ''`
+  ).run(UNVERIFIED_CALLER_USERNAME);
+}
+
+/**
+ * Before the result column, a row's outcome was only its action name's suffix, which is still the rule
+ * for a row written without one. A row with no correlation id was written by a release that predates
+ * these columns (recordPortalAdminLog always sets one), so its result is only the column default. Such
+ * rows are given the rule's result on every boot, not only on the one that adds the column: an older
+ * release run on this database after a rollback writes them too. A row this version wrote is never
+ * touched. The other structured columns stay empty on those rows.
+ */
+function backfillLegacyAuditResults() {
+  runInTransaction(() => {
+    const actions = db
+      .prepare(`SELECT DISTINCT action FROM portal_admin_logs WHERE correlation_id = '' AND result = 'SUCCESS'`)
+      .all() as Array<{ action: string }>;
+    const setResult = db.prepare(
+      `UPDATE portal_admin_logs SET result = ? WHERE action = ? AND correlation_id = '' AND result = 'SUCCESS'`
+    );
+    for (const { action } of actions) {
+      const result = auditResultFromAction(action);
+      if (result !== 'SUCCESS') setResult.run(result, action);
+    }
+  });
+}
+
+/**
+ * Rewrites one group's grants with the catalog's spelling of their Object and field names, matched
+ * case-insensitively as the policy engine matches them, and merges the entries that then name the same
+ * Object (see mergeGrants, which also keeps the Id an entry naming no field of its Object gave).
+ * Returns null when nothing changes. A malformed entry, an entry for an Object the catalog does not
+ * have and a field it does not have are kept as they are: the engine grants nothing for them either
+ * way. So is an entry `objectSpelling` gives no name for. Names are not trimmed, because the engine
+ * does not trim them.
+ */
+function canonicalGroupGrants(
+  entries: unknown[],
+  objectSpelling: (name: string) => string | null,
+  fieldNamesOf: (objectName: string) => readonly string[]
+): unknown[] | null {
+  const out: unknown[] = [];
+  const slots = new Map<string, Array<{ index: number; stored: unknown; grant: GroupObjectPermission }>>();
+  for (const entry of entries) {
+    // A held entry stays as stored: merged into a live entry, it would grant what it holds.
+    if (malformedGrantReason(entry) !== null || isHeldGrant(entry)) {
+      out.push(entry);
+      continue;
+    }
+    const grant = entry as GroupObjectPermission;
+    const objectName = objectSpelling(grant.objectName);
+    if (!objectName) {
+      out.push(entry);
+      continue;
+    }
+    const field = spellingLookup(fieldNamesOf(objectName));
+    const renamed: GroupObjectPermission = {
+      ...grant,
+      objectName,
+      ...(Array.isArray(grant.allowedFields)
+        ? { allowedFields: uniqueIgnoringCase(grant.allowedFields.map((name) => field(name) ?? name)) }
+        : {}),
+    };
+    const key = objectName.toLowerCase();
+    slots.set(key, [...(slots.get(key) ?? []), { index: out.length, stored: entry, grant: renamed }]);
+    out.push(renamed);
+  }
+  const dropped = new Set<number>();
+  for (const same of slots.values()) {
+    if (same.length === 1) continue;
+    // A merged entry keeps a field held when any of its entries holds it, so an entry that grants a
+    // field another entry holds would lose it here: such an Object's entries are left as stored.
+    const held = new Set(
+      same.flatMap(({ grant }) =>
+        (Array.isArray(grant.removedFields) ? grant.removedFields : []).flatMap((f) =>
+          f && typeof f === 'object' && typeof f.fieldName === 'string' ? [f.fieldName.toLowerCase()] : []
+        )
+      )
+    );
+    if (same.some(({ grant }) => (grant.allowedFields ?? []).some((name) => held.has(name.toLowerCase())))) {
+      for (const { index, stored } of same) out[index] = stored;
+      continue;
+    }
+    out[same[0].index] = mergeGrants(
+      same.map(({ grant }) => grant),
+      fieldNamesOf
+    )[0];
+    for (const { index } of same.slice(1)) dropped.add(index);
+  }
+  const canonical = out.filter((_, index) => !dropped.has(index));
+  return JSON.stringify(canonical) === JSON.stringify(entries) ? null : canonical;
+}
+
+/**
+ * Before the version column, POST /groups stored Object and field names as sent, so a grant could name
+ * 'account' while Salesforce > Objects holds 'Account'. /mcp matches names case-insensitively and so
+ * honoured it, but the group editor showed no such grant. This runs only when the column is added, in
+ * one transaction with it, like addSimulatedColumnAndMarkLegacyRows, so it happens once. Every group it
+ * changes gets version 2, so a portal tab opened before the upgrade cannot save over the result. If it
+ * changes any group, the policy revision goes up by one, like any other transaction that changes a group.
+ *
+ * An older version could also store one Object as two rows, 'Opportunity' and 'opportunity'. The engine
+ * reads the enabled one, which an admin can change, so a merge could take the Id an entry gives from the
+ * fields of a row the engine does not read: the entries for such an Object are left as stored.
+ *
+ * A release with held grants (`removed`, `removedFields`) but no version column can be upgraded too.
+ * Held entries are never renamed or merged, and an Object whose entries hold a field one of them grants
+ * is left as stored, since the merged entry would hold it.
+ */
+function addGroupVersionAndCanonicalizeGrants() {
+  runInTransaction(() => {
+    if (!ensureColumnExists('access_groups', 'version', 'INTEGER NOT NULL DEFAULT 1')) return;
+    const objectNames = (
+      db.prepare('SELECT object_name FROM sf_objects ORDER BY object_name').all() as Array<{ object_name: string }>
+    ).map((row) => row.object_name);
+    const fieldRows = db
+      .prepare('SELECT object_name, field_name FROM sf_object_fields ORDER BY object_name, field_name')
+      .all() as Array<{ object_name: string; field_name: string }>;
+    const fieldNamesOf = new Map<string, string[]>();
+    for (const row of fieldRows) {
+      fieldNamesOf.set(row.object_name, [...(fieldNamesOf.get(row.object_name) ?? []), row.field_name]);
+    }
+    const catalogSpelling = spellingLookup(objectNames);
+    const rowsByLowerName = new Map<string, number>();
+    for (const name of objectNames) {
+      rowsByLowerName.set(name.toLowerCase(), (rowsByLowerName.get(name.toLowerCase()) ?? 0) + 1);
+    }
+    const objectSpelling = (name: string) =>
+      rowsByLowerName.get(name.toLowerCase()) === 1 ? catalogSpelling(name) : null;
+
+    const rows = db.prepare('SELECT id, object_permissions_json FROM access_groups').all() as Array<{
+      id: string;
+      object_permissions_json: string;
+    }>;
+    const update = db.prepare(
+      'UPDATE access_groups SET object_permissions_json = ?, version = version + 1, updated_at = ? WHERE id = ?'
+    );
+    const now = new Date().toISOString();
+    for (const row of rows) {
+      const entries = parseStoredJson(row.object_permissions_json);
+      if (!Array.isArray(entries)) continue;
+      const canonical = canonicalGroupGrants(entries, objectSpelling, (name) => fieldNamesOf.get(name) ?? []);
+      if (canonical) update.run(JSON.stringify(canonical), now, row.id);
+    }
+  });
+}
+
+/**
+ * A group's version goes up with every change to it, so that the group editor, which saves with the
+ * version it loaded, is refused (409) rather than saving over a change made since. This release raises
+ * it in every statement that changes a group. An older release run on the database after a rollback
+ * does not (its saves and its revocations leave the column alone), and nor does a hand edit, so a
+ * trigger stored in the database raises it for them, on any connection: after an update that changes
+ * a policy column (one installPolicyRevision compares) and leaves the version as it was. Its own update
+ * changes only the version, which no policy trigger compares, and it names no TEMP table, so an older
+ * release's writes still succeed. It is made again on every boot, after the migration that adds the
+ * column, so it compares the columns the table has.
+ */
+function installGroupVersionTrigger() {
+  const changed = (db.prepare('PRAGMA table_info(access_groups)').all() as Array<{ name: string }>)
+    .filter((c) => !NON_POLICY_COLUMNS.has(c.name))
+    .map((c) => `OLD."${c.name}" IS NOT NEW."${c.name}"`)
+    .join(' OR ');
+  db.exec(`
+    DROP TRIGGER IF EXISTS main.group_version_unversioned_update;
+    CREATE TRIGGER main.group_version_unversioned_update AFTER UPDATE ON access_groups
+    WHEN NEW.version = OLD.version AND (${changed})
+    BEGIN
+      UPDATE access_groups SET version = version + 1 WHERE id = NEW.id;
+    END;
+  `);
+}
+
+/** A stored JSON column, or undefined when it does not parse. */
+function parseStoredJson(json: string): unknown {
+  try {
+    return JSON.parse(json || '[]');
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether two stored JSON columns hold the same value, with object keys in any order. */
+function sameStoredJson(a: string, b: string): boolean {
+  const [left, right] = [parseStoredJson(a), parseStoredJson(b)];
+  if (left === undefined || right === undefined) return false;
+  const sortedKeys = (_key: string, value: unknown) =>
+    value && typeof value === 'object' && !Array.isArray(value)
+      ? Object.fromEntries(Object.entries(value).sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0)))
+      : value;
+  return JSON.stringify(left, sortedKeys) === JSON.stringify(right, sortedKeys);
+}
+
 function runSchemaMigrations() {
   ensureColumnExists('sf_profiles', 'missing_in_org', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumnExists('sf_objects', 'missing_in_org', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumnExists('sf_object_fields', 'missing_in_org', 'INTEGER NOT NULL DEFAULT 0');
+  // The policy tables now have every column they compare; the grant canonicalization below is a change.
+  installPolicyRevision();
 
   ensureColumnExists('sf_connection_settings', 'enabled', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumnExists('sf_connection_settings', 'auth_mode', "TEXT NOT NULL DEFAULT 'jwt_bearer'");
@@ -552,9 +963,28 @@ function runSchemaMigrations() {
   ensureColumnExists('sf_connection_settings', 'sync_instance_url', "TEXT NOT NULL DEFAULT ''");
 
   addSimulatedColumnAndMarkLegacyRows();
+
+  // In the order CREATE TABLE lists them, so an upgraded database ends with the same table as a new one.
+  ensureColumnExists('portal_admin_logs', 'result', "TEXT NOT NULL DEFAULT 'SUCCESS'");
+  ensureColumnExists('portal_admin_logs', 'target_type', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('portal_admin_logs', 'target_id', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('portal_admin_logs', 'diff_json', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('portal_admin_logs', 'correlation_id', "TEXT NOT NULL DEFAULT ''");
+  backfillLegacyAuditResults();
+
+  addGroupVersionAndCanonicalizeGrants();
+  installGroupVersionTrigger();
+
+  // After the column migrations above, so the simulated backfill has run once on a database from before
+  // that column, and the copy carries every column they added. Neither rebuild runs again.
+  rebuildLogTableWithSeq('mcp_copilot_logs');
+  rebuildLogTableWithSeq('portal_admin_logs');
+  classifyMcpLogKinds();
+
   // The dashboard's 24-hour figures read recent calls by time. The index is on timestamp alone: one
-  // led by `simulated` would take over the `simulated = 0 ... ORDER BY rowid DESC LIMIT n` queries,
-  // which then read and sort every real row instead of stopping after n.
+  // led by `simulated` would take over the `simulated = 0 ... ORDER BY seq DESC LIMIT n` queries,
+  // which then read and sort every real row instead of stopping after n. After the seq rebuild
+  // above, so the rollup's triggers are made on the table that stays.
   db.exec('CREATE INDEX IF NOT EXISTS idx_mcp_copilot_logs_timestamp ON mcp_copilot_logs (timestamp)');
   addTrafficMinuteRollup();
 }
@@ -741,8 +1171,22 @@ repairConnectInstanceUrls();
 /** The portal admin log action written once per policy simulation. */
 export const SIMULATE_MCP_CALL_ACTION = 'SIMULATE_MCP_CALL';
 
-/** The MCP log user for a bearer token that failed verification, so the caller is unknown. */
-export const UNVERIFIED_CALLER_USERNAME = 'unverified_caller';
+const MCP_LOG_KINDS: readonly string[] = ['real', 'simulated', 'rejected'] satisfies McpLogKind[];
+const MCP_LOG_MATCH_METHODS: readonly string[] = ['id', 'name', 'none'];
+
+/** A stored decision, or null when none was recorded. A value that is not a JSON object reads as none. */
+function parseLoggedDecision(json: string): McpLogDecision | null {
+  const parsed = json ? parseStoredJson(json) : undefined;
+  return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as McpLogDecision) : null;
+}
+
+/** A stored list of ids; anything else reads as none. */
+function parseIdList(json: string): string[] {
+  const parsed = parseStoredJson(json);
+  return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === 'string') : [];
+}
+
+const storedNumberOrNull = (value: unknown) => (value === null || value === undefined ? null : Number(value));
 
 /**
  * Each chart range's window and the slice its counts are sent in. A slice divides the range's bars
@@ -769,7 +1213,60 @@ function toCopilotMcpLogRecord(r: any): CopilotMcpLogRecord {
     sanitizedRequestPayload: r.sanitized_request_payload,
     sanitizedResponseSummary: r.sanitized_response_summary,
     ...(r.simulated ? { simulated: true as const } : {}),
+    seq: Number(r.seq),
+    // A row an older release wrote since the last boot has no kind yet; it reads as the one it will get.
+    kind: MCP_LOG_KINDS.includes(r.kind) ? r.kind : mcpLogKind(Boolean(r.simulated), r.sf_username),
+    decision: parseLoggedDecision(r.decision_json),
+    decisionStage: r.decision_stage,
+    decisionCode: r.decision_code,
+    assignedGroupIds: parseIdList(r.assigned_group_ids_json),
+    decidingGroupIds: parseIdList(r.deciding_group_ids_json),
+    policyRevision: storedNumberOrNull(r.policy_revision),
+    callerProfileId: r.caller_profile_id,
+    matchedProfileId: r.matched_profile_id,
+    matchMethod: MCP_LOG_MATCH_METHODS.includes(r.match_method) ? r.match_method : '',
+    verificationMs: storedNumberOrNull(r.verification_ms),
+    totalMs: storedNumberOrNull(r.total_ms),
   };
+}
+
+/**
+ * What decided a logged call. A policy decision comes with the snapshot it was made from: its names and
+ * ids are checked against that snapshot (policySnapshotCatalog), not against the tables when the row is
+ * written, so access revoked while the call ran does not unname the group, Object or Profile it was
+ * decided on. A GatewayDecision (a refused token or an outage) read no policy.
+ */
+type DecidedBy =
+  | { decision?: GatewayDecision; policySnapshot?: undefined }
+  | { decision: PolicyDecision; policySnapshot: PolicySnapshot };
+
+/** A duration as stored: whole non-negative milliseconds, or NULL (not recorded). */
+function storedMs(ms: number | undefined): number | null {
+  return typeof ms === 'number' && Number.isFinite(ms) && ms >= 0 ? Math.round(ms) : null;
+}
+
+/**
+ * The longest diff_json a Portal Admin log row keeps. The log cannot be cleared and /overview sends its
+ * latest rows on every poll, so a larger diff is replaced by a note of its length; the row itself, with
+ * its action, target and details, is still written.
+ */
+const AUDIT_DIFF_MAX_LENGTH = 64 * 1024;
+
+function storedAuditDiff(diff: Record<string, unknown> | undefined): string {
+  if (!diff) return '';
+  const json = JSON.stringify(diff);
+  return json.length > AUDIT_DIFF_MAX_LENGTH ? JSON.stringify({ truncated: true, length: json.length }) : json;
+}
+
+/** A stored diff, or null when none was recorded. A value that is not a JSON object reads as none. */
+function parseAuditDiff(diffJson: string): Record<string, unknown> | null {
+  if (!diffJson) return null;
+  try {
+    const parsed = JSON.parse(diffJson);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 function toPortalAdminLogRecord(r: any): PortalAdminLogRecord {
@@ -782,10 +1279,17 @@ function toPortalAdminLogRecord(r: any): PortalAdminLogRecord {
     target: r.target,
     details: r.details,
     ipAddress: r.ip_address,
+    // A row an older release wrote since the last boot holds only the column default; it reads as the
+    // result backfillLegacyAuditResults will give it.
+    result: r.correlation_id === '' ? auditResultFromAction(r.action) : r.result,
+    targetType: r.target_type,
+    targetId: r.target_id,
+    diff: parseAuditDiff(r.diff_json),
+    correlationId: r.correlation_id,
   };
 }
 
-/** Keeps the rowid a log query selected as `seq`, the order rows were written in and the paging cursor. */
+/** Keeps a log row's `seq`, the order rows were written in and the paging cursor. */
 function withSeq<T>(toRecord: (r: any) => T): (r: any) => T & { seq: number } {
   return (r) => ({ ...toRecord(r), seq: Number(r.seq) });
 }
@@ -825,12 +1329,12 @@ function readLogPage<T>(
   const conditions = [...where];
   const bound: Record<string, string | number> = { ...params, limit: cursor.limit + 1 };
   if (cursor.before !== undefined) {
-    conditions.push('rowid < :before');
+    conditions.push('seq < :before');
     bound.before = cursor.before;
   }
   const filter = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
   const rows = db
-    .prepare(`SELECT rowid AS seq, * FROM ${table} ${filter} ORDER BY rowid DESC LIMIT :limit`)
+    .prepare(`SELECT * FROM ${table} ${filter} ORDER BY seq DESC LIMIT :limit`)
     .all(bound) as any[];
   const page = rows.slice(0, cursor.limit).map(withSeq(toRecord));
   return {
@@ -844,21 +1348,37 @@ function readLogPage<T>(
  * so Copilot MCP logs never store raw customer PII or record values.
  */
 export function stripSensitivePayloadData(input: unknown): unknown {
+  return stripPayloadLevel(input, true);
+}
+
+/**
+ * A payload key as stored. Keys are caller text too (the field names of create_record's `fields`, any
+ * argument name), so one that is not a Salesforce API name is stored by its length, as decision_json
+ * stores such a field name and target_object such an Object name. A number after it keeps two such
+ * keys of one level apart.
+ */
+function storedPayloadKey(key: string, level: Record<string, unknown>): string {
+  if (SALESFORCE_API_NAME_PATTERN.test(key)) return key;
+  const byLength = `<invalid:len=${key.length}>`;
+  let stored = byLength;
+  for (let n = 2; Object.hasOwn(level, stored); n++) stored = `${byLength}#${n}`;
+  return stored;
+}
+
+// Safe keys count only at the payload's top level. Below it, e.g. in the field-to-value map of
+// create_record and update_record, a key such as `status` or `limit` is a record field and its
+// value is customer data.
+function stripPayloadLevel(input: unknown, topLevel: boolean): unknown {
   if (input === null || input === undefined) return input;
   if (Array.isArray(input)) {
     return {
       _type: 'Array',
       count: input.length,
-      sampleStructure: input.length > 0 ? stripSensitivePayloadData(input[0]) : null,
+      sampleStructure: input.length > 0 ? stripPayloadLevel(input[0], false) : null,
     };
   }
   if (typeof input === 'object') {
     const safeKeys = new Set([
-      'objectName',
-      'object',
-      'sobject',
-      'tool',
-      'toolName',
       'fields',
       'fieldNames',
       'limit',
@@ -868,31 +1388,66 @@ export function stripSensitivePayloadData(input: unknown): unknown {
       'id',
       'Id',
     ]);
-    // Structural values (object/field API names, record ids, tool names) are kept; anything that
+    // Structural values (field API names, record ids, limits) are kept; anything that
     // does not look like one (e.g. a record's values sent where field names belong) is redacted.
     const isStructuralToken = (item: unknown) =>
       typeof item === 'number' || (typeof item === 'string' && /^(\*|[A-Za-z0-9_.:-]{1,120})$/.test(item));
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(input as Record<string, unknown>)) {
+      const safe = topLevel && safeKeys.has(k);
+      const storedName = topLevel ? STORED_NAME_KEYS.get(k) : undefined;
+      const key = storedPayloadKey(k, out);
       if (k === 'records' && Array.isArray(v)) {
         out.records = `[REDACTED ${v.length} RECORDS]`;
-      } else if (k === 'soql' && typeof v === 'string') {
-        // Redact quoted string literals in SOQL WHERE clauses (`'...'` -> `'[REDACTED]'`)
-        out.soql = v.replace(/'(?:[^'\\]|\\.)*'?/g, "'[REDACTED]'");
-      } else if (safeKeys.has(k) && (typeof v === 'number' || typeof v === 'boolean' || isStructuralToken(v))) {
-        out[k] = v;
-      } else if (Array.isArray(v) && safeKeys.has(k) && v.every(isStructuralToken)) {
-        out[k] = v;
+      } else if (topLevel && k === 'soql' && typeof v === 'string') {
+        // Every literal (string, number, date, ...) becomes a typed placeholder.
+        out.soql = soqlSkeleton(v);
+      } else if (storedName && typeof v === 'string') {
+        // The check the tool_name and target_object columns use, so the payload keeps no text they refuse.
+        out[key] = storedName(v);
+      } else if (safe && (typeof v === 'number' || typeof v === 'boolean' || isStructuralToken(v))) {
+        out[key] = v;
+      } else if (Array.isArray(v) && safe && v.every(isStructuralToken)) {
+        out[key] = v;
       } else if (typeof v === 'object' && v !== null) {
-        out[k] = stripSensitivePayloadData(v);
+        out[key] = stripPayloadLevel(v, false);
       } else {
-        out[k] = `<REDACTED:${typeof v}>`;
+        out[key] = `<REDACTED:${typeof v}>`;
       }
     }
     return out;
   }
   return `<REDACTED:${typeof input}>`;
 }
+
+const LOGGED_TOOL_NAMES = new Set<string>([
+  ...AVAILABLE_MCP_ACTIONS.map((action) => action.id),
+  // The row /mcp writes for a rejected token (src/mcp/streamableHttp.ts).
+  'mcp_authenticate',
+]);
+
+// tool_name and target_object arrive from the caller. Text that is not a known tool or an API name
+// is stored by its length only, like any other redacted value.
+function storedToolName(toolName: string): string {
+  return LOGGED_TOOL_NAMES.has(toolName) ? toolName : `<invalid:len=${toolName.length}>`;
+}
+
+/** '*' (or '') is a call without an object. */
+function storedTargetObject(targetObject: string): string {
+  if (!targetObject || targetObject === '*' || SALESFORCE_API_NAME_PATTERN.test(targetObject)) {
+    return targetObject || '';
+  }
+  return `<invalid:len=${targetObject.length}>`;
+}
+
+// Top-level payload keys that name the tool or the object. A value of any other type under them is redacted.
+const STORED_NAME_KEYS = new Map<string, (value: string) => string>([
+  ['objectName', storedTargetObject],
+  ['object', storedTargetObject],
+  ['sobject', storedTargetObject],
+  ['tool', storedToolName],
+  ['toolName', storedToolName],
+]);
 
 export { parseSfdxFilesToObjects } from './importers.js';
 
@@ -960,6 +1515,47 @@ function planProfileForms(forms: SalesforceProfile[], groupIdsOf: (profileId: st
   return { conflict: distinctSets.size > 1 && granted.length > 0, union, granted };
 }
 
+/** Single memberships to add and remove. Every membership not named stays as it is. */
+export interface MembershipDelta {
+  add: string[];
+  remove: string[];
+}
+
+/** A membership change naming a Profile or group that does not exist, or adding and removing one id. */
+export class MembershipChangeError extends Error {}
+
+/** The delta's ids without repeats; an id both added and removed has no meaning, so it is refused. */
+function distinctMembershipDelta(delta: MembershipDelta, kind: string): MembershipDelta {
+  const add = Array.from(new Set(delta.add));
+  const remove = Array.from(new Set(delta.remove));
+  const both = add.filter((id) => remove.includes(id));
+  if (both.length > 0) {
+    throw new MembershipChangeError(`${kind} id(s) both added and removed: ${both.join(', ')}`);
+  }
+  return { add, remove };
+}
+
+function unknownIdsIn(table: 'sf_profiles' | 'access_groups', ids: string[]): string[] {
+  const known = db.prepare(`SELECT 1 FROM ${table} WHERE id = ?`);
+  return ids.filter((id) => !known.get(id));
+}
+
+/**
+ * Adds and removes [profileId, groupId] memberships inside the caller's transaction and returns the
+ * ones that really changed. Each pair is one INSERT OR IGNORE or one single-row DELETE, so a
+ * membership no pair names is never touched.
+ */
+function writeMemberships(add: Array<[string, string]>, remove: Array<[string, string]>) {
+  const insert = db.prepare(
+    'INSERT OR IGNORE INTO profile_group_memberships (profile_id, group_id) VALUES (?, ?)'
+  );
+  const del = db.prepare('DELETE FROM profile_group_memberships WHERE profile_id = ? AND group_id = ?');
+  return {
+    added: add.filter(([profileId, groupId]) => insert.run(profileId, groupId).changes > 0),
+    removed: remove.filter(([profileId, groupId]) => del.run(profileId, groupId).changes > 0),
+  };
+}
+
 /** What an Okta settings save may change. An omitted field keeps the stored value. */
 export interface OktaConfigInput {
   enabled?: boolean;
@@ -969,6 +1565,34 @@ export interface OktaConfigInput {
   clientSecret?: string;
   redirectUri?: string;
   adminGroup?: string;
+}
+
+/** What a group write stores, besides its id. */
+type GroupWrite = {
+  name: string;
+  description?: string;
+  allowedActions: string[];
+  objectPermissions: GroupObjectPermission[];
+};
+
+const warnedUnreadableGroupColumns = new Set<string>();
+
+/**
+ * A group's JSON list column. One that does not parse or holds no list reads as an empty list,
+ * which grants nothing, so that no reader (the policy engine above all) can fail on it. The
+ * operator is told once per group and column, without the stored text.
+ */
+function storedGroupList(groupId: string, column: string, json: string): any[] {
+  const value = parseStoredJson(json);
+  if (Array.isArray(value)) return value;
+  const key = `${groupId}\u0000${column}`;
+  if (!warnedUnreadableGroupColumns.has(key)) {
+    warnedUnreadableGroupColumns.add(key);
+    console.warn(
+      `[store] Access Group ${groupId} has an unreadable ${column}; it is read as an empty list and grants nothing until the group is saved again.`
+    );
+  }
+  return [];
 }
 
 export const store = {
@@ -1049,20 +1673,29 @@ export const store = {
     return this.getPortalUsers().find((u) => u.username === targetUsername)!;
   },
 
-  deletePortalUser(username: string): boolean {
+  /**
+   * The stored username that `username` names, matched like sign-in does (trimmed, any case), or
+   * undefined. It resolves one exact row, preferring an exact-case match, so case variants left by
+   * older versions stay apart. deletePortalUser deletes that row.
+   */
+  findPortalUsername(username: string): string | undefined {
     const requested = username.trim();
-    // Resolve one exact row (preferring an exact-case match), so case variants left by older
-    // versions are never deleted together and the last-administrator guard always holds.
     const target = db
       .prepare(
         'SELECT username FROM portal_users WHERE lower(username) = lower(?) ORDER BY (username = ?) DESC LIMIT 1'
       )
       .get(requested, requested) as { username: string } | undefined;
-    if (!target) return false;
+    return target?.username;
+  },
+
+  deletePortalUser(username: string): boolean {
+    // One exact row, so case variants are never deleted together and the last-administrator guard always holds.
+    const target = this.findPortalUsername(username);
+    if (target === undefined) return false;
     if (this.getPortalUsers().length <= 1) {
       throw new Error('Cannot delete the last remaining portal administrator account.');
     }
-    const res = db.prepare('DELETE FROM portal_users WHERE username = ?').run(target.username);
+    const res = db.prepare('DELETE FROM portal_users WHERE username = ?').run(target);
     return res.changes > 0;
   },
 
@@ -1153,27 +1786,30 @@ export const store = {
     });
   },
 
+  /** Saves every row or none, in one transaction, so an import is one policy revision. */
   importProfilesFromCsvRows(
     rows: Array<{ id: string; name: string }>
   ): { inserted: number; updated: number; idsUpgraded: number; namesKept: number; total: number } {
-    let inserted = 0;
-    let updated = 0;
-    let idsUpgraded = 0;
-    let namesKept = 0;
-    for (const r of rows) {
-      if (!r.id || !r.name) continue;
-      const res = this.upsertProfile(r.id, r.name);
-      if (res.action === 'inserted') inserted++;
-      else updated++;
-      if (res.previousId) idsUpgraded++;
-      if (res.nameKept) namesKept++;
-    }
-    return { inserted, updated, idsUpgraded, namesKept, total: this.getProfiles().length };
+    return runInTransaction(() => {
+      let inserted = 0;
+      let updated = 0;
+      let idsUpgraded = 0;
+      let namesKept = 0;
+      for (const r of rows) {
+        if (!r.id || !r.name) continue;
+        const res = this.upsertProfile(r.id, r.name);
+        if (res.action === 'inserted') inserted++;
+        else updated++;
+        if (res.previousId) idsUpgraded++;
+        if (res.nameKept) namesKept++;
+      }
+      return { inserted, updated, idsUpgraded, namesKept, total: this.getProfiles().length };
+    });
   },
 
   deleteProfile(id: string): boolean {
-    const res = db.prepare('DELETE FROM sf_profiles WHERE id = ?').run(id.trim());
-    return res.changes > 0;
+    // In a transaction, so the Profile and the memberships its delete cascades to are one policy revision.
+    return runInTransaction(() => db.prepare('DELETE FROM sf_profiles WHERE id = ?').run(id.trim()).changes > 0);
   },
 
   previewProfilesSyncFromOrg(
@@ -1428,6 +2064,16 @@ export const store = {
     return row?.object_name ?? name;
   },
 
+  /** The field names of the object stored under exactly this name, or null when there is no such object. */
+  getObjectFieldNames(objectName: string): string[] | null {
+    if (!db.prepare('SELECT 1 FROM sf_objects WHERE object_name = ?').get(objectName)) return null;
+    return (
+      db
+        .prepare('SELECT field_name FROM sf_object_fields WHERE object_name = ? ORDER BY field_name')
+        .all(objectName) as Array<{ field_name: string }>
+    ).map((row) => row.field_name);
+  },
+
   upsertObjectWithFields(input: {
     objectName: string;
     label?: string;
@@ -1456,121 +2102,127 @@ export const store = {
     if (invalidField) {
       throw new Error(`'${invalidField.fieldName}' is not a valid Salesforce field API name.`);
     }
-    const existing = db
-      .prepare('SELECT * FROM sf_objects WHERE object_name = ?')
-      .get(objName) as any;
+    // The object and its fields are one transaction, and so one policy revision.
+    return runInTransaction(() => {
+      const existing = db
+        .prepare('SELECT * FROM sf_objects WHERE object_name = ?')
+        .get(objName) as any;
 
-    const isCustom =
-      input.isCustom !== undefined
-        ? input.isCustom
-        : objName.endsWith('__c') || objName.endsWith('__mdt');
-    const label = input.label?.trim() || existing?.label || objName;
-    const enabled =
-      input.enabled !== undefined
-        ? input.enabled
-        : existing
-        ? Boolean(existing.enabled)
-        : true;
-    const sourcePath = input.sourcePath ?? existing?.source_path ?? 'manual';
-    // Only org sync passes this; a re-import or manual save must not clear what sync flagged.
-    const missingInOrg =
-      input.missingInOrg !== undefined
-        ? input.missingInOrg
-        : existing
-        ? Boolean(existing.missing_in_org)
-        : false;
+      const isCustom =
+        input.isCustom !== undefined
+          ? input.isCustom
+          : objName.endsWith('__c') || objName.endsWith('__mdt');
+      const label = input.label?.trim() || existing?.label || objName;
+      const enabled =
+        input.enabled !== undefined
+          ? input.enabled
+          : existing
+          ? Boolean(existing.enabled)
+          : true;
+      const sourcePath = input.sourcePath ?? existing?.source_path ?? 'manual';
+      // Only org sync passes this; a re-import or manual save must not clear what sync flagged.
+      const missingInOrg =
+        input.missingInOrg !== undefined
+          ? input.missingInOrg
+          : existing
+          ? Boolean(existing.missing_in_org)
+          : false;
 
-    db.prepare(`
-      INSERT INTO sf_objects (object_name, label, is_custom, enabled, source_path, missing_in_org, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(object_name) DO UPDATE SET
-        label = excluded.label,
-        is_custom = excluded.is_custom,
-        enabled = excluded.enabled,
-        source_path = excluded.source_path,
-        missing_in_org = excluded.missing_in_org,
-        updated_at = excluded.updated_at
-    `).run(objName, label, isCustom ? 1 : 0, enabled ? 1 : 0, sourcePath, missingInOrg ? 1 : 0, now);
+      db.prepare(`
+        INSERT INTO sf_objects (object_name, label, is_custom, enabled, source_path, missing_in_org, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(object_name) DO UPDATE SET
+          label = excluded.label,
+          is_custom = excluded.is_custom,
+          enabled = excluded.enabled,
+          source_path = excluded.source_path,
+          missing_in_org = excluded.missing_in_org,
+          updated_at = excluded.updated_at
+      `).run(objName, label, isCustom ? 1 : 0, enabled ? 1 : 0, sourcePath, missingInOrg ? 1 : 0, now);
 
-    const fieldsToUpsert = input.fields || [
-      { fieldName: 'Id', label: 'Record ID', fieldType: 'Id', isCustom: false, required: true },
-      { fieldName: 'Name', label: 'Name', fieldType: 'Text', isCustom: false, required: false },
-    ];
+      const fieldsToUpsert = input.fields || [
+        { fieldName: 'Id', label: 'Record ID', fieldType: 'Id', isCustom: false, required: true },
+        { fieldName: 'Name', label: 'Name', fieldType: 'Text', isCustom: false, required: false },
+      ];
 
-    // An explicit `enabled` or `missingInOrg` is applied; when omitted (e.g. an SFDX re-import) an
-    // existing field keeps the admin's manual toggle and what org sync flagged.
-    const fieldUpsertSql = (applyEnabled: boolean, applyMissingInOrg: boolean) => `
-      INSERT INTO sf_object_fields (object_name, field_name, label, field_type, is_custom, required, enabled, missing_in_org)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(object_name, field_name) DO UPDATE SET
-        label = excluded.label,
-        field_type = excluded.field_type,
-        is_custom = excluded.is_custom,
-        required = excluded.required${applyMissingInOrg ? ',\n        missing_in_org = excluded.missing_in_org' : ''}${applyEnabled ? ',\n        enabled = excluded.enabled' : ''}
-    `;
-    const fieldUpsertStatements = new Map<string, ReturnType<typeof db.prepare>>();
-    const fieldUpsertStatement = (applyEnabled: boolean, applyMissingInOrg: boolean) => {
-      const key = `${applyEnabled}:${applyMissingInOrg}`;
-      let statement = fieldUpsertStatements.get(key);
-      if (!statement) {
-        statement = db.prepare(fieldUpsertSql(applyEnabled, applyMissingInOrg));
-        fieldUpsertStatements.set(key, statement);
+      // An explicit `enabled` or `missingInOrg` is applied; when omitted (e.g. an SFDX re-import) an
+      // existing field keeps the admin's manual toggle and what org sync flagged.
+      const fieldUpsertSql = (applyEnabled: boolean, applyMissingInOrg: boolean) => `
+        INSERT INTO sf_object_fields (object_name, field_name, label, field_type, is_custom, required, enabled, missing_in_org)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(object_name, field_name) DO UPDATE SET
+          label = excluded.label,
+          field_type = excluded.field_type,
+          is_custom = excluded.is_custom,
+          required = excluded.required${applyMissingInOrg ? ',\n        missing_in_org = excluded.missing_in_org' : ''}${applyEnabled ? ',\n        enabled = excluded.enabled' : ''}
+      `;
+      const fieldUpsertStatements = new Map<string, ReturnType<typeof db.prepare>>();
+      const fieldUpsertStatement = (applyEnabled: boolean, applyMissingInOrg: boolean) => {
+        const key = `${applyEnabled}:${applyMissingInOrg}`;
+        let statement = fieldUpsertStatements.get(key);
+        if (!statement) {
+          statement = db.prepare(fieldUpsertSql(applyEnabled, applyMissingInOrg));
+          fieldUpsertStatements.set(key, statement);
+        }
+        return statement;
+      };
+
+      const existingFieldNames = (
+        db.prepare('SELECT field_name FROM sf_object_fields WHERE object_name = ? ORDER BY field_name').all(objName) as Array<{
+          field_name: string;
+        }>
+      ).map((r) => r.field_name);
+      const exactFieldNames = new Set(existingFieldNames);
+      const fieldNameByLower = new Map<string, string>();
+      for (const name of existingFieldNames) {
+        if (!fieldNameByLower.has(name.toLowerCase())) fieldNameByLower.set(name.toLowerCase(), name);
       }
-      return statement;
-    };
 
-    const existingFieldNames = (
-      db.prepare('SELECT field_name FROM sf_object_fields WHERE object_name = ? ORDER BY field_name').all(objName) as Array<{
-        field_name: string;
-      }>
-    ).map((r) => r.field_name);
-    const exactFieldNames = new Set(existingFieldNames);
-    const fieldNameByLower = new Map<string, string>();
-    for (const name of existingFieldNames) {
-      if (!fieldNameByLower.has(name.toLowerCase())) fieldNameByLower.set(name.toLowerCase(), name);
-    }
+      for (const f of fieldsToUpsert) {
+        if (!f.fieldName) continue;
+        const requestedField = f.fieldName.trim();
+        const fieldName = exactFieldNames.has(requestedField)
+          ? requestedField
+          : fieldNameByLower.get(requestedField.toLowerCase()) ?? requestedField;
+        exactFieldNames.add(fieldName);
+        if (!fieldNameByLower.has(fieldName.toLowerCase())) fieldNameByLower.set(fieldName.toLowerCase(), fieldName);
+        const stmt = fieldUpsertStatement(f.enabled !== undefined, f.missingInOrg !== undefined);
+        stmt.run(
+          objName,
+          fieldName,
+          (f.label || f.fieldName).trim(),
+          f.fieldType || 'Text',
+          (f.isCustom ?? f.fieldName.endsWith('__c')) ? 1 : 0,
+          f.required ? 1 : 0,
+          f.enabled !== undefined ? (f.enabled ? 1 : 0) : 1,
+          f.missingInOrg ? 1 : 0
+        );
+      }
 
-    for (const f of fieldsToUpsert) {
-      if (!f.fieldName) continue;
-      const requestedField = f.fieldName.trim();
-      const fieldName = exactFieldNames.has(requestedField)
-        ? requestedField
-        : fieldNameByLower.get(requestedField.toLowerCase()) ?? requestedField;
-      exactFieldNames.add(fieldName);
-      if (!fieldNameByLower.has(fieldName.toLowerCase())) fieldNameByLower.set(fieldName.toLowerCase(), fieldName);
-      const stmt = fieldUpsertStatement(f.enabled !== undefined, f.missingInOrg !== undefined);
-      stmt.run(
-        objName,
-        fieldName,
-        (f.label || f.fieldName).trim(),
-        f.fieldType || 'Text',
-        (f.isCustom ?? f.fieldName.endsWith('__c')) ? 1 : 0,
-        f.required ? 1 : 0,
-        f.enabled !== undefined ? (f.enabled ? 1 : 0) : 1,
-        f.missingInOrg ? 1 : 0
-      );
-    }
-
-    return this.getObjects().find((o) => o.objectName === objName)!;
+      return this.getObjects().find((o) => o.objectName === objName)!;
+    });
   },
 
+  /** Saves every Object or none, in one transaction, so an import is one policy revision. */
   importObjectsFromParsedSfdx(
     parsedObjects: ReturnType<typeof parseSfdxFilesToObjects>
   ): { objectsImported: number; fieldsImported: number } {
-    let objectsImported = 0;
-    let fieldsImported = 0;
-    for (const obj of parsedObjects) {
-      this.upsertObjectWithFields({
-        objectName: this.resolveObjectName(obj.objectName),
-        label: obj.label,
-        isCustom: obj.isCustom,
-        sourcePath: obj.sourcePath,
-        fields: obj.fields,
-      });
-      objectsImported++;
-      fieldsImported += obj.fields.length;
-    }
-    return { objectsImported, fieldsImported };
+    return runInTransaction(() => {
+      let objectsImported = 0;
+      let fieldsImported = 0;
+      for (const obj of parsedObjects) {
+        this.upsertObjectWithFields({
+          objectName: this.resolveObjectName(obj.objectName),
+          label: obj.label,
+          isCustom: obj.isCustom,
+          sourcePath: obj.sourcePath,
+          fields: obj.fields,
+        });
+        objectsImported++;
+        fieldsImported += obj.fields.length;
+      }
+      return { objectsImported, fieldsImported };
+    });
   },
 
   importObjectsFromLocalDiskFolder(folderPath: string): {
@@ -1704,8 +2356,9 @@ export const store = {
     const wanted = input.fieldNames ? new Set(input.fieldNames.map((f) => f.toLowerCase())) : null;
     runInTransaction(() => {
       for (const group of this.getGroups()) {
-        const perm = group.objectPermissions.find(
-          (p) => String(p.objectName).toLowerCase() === input.objectName.toLowerCase() && !p.removed
+        // As the policy engine reads the group: held and malformed entries grant nothing either way.
+        const perm = readableGrants(group.objectPermissions).find(
+          (p) => p.objectName.toLowerCase() === input.objectName.toLowerCase()
         );
         if (!perm) continue;
         const granted = wanted ? (perm.allowedFields || []).filter((f) => wanted.has(f.toLowerCase())) : [];
@@ -1744,8 +2397,8 @@ export const store = {
       if (!pulled.existsInOrg) {
         const referencedInGroups = groups
           .filter((g) =>
-            g.objectPermissions.some(
-              (op) => op.objectName.toLowerCase() === pulled.objectName.toLowerCase() && !op.removed
+            readableGrants(g.objectPermissions).some(
+              (op) => op.objectName.toLowerCase() === pulled.objectName.toLowerCase()
             )
           )
           .map((g) => g.name);
@@ -1785,7 +2438,7 @@ export const store = {
           if (!orgFieldMap.has(lf.fieldName.toLowerCase())) {
             const referencedInGroups = groups
               .filter((g) =>
-                g.objectPermissions.some(
+                readableGrants(g.objectPermissions).some(
                   (op) =>
                     op.objectName.toLowerCase() === pulled.objectName.toLowerCase() &&
                     !op.removed &&
@@ -2020,34 +2673,107 @@ export const store = {
   },
 
   /**
-   * Creates or updates a group. With `change`, the save is recorded in the group's history in the
-   * same transaction. A save from the editors that changes nothing it grants is not recorded; an
+   * Creates a group. A create is a plain INSERT, so it can never collide with (and silently
+   * overwrite) another group. A new group gets a random id; `id` is for the sample matrix and tests,
+   * which need a fixed one. With `change`, the creation is recorded in the group's history in the
+   * same transaction.
+   */
+  createGroup(input: GroupWrite & { id?: string }, change?: GroupChange): AccessGroup {
+    const id =
+      input.id?.trim() ||
+      `grp_${input.name
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '_')}_${crypto.randomBytes(6).toString('hex')}`;
+    return runInTransaction(() => {
+      const now = new Date().toISOString();
+      db.prepare(`
+        INSERT INTO access_groups (id, name, description, allowed_actions_json, object_permissions_json, updated_at, version)
+        VALUES (?, ?, ?, ?, ?, ?, 1)
+      `).run(
+        id,
+        input.name.trim(),
+        (input.description || '').trim(),
+        JSON.stringify(input.allowedActions || []),
+        JSON.stringify(input.objectPermissions || []),
+        now
+      );
+      const saved = this.getGroup(id)!;
+      if (change) {
+        insertGroupHistory({
+          groupId: id,
+          kind: 'created',
+          change,
+          changes: describeGroupChanges(null, saved),
+          snapshot: saved,
+          timestamp: now,
+        });
+      }
+      return saved;
+    });
+  },
+
+  /**
+   * Creates a group when no id is given and updates the group with the given id, whose version then
+   * goes up by one. A save that would store what is stored (the same text, and the same JSON in the list
+   * columns, with object keys in any order) writes nothing, so its version and
+   * updatedAt stay and an editor that loaded that version can still save. An id no group has is
+   * refused: it never creates a group. With `change`, the save is recorded in the group's history in
+   * the same transaction. A save from the editors that changes nothing it grants is not recorded; an
    * import or restore always is, so the history shows the file or version was applied.
    */
-  upsertGroup(
-    input: {
-      id?: string;
-      name: string;
-      description?: string;
-      allowedActions: string[];
-      objectPermissions: GroupObjectPermission[];
-    },
-    change?: GroupChange
-  ): AccessGroup {
+  upsertGroup(input: GroupWrite & { id?: string }, change?: GroupChange): AccessGroup {
+    const requestedId = input.id?.trim();
+    if (!requestedId) return this.createGroup(input, change);
+
     return runInTransaction(() => {
-      const previous = input.id?.trim() ? this.getGroup(input.id.trim()) : null;
-      const saved = writeGroupRow(input);
+      const next = {
+        name: input.name.trim(),
+        description: (input.description || '').trim(),
+        allowed_actions_json: JSON.stringify(input.allowedActions || []),
+        object_permissions_json: JSON.stringify(input.objectPermissions || []),
+      };
+      const stored = db
+        .prepare('SELECT name, description, allowed_actions_json, object_permissions_json FROM access_groups WHERE id = ?')
+        .get(requestedId) as typeof next | undefined;
+      if (!stored) throw new Error(`Unknown Access Group id: ${requestedId}`);
+      const previous = this.getGroup(requestedId)!;
+      const now = new Date().toISOString();
+      // A list column that holds the same JSON with its keys in another order (an entry a revocation
+      // rewrote) is unchanged too: such a save changes nothing, so it keeps the version. The name and
+      // description are text, compared as they are.
+      const unchanged = (Object.keys(next) as Array<keyof typeof next>).every(
+        (column) =>
+          stored[column] === next[column] ||
+          (column.endsWith('_json') && sameStoredJson(stored[column], next[column]))
+      );
+      if (!unchanged) {
+        db.prepare(`
+          UPDATE access_groups SET
+            name = ?, description = ?, allowed_actions_json = ?, object_permissions_json = ?,
+            version = version + 1, updated_at = ?
+          WHERE id = ?
+        `).run(
+          next.name,
+          next.description,
+          next.allowed_actions_json,
+          next.object_permissions_json,
+          now,
+          requestedId
+        );
+      }
+      const saved = this.getGroup(requestedId)!;
       if (change) {
         const changes = describeGroupChanges(previous, saved);
         const isEdit = change.source === 'editor' || change.source === 'xml_editor';
-        if (!previous || changes.length > 0 || !isEdit) {
+        if (changes.length > 0 || !isEdit) {
           insertGroupHistory({
             groupId: saved.id,
-            kind: previous ? 'updated' : 'created',
+            kind: 'updated',
             change,
             changes: changes.length > 0 ? changes : ['Nothing the group grants changed.'],
             snapshot: saved,
-            timestamp: saved.updatedAt,
+            timestamp: now,
           });
         }
       }
@@ -2055,12 +2781,14 @@ export const store = {
     });
   },
 
-  /** Deletes a group. With `change`, its history records the deletion and what the group held. */
+  /**
+   * Deletes a group. In a transaction, so the group and the memberships its delete cascades to are one
+   * policy revision. With `change`, its history records the deletion and what the group held.
+   */
   deleteGroup(id: string, change?: GroupChange): boolean {
     return runInTransaction(() => {
       const existing = this.getGroup(id);
-      const res = db.prepare('DELETE FROM access_groups WHERE id = ?').run(id);
-      if (res.changes === 0 || !existing) return false;
+      if (db.prepare('DELETE FROM access_groups WHERE id = ?').run(id).changes === 0 || !existing) return false;
       if (change) {
         insertGroupHistory({
           groupId: id,
@@ -2074,24 +2802,31 @@ export const store = {
     });
   },
 
-  /** A group's history, newest first. It is kept after the group is deleted. */
+  /**
+   * A group's history, newest first. It is kept after the group is deleted. A column that does not
+   * parse reads as no changes, or an empty snapshot, so no reader fails on it.
+   */
   getGroupHistory(groupId: string, limit = 200): AccessGroupHistoryEntry[] {
     const rows = db
       .prepare('SELECT * FROM access_group_history WHERE group_id = ? ORDER BY rowid DESC LIMIT ?')
       .all(groupId, Math.max(1, Math.min(limit, 1000))) as any[];
-    return rows.map((r) => ({
-      id: r.id,
-      groupId: r.group_id,
-      groupName: r.group_name,
-      timestamp: r.timestamp,
-      adminUsername: r.admin_username,
-      authMethod: r.auth_method,
-      kind: r.kind,
-      source: r.source,
-      sourceDetail: r.source_detail,
-      changes: JSON.parse(r.changes_json || '[]'),
-      snapshot: JSON.parse(r.snapshot_json || '{}'),
-    }));
+    return rows.map((r) => {
+      const changes = parseStoredJson(r.changes_json);
+      const snapshot = parseStoredJson(r.snapshot_json || '{}');
+      return {
+        id: r.id,
+        groupId: r.group_id,
+        groupName: r.group_name,
+        timestamp: r.timestamp,
+        adminUsername: r.admin_username,
+        authMethod: r.auth_method,
+        kind: r.kind,
+        source: r.source,
+        sourceDetail: r.source_detail,
+        changes: Array.isArray(changes) ? changes.filter((line): line is string => typeof line === 'string') : [],
+        snapshot: (snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot) ? snapshot : {}) as AccessGroupSnapshot,
+      };
+    });
   },
 
   getProfileGroupMappings(): ProfileGroupMapping[] {
@@ -2112,7 +2847,10 @@ export const store = {
     }));
   },
 
-  /** Replaces a Profile's groups atomically; unknown group ids are rejected before anything changes. */
+  /**
+   * Replaces a Profile's groups atomically; unknown group ids are rejected before anything changes.
+   * Only the memberships that differ are written, so saving the same groups again changes nothing.
+   */
   setProfileGroups(profileId: string, groupIds: string[]): ProfileGroupMapping {
     const uniqueIds = Array.from(new Set(groupIds));
     const knownIds = new Set(this.getGroups().map((g) => g.id));
@@ -2122,15 +2860,93 @@ export const store = {
     }
 
     runInTransaction(() => {
-      db.prepare('DELETE FROM profile_group_memberships WHERE profile_id = ?').run(profileId);
-      const ins = db.prepare(
-        'INSERT OR IGNORE INTO profile_group_memberships (profile_id, group_id) VALUES (?, ?)'
+      const stored = this.getProfileGroupIds(profileId);
+      writeMemberships(
+        uniqueIds.filter((gid) => !stored.includes(gid)).map((gid) => [profileId, gid]),
+        stored.filter((gid) => !uniqueIds.includes(gid)).map((gid) => [profileId, gid])
       );
-      for (const gid of uniqueIds) {
-        ins.run(profileId, gid);
-      }
     });
     return { profileId, groupIds: uniqueIds };
+  },
+
+  getProfileGroupIds(profileId: string): string[] {
+    const rows = db
+      .prepare('SELECT group_id FROM profile_group_memberships WHERE profile_id = ?')
+      .all(profileId) as Array<{ group_id: string }>;
+    return rows.map((r) => r.group_id);
+  },
+
+  /**
+   * Adds and removes single groups of one Profile and keeps its other groups, so a client working
+   * from an old copy of the matrix cannot undo a change it never saw. Unknown ids are rejected before
+   * anything changes; `added` and `removed` hold only the memberships that really changed.
+   */
+  applyMembershipDelta(
+    profileId: string,
+    delta: MembershipDelta
+  ): { mapping: ProfileGroupMapping; added: string[]; removed: string[] } {
+    return runInTransaction(() => {
+      const { add, remove } = distinctMembershipDelta(delta, 'Access Group');
+      const unknownIds = unknownIdsIn('access_groups', [...add, ...remove]);
+      if (unknownIds.length > 0) {
+        throw new MembershipChangeError(`Unknown Access Group id(s): ${unknownIds.join(', ')}`);
+      }
+      if (unknownIdsIn('sf_profiles', [profileId]).length > 0) {
+        throw new MembershipChangeError(`Unknown Profile id: ${profileId}`);
+      }
+
+      const changed = writeMemberships(
+        add.map((groupId) => [profileId, groupId]),
+        remove.map((groupId) => [profileId, groupId])
+      );
+      return {
+        mapping: { profileId, groupIds: this.getProfileGroupIds(profileId) },
+        added: changed.added.map(([, groupId]) => groupId),
+        removed: changed.removed.map(([, groupId]) => groupId),
+      };
+    });
+  },
+
+  /** The same for many Profiles of one group: only the memberships of the Profiles named change. */
+  applyGroupMembershipDelta(
+    groupId: string,
+    delta: MembershipDelta
+  ): { membership: { groupId: string; profileIds: string[] }; added: string[]; removed: string[] } {
+    return runInTransaction(() => {
+      const { add, remove } = distinctMembershipDelta(delta, 'Profile');
+      if (unknownIdsIn('access_groups', [groupId]).length > 0) {
+        throw new MembershipChangeError(`Unknown Access Group id: ${groupId}`);
+      }
+      const unknownIds = unknownIdsIn('sf_profiles', [...add, ...remove]);
+      if (unknownIds.length > 0) {
+        throw new MembershipChangeError(`Unknown Profile id(s): ${unknownIds.join(', ')}`);
+      }
+
+      const changed = writeMemberships(
+        add.map((profileId) => [profileId, groupId]),
+        remove.map((profileId) => [profileId, groupId])
+      );
+      const profileIds = (
+        db
+          .prepare('SELECT profile_id FROM profile_group_memberships WHERE group_id = ?')
+          .all(groupId) as Array<{ profile_id: string }>
+      ).map((r) => r.profile_id);
+      return {
+        membership: { groupId, profileIds },
+        added: changed.added.map(([profileId]) => profileId),
+        removed: changed.removed.map(([profileId]) => profileId),
+      };
+    });
+  },
+
+  /**
+   * The policy revision: 1 on a new database, and one more for every committed change to a Profile, an
+   * Object or field, an Access Group or a membership (see installPolicyRevision). Read inside a
+   * transaction, it already counts that transaction's change.
+   */
+  getPolicyRevision(): number {
+    const row = db.prepare('SELECT revision FROM policy_state WHERE id = 1').get() as { revision: number };
+    return Number(row.revision);
   },
 
   // ============================================================================
@@ -2138,7 +2954,7 @@ export const store = {
   // ============================================================================
   getCopilotMcpLogs(limit = 150): CopilotMcpLogRecord[] {
     const rows = db
-      .prepare('SELECT * FROM mcp_copilot_logs ORDER BY rowid DESC LIMIT ?')
+      .prepare('SELECT * FROM mcp_copilot_logs ORDER BY seq DESC LIMIT ?')
       .all(limit) as any[];
     return rows.map(toCopilotMcpLogRecord);
   },
@@ -2156,22 +2972,22 @@ export const store = {
     const rows = db
       .prepare(
         `SELECT * FROM (
-           SELECT rowid AS seq, * FROM mcp_copilot_logs
-           WHERE simulated = 0 AND sf_username <> :unverified ORDER BY rowid DESC LIMIT :realLimit
+           SELECT * FROM mcp_copilot_logs
+           WHERE simulated = 0 AND sf_username <> :unverified ORDER BY seq DESC LIMIT :realLimit
          )
          UNION ALL
          SELECT * FROM (
-           SELECT rowid AS seq, * FROM mcp_copilot_logs WHERE simulated <> 0 ORDER BY rowid DESC LIMIT :simulatedLimit
+           SELECT * FROM mcp_copilot_logs WHERE simulated <> 0 ORDER BY seq DESC LIMIT :simulatedLimit
          )
          UNION ALL
          SELECT * FROM (
-           SELECT rowid AS seq, * FROM mcp_copilot_logs
-           WHERE simulated = 0 AND sf_username = :unverified ORDER BY rowid DESC LIMIT :rejectedLimit
+           SELECT * FROM mcp_copilot_logs
+           WHERE simulated = 0 AND sf_username = :unverified ORDER BY seq DESC LIMIT :rejectedLimit
          )
          ORDER BY seq DESC`
       )
       .all({ unverified: UNVERIFIED_CALLER_USERNAME, realLimit, simulatedLimit, rejectedLimit }) as any[];
-    return rows.map(withSeq(toCopilotMcpLogRecord));
+    return rows.map(toCopilotMcpLogRecord);
   },
 
   /**
@@ -2252,7 +3068,7 @@ export const store = {
     // user's latest call.
     const topUsers = db
       .prepare(
-        `SELECT sf_username AS username, profile_name AS profileName, COUNT(*) AS calls, MAX(rowid) AS latest
+        `SELECT sf_username AS username, profile_name AS profileName, COUNT(*) AS calls, MAX(seq) AS latest
          ${verified}
          GROUP BY sf_username ORDER BY calls DESC, sf_username LIMIT 5`
       )
@@ -2318,13 +3134,19 @@ export const store = {
       .prepare(
         `SELECT timestamp FROM mcp_copilot_logs
          WHERE simulated = 0 AND sf_username <> ?
-         ORDER BY rowid DESC LIMIT 1`
+         ORDER BY seq DESC LIMIT 1`
       )
       .get(UNVERIFIED_CALLER_USERNAME) as { timestamp: string } | undefined;
     return row?.timestamp ?? null;
   },
 
-  recordCopilotMcpLog(input: {
+  /**
+   * Writes one MCP log row. Its kind follows from `simulated` and the user (mcpLogKind): a refused
+   * token is logged as UNVERIFIED_CALLER_USERNAME. The payloads go through stripSensitivePayloadData;
+   * the decision is reduced to names, ids and codes its policy snapshot holds (decisionLogColumns) and
+   * never goes through it, since it holds no value.
+   */
+  recordCopilotMcpLog(input: DecidedBy & {
     sfUsername: string;
     profileId: string;
     profileName: string;
@@ -2332,11 +3154,16 @@ export const store = {
     toolName: string;
     targetObject: string;
     status: 'ALLOWED' | 'DENIED' | 'ERROR';
-    latencyMs: number;
+    /** The latency of a row written without totalMs. */
+    latencyMs?: number;
     rawRequestPayload: unknown;
     rawResponseSummary: unknown;
     /** Callers pass this from a verified token or a server route, never from request input. */
     simulated?: boolean;
+    /** How long verifying the bearer token took, in ms; left out when the row's request verified none. */
+    verificationMs?: number;
+    /** Ms from the request's receipt to this row; latency_ms is written from it. */
+    totalMs?: number;
   }): CopilotMcpLogRecord {
     const id = `mcp_${Date.now().toString(36)}_${crypto.randomBytes(8).toString('hex')}`;
     const timestamp = new Date().toISOString();
@@ -2350,13 +3177,22 @@ export const store = {
       null,
       2
     );
+    const toolName = storedToolName(input.toolName);
+    const targetObject = storedTargetObject(input.targetObject);
+    const simulated = input.simulated === true;
+    const decided = input.decision
+      ? decisionLogColumns(input.decision, policySnapshotCatalog(input.policySnapshot))
+      : null;
+    const totalMs = storedMs(input.totalMs);
 
-    db.prepare(`
+    const { lastInsertRowid } = db.prepare(`
       INSERT INTO mcp_copilot_logs (
         id, timestamp, sf_username, profile_id, profile_name, matched_groups_json,
         tool_name, target_object, status, latency_ms,
-        sanitized_request_payload, sanitized_response_summary, simulated
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        sanitized_request_payload, sanitized_response_summary, simulated, kind,
+        decision_json, decision_stage, decision_code, assigned_group_ids_json, deciding_group_ids_json,
+        policy_revision, caller_profile_id, matched_profile_id, match_method, verification_ms, total_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       timestamp,
@@ -2364,35 +3200,34 @@ export const store = {
       input.profileId,
       input.profileName,
       JSON.stringify(input.matchedGroups),
-      input.toolName,
-      input.targetObject || '',
+      toolName,
+      targetObject,
       input.status,
-      input.latencyMs,
+      totalMs ?? input.latencyMs ?? 0,
       sanitizedReq,
       sanitizedRes,
-      input.simulated ? 1 : 0
+      simulated ? 1 : 0,
+      mcpLogKind(simulated, input.sfUsername),
+      decided ? JSON.stringify(decided.decision) : '',
+      decided?.stage ?? '',
+      decided?.code ?? '',
+      JSON.stringify(decided?.assignedGroupIds ?? []),
+      JSON.stringify(decided?.decidingGroupIds ?? []),
+      decided?.policyRevision ?? null,
+      decided?.callerProfileId ?? '',
+      decided?.matchedProfileId ?? '',
+      decided?.matchMethod ?? '',
+      storedMs(input.verificationMs),
+      totalMs
     );
 
-    return {
-      id,
-      timestamp,
-      sfUsername: input.sfUsername,
-      profileId: input.profileId,
-      profileName: input.profileName,
-      matchedGroups: input.matchedGroups,
-      toolName: input.toolName,
-      targetObject: input.targetObject,
-      status: input.status,
-      latencyMs: input.latencyMs,
-      sanitizedRequestPayload: sanitizedReq,
-      sanitizedResponseSummary: sanitizedRes,
-      ...(input.simulated ? { simulated: true as const } : {}),
-    };
+    // Read back, so the row returned is the one every reader returns.
+    return toCopilotMcpLogRecord(db.prepare('SELECT * FROM mcp_copilot_logs WHERE seq = ?').get(lastInsertRowid));
   },
 
   getPortalAdminLogs(limit = 150): PortalAdminLogRecord[] {
     const rows = db
-      .prepare('SELECT * FROM portal_admin_logs ORDER BY rowid DESC LIMIT ?')
+      .prepare('SELECT * FROM portal_admin_logs ORDER BY seq DESC LIMIT ?')
       .all(limit) as any[];
     return rows.map(toPortalAdminLogRecord);
   },
@@ -2405,11 +3240,11 @@ export const store = {
     const rows = db
       .prepare(
         `SELECT * FROM (
-           SELECT rowid AS seq, * FROM portal_admin_logs WHERE action <> :action ORDER BY rowid DESC LIMIT :otherLimit
+           SELECT * FROM portal_admin_logs WHERE action <> :action ORDER BY seq DESC LIMIT :otherLimit
          )
          UNION ALL
          SELECT * FROM (
-           SELECT rowid AS seq, * FROM portal_admin_logs WHERE action = :action ORDER BY rowid DESC LIMIT :simulationLimit
+           SELECT * FROM portal_admin_logs WHERE action = :action ORDER BY seq DESC LIMIT :simulationLimit
          )
          ORDER BY seq DESC`
       )
@@ -2439,15 +3274,36 @@ export const store = {
     target: string;
     details: string;
     ipAddress?: string;
+    /** Defaults to the action-name rule: *_FAILED is FAILED, *_DENIED is DENIED, anything else SUCCESS. */
+    result?: PortalAuditResult;
+    /** What the action changed, by a stable id, e.g. 'group' and the group's id. */
+    targetType?: string;
+    targetId?: string;
+    /**
+     * Names, ids and flags of what changed, stored as JSON. Never a secret, a password, a key or a token.
+     * One over 64 KB is stored as { truncated: true, length } instead.
+     */
+    diff?: Record<string, unknown>;
+    /** The id of the Admin API request that wrote this row. A row written without one gets its own. */
+    correlationId?: string;
   }): PortalAdminLogRecord {
+    const result = input.result ?? auditResultFromAction(input.action);
+    if (!PORTAL_AUDIT_RESULTS.includes(result)) {
+      throw new Error(`Unknown audit result '${result}'.`);
+    }
     const id = `adm_${Date.now().toString(36)}_${crypto.randomBytes(8).toString('hex')}`;
     const timestamp = new Date().toISOString();
     const ip = input.ipAddress || '127.0.0.1';
+    const targetType = input.targetType || '';
+    const targetId = input.targetId || '';
+    const diffJson = storedAuditDiff(input.diff);
+    const correlationId = input.correlationId || crypto.randomUUID();
 
     db.prepare(`
       INSERT INTO portal_admin_logs (
-        id, timestamp, admin_username, auth_method, action, target, details, ip_address
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        id, timestamp, admin_username, auth_method, action, target, details, ip_address,
+        result, target_type, target_id, diff_json, correlation_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       timestamp,
@@ -2456,7 +3312,12 @@ export const store = {
       input.action,
       input.target,
       input.details,
-      ip
+      ip,
+      result,
+      targetType,
+      targetId,
+      diffJson,
+      correlationId
     );
 
     return {
@@ -2468,6 +3329,11 @@ export const store = {
       target: input.target,
       details: input.details,
       ipAddress: ip,
+      result,
+      targetType,
+      targetId,
+      diff: parseAuditDiff(diffJson),
+      correlationId,
     };
   },
 

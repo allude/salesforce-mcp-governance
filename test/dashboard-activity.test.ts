@@ -143,14 +143,20 @@ describe('getCopilotMcpActivityFigures', () => {
   test('ties rank by name, and the lists stop at 6 tools and 5 users', () => {
     const now = freshSlot();
     for (const u of ['f', 'e', 'd', 'c', 'b', 'a']) logCall(`${u}@acme.com`);
-    for (const t of ['t7', 't6', 't5', 't4', 't3', 't2', 't1']) logCall('a@acme.com', { toolName: t });
+    // Known tools only: the log stores any other tool name by its length alone. Written in reverse name order.
+    for (const t of ['update_record', 'list_enabled_objects', 'get_record', 'describe_object', 'delete_record', 'create_record']) {
+      logCall('a@acme.com', { toolName: t });
+    }
 
     const figures = store.getCopilotMcpActivityFigures(now);
     assert.deepEqual(figures.topUsers.map((u) => u.username), ['a@acme.com', 'b@acme.com', 'c@acme.com', 'd@acme.com', 'e@acme.com']);
-    assert.equal(figures.topTools.length, 6);
-    assert.deepEqual(figures.topTools.slice(0, 2), [
-      { toolName: 'soql_query', calls: 6 },
-      { toolName: 't1', calls: 1 },
+    assert.deepEqual(figures.topTools.map((t) => [t.toolName, t.calls]), [
+      ['soql_query', 6],
+      ['create_record', 1],
+      ['delete_record', 1],
+      ['describe_object', 1],
+      ['get_record', 1],
+      ['list_enabled_objects', 1],
     ]);
   });
 

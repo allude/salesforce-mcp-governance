@@ -167,7 +167,7 @@ try {
     const mapping = await call(portal, '/api/admin/profile-groups/00e000000000001AAA', {
       method: 'PUT',
       headers: auth(),
-      body: { groupIds: [group.json.group.id] },
+      body: { add: [group.json.group.id] },
     });
     assert.equal(mapping.status, 200, mapping.text);
   });
@@ -224,7 +224,7 @@ try {
     const statuses = res.json.copilotLogs.map((l) => `${l.toolName}:${l.status}`);
     assert.ok(statuses.includes('soql_query:ALLOWED'), statuses.join(', '));
     assert.ok(statuses.includes('delete_record:DENIED'), statuses.join(', '));
-    assert.ok(res.json.portalLogs.some((l) => l.action === 'LOGIN_SUCCESS'));
+    assert.ok(res.json.portalLogs.some((l) => l.action === 'LOGIN_SUCCESS' && l.result === 'SUCCESS' && l.correlationId));
   });
 
   console.log(`\n✔ live E2E smoke test passed (${passed} checks)`);

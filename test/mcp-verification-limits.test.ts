@@ -407,6 +407,67 @@ describe('/mcp end to end', () => {
     }
   });
 
+  test('an outage writes one ERROR row at upstream, timed from receipt, and the 503 is byte for byte as before', async () => {
+    const delayMs = 120;
+    const token = `valid_${crypto.randomBytes(8).toString('hex')}`;
+    sf.addUser(token, {
+      userId: '005000000000885AAA', organizationId: '00D000000000001AAA', username: 'outage.row@acme.example',
+      profileId: '00e000000000885AAA', profileName: 'Outage Row Test',
+    });
+    const existing = new Set(store.getCopilotMcpLogs(1_000_000).map((row) => row.id));
+    const restore = failSalesforce(async () => {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      return new Response('down', { status: 503 });
+    });
+    let res: Response;
+    try {
+      res = await fetch(`${server.baseUrl}/mcp`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+          Authorization: `Bearer ${token}`,
+          ...freshClient(),
+        },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+      });
+    } finally {
+      restore();
+    }
+
+    assert.equal(res.status, 503);
+    assert.equal(res.headers.get('retry-after'), '5');
+    assert.equal(res.headers.get('www-authenticate'), null);
+    assert.equal(
+      await res.text(),
+      JSON.stringify({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Salesforce could not verify the token right now (HTTP 503); try again shortly' },
+        id: null,
+      })
+    );
+    const rows = store.getCopilotMcpLogs(1_000_000).filter((row) => !existing.has(row.id));
+    assert.equal(rows.length, 1, JSON.stringify(rows));
+    const [row] = rows;
+    assert.deepEqual(
+      [row.sfUsername, row.toolName, row.status, row.kind, row.decisionStage, row.decisionCode],
+      [UNVERIFIED_CALLER_USERNAME, 'mcp_authenticate', 'ERROR', 'rejected', 'upstream', 'UPSTREAM_UNAVAILABLE']
+    );
+    assert.deepEqual(row.decision, {
+      outcome: 'error',
+      code: 'UPSTREAM_UNAVAILABLE',
+      stage: 'upstream',
+      steps: [{ stage: 'upstream', result: 'fail', grantingGroupIds: [], objectName: null, fieldNames: [] }],
+      decidingGroupIds: [],
+      matchMethod: 'none',
+      policyRevision: null,
+    });
+    assert.equal(row.policyRevision, null);
+    assert.ok(row.verificationMs! >= delayMs, `verificationMs ${row.verificationMs} includes the ${delayMs} ms wait`);
+    assert.ok(row.totalMs! >= row.verificationMs!, `totalMs ${row.totalMs} >= ${row.verificationMs}`);
+    assert.equal(row.latencyMs, row.totalMs);
+  });
+
   test('a Salesforce outage keeps a verified token exempt, while unverified tokens still count towards the limit', async () => {
     const client = freshClient();
     const token = `valid_${crypto.randomBytes(8).toString('hex')}`;
@@ -512,12 +573,14 @@ describe('/mcp end to end', () => {
       );
       while (verificationGateStats().queued < 100) await new Promise((r) => setTimeout(r, 5));
       const rowsBefore = rejectedRows();
+      const allRowsBefore = store.getCopilotMcpLogStats().total;
 
       const busy = await mcpRequest(server.baseUrl, 'junk_gate_over', 'tools/list', {}, { 'X-Forwarded-For': '198.19.1.1' });
 
       assert.equal(busy.status, 503);
       assert.equal(busy.headers.get('retry-after'), '5');
       assert.equal(rejectedRows() - rowsBefore, 0);
+      assert.equal(store.getCopilotMcpLogStats().total, allRowsBefore, 'no row of any kind');
 
       const drain = setInterval(() => release.splice(0).forEach((r) => r()), 2);
       const statuses = (await Promise.all(pending)).map((res) => res.status);

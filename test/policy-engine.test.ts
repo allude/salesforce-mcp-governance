@@ -9,16 +9,29 @@ import crypto from 'node:crypto';
 import { store } from '../src/db/store.js';
 import {
   PolicyViolationError,
+  decisionLogStatus,
   evaluateMcpToolCall,
+  evaluatePolicy,
+  evaluateToolAccess,
   getVisibleToolsForUser,
+  loadPolicySnapshot,
+  resolveEffectiveProfilePermissions,
+  type PolicyDecision,
+  type PolicyDecisionCode,
   type PolicyEvaluationResult,
+  type PolicyOutcome,
+  type PolicyOverrides,
+  type PolicySnapshot,
+  type PolicyStage,
 } from '../src/rbac/policyEngine.js';
-import { assertSafeSoqlWhereClause } from '../src/mcp/soqlGuard.js';
+import { mergeGrants } from '../src/rbac/groupGrants.js';
+import { assertSafeSoqlWhereClause, checkSoqlWhereClause } from '../src/mcp/soqlGuard.js';
 import { salesforceIdsMatch, type VerifiedSalesforceUser } from '../src/salesforce/client.js';
 import {
   AVAILABLE_MCP_ACTIONS,
   type AccessGroup,
   type GroupObjectPermission,
+  type SalesforceObject,
 } from '../src/types/governance.js';
 
 // ---------------------------------------------------------------------------
@@ -148,7 +161,7 @@ class PolicyFixture {
   }
 
   group(baseName: string, allowedActions: string[], objectPermissions: GroupObjectPermission[] = []): AccessGroup {
-    const group = store.upsertGroup({
+    const group = store.createGroup({
       id: `grp_policy_test_${this.tag}_${this.groupIds.length + 1}`,
       name: `${baseName} ${this.tag}`,
       allowedActions,
@@ -184,12 +197,48 @@ function describeCall(toolName: string, targetObject: string | undefined): strin
   return `${toolName}(${targetObject === undefined ? '<no object>' : JSON.stringify(targetObject)})`;
 }
 
-/** Asserts a denial with a matching reason, no fields or object leaked, and the same result twice. */
+/** The code, failing stage and (when not 'denied') outcome a refused decision must carry. */
+interface ExpectedRefusal {
+  code: PolicyDecisionCode;
+  stage: PolicyStage;
+  outcome?: PolicyOutcome;
+}
+
+/**
+ * Asserts the decision was refused with this code at this stage: every earlier step passed, nothing
+ * after the failing step was recorded, and no group decided it.
+ */
+function assertRefusal(decision: PolicyDecision, expected: ExpectedRefusal, label: string): void {
+  const outcome = expected.outcome ?? (expected.code === 'INPUT_INVALID' ? 'invalid' : 'denied');
+  const trace = JSON.stringify(decision.steps.map((s) => `${s.stage}:${s.result}`));
+  assert.equal(decision.outcome, outcome, `${label} outcome (${decision.code}: ${decision.reason})`);
+  assert.equal(decision.code, expected.code, `${label} code (${decision.reason})`);
+  assert.equal(decision.steps.at(-1)?.stage, expected.stage, `${label} failing stage, trace ${trace}`);
+  assert.equal(decision.steps.at(-1)?.result, 'fail', `${label} the last step fails, trace ${trace}`);
+  assert.ok(decision.steps.slice(0, -1).every((s) => s.result === 'pass'), `${label} earlier steps pass, trace ${trace}`);
+  assert.deepEqual(decision.decidingGroupIds, [], `${label} a refusal has no deciding groups`);
+  assert.deepEqual(decision.steps.at(-1)?.grantingGroupIds, [], `${label} a failed step granted nothing`);
+  assert.equal(decision.objectName, null, `${label} a refusal resolves no object`);
+  assert.deepEqual(decision.allowedFields, [], `${label} a refusal exposes no fields`);
+}
+
+/** Asserts an allowed decision: every step passed and its deciding groups are among the assigned ones. */
+function assertAllowedDecision(decision: PolicyDecision, label: string): void {
+  assert.equal(decision.outcome, 'allowed', `${label} must be allowed, got ${decision.code}: ${decision.reason}`);
+  assert.equal(decision.code, 'ALLOWED', label);
+  assert.ok(decision.steps.every((s) => s.result === 'pass'), `${label} every step passes`);
+  const assigned = decision.assignedGroups.map((g) => g.id);
+  assert.ok(decision.decidingGroupIds.length > 0, `${label} some group decided it`);
+  assert.ok(decision.decidingGroupIds.every((id) => assigned.includes(id)), `${label} deciding groups are assigned`);
+}
+
+/** Asserts a denial with a matching reason, code and stage, no fields or object leaked, and the same result twice. */
 function assertDenied(
   user: VerifiedSalesforceUser,
   toolName: string,
   targetObject: string | undefined,
-  reason: RegExp
+  reason: RegExp,
+  expected: ExpectedRefusal
 ): PolicyEvaluationResult {
   const call = describeCall(toolName, targetObject);
   const first = evaluateMcpToolCall(user, toolName, targetObject);
@@ -198,6 +247,8 @@ function assertDenied(
   assert.match(first.reason, reason, `${call} denial reason`);
   assert.deepEqual(first.allowedFields, [], `${call} denial must not expose fields`);
   assert.equal(first.objectName, undefined, `${call} denial must not resolve an object`);
+  assertRefusal(first.decision, expected, call);
+  assert.equal(first.decision.reason, first.reason, `${call} the decision carries the same reason`);
   assert.deepEqual(evaluateMcpToolCall(user, toolName, targetObject), first, `${call} denial must be deterministic`);
   return first;
 }
@@ -213,7 +264,23 @@ function assertPermitted(
     true,
     `${describeCall(toolName, targetObject)} must be permitted, got ${JSON.stringify(result)}`
   );
+  assertAllowedDecision(result.decision, describeCall(toolName, targetObject));
   return result;
+}
+
+/** evaluatePolicy with the call's arguments, on a snapshot read now. */
+function decide(
+  user: VerifiedSalesforceUser,
+  toolName: string,
+  args: Record<string, unknown>,
+  overrides?: PolicyOverrides
+): PolicyDecision {
+  return evaluatePolicy(user, toolName, args, loadPolicySnapshot(), overrides);
+}
+
+/** The steps as `stage:result[groups]`, for comparing whole traces. */
+function trace(decision: PolicyDecision): string[] {
+  return decision.steps.map((s) => `${s.stage}:${s.result}[${s.grantingGroupIds.join(',')}]`);
 }
 
 const sorted = (values: readonly string[]) => [...values].sort();
@@ -289,7 +356,10 @@ test('evaluateMcpToolCall: denies a caller whose Profile is not registered', (t)
 
   for (const tool of ALL_ACTIONS) {
     const target = tool === 'list_enabled_objects' ? undefined : obj;
-    const result = assertDenied(stranger, tool, target, /not registered/i);
+    const result = assertDenied(stranger, tool, target, /not registered/i, {
+      code: 'PROFILE_UNREGISTERED',
+      stage: 'identity',
+    });
     assert.deepEqual(result.matchedGroups, []);
     assert.ok(result.reason.includes(stranger.profileId), `reason names the caller's Profile id: ${result.reason}`);
   }
@@ -303,7 +373,7 @@ test('evaluateMcpToolCall: denies a registered Profile that has no groups', (t) 
 
   for (const tool of ALL_ACTIONS) {
     const target = tool === 'list_enabled_objects' ? undefined : obj;
-    const result = assertDenied(user, tool, target, /no Groups/i);
+    const result = assertDenied(user, tool, target, /no Groups/i, { code: 'NO_GROUPS', stage: 'groups' });
     assert.deepEqual(result.matchedGroups, []);
   }
 });
@@ -318,7 +388,7 @@ test("evaluateMcpToolCall: denies a known tool that none of the Profile's groups
   assertPermitted(user, 'soql_query', obj);
   for (const tool of ['list_enabled_objects', 'describe_object', 'create_record', 'update_record', 'delete_record']) {
     const target = tool === 'list_enabled_objects' ? undefined : obj;
-    const result = assertDenied(user, tool, target, /not granted/i);
+    const result = assertDenied(user, tool, target, /not granted/i, { code: 'TOOL_NOT_GRANTED', stage: 'tool_grant' });
     assert.ok(result.reason.includes(tool), `reason names the tool: ${result.reason}`);
   }
 });
@@ -333,8 +403,8 @@ test('evaluateMcpToolCall: denies an unknown tool name even when a group lists i
   const user = fx.callerFor(fx.profile('Unknown Tools Profile', [group]));
 
   for (const tool of unknownTools) {
-    assertDenied(user, tool, obj, /unknown/i);
-    assertDenied(user, tool, undefined, /unknown/i);
+    assertDenied(user, tool, obj, /unknown/i, { code: 'TOOL_UNKNOWN', stage: 'tool' });
+    assertDenied(user, tool, undefined, /unknown/i, { code: 'TOOL_UNKNOWN', stage: 'tool' });
   }
 });
 
@@ -347,7 +417,7 @@ test("evaluateMcpToolCall: denies object-scoped tools called with no object or w
   for (const tool of OBJECT_SCOPED_TOOLS) {
     assertPermitted(user, tool, obj); // control: the same call naming the object is allowed
     for (const target of [undefined, '', '*']) {
-      assertDenied(user, tool, target, /requires an objectName/i);
+      assertDenied(user, tool, target, /requires an objectName/i, { code: 'INPUT_INVALID', stage: 'input' });
     }
   }
 });
@@ -362,8 +432,8 @@ test("evaluateMcpToolCall: denies an object that none of the Profile's groups gr
 
   assertPermitted(user, 'soql_query', granted);
   for (const tool of OBJECT_SCOPED_TOOLS) {
-    assertDenied(user, tool, other, /not permitted/i);
-    assertDenied(user, tool, `Missing_${fx.tag}__c`, /not permitted/i);
+    assertDenied(user, tool, other, /not permitted/i, { code: 'OBJECT_NOT_GRANTED', stage: 'object' });
+    assertDenied(user, tool, `Missing_${fx.tag}__c`, /not permitted/i, { code: 'OBJECT_NOT_GRANTED', stage: 'object' });
   }
 });
 
@@ -374,7 +444,7 @@ test('evaluateMcpToolCall: denies every object-scoped tool on an object whose gr
   const user = fx.callerFor(fx.profile('No Flags Profile', [group]));
 
   for (const tool of OBJECT_SCOPED_TOOLS) {
-    assertDenied(user, tool, obj, /not permitted/i);
+    assertDenied(user, tool, obj, /not permitted/i, { code: 'OBJECT_NOT_GRANTED', stage: 'object' });
   }
 });
 
@@ -394,8 +464,9 @@ test('evaluateMcpToolCall: denies every object-scoped tool on an object disabled
   store.toggleObject(toggled, false);
 
   for (const tool of OBJECT_SCOPED_TOOLS) {
-    assertDenied(user, tool, toggled, /disabled/i);
-    assertDenied(user, tool, seededDisabled, /disabled/i);
+    // Granted, but switched off in Salesforce > Objects: blocked, not "not granted".
+    assertDenied(user, tool, toggled, /disabled/i, { code: 'OBJECT_BLOCKED', stage: 'object' });
+    assertDenied(user, tool, seededDisabled, /disabled/i, { code: 'OBJECT_BLOCKED', stage: 'object' });
   }
 });
 
@@ -409,7 +480,7 @@ test('evaluateMcpToolCall: denies read tools (describe_object, soql_query, get_r
 
   assertPermitted(user, 'create_record', obj); // control: the object itself is granted
   for (const tool of ['describe_object', 'soql_query', 'get_record']) {
-    assertDenied(user, tool, obj, /read access/i);
+    assertDenied(user, tool, obj, /read access/i, { code: 'CRUD_MISSING', stage: 'crud' });
   }
 });
 
@@ -422,7 +493,7 @@ test('evaluateMcpToolCall: denies create_record without canCreate', (t) => {
   const user = fx.callerFor(fx.profile('No Create Profile', [group]));
 
   assertPermitted(user, 'update_record', obj); // control
-  assertDenied(user, 'create_record', obj, /create access/i);
+  assertDenied(user, 'create_record', obj, /create access/i, { code: 'CRUD_MISSING', stage: 'crud' });
 });
 
 test('evaluateMcpToolCall: denies update_record without canUpdate', (t) => {
@@ -434,7 +505,7 @@ test('evaluateMcpToolCall: denies update_record without canUpdate', (t) => {
   const user = fx.callerFor(fx.profile('No Update Profile', [group]));
 
   assertPermitted(user, 'create_record', obj); // control
-  assertDenied(user, 'update_record', obj, /update access/i);
+  assertDenied(user, 'update_record', obj, /update access/i, { code: 'CRUD_MISSING', stage: 'crud' });
 });
 
 test('evaluateMcpToolCall: denies delete_record without canDelete', (t) => {
@@ -446,7 +517,7 @@ test('evaluateMcpToolCall: denies delete_record without canDelete', (t) => {
   const user = fx.callerFor(fx.profile('No Delete Profile', [group]));
 
   assertPermitted(user, 'update_record', obj); // control
-  assertDenied(user, 'delete_record', obj, /delete access/i);
+  assertDenied(user, 'delete_record', obj, /delete access/i, { code: 'CRUD_MISSING', stage: 'crud' });
 });
 
 // ---------------------------------------------------------------------------
@@ -465,6 +536,17 @@ test('evaluateMcpToolCall: permits a granted tool on a granted object and lists 
   assert.equal(result.objectName, obj);
   assert.deepEqual(sorted(result.allowedFields), ['Id', 'Name']);
   assert.ok(result.reason.length > 0, 'a permit also carries a reason');
+  // Without the call's arguments the wrapper checks the tool and the Object only.
+  assert.deepEqual(trace(result.decision), [
+    'tool:pass[]',
+    'identity:pass[]',
+    'groups:pass[]',
+    `tool_grant:pass[${group.id}]`,
+    `object:pass[${group.id}]`,
+    `crud:pass[${group.id}]`,
+  ]);
+  assert.deepEqual(result.decision.decidingGroupIds, [group.id]);
+  assert.equal(result.decision.objectName, obj);
 });
 
 test("evaluateMcpToolCall: allowedFields is the groups' allowedFields intersected with the globally enabled fields", (t) => {
@@ -534,8 +616,75 @@ test('evaluateMcpToolCall: combines a tool granted by one group with object acce
   const accessOnly = fx.group('Cross Access', [], [grant(obj, { canRead: true, canDelete: true }, ['Name'])]);
   const user = fx.callerFor(fx.profile('Cross Profile', [toolsOnly, accessOnly]));
 
-  assert.deepEqual(assertPermitted(user, 'get_record', obj).allowedFields, ['Name']);
+  const read = assertPermitted(user, 'get_record', obj);
+  assert.deepEqual(read.allowedFields, ['Name']);
   assertPermitted(user, 'delete_record', obj);
+
+  // Still allowed, and the trace shows which group gave what: the tool from one, the Object, the
+  // operation and the field from the other.
+  const decision = decide(user, 'get_record', { objectName: obj, recordId: to18(randomSfId15('a01')), fields: ['Name'] });
+  assertAllowedDecision(decision, 'get_record with arguments');
+  assert.deepEqual(trace(decision), [
+    'tool:pass[]',
+    'identity:pass[]',
+    'groups:pass[]',
+    `tool_grant:pass[${toolsOnly.id}]`,
+    `object:pass[${accessOnly.id}]`,
+    `crud:pass[${accessOnly.id}]`,
+    `fields:pass[${accessOnly.id}]`,
+    'input:pass[]',
+  ]);
+  assert.deepEqual(decision.steps.find((s) => s.stage === 'fields')?.fieldNames, ['Name']);
+  assert.deepEqual(sorted(decision.decidingGroupIds), sorted([toolsOnly.id, accessOnly.id]));
+  assert.deepEqual(sorted(read.decision.decidingGroupIds), sorted([toolsOnly.id, accessOnly.id]));
+});
+
+test('evaluatePolicy: per-step groups follow each capability, the per-entry Id fallback included, and unrelated groups do not decide', (t) => {
+  const fx = new PolicyFixture(t);
+  const obj = fx.object('Provenance', { Id: true, Name: true, Phone: true });
+  const other = fx.object('ProvenanceOther', { Id: true, Name: true });
+  const named = fx.group('A Provenance Named', ['soql_query'], [grant(obj, { canRead: true }, ['Name'])]);
+  // Lists no field, so it gives Id (the per-entry fallback), and grants no tool.
+  const fieldless = fx.group('B Provenance Fieldless', [], [grant(obj, { canRead: true, canUpdate: true }, [])]);
+  const phone = fx.group('C Provenance Phone', ['update_record'], [grant(obj, { canUpdate: true }, ['phone'])]);
+  const unrelated = fx.group('D Provenance Unrelated', ['soql_query'], [grant(other, FULL_CRUD, ['Id', 'Name'])]);
+  const user = fx.callerFor(fx.profile('Provenance Profile', [named, fieldless, phone, unrelated]));
+
+  const byId = decide(user, 'soql_query', { objectName: obj, fields: ['Id'] });
+  assertAllowedDecision(byId, 'soql_query Id');
+  assert.deepEqual(trace(byId), [
+    'tool:pass[]',
+    'identity:pass[]',
+    'groups:pass[]',
+    `tool_grant:pass[${named.id},${unrelated.id}]`,
+    `object:pass[${named.id},${fieldless.id},${phone.id}]`,
+    `crud:pass[${named.id},${fieldless.id}]`,
+    `fields:pass[${fieldless.id}]`,
+    'where:pass[]',
+    'input:pass[]',
+  ]);
+  assert.deepEqual(byId.decidingGroupIds, [named.id, fieldless.id, phone.id, unrelated.id]);
+
+  const byName = decide(user, 'soql_query', { objectName: obj.toUpperCase(), fields: ['NAME'], whereClause: "name != null AND ID != null" });
+  assertAllowedDecision(byName, 'soql_query Name');
+  assert.deepEqual(byName.steps.find((s) => s.stage === 'fields')?.grantingGroupIds, [named.id]);
+  const where = byName.steps.find((s) => s.stage === 'where');
+  assert.deepEqual(where?.fieldNames, ['name', 'ID']);
+  assert.deepEqual(where?.grantingGroupIds, [named.id, fieldless.id]);
+  assert.equal(byName.objectName, obj, 'the catalog spelling');
+  assert.ok(byName.steps.slice(4).every((s) => s.objectName === obj), 'the object-scoped steps name the Object');
+
+  // The write: the tool from C, Update from B and C, Phone (granted as 'phone') from C only.
+  const write = decide(user, 'update_record', { objectName: obj, recordId: to18(randomSfId15('a01')), fields: { Phone: '1' } });
+  assertAllowedDecision(write, 'update_record Phone');
+  assert.deepEqual(trace(write).slice(3), [
+    `tool_grant:pass[${phone.id}]`,
+    `object:pass[${named.id},${fieldless.id},${phone.id}]`,
+    `crud:pass[${fieldless.id},${phone.id}]`,
+    `fields:pass[${phone.id}]`,
+    'input:pass[]',
+  ]);
+  assert.deepEqual(write.decidingGroupIds, [named.id, fieldless.id, phone.id], 'D grants another tool and Object only');
 });
 
 test("evaluateMcpToolCall: allowedFields do not depend on the alphabetical order of the Profile's group names", (t) => {
@@ -562,6 +711,108 @@ test("evaluateMcpToolCall: allowedFields do not depend on the alphabetical order
   );
 });
 
+test('evaluateMcpToolCall: an entry with no enabled fields adds Id whichever group name sorts first', (t) => {
+  const fx = new PolicyFixture(t);
+  const obj = fx.object('IdSwap', { Id: true, Name: true, Secret__c: false });
+  // Each form of "no resolvable fields": none listed, only a globally disabled field, only a field the object lacks.
+  for (const noFields of [[], ['Secret__c'], ['Ghost__c']]) {
+    const label = JSON.stringify(noFields);
+    const fieldlessFirst = fx.profile(`IdSwap Fieldless First ${label}`, [
+      fx.group(`A IdSwap Fieldless ${label}`, ['soql_query'], [grant(obj, { canRead: true }, noFields)]),
+      fx.group(`B IdSwap Name ${label}`, ['soql_query'], [grant(obj, { canRead: true }, ['Name'])]),
+    ]);
+    const nameFirst = fx.profile(`IdSwap Name First ${label}`, [
+      fx.group(`A IdSwap Name ${label}`, ['soql_query'], [grant(obj, { canRead: true }, ['Name'])]),
+      fx.group(`B IdSwap Fieldless ${label}`, ['soql_query'], [grant(obj, { canRead: true }, noFields)]),
+    ]);
+
+    for (const profile of [fieldlessFirst, nameFirst]) {
+      assert.deepEqual(
+        sorted(assertPermitted(fx.callerFor(profile), 'soql_query', obj).allowedFields),
+        ['Id', 'Name'],
+        profile.name
+      );
+    }
+  }
+});
+
+test('evaluateMcpToolCall: a Delete-only entry with no fields adds no Id, in either group order', (t) => {
+  const fx = new PolicyFixture(t);
+  const obj = fx.object('IdDeleteOnly', { Id: true, Name: true });
+  // delete_record reads no field, so Delete-only access must not make Id readable through soql_query or get_record.
+  const deleteFirst = fx.profile('IdDeleteOnly Delete First', [
+    fx.group('A IdDeleteOnly Delete', ['soql_query'], [grant(obj, { canDelete: true }, [])]),
+    fx.group('B IdDeleteOnly Name', ['soql_query'], [grant(obj, { canRead: true }, ['Name'])]),
+  ]);
+  const nameFirst = fx.profile('IdDeleteOnly Name First', [
+    fx.group('A IdDeleteOnly Name', ['soql_query'], [grant(obj, { canRead: true }, ['Name'])]),
+    fx.group('B IdDeleteOnly Delete', ['soql_query'], [grant(obj, { canDelete: true }, [])]),
+  ]);
+
+  for (const profile of [deleteFirst, nameFirst]) {
+    assert.deepEqual(sorted(assertPermitted(fx.callerFor(profile), 'soql_query', obj).allowedFields), ['Name'], profile.name);
+  }
+});
+
+test('resolveEffectiveProfilePermissions: the Id fallback keeps every field the merged-set rule gave, in every group order', (t) => {
+  const fx = new PolicyFixture(t);
+  const enabledFields = ['Id', 'Name'];
+  const obj = fx.object('IdSuperset', { Id: true, Name: true, Secret__c: false });
+  const entries: Record<string, GroupObjectPermission> = {
+    ReadNone: grant(obj, { canRead: true }, []),
+    ReadName: grant(obj, { canRead: true }, ['Name']),
+    UpdateDisabled: grant(obj, { canUpdate: true }, ['Secret__c']),
+    DeleteNone: grant(obj, { canDelete: true }, []),
+  };
+
+  // The rule before the fix: Id was added only while the fields merged so far were still empty.
+  const mergedSetRule = (order: GroupObjectPermission[]): string[] => {
+    const fields = new Set<string>();
+    let readCreateOrUpdate = false;
+    for (const entry of order) {
+      readCreateOrUpdate ||= entry.canRead || entry.canCreate || entry.canUpdate;
+      for (const f of entry.allowedFields) if (enabledFields.includes(f)) fields.add(f);
+      if (fields.size === 0 && readCreateOrUpdate) fields.add('Id');
+    }
+    return sorted([...fields]);
+  };
+
+  // Every non-empty selection of the entries, in every order.
+  const orders: string[][] = [];
+  const arrange = (prefix: string[], rest: string[]) => {
+    if (prefix.length > 0) orders.push(prefix);
+    rest.forEach((key, i) => arrange([...prefix, key], [...rest.slice(0, i), ...rest.slice(i + 1)]));
+  };
+  arrange([], Object.keys(entries));
+
+  const resultBySet = new Map<string, string[]>();
+  let ordersThatGainId = 0;
+  for (const order of orders) {
+    // A leading letter per position makes the groups' name order follow `order`.
+    const groups = order.map((key, i) =>
+      fx.group(`${String.fromCharCode(65 + i)} IdSuperset ${order.join(' ')} ${key}`, [], [entries[key]])
+    );
+    const profile = fx.profile(`IdSuperset ${order.join(' ')}`, groups);
+    const effective = resolveEffectiveProfilePermissions(profile.id, profile.name);
+    const result = sorted([...(effective.objectPermissions.get(obj)?.allowedFields ?? [])]);
+    const before = mergedSetRule(order.map((key) => entries[key]));
+
+    for (const field of before) {
+      assert.ok(result.includes(field), `${order.join(' > ')}: keeps ${field} (before: ${before}, now: ${result})`);
+    }
+    if (result.length > before.length) ordersThatGainId++;
+
+    const setKey = sorted(order).join(' ');
+    const sameSet = resultBySet.get(setKey);
+    if (sameSet) {
+      assert.deepEqual(result, sameSet, `${order.join(' > ')}: same allowedFields as any other order of ${setKey}`);
+    } else {
+      resultBySet.set(setKey, result);
+    }
+  }
+  assert.ok(ordersThatGainId > 0, 'control: some orders gain Id that the merged-set rule left out');
+});
+
 test('evaluateMcpToolCall: matches the object name case-insensitively and returns the canonical API name', (t) => {
   const fx = new PolicyFixture(t);
   const obj = fx.object('Invoice', { Id: true, Name: true, Total__c: true }); // canonical: Invoice_<tag>__c
@@ -577,6 +828,108 @@ test('evaluateMcpToolCall: matches the object name case-insensitively and return
       assert.deepEqual(sorted(result.allowedFields), ['Name', 'Total__c']);
     }
   }
+});
+
+// Groups saved by an older version hold their grants as they were sent. The engine must neither grant
+// on a value that only looks like a flag nor throw on an entry it cannot read.
+test("evaluateMcpToolCall: a flag grants only when it is exactly true; an entry with any other value is skipped whole", (t) => {
+  const fx = new PolicyFixture(t);
+  const obj = fx.object('StrictFlags', { Id: true, Name: true });
+  const group = fx.group('Strict Flags', OBJECT_SCOPED_TOOLS, [
+    { ...grant(obj, { canDelete: true }, ['Id', 'Name']), canRead: 'false' } as never,
+  ]);
+  const user = fx.callerFor(fx.profile('Strict Flags Profile', [group]));
+
+  const notGranted = { code: 'OBJECT_NOT_GRANTED', stage: 'object' } as const;
+  for (const tool of OBJECT_SCOPED_TOOLS) assertDenied(user, tool, obj, /either disabled .* or not permitted/, notGranted);
+  const denied = assertDenied(user, 'soql_query', obj, /not permitted/, notGranted);
+  assert.deepEqual(denied.decision.skippedGroupEntries, denied.skippedGroupEntries, 'the decision carries them too');
+  assert.deepEqual(denied.skippedGroupEntries, [
+    { groupId: group.id, index: 0, reason: 'canRead is not true or false' },
+  ]);
+});
+
+test('resolveEffectiveProfilePermissions: skips each malformed stored entry, records why, and keeps the others', (t) => {
+  const warnings: string[] = [];
+  t.mock.method(console, 'warn', (message: string) => warnings.push(message));
+  const fx = new PolicyFixture(t);
+  const obj = fx.object('Malformed', { Id: true, Name: true, Secret__c: true });
+  const secret = `secret-${fx.tag}`;
+  const malformed = [
+    null,
+    `free text ${secret}`,
+    [obj],
+    { objectName: 7, canRead: true },
+    { ...grant(obj, { canRead: true }, ['Secret__c']), canUpdate: secret },
+    { ...grant(obj, { canRead: true }, []), allowedFields: secret },
+    { ...grant(obj, { canRead: true }, []), allowedFields: ['Secret__c', 7] },
+  ];
+  const group = fx.group('Malformed', ['soql_query'], [...malformed, grant(obj, { canRead: true }, ['Name'])] as never);
+  const profile = fx.profile('Malformed Profile', [group]);
+
+  const effective = resolveEffectiveProfilePermissions(profile.id);
+  assert.deepEqual(sorted([...(effective.objectPermissions.get(obj)?.allowedFields ?? [])]), ['Name']);
+  assert.deepEqual(effective.skippedGroupEntries, [
+    { groupId: group.id, index: 0, reason: 'the entry is not an object' },
+    { groupId: group.id, index: 1, reason: 'the entry is not an object' },
+    { groupId: group.id, index: 2, reason: 'the entry is not an object' },
+    { groupId: group.id, index: 3, reason: 'objectName is not text' },
+    { groupId: group.id, index: 4, reason: 'canUpdate is not true or false' },
+    { groupId: group.id, index: 5, reason: 'allowedFields is not a list of field names' },
+    { groupId: group.id, index: 6, reason: 'allowedFields is not a list of field names' },
+  ]);
+  const permitted = assertPermitted(fx.callerFor(profile), 'soql_query', obj);
+  assert.deepEqual(permitted.allowedFields, ['Name']);
+  assert.equal(permitted.skippedGroupEntries?.length, 7);
+
+  // Told once per entry and reason, by key only: evaluating again warns no more, and no value is logged.
+  resolveEffectiveProfilePermissions(profile.id);
+  assert.equal(warnings.length, 7);
+  for (const warning of warnings) {
+    assert.match(warning, new RegExp(`Access Group ${group.id}: object entry \\d is skipped`));
+    assert.ok(!warning.includes(secret), warning);
+  }
+});
+
+// POST /groups, the group editor and the upgrade migration merge a group's entries for one Object.
+test('mergeGrants: a merged entry gives what its entries gave one by one, including the Id fallback of each', (t) => {
+  const fx = new PolicyFixture(t);
+  const obj = fx.object('MergeId', { Id: true, Name: true, Phone: false });
+  const catalogFields = (objectName: string) => store.getObjectFieldNames(store.resolveObjectName(objectName)) ?? [];
+  let n = 0;
+  const effectiveFields = (entries: GroupObjectPermission[]) => {
+    n++;
+    const group = fx.group(`Merge Id ${n}`, ['soql_query'], entries);
+    const profile = fx.profile(`Merge Id ${n}`, [group]);
+    return sorted([...(resolveEffectiveProfilePermissions(profile.id).objectPermissions.get(obj)?.allowedFields ?? [])]);
+  };
+
+  const sameAccess: Array<[string, GroupObjectPermission[]]> = [
+    ['an entry with no field', [grant(obj.toLowerCase(), { canRead: true }, []), grant(obj, { canUpdate: true }, ['Name'])]],
+    ['an entry with only unknown fields', [grant(obj, { canCreate: true }, ['Gone__c']), grant(obj.toUpperCase(), { canRead: true }, ['name'])]],
+    ['an entry that only deletes, which has no fallback', [grant(obj, { canDelete: true }, []), grant(obj, { canRead: true }, ['Name'])]],
+    ['an entry that grants nothing', [grant(obj, {}, []), grant(obj, { canRead: true }, ['Name'])]],
+  ];
+  for (const [label, entries] of sameAccess) {
+    const merged = mergeGrants(entries, catalogFields);
+    assert.equal(merged.length, 1, label);
+    assert.deepEqual(effectiveFields(merged), effectiveFields(entries), label);
+  }
+  assert.deepEqual(mergeGrants(sameAccess[0][1], catalogFields)[0].allowedFields, ['Name', 'Id']);
+
+  // An entry whose fields all exist but are disabled falls back to Id only while they stay disabled,
+  // so no stored list gives the same in both states: the merged entry keeps the narrower one.
+  const disabledOnly = [grant(obj, { canRead: true }, ['Phone']), grant(obj, { canRead: true }, ['Name'])];
+  assert.deepEqual(effectiveFields(disabledOnly), ['Id', 'Name']);
+  assert.deepEqual(effectiveFields(mergeGrants(disabledOnly, catalogFields)), ['Name']);
+});
+
+test('evaluateMcpToolCall: a well-formed group adds no skippedGroupEntries property', (t) => {
+  const fx = new PolicyFixture(t);
+  const obj = fx.object('WellFormed', { Id: true });
+  const group = fx.group('Well Formed', ['soql_query'], [grant(obj, { canRead: true }, ['Id'])]);
+  const result = assertPermitted(fx.callerFor(fx.profile('Well Formed Profile', [group])), 'soql_query', obj);
+  assert.equal('skippedGroupEntries' in result, false);
 });
 
 test('evaluateMcpToolCall: permits list_enabled_objects without an object', (t) => {
@@ -638,7 +991,7 @@ test('profile resolution: a caller whose ProfileId has a different 15-character 
   for (const profileId of lookalikes) {
     const user = caller(profileId, `Lookalike ${fx.tag}`);
     assert.deepEqual(getVisibleToolsForUser(user), [], `${profileId} must see no tools`);
-    assertDenied(user, 'soql_query', obj, /not registered/i);
+    assertDenied(user, 'soql_query', obj, /not registered/i, { code: 'PROFILE_UNREGISTERED', stage: 'identity' });
   }
 });
 
@@ -654,7 +1007,7 @@ test("profile resolution: an id match wins over another registered Profile that 
 
   assert.deepEqual(getVisibleToolsForUser(user).map((a) => a.id), ['soql_query']);
   assert.deepEqual(assertPermitted(user, 'soql_query', obj).matchedGroups, [readers.name]);
-  assertDenied(user, 'delete_record', obj, /not granted/i);
+  assertDenied(user, 'delete_record', obj, /not granted/i, { code: 'TOOL_NOT_GRANTED', stage: 'tool_grant' });
 });
 
 test('salesforceIdsMatch: treats the 15- and 18-character forms of an id as equal', () => {
@@ -893,4 +1246,451 @@ test('assertSafeSoqlWhereClause: rejects a clause longer than 2000 characters', 
   assertAccepted(clauseOfLength(2000)); // control: the limit itself is allowed
   assertRejected(clauseOfLength(2001));
   assertRejected(`${"Name = 'x' OR ".repeat(200)}Name = 'x'`);
+});
+
+test('checkSoqlWhereClause: reports the first problem in reading order, and the fields an accepted clause uses', () => {
+  const allowed = ['Name', 'Amount__c'];
+  assert.deepEqual(checkSoqlWhereClause("name = 'a' AND (NAME != 'b' OR amount__c > 1) AND Id != null", allowed), {
+    ok: true,
+    fieldNames: ['name', 'amount__c', 'Id'],
+  });
+  assert.deepEqual(checkSoqlWhereClause("Secret__c = 'x' AND (", allowed), {
+    ok: false,
+    problem: 'field',
+    fieldName: 'Secret__c',
+    message: "whereClause references 'Secret__c', which is not an allowed field for this Profile.",
+  });
+  assert.deepEqual(checkSoqlWhereClause("Name = 'x'; Secret__c = 'y'", allowed), {
+    ok: false,
+    problem: 'malformed',
+    message: 'whereClause contains an unsupported character at position 11.',
+  });
+  assert.deepEqual(checkSoqlWhereClause("(Name = 'x'", allowed), {
+    ok: false,
+    problem: 'malformed',
+    message: 'whereClause has unbalanced parentheses.',
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6. evaluatePolicy: the decision with the call's arguments
+// ---------------------------------------------------------------------------
+
+const RECORD_ID = to18(randomSfId15('a01'));
+
+/** One Profile with read and write access to one Object, for the argument checks. */
+function argumentFixture(t: TestContext) {
+  const fx = new PolicyFixture(t);
+  const obj = fx.object('Args', { Id: true, Name: true, Amount__c: true, Secret__c: false });
+  const group = fx.group('Args Everything', ALL_ACTIONS, [grant(obj, FULL_CRUD, ['Id', 'Name', 'Amount__c', 'Secret__c'])]);
+  const profile = fx.profile('Args Profile', [group]);
+  return { fx, obj, group, profile, user: fx.callerFor(profile) };
+}
+
+test('evaluatePolicy: a requested or written field outside the allowlist is FIELD_NOT_PERMITTED at the fields stage', (t) => {
+  const { obj, profile, user } = argumentFixture(t);
+  const calls: Array<[string, Record<string, unknown>, string[]]> = [
+    ['soql_query', { objectName: obj, fields: ['Name', 'Secret__c'] }, ['Secret__c']],
+    ['get_record', { objectName: obj, recordId: RECORD_ID, fields: ['Ghost__c', 'id'] }, ['Ghost__c']],
+    ['create_record', { objectName: obj, fields: { Name: 'x', Secret__c: 'y', Other__c: 1 } }, ['Secret__c', 'Other__c']],
+    ['update_record', { objectName: obj, recordId: RECORD_ID, fields: { secret__C: 'y' } }, ['secret__C']],
+  ];
+  for (const [tool, args, denied] of calls) {
+    const decision = decide(user, tool, args);
+    assertRefusal(decision, { code: 'FIELD_NOT_PERMITTED', stage: 'fields' }, tool);
+    assert.equal(
+      decision.reason,
+      `Fields [${denied.join(', ')}] on ${obj} are not permitted for Profile '${profile.name}'.`,
+      `${tool} reason`
+    );
+    assert.deepEqual(decision.steps.at(-1)?.fieldNames, denied, `${tool} names the refused fields`);
+    assert.equal(decision.steps.at(-1)?.objectName, obj);
+    assert.equal(decisionLogStatus(decision), 'DENIED');
+  }
+});
+
+test('evaluatePolicy: a WHERE clause naming a field outside the allowlist is WHERE_FIELD_NOT_PERMITTED at the where stage', (t) => {
+  const { obj, user } = argumentFixture(t);
+  for (const [whereClause, field] of [
+    ["Secret__c = 'x'", 'Secret__c'],
+    ["Name = 'x' OR (Owner__c != null)", 'Owner__c'],
+    ['Id IN (SELECT AccountId FROM Contact)', 'SELECT'],
+  ]) {
+    const decision = decide(user, 'soql_query', { objectName: obj, fields: ['Name'], whereClause });
+    assertRefusal(decision, { code: 'WHERE_FIELD_NOT_PERMITTED', stage: 'where' }, whereClause);
+    assert.equal(decision.reason, `whereClause references '${field}', which is not an allowed field for this Profile.`);
+    assert.deepEqual(decision.steps.at(-1)?.fieldNames, [field]);
+    assert.equal(decision.steps.at(-2)?.stage, 'fields', 'the field names were checked first');
+  }
+});
+
+test('evaluatePolicy: malformed arguments are invalid (INPUT_INVALID at the input stage), logged DENIED, with the handlers\' messages', (t) => {
+  const { obj, user } = argumentFixture(t);
+  const cases: Array<[string, Record<string, unknown>, string]> = [
+    ['soql_query', { objectName: obj, whereClause: "(Name = 'x'" }, 'whereClause has unbalanced parentheses.'],
+    ['soql_query', { objectName: obj, whereClause: "Name = 'x')" }, 'whereClause has unbalanced parentheses.'],
+    ['soql_query', { objectName: obj, whereClause: "Name = 'x' -- c" }, 'whereClause contains an unsupported character at position 12.'],
+    ['soql_query', { objectName: obj, whereClause: `Name = '${'a'.repeat(2000)}'` }, 'whereClause is longer than 2000 characters.'],
+    ['get_record', { objectName: obj, recordId: 'abc' }, 'recordId must be a 15 or 18-character Salesforce Record ID.'],
+    ['get_record', { objectName: obj }, 'recordId must be a 15 or 18-character Salesforce Record ID.'],
+    ['update_record', { objectName: obj, recordId: '../../limits', fields: { Name: 'x' } }, 'recordId must be a 15 or 18-character Salesforce Record ID.'],
+    ['delete_record', { objectName: obj, recordId: 42 }, 'recordId must be a 15 or 18-character Salesforce Record ID.'],
+    ['create_record', { objectName: obj }, 'fields must be an object of field names to values.'],
+    ['create_record', { objectName: obj, fields: {} }, 'fields must be an object of field names to values.'],
+    ['update_record', { objectName: obj, recordId: RECORD_ID, fields: ['Name'] }, 'fields must be an object of field names to values.'],
+  ];
+  for (const [tool, args, message] of cases) {
+    const decision = decide(user, tool, args);
+    assertRefusal(decision, { code: 'INPUT_INVALID', stage: 'input', outcome: 'invalid' }, `${tool} ${JSON.stringify(args).slice(0, 80)}`);
+    assert.equal(decision.reason, message);
+    assert.equal(decisionLogStatus(decision), 'DENIED', 'invalid arguments are logged as DENIED, not ERROR');
+  }
+
+  // A missing objectName is refused before the Object is looked up.
+  const missing = decide(user, 'soql_query', { fields: ['Name'] });
+  assertRefusal(missing, { code: 'INPUT_INVALID', stage: 'input' }, 'missing objectName');
+  assert.deepEqual(missing.steps.map((s) => s.stage), ['tool', 'identity', 'groups', 'tool_grant', 'input']);
+  assert.equal(missing.reason, "MCP Action 'soql_query' requires an objectName argument.");
+});
+
+test('evaluatePolicy: an objectName that is not an API name is invalid at the input stage, with the reason an ungranted Object gets', (t) => {
+  const { fx, obj, group, user } = argumentFixture(t);
+  const notGranted = (name: string) =>
+    `Object '${name}' is either disabled in Salesforce > Objects or not permitted by Groups [${group.name}].`;
+  const cases: Array<[unknown, string]> = [
+    ['ACCT-99812', 'ACCT-99812'],
+    ["Account WHERE Name != null", "Account WHERE Name != null"],
+    [` ${obj}`, ` ${obj}`],
+    [`${obj}.Owner`, `${obj}.Owner`],
+    [5, '5'],
+    // Not text at all, even when it reads as an API name.
+    [true, 'true'],
+    [['Nothing__c'], 'Nothing__c'],
+  ];
+  for (const [objectName, asText] of cases) {
+    const label = `objectName ${JSON.stringify(objectName)}`;
+    const decision = decide(user, 'soql_query', { objectName, fields: ['Name'] });
+    assertRefusal(decision, { code: 'INPUT_INVALID', stage: 'input' }, label);
+    assert.deepEqual(decision.steps.map((s) => s.stage), ['tool', 'identity', 'groups', 'tool_grant', 'input'], label);
+    assert.equal(decision.steps.at(-1)?.objectName, asText, label);
+    assert.equal(decision.reason, notGranted(asText), `${label}: the caller is told what an ungranted Object gets`);
+    assert.equal(decisionLogStatus(decision), 'DENIED', label);
+  }
+  // The wrapper (no arguments but the Object) classifies a text one the same way, with the same reason.
+  for (const target of ['ACCT-99812', "Account WHERE Email = 'x'"]) {
+    assertDenied(user, 'soql_query', target, /not permitted by Groups/, { code: 'INPUT_INVALID', stage: 'input' });
+  }
+  // A valid API name that names no granted Object is still a permission denial.
+  assertRefusal(
+    decide(user, 'soql_query', { objectName: `Nothing_${fx.tag}__c` }),
+    { code: 'OBJECT_NOT_GRANTED', stage: 'object' },
+    'an API name nothing grants'
+  );
+});
+
+test('evaluatePolicy: an argument that cannot be read as text is invalid with the reader\'s message, never an error decision', (t) => {
+  const errors: unknown[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => errors.push(args));
+  const { obj, user } = argumentFixture(t);
+  // JSON can carry an object whose toString is not a function; String() of it throws a TypeError.
+  const unreadable = { toString: 1 };
+  for (const tool of ['soql_query', 'get_record']) {
+    const decision = decide(user, tool, { objectName: obj, recordId: RECORD_ID, fields: ['Name', unreadable] });
+    assertRefusal(decision, { code: 'INPUT_INVALID', stage: 'input', outcome: 'invalid' }, tool);
+    assert.equal(decision.reason, 'Cannot convert object to primitive value', tool);
+    assert.equal(decision.steps.at(-2)?.stage, 'crud', `${tool}: read after access was decided`);
+    assert.equal(decisionLogStatus(decision), 'DENIED', tool);
+  }
+  // The objectName is read before the Object is looked up.
+  const objectName = decide(user, 'soql_query', { objectName: unreadable });
+  assertRefusal(objectName, { code: 'INPUT_INVALID', stage: 'input' }, 'objectName');
+  assert.equal(objectName.reason, 'Cannot convert object to primitive value');
+  assert.deepEqual(errors, [], 'a caller\'s malformed input is not reported as an engine failure');
+});
+
+test('evaluatePolicy: checks run in the order the handlers ran them, so a call with two problems reports the same one as before', (t) => {
+  const { fx, obj, user } = argumentFixture(t);
+  const ungranted = fx.object('ArgsUngranted', { Id: true });
+  const cases: Array<[string, Record<string, unknown>, PolicyDecisionCode, PolicyStage]> = [
+    // Access before arguments: an unauthorized caller learns nothing about its arguments.
+    ['get_record', { objectName: ungranted, recordId: 'abc' }, 'OBJECT_NOT_GRANTED', 'object'],
+    ['create_record', { objectName: ungranted, fields: [] }, 'OBJECT_NOT_GRANTED', 'object'],
+    // The record id before the field names, as get_record and update_record read them.
+    ['get_record', { objectName: obj, recordId: 'abc', fields: ['Secret__c'] }, 'INPUT_INVALID', 'input'],
+    ['update_record', { objectName: obj, recordId: 'abc', fields: { Secret__c: 1 } }, 'INPUT_INVALID', 'input'],
+    // The selected fields before the WHERE clause, and the WHERE clause in reading order.
+    ['soql_query', { objectName: obj, fields: ['Secret__c'], whereClause: "(Name = 'x'" }, 'FIELD_NOT_PERMITTED', 'fields'],
+    ['soql_query', { objectName: obj, whereClause: "Secret__c = 'x' AND (" }, 'WHERE_FIELD_NOT_PERMITTED', 'where'],
+    ['soql_query', { objectName: obj, whereClause: "Name = 'x'; Secret__c = 'y'" }, 'INPUT_INVALID', 'input'],
+  ];
+  for (const [tool, args, code, stage] of cases) {
+    assertRefusal(decide(user, tool, args), { code, stage }, `${tool} ${JSON.stringify(args)}`);
+  }
+});
+
+test('evaluatePolicy: allowed calls with arguments record the argument stages and keep the wrapper\'s result', (t) => {
+  const { obj, group, user } = argumentFixture(t);
+  const cases: Array<[string, Record<string, unknown>, PolicyStage[]]> = [
+    ['describe_object', { objectName: obj.toLowerCase() }, []],
+    ['soql_query', { objectName: obj, fields: ['Id', 'name'], whereClause: "Amount__c > 5", limit: 'abc' }, ['fields', 'where']],
+    // A fields value that is not a list selects every allowed field, as soql_query always did.
+    ['soql_query', { objectName: obj, fields: { Name: 'x' } }, ['fields', 'where']],
+    ['get_record', { objectName: obj, recordId: ` ${RECORD_ID} ` }, ['fields']],
+    ['create_record', { objectName: obj, fields: { Name: 'x' } }, ['fields']],
+    ['update_record', { objectName: obj, recordId: RECORD_ID, fields: { Amount__c: 1 } }, ['fields']],
+    ['delete_record', { objectName: obj, recordId: RECORD_ID }, []],
+    ['list_enabled_objects', {}, []],
+  ];
+  for (const [tool, args, argumentStages] of cases) {
+    const decision = decide(user, tool, args);
+    assertAllowedDecision(decision, tool);
+    const accessStages = tool === 'list_enabled_objects'
+      ? ['tool', 'identity', 'groups', 'tool_grant']
+      : ['tool', 'identity', 'groups', 'tool_grant', 'object', 'crud'];
+    // The last step, an 'input' pass, says the arguments were checked and all passed.
+    assert.deepEqual(decision.steps.map((s) => s.stage), [...accessStages, ...argumentStages, 'input'], tool);
+    assert.deepEqual(decision.steps.at(-1), {
+      stage: 'input',
+      result: 'pass',
+      grantingGroupIds: [],
+      objectName: tool === 'list_enabled_objects' ? null : obj,
+      fieldNames: [],
+      ruleId: null,
+    }, tool);
+    assert.deepEqual(decision.decidingGroupIds, [group.id], tool);
+
+    const wrapper = evaluateMcpToolCall(user, tool, typeof args.objectName === 'string' ? args.objectName : undefined);
+    assert.equal(decision.reason, wrapper.reason, tool);
+    assert.equal(decision.objectName, wrapper.objectName ?? null, tool);
+    assert.deepEqual(decision.allowedFields, wrapper.allowedFields, tool);
+    // The wrapper checked no argument, and its trace says so: no 'input' step.
+    assert.deepEqual(wrapper.decision.steps.map((s) => s.stage), accessStages, `${tool} wrapper`);
+    assert.notDeepEqual(wrapper.decision.steps, decision.steps, `${tool}: a check without the arguments looks different`);
+  }
+  const selectAll = decide(user, 'soql_query', { objectName: obj, fields: { Name: 'x' } });
+  assert.deepEqual(selectAll.steps.find((s) => s.stage === 'fields')?.fieldNames, ['Id', 'Name', 'Amount__c']);
+});
+
+test('evaluatePolicy: list_enabled_objects ignores objectName, so no Object it names can deny it', (t) => {
+  const fx = new PolicyFixture(t);
+  const granted = fx.object('ListGranted', { Id: true });
+  const disabled = fx.object('ListDisabled', { Id: true }, { enabled: false });
+  const unshared = fx.object('ListUnshared', { Id: true });
+  const group = fx.group('List Readers', ['list_enabled_objects'], [
+    grant(granted, { canRead: true }, ['Id']),
+    grant(disabled, { canRead: true }, ['Id']),
+  ]);
+  const user = fx.callerFor(fx.profile('List Profile', [group]));
+
+  for (const objectName of [granted, disabled, unshared, `Missing_${fx.tag}__c`, "Account WHERE x = 'y'", 7]) {
+    const decision = decide(user, 'list_enabled_objects', { objectName });
+    assertAllowedDecision(decision, `list_enabled_objects(${objectName})`);
+    assert.deepEqual(decision.steps.map((s) => s.stage), ['tool', 'identity', 'groups', 'tool_grant', 'input']);
+    assert.equal(decision.steps.at(-1)?.objectName, null, 'the ignored objectName is not recorded');
+    assert.equal(decision.objectName, null);
+    assert.deepEqual(decision.allowedFields, []);
+    if (typeof objectName === 'string') {
+      const wrapper = assertPermitted(user, 'list_enabled_objects', objectName);
+      assert.deepEqual(wrapper.allowedFields, []);
+      assert.equal(wrapper.objectName, undefined);
+    }
+  }
+});
+
+test('evaluatePolicy: identity records how the Profile was matched', (t) => {
+  const fx = new PolicyFixture(t);
+  const group = fx.group('Identity Readers', ['list_enabled_objects']);
+  const id15 = randomSfId15('00e');
+  const profile = fx.profile('Identity Profile', [group], id15);
+
+  const byId = decide(caller(to18(id15), 'Some Other Name'), 'list_enabled_objects', {});
+  assert.deepEqual(byId.identity, { callerProfileId: to18(id15), matchedProfileId: id15, matchMethod: 'id' });
+
+  const strangerId = to18(randomSfId15('00e'));
+  const byName = decide(caller(strangerId, profile.name.toUpperCase()), 'list_enabled_objects', {});
+  assertAllowedDecision(byName, 'name fallback');
+  assert.deepEqual(byName.identity, { callerProfileId: strangerId, matchedProfileId: id15, matchMethod: 'name' });
+
+  const none = decide(caller(strangerId, `Nobody ${fx.tag}`), 'list_enabled_objects', {});
+  assertRefusal(none, { code: 'PROFILE_UNREGISTERED', stage: 'identity' }, 'no match');
+  assert.deepEqual(none.identity, { callerProfileId: strangerId, matchedProfileId: null, matchMethod: 'none' });
+  assert.deepEqual(none.assignedGroups, []);
+});
+
+test('evaluatePolicy: the decision carries the policy revision of its snapshot', (t) => {
+  const fx = new PolicyFixture(t);
+  const user = fx.callerFor(fx.profile('Revision Profile', [fx.group('Revision Readers', ['list_enabled_objects'])]));
+  const snapshot = loadPolicySnapshot();
+  assert.equal(snapshot.policyRevision, store.getPolicyRevision());
+  assert.equal(evaluatePolicy(user, 'list_enabled_objects', {}, snapshot).policyRevision, snapshot.policyRevision);
+
+  fx.object('RevisionBump', { Id: true }); // a policy change
+  assert.equal(evaluatePolicy(user, 'list_enabled_objects', {}, snapshot).policyRevision, snapshot.policyRevision);
+  assert.ok(decide(user, 'list_enabled_objects', {}).policyRevision > snapshot.policyRevision);
+});
+
+test('evaluatePolicy: overrides.assignedGroupIds replaces the mapped groups for one evaluation', (t) => {
+  const fx = new PolicyFixture(t);
+  const obj = fx.object('WhatIf', { Id: true, Name: true });
+  const readers = fx.group('WhatIf Readers', ['soql_query'], [grant(obj, { canRead: true }, ['Name'])]);
+  const deleters = fx.group('WhatIf Deleters', ['delete_record'], [grant(obj, { canDelete: true }, [])]);
+  const profile = fx.profile('WhatIf Profile', [readers]);
+  const user = fx.callerFor(profile);
+  const remove = { objectName: obj, recordId: RECORD_ID };
+
+  assertRefusal(decide(user, 'delete_record', remove), { code: 'TOOL_NOT_GRANTED', stage: 'tool_grant' }, 'as stored');
+
+  const whatIf = decide(user, 'delete_record', remove, { assignedGroupIds: [deleters.id, `grp_unknown_${fx.tag}`] });
+  assertAllowedDecision(whatIf, 'what-if');
+  assert.deepEqual(whatIf.assignedGroups, [{ id: deleters.id, name: deleters.name }], 'unknown ids grant nothing');
+  assert.deepEqual(whatIf.decidingGroupIds, [deleters.id]);
+  assertRefusal(
+    decide(user, 'soql_query', { objectName: obj }, { assignedGroupIds: [deleters.id] }),
+    { code: 'TOOL_NOT_GRANTED', stage: 'tool_grant' },
+    'the mapped group no longer applies'
+  );
+
+  assertRefusal(decide(user, 'soql_query', { objectName: obj }, { assignedGroupIds: [] }), { code: 'NO_GROUPS', stage: 'groups' }, 'no groups');
+  assertRefusal(
+    decide(fx.unregisteredCaller(), 'delete_record', remove, { assignedGroupIds: [deleters.id] }),
+    { code: 'PROFILE_UNREGISTERED', stage: 'identity' },
+    'an override does not register a Profile'
+  );
+
+  // Nothing was stored: the Profile still has only its mapped group.
+  assert.deepEqual(store.getProfileGroupIds(profile.id), [readers.id]);
+  assertAllowedDecision(decide(user, 'soql_query', { objectName: obj }), 'as stored again');
+});
+
+/** A policy that exists only in memory: one Profile, one group reading Name on one Object. */
+function syntheticSnapshot(objectName: string): { snapshot: PolicySnapshot; user: VerifiedSalesforceUser; groupId: string } {
+  const profileId = to18(randomSfId15('00e'));
+  const field = (fieldName: string) => ({
+    objectName,
+    fieldName,
+    label: fieldName,
+    fieldType: 'Text',
+    isCustom: false,
+    required: false,
+    enabled: true,
+    missingInOrg: false,
+  });
+  const object: SalesforceObject = {
+    objectName,
+    label: objectName,
+    isCustom: true,
+    enabled: true,
+    sourcePath: '',
+    fieldCount: 2,
+    enabledFieldCount: 2,
+    fields: [field('Id'), field('Name')],
+    updatedAt: '',
+  };
+  const group: AccessGroup = {
+    id: `grp_synthetic_${crypto.randomBytes(4).toString('hex')}`,
+    name: 'Synthetic Readers',
+    description: '',
+    allowedActions: ['soql_query'],
+    objectPermissions: [grant(objectName, { canRead: true }, ['Name'])],
+    version: 1,
+    updatedAt: '',
+  };
+  return {
+    snapshot: {
+      policyRevision: 41,
+      profiles: [{ id: profileId, name: 'Synthetic Profile', updatedAt: '' }],
+      groups: [group],
+      mappings: [{ profileId, groupIds: [group.id] }],
+      objects: [object],
+    },
+    user: caller(profileId, 'Synthetic Profile'),
+    groupId: group.id,
+  };
+}
+
+test('evaluatePolicy: is pure, deciding from the snapshot alone without reading the store', (t) => {
+  const { snapshot, user, groupId } = syntheticSnapshot('Synthetic__c');
+  for (const method of ['getPolicyRevision', 'getProfiles', 'getGroups', 'getProfileGroupMappings', 'getObjects'] as const) {
+    t.mock.method(store, method, () => {
+      throw new Error(`evaluatePolicy read store.${method}()`);
+    });
+  }
+
+  const decision = evaluatePolicy(user, 'soql_query', { objectName: 'synthetic__C', fields: ['Name'] }, snapshot);
+  assertAllowedDecision(decision, 'synthetic');
+  assert.equal(decision.objectName, 'Synthetic__c');
+  assert.equal(decision.policyRevision, 41);
+  assert.deepEqual(decision.decidingGroupIds, [groupId]);
+  assert.deepEqual(
+    resolveEffectiveProfilePermissions(user.profileId, user.profileName, snapshot).assignedGroups.map((g) => g.id),
+    [groupId]
+  );
+});
+
+test('evaluatePolicy: an Object stored under a name that is not an API name is a policy fault, an error decision', (t) => {
+  const errors: unknown[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => errors.push(args));
+  // Saved before names were validated; the catalog no longer accepts one, so only a snapshot holds it.
+  // The name is the stored policy's, not the caller's (who may spell it in any case), so it is not
+  // the caller's invalid input: it is logged as ERROR, as the handler's check logged it.
+  const { snapshot, user } = syntheticSnapshot('Legacy Object');
+  const decision = evaluatePolicy(user, 'soql_query', { objectName: 'legacy object', fields: ['Name'] }, snapshot);
+  assert.equal(decision.outcome, 'error');
+  assert.equal(decision.code, 'INTERNAL_ERROR');
+  assert.equal(decision.reason, "Object 'Legacy Object' is not a valid Salesforce API name.", 'the text the handler gave');
+  assert.equal(decisionLogStatus(decision), 'ERROR');
+  // Access was decided first; evaluation stopped after it, with no step failed.
+  assert.deepEqual(decision.steps.map((s) => `${s.stage}:${s.result}`), [
+    'tool:pass',
+    'identity:pass',
+    'groups:pass',
+    'tool_grant:pass',
+    'object:pass',
+    'crud:pass',
+  ]);
+  assert.deepEqual(decision.decidingGroupIds, []);
+  assert.equal(decision.objectName, null);
+  assert.deepEqual(decision.allowedFields, []);
+  assert.deepEqual(errors, [], 'a stored name is reported by the decision, not as an exception');
+  // Without the arguments (the wrapper, the simulator without a sample payload) the handler's check
+  // is not made, as before.
+  assert.equal(
+    evaluateToolAccess(user, 'soql_query', 'legacy object', snapshot).outcome,
+    'allowed'
+  );
+});
+
+test('evaluatePolicy: an exception inside the evaluation is an error decision that allows nothing', (t) => {
+  const errors: unknown[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => errors.push(args));
+  const { snapshot, user } = syntheticSnapshot('Broken__c');
+  const broken = { ...snapshot, objects: [{ ...snapshot.objects[0], fields: [null] }] } as unknown as PolicySnapshot;
+
+  const decision = evaluatePolicy(user, 'soql_query', { objectName: 'Broken__c' }, broken);
+  assert.equal(decision.outcome, 'error');
+  assert.equal(decision.code, 'INTERNAL_ERROR');
+  assert.equal(decision.reason, 'The access policy could not be evaluated, so the call is refused.');
+  assert.deepEqual(decision.decidingGroupIds, []);
+  assert.deepEqual(decision.allowedFields, []);
+  assert.equal(decision.objectName, null);
+  assert.equal(decision.policyRevision, 41);
+  assert.equal(decisionLogStatus(decision), 'ERROR');
+  assert.equal(errors.length, 1, 'the failure is logged for the operator');
+
+  const unreadable = evaluatePolicy(user, 'soql_query', {}, null as unknown as PolicySnapshot);
+  assert.equal(unreadable.outcome, 'error');
+  assert.equal(unreadable.policyRevision, 0);
+});
+
+test('resolveEffectiveProfilePermissions: the same result from the store as from a snapshot of it', (t) => {
+  const fx = new PolicyFixture(t);
+  const obj = fx.object('SameMerge', { Id: true, Name: true, Phone: false });
+  const profile = fx.profile('SameMerge Profile', [
+    fx.group('SameMerge A', ['soql_query'], [grant(obj, { canRead: true }, ['Name', 'Phone'])]),
+    fx.group('SameMerge B', ['get_record'], [grant(obj.toUpperCase(), { canUpdate: true }, [])]),
+  ]);
+  assert.deepEqual(
+    resolveEffectiveProfilePermissions(profile.id, profile.name, loadPolicySnapshot()),
+    resolveEffectiveProfilePermissions(profile.id, profile.name)
+  );
 });
