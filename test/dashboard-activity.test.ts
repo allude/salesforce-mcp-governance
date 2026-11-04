@@ -10,7 +10,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { store, UNVERIFIED_CALLER_USERNAME } from '../src/db/store.js';
 import { TrafficDashboardView } from '../src/components/views/DashboardAndLogsViews.js';
 import type { CopilotMcpLogEntry, McpActivityFigures } from '../src/types/governance.js';
-import { formatShortTime } from '../src/components/ui/primitives.js';
+import { formatTimeOfDayUtc } from '../src/components/ui/timestamp.js';
 import { startTestServer, loginAsAdmin, adminFetch, type AdminSession, type TestServer } from './helpers/server.js';
 
 const MINUTE = 60_000;
@@ -297,7 +297,7 @@ describe('the dashboard shows the server figures', () => {
 
   test('while live refresh is paused, the figures say when their window ended instead of "last"', () => {
     const html = render(figures, VIEW_NOW + 3 * MINUTE);
-    const end = formatShortTime(figures.asOf);
+    const end = formatTimeOfDayUtc(figures.asOf);
     assert.doesNotMatch(html, /last 24 h\b/, "the chart's own \"last 24 hours\" is not one of the figures");
     assert.ok(html.includes(`420 verified calls, 24 h to ${end}`));
     assert.ok(html.includes(`across 12 profiles, 24 h to ${end}`));

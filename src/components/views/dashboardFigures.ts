@@ -1,4 +1,4 @@
-import { formatShortTime } from '@/components/ui/primitives';
+import { formatTimeOfDayUtc } from '@/components/ui/timestamp';
 import type { McpActivityFigures } from '@/types/governance';
 
 /** The dashboard's target share of MCP calls answered without an error, in percent. */
@@ -31,17 +31,18 @@ const ACTIVITY_CURRENT_MS = 2 * 60_000;
 /**
  * The window the activity figures cover. They are as of the last answer from the server, while the
  * chart beside them keeps ageing between answers, so once they are older than a couple of polls,
- * which happens while live refresh is paused, the label says when the window ended, with its date
- * when that was an earlier day. `now` should be on the server's clock.
+ * which happens while live refresh is paused, the label says when the window ended (UTC), with its date
+ * when that was an earlier UTC day. `now` should be on the server's clock.
  */
 export function activityWindowLabel(figures: McpActivityFigures | null | undefined, now: number): string {
   const hours = figures?.windowHours ?? 24;
   const asOf = figures ? Date.parse(figures.asOf) : NaN;
   if (Number.isNaN(asOf) || now - asOf < ACTIVITY_CURRENT_MS) return `last ${hours} h`;
+  // Days are UTC days, like the time itself (src/components/ui/timestamp.ts).
   const end = new Date(asOf);
   const day =
-    end.toDateString() === new Date(now).toDateString()
+    end.toISOString().slice(0, 10) === new Date(now).toISOString().slice(0, 10)
       ? ''
-      : `${end.toLocaleDateString([], { month: 'short', day: 'numeric' })} `;
-  return `${hours} h to ${day}${formatShortTime(figures!.asOf)}`;
+      : `${end.toLocaleDateString([], { month: 'short', day: 'numeric', timeZone: 'UTC' })} `;
+  return `${hours} h to ${day}${formatTimeOfDayUtc(figures!.asOf)}`;
 }

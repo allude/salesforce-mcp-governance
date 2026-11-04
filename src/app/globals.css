@@ -2037,4 +2037,85 @@ time {
   width: 11px;
   height: 11px;
 }
+
+/* Primitives (src/components/ui/primitives.tsx) */
+.sw-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.tgl {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border-radius: 5px;
+  border: 1px solid var(--bd);
+  background: var(--pan);
+  color: var(--t2);
+  font-size: 11.5px;
+}
+
+.tgl.on,
+.tgl[aria-pressed='true'] {
+  border-color: var(--ctl-primary);
+  color: var(--tx);
+  background: var(--ctl-primary-d);
+}
+
+.api-name {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--tx);
+}
+
+.num-unit {
+  color: var(--t3);
+}
+
+.dlg-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.toast-region {
+  position: fixed;
+  right: 22px;
+  bottom: 18px;
+  z-index: var(--z-toast);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.toast-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.toast-stack:empty {
+  display: none;
+}
+
+.toast-region .toast-banner {
+  position: static;
+  pointer-events: auto;
+  max-width: min(520px, calc(100vw - 44px));
+}
+
+.toast-banner.is-error {
+  border-color: var(--status-error-border);
+}
+
+.toast-msg {
+  flex: 1;
+}
 }

@@ -1,8 +1,14 @@
+'use client';
+
 import React from 'react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { AVAILABLE_MCP_ACTIONS } from '@/types/governance';
 import type { McpActionId, McpActionType } from '@/types/governance';
+import { useModalDialog } from '@/components/views/useModalDialog';
+import { statusTone, statusToneClass, type StatusTone } from './statusTone';
+import { formatDateUtc, formatLocalTimestamp, formatTimestamp } from './timestamp';
+import type { ToastItem } from './toastQueue';
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -55,25 +61,6 @@ export function isSensitiveField(fieldName: string, label?: string): boolean {
   return /ssn|tax|birth|salary|password|secret|margin|payment|routing|credit|bank/i.test(
     target
   );
-}
-
-export function formatShortTime(iso: string): string {
-  if (!iso) return '—';
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleTimeString([], {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-  });
-}
-
-export function formatDateShort(iso: string): string {
-  if (!iso) return '—';
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  return d.toISOString().slice(0, 10);
 }
 
 export function Card({
@@ -207,31 +194,362 @@ export function Button({
   );
 }
 
+/**
+ * A switch with an accessible name. `label` is required: an unlabelled role="switch" reads as "switch,
+ * off" with nothing to say what it turns on. Pass `labelHidden` to keep the name off screen.
+ */
 export function Switch({
   checked,
   onCheckedChange,
   disabled,
+  label,
+  labelHidden = true,
+  describedBy,
+  className,
 }: {
   checked: boolean;
   onCheckedChange: (checked: boolean) => void;
   disabled?: boolean;
+  label: string;
+  labelHidden?: boolean;
+  describedBy?: string;
+  className?: string;
 }) {
-  return (
+  const button = (
     <button
       type="button"
       role="switch"
       aria-checked={checked}
+      aria-label={labelHidden ? label : undefined}
+      aria-describedby={describedBy}
       disabled={disabled}
       onClick={(e) => {
         e.stopPropagation();
         onCheckedChange(!checked);
       }}
-      className={cn(
-        'sw',
-        checked && 'on',
-        disabled && 'opacity-50 cursor-not-allowed'
-      )}
+      className={cn('sw', checked && 'on', disabled && 'opacity-50 cursor-not-allowed', className)}
     />
+  );
+  if (labelHidden) return button;
+  return (
+    <label className="sw-row">
+      {button}
+      <span>{label}</span>
+    </label>
+  );
+}
+
+/** A two-state button (a filter chip, Live/Paused): `aria-pressed` says which state it is in. */
+export function ToggleButton({
+  pressed,
+  onPressedChange,
+  className,
+  children,
+  ...props
+}: Omit<React.ButtonHTMLAttributes<HTMLButtonElement>, 'onClick'> & {
+  pressed: boolean;
+  onPressedChange: (pressed: boolean) => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={pressed}
+      className={cn('tgl', pressed && 'on', className)}
+      onClick={() => onPressedChange(!pressed)}
+      {...props}
+    >
+      {children}
+    </button>
+  );
+}
+
+/**
+ * A runtime status (ALLOWED, DENIED, ERROR, SUCCESS, FAILED, a connection state) in its one colour,
+ * from statusTone(). The dot's shape differs per tone, so it never rests on colour alone.
+ */
+export function StatusBadge({
+  status,
+  tone,
+  label,
+  dot = true,
+  className,
+  title,
+}: {
+  status?: string | null;
+  /** Overrides the tone read from `status`, for a label that is not itself a status word. */
+  tone?: StatusTone;
+  label?: React.ReactNode;
+  dot?: boolean;
+  className?: string;
+  title?: string;
+}) {
+  const resolved = tone ?? statusTone(status);
+  const toneClass = statusToneClass(resolved);
+  return (
+    <span className={cn('tag', toneClass, className)} title={title} data-tone={resolved}>
+      {dot && <span className={cn('dot', toneClass || 'off')} aria-hidden="true" />}
+      {label ?? status}
+    </span>
+  );
+}
+
+function LockIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+      <rect x="5" y="11" width="14" height="9" rx="2" />
+      <path d="M8 11V8a4 4 0 0 1 8 0v3" />
+    </svg>
+  );
+}
+
+/**
+ * An identifier as the API knows it: SObject, field, tool, SOQL, Salesforce IDs, usernames, Okta client
+ * ID / issuer / group claim, IP addresses, log event ids, sync run ids, certificate fingerprints, the
+ * policy revision. Mono, never translated. `locked` marks Tier C (sync-sourced, read-only) values.
+ */
+export function ApiName({
+  children,
+  locked = false,
+  title,
+  className,
+}: {
+  children: React.ReactNode;
+  locked?: boolean;
+  title?: string;
+  className?: string;
+}) {
+  return (
+    <code
+      className={cn('tag mono api-name', locked && 'lock', className)}
+      title={title ?? (locked ? 'Comes from Salesforce. Change it in Salesforce, then Sync now.' : undefined)}
+    >
+      {locked && <LockIcon />}
+      {children}
+    </code>
+  );
+}
+
+/** A count, latency or status code: tabular figures, and '—' (never 0) when there is no value yet. */
+export function Num({
+  value,
+  unit,
+  fallback = '—',
+  className,
+  format = (n: number) => n.toLocaleString('en-US'),
+}: {
+  value: number | null | undefined;
+  unit?: string;
+  fallback?: string;
+  className?: string;
+  format?: (n: number) => string;
+}) {
+  const shown = typeof value === 'number' && Number.isFinite(value) ? format(value) : fallback;
+  return (
+    <span className={cn('num', className)}>
+      {shown}
+      {unit && shown !== fallback ? <span className="num-unit"> {unit}</span> : null}
+    </span>
+  );
+}
+
+/** A moment, always with its date and zone (UTC); the admin's local time is in the tooltip. */
+export function Timestamp({
+  iso,
+  precision = 'second',
+  className,
+}: {
+  iso: string | null | undefined;
+  precision?: 'second' | 'date';
+  className?: string;
+}) {
+  if (!iso) return <span className={cn('num', className)}>—</span>;
+  const text = precision === 'date' ? formatDateUtc(iso) : formatTimestamp(iso);
+  return (
+    <time className={cn('num', className)} dateTime={iso} title={`${formatTimestamp(iso)} · ${formatLocalTimestamp(iso)}`}>
+      {text}
+    </time>
+  );
+}
+
+/**
+ * A modal dialog on useModalDialog: focus starts on `initialFocus` (Cancel) or the box, Tab stays in,
+ * Escape and a scrim click call `onClose`, Cmd/Ctrl+K cannot reach the page behind. `onClose` is where
+ * a caller puts its unsaved-changes guard.
+ */
+export function Dialog({
+  open,
+  onClose,
+  title,
+  description,
+  children,
+  footer,
+  role = 'dialog',
+  width = 480,
+  initialFocus = 'first-button',
+}: {
+  open: boolean;
+  onClose: () => void;
+  title: React.ReactNode;
+  description?: React.ReactNode;
+  children?: React.ReactNode;
+  /** Renders the actions; the first button gets initial focus unless initialFocus is 'box'. */
+  footer?: (modal: { close: () => void; initialFocusRef: React.RefObject<HTMLButtonElement | null> }) => React.ReactNode;
+  role?: 'dialog' | 'alertdialog';
+  width?: number;
+  initialFocus?: 'first-button' | 'box';
+}) {
+  const modal = useModalDialog(open, onClose);
+  const titleId = React.useId();
+  const bodyId = React.useId();
+  if (!open) return null;
+  return (
+    <div className="cmdk-scrim modal-scrim" onClick={modal.close}>
+      <div
+        ref={modal.dialogRef}
+        className="cmdk-box"
+        role={role}
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={description ? bodyId : undefined}
+        tabIndex={-1}
+        style={{ maxWidth: width }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="card-h">
+          <div className="card-t" id={titleId}>
+            {title}
+          </div>
+        </div>
+        <div className="card-b">
+          {description && (
+            <p id={bodyId} style={{ fontSize: 12.5, color: 'var(--t2)', marginTop: 0 }}>
+              {description}
+            </p>
+          )}
+          {children}
+          {footer && (
+            <div className="dlg-actions">
+              {footer({
+                close: modal.close,
+                initialFocusRef: initialFocus === 'box' ? { current: null } : modal.initialFocusRef,
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The slide-over drawer, a modal on useModalDialog like Dialog: Escape, the scrim and ✕ all call
+ * `onClose` (the caller's unsaved-changes guard), focus starts on ✕ and returns to the opener.
+ */
+export function Drawer({
+  open,
+  onClose,
+  title,
+  subtitle,
+  children,
+  footer,
+  label = 'Details drawer',
+}: {
+  open: boolean;
+  onClose: () => void;
+  title: React.ReactNode;
+  subtitle?: React.ReactNode;
+  children: React.ReactNode;
+  footer?: React.ReactNode;
+  label?: string;
+}) {
+  const modal = useModalDialog<HTMLElement, HTMLButtonElement>(open, onClose);
+  const titleId = React.useId();
+  if (!open) return null;
+  return (
+    <>
+      <div className="scrim" onClick={modal.close} />
+      <aside
+        ref={modal.dialogRef}
+        className="fly"
+        role="dialog"
+        aria-modal="true"
+        aria-label={label}
+        aria-labelledby={titleId}
+        tabIndex={-1}
+      >
+        <div className="fly-h">
+          <div>
+            <div className="fly-t" id={titleId}>
+              {title}
+            </div>
+            {subtitle && <div className="fly-s">{subtitle}</div>}
+          </div>
+          <button
+            ref={modal.initialFocusRef}
+            type="button"
+            className="btn gh sm"
+            onClick={modal.close}
+            title="Close (Esc)"
+            aria-label="Close drawer"
+          >
+            ✕
+          </button>
+        </div>
+        <div className="fly-b">{children}</div>
+        {footer}
+      </aside>
+    </>
+  );
+}
+
+/**
+ * The stacked toast region, above every drawer and modal (--z-toast). Errors are role="alert" and stay
+ * until dismissed or replaced; others are polite. A toast with `undo` shows an Undo button.
+ */
+export function ToastRegion({
+  toasts,
+  onDismiss,
+}: {
+  toasts: readonly ToastItem[];
+  onDismiss: (id: number) => void;
+}) {
+  return (
+    <div className="toast-region" aria-label="Notifications">
+      <div role="status" aria-live="polite" className="toast-stack">
+        {toasts.filter((t) => t.kind !== 'error').map((t) => (
+          <Toast key={t.id} toast={t} onDismiss={onDismiss} />
+        ))}
+      </div>
+      <div role="alert" aria-live="assertive" className="toast-stack">
+        {toasts.filter((t) => t.kind === 'error').map((t) => (
+          <Toast key={t.id} toast={t} onDismiss={onDismiss} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function Toast({ toast, onDismiss }: { toast: ToastItem; onDismiss: (id: number) => void }) {
+  return (
+    <div className={cn('toast-banner', toast.kind === 'error' && 'is-error')} data-kind={toast.kind}>
+      <span className={cn('dot', toast.kind === 'error' ? 'st-error' : 'st-allowed')} aria-hidden="true" />
+      <span className="toast-msg">{toast.message}</span>
+      {toast.undo && (
+        <button
+          type="button"
+          className="btn sm"
+          onClick={() => {
+            onDismiss(toast.id);
+            toast.undo?.run();
+          }}
+        >
+          {toast.undo.label || 'Undo'}
+        </button>
+      )}
+      <button type="button" className="btn gh sm" aria-label="Dismiss notification" onClick={() => onDismiss(toast.id)}>
+        ✕
+      </button>
+    </div>
   );
 }
 

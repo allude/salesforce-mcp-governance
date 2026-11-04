@@ -13,7 +13,7 @@ import type {
   ObjectSyncDiffPreview,
   RemovalResolutionAction,
 } from '@/types/governance';
-import { formatDateShort } from '@/components/ui/primitives';
+import { Switch, Timestamp } from '@/components/ui/primitives';
 import { effectiveGrants, grantsAccess, readableGrants } from '@/rbac/groupGrants';
 import type { FlyoutState } from './FlyoutDrawer';
 import { describeProfileDuplicate, profileSyncNeedsReview } from './profileSyncReview';
@@ -543,7 +543,7 @@ export function SalesforceProfilesView({
                         )}
                       </td>
                       <td className="mono" style={{ color: 'var(--t2)' }}>
-                        {formatDateShort(p.updatedAt)}
+                        <Timestamp iso={p.updatedAt} precision="date" />
                       </td>
                     </tr>
                   );
@@ -883,10 +883,10 @@ export function SalesforceObjectsView({
                                   </span>
                                 )}
                               </div>
-                              <button
-                                type="button"
-                                className={`sw ${on ? 'on' : ''}`}
-                                onClick={() => {
+                              <Switch
+                                checked={on}
+                                label={`Select ${c.objectName} to sync`}
+                                onCheckedChange={() => {
                                   if (on) {
                                     setSelectedOrgObjs(
                                       selectedOrgObjs.filter(
@@ -1222,12 +1222,10 @@ export function SalesforceObjectsView({
                       }
                     >
                       <td onClick={(e) => e.stopPropagation()}>
-                        <button
-                          type="button"
-                          className={`sw ${o.enabled ? 'on' : ''}`}
-                          onClick={() =>
-                            onToggleObject(o.objectName, !o.enabled)
-                          }
+                        <Switch
+                          checked={o.enabled}
+                          label={`Enable ${o.objectName} for MCP`}
+                          onCheckedChange={(next) => onToggleObject(o.objectName, next)}
                         />
                       </td>
                       <td className="mono" style={{ fontWeight: 600 }}>
@@ -1271,7 +1269,7 @@ export function SalesforceObjectsView({
                         <span className="tag mono">{o.sourcePath}</span>
                       </td>
                       <td className="mono" style={{ color: 'var(--t2)' }}>
-                        {formatDateShort(o.updatedAt)}
+                        <Timestamp iso={o.updatedAt} precision="date" />
                       </td>
                     </tr>
                   );

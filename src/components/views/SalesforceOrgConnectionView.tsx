@@ -23,7 +23,7 @@ import {
   SalesforceConnectionSettings,
   NavViewId,
 } from '@/types/governance';
-import { Card, Badge, Switch } from '@/components/ui/primitives';
+import { Card, Badge, StatusBadge, Switch } from '@/components/ui/primitives';
 import { useModalDialog } from './useModalDialog';
 import {
   connectionStatusBadge,
@@ -307,7 +307,7 @@ export function SalesforceOrgConnectionView({
             <h2 className="text-base font-bold text-slate-900">
               Connect to Salesforce Org (JWT Metadata Sync)
             </h2>
-            <Badge variant={statusBadge.variant}>{statusBadge.label}</Badge>
+            <StatusBadge tone={statusBadge.tone} label={statusBadge.label} />
           </div>
           <p className="mt-0.5 text-xs text-slate-500">
             Configure an External Connected App with X.509 JWT Certificate authentication to automatically pull Salesforce Profiles, Objects, and Fields without requiring customer record data access.
@@ -796,6 +796,7 @@ export function SalesforceOrgConnectionView({
                   </div>
                   <Switch
                     checked={enforceOrgIdLock}
+                    label="Enforce Salesforce Org ID Lock"
                     onCheckedChange={setEnforceOrgIdLock}
                   />
                 </div>

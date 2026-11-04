@@ -8,6 +8,14 @@ import {
   modalKeyAction,
 } from './modalFocus';
 
+/** The open modal layers (dialogs, the drawer, the palette), oldest first. */
+const openModalLayers: symbol[] = [];
+
+/** Whether any modal layer is open: page-level shortcuts stand down while one is. */
+export function anyModalOpen(): boolean {
+  return openModalLayers.length > 0;
+}
+
 /**
  * Focus handling for an aria-modal confirmation dialog: focus starts on `initialFocusRef` (Cancel),
  * Tab and Shift+Tab stay inside `dialogRef`, Escape closes from anywhere on the page, page-wide
@@ -15,9 +23,12 @@ import {
  * back in, and focus goes back to the control that opened it. Answer the dialog through `close`,
  * which hands focus back before the caller's action can disable or remove that control.
  */
-export function useModalDialog(open: boolean, onClose: () => void) {
-  const dialogRef = useRef<HTMLDivElement | null>(null);
-  const initialFocusRef = useRef<HTMLButtonElement | null>(null);
+export function useModalDialog<
+  TDialog extends HTMLElement = HTMLDivElement,
+  TInitial extends HTMLElement = HTMLButtonElement,
+>(open: boolean, onClose: () => void) {
+  const dialogRef = useRef<TDialog | null>(null);
+  const initialFocusRef = useRef<TInitial | null>(null);
   const openerRef = useRef<HTMLElement | null>(null);
   const onCloseRef = useRef(onClose);
   // Set while focus goes back to the opener, so the focusin guard lets it leave the dialog.
@@ -46,6 +57,11 @@ export function useModalDialog(open: boolean, onClose: () => void) {
 
   useLayoutEffect(() => {
     if (!open) return;
+    // Only the topmost open dialog answers keys and guards focus: a confirm opened over the drawer, or
+    // the palette over it, closes alone on Escape instead of taking the drawer with it.
+    const layer = Symbol('modal');
+    openModalLayers.push(layer);
+    const isTopmost = () => openModalLayers[openModalLayers.length - 1] === layer;
     const box = dialogRef.current;
     const active = document.activeElement;
     openerRef.current = active instanceof HTMLElement && active !== document.body ? active : null;
@@ -58,7 +74,7 @@ export function useModalDialog(open: boolean, onClose: () => void) {
     // listeners behind the dialog (such as the drawer's Escape and the page's Cmd/Ctrl+K on window)
     // never see these keys.
     const onKey = (e: KeyboardEvent) => {
-      if (!box) return;
+      if (!box || !isTopmost()) return;
       const focusables = Array.from(box.querySelectorAll<HTMLElement>(MODAL_FOCUSABLE_SELECTOR));
       const current = document.activeElement;
       const action = modalKeyAction(
@@ -78,7 +94,7 @@ export function useModalDialog(open: boolean, onClose: () => void) {
     // Whatever still moves focus behind the dialog (a script's focus(), an autoFocus control
     // mounting) is undone: focus returns to the control in the dialog that last held it.
     const onFocusIn = (e: FocusEvent) => {
-      if (!box) return;
+      if (!box || !isTopmost()) return;
       const target = e.target;
       const inDialog = target instanceof Node && box.contains(target);
       const action = modalFocusinAction(inDialog, releasingRef.current);
@@ -96,6 +112,7 @@ export function useModalDialog(open: boolean, onClose: () => void) {
     document.addEventListener('keydown', onKey, true);
     document.addEventListener('focusin', onFocusIn, true);
     return () => {
+      openModalLayers.splice(openModalLayers.indexOf(layer), 1);
       document.removeEventListener('keydown', onKey, true);
       document.removeEventListener('focusin', onFocusIn, true);
       // Closed without `close` (or unmounted): only reclaim focus the dialog was holding.

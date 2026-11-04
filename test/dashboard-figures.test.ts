@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { SUCCESS_RATE_TARGET, activityWindowLabel, successRate } from '../src/components/views/dashboardFigures.js';
-import { formatShortTime } from '../src/components/ui/primitives.js';
+import { formatTimeOfDayUtc } from '../src/components/ui/timestamp.js';
 import type { McpActivityFigures } from '../src/types/governance.js';
 import { TrafficDashboardView, type McpRequestStats } from '../src/components/views/DashboardAndLogsViews.js';
 
@@ -66,7 +66,7 @@ describe('Success rate KPI', () => {
       render({ totalMcpRequests: 9857, allowedMcpRequests: 8824, deniedMcpRequests: 928, erroredMcpRequests: 105, lastMcpCallAt: null })
     );
     assert.match(html, />98\.9%</);
-    assert.match(html, /class="dot ok"/);
+    assert.match(html, /class="dot st-allowed"/);
     assert.match(html, /105 errors/);
     assert.doesNotMatch(html, /transport errors/);
   });
@@ -76,13 +76,13 @@ describe('Success rate KPI', () => {
       render({ totalMcpRequests: 100, allowedMcpRequests: 95, deniedMcpRequests: 0, erroredMcpRequests: 5, lastMcpCallAt: null })
     );
     assert.match(html, />95\.0%</);
-    assert.match(html, /class="dot err"/);
+    assert.match(html, /class="dot st-error"/);
   });
 });
 
 describe('activityWindowLabel', () => {
   // Local noon, so the same-day cases hold in any time zone.
-  const at = new Date(2026, 10, 1, 12, 0, 0).getTime();
+  const at = Date.UTC(2026, 10, 1, 6, 0, 0);
   const asOf = new Date(at).toISOString();
   const figures = { windowHours: 24, asOf } as McpActivityFigures;
 
@@ -92,14 +92,14 @@ describe('activityWindowLabel', () => {
   });
 
   test('figures two minutes old or more say when their window ended', () => {
-    assert.equal(activityWindowLabel(figures, at + 2 * 60_000), `24 h to ${formatShortTime(asOf)}`);
-    assert.equal(activityWindowLabel(figures, at + 11 * 3_600_000), `24 h to ${formatShortTime(asOf)}`);
+    assert.equal(activityWindowLabel(figures, at + 2 * 60_000), `24 h to ${formatTimeOfDayUtc(asOf)}`);
+    assert.equal(activityWindowLabel(figures, at + 11 * 3_600_000), `24 h to ${formatTimeOfDayUtc(asOf)}`);
   });
 
   test('figures from an earlier day say which day', () => {
-    const day = new Date(at).toLocaleDateString([], { month: 'short', day: 'numeric' });
-    assert.equal(activityWindowLabel(figures, at + 13 * 3_600_000), `24 h to ${day} ${formatShortTime(asOf)}`);
-    assert.equal(activityWindowLabel(figures, at + 3 * 86_400_000), `24 h to ${day} ${formatShortTime(asOf)}`);
+    const day = new Date(at).toLocaleDateString([], { month: 'short', day: 'numeric', timeZone: 'UTC' });
+    assert.equal(activityWindowLabel(figures, at + 19 * 3_600_000), `24 h to ${day} ${formatTimeOfDayUtc(asOf)}`);
+    assert.equal(activityWindowLabel(figures, at + 3 * 86_400_000), `24 h to ${day} ${formatTimeOfDayUtc(asOf)}`);
   });
 
   test('with no figures, or an unreadable time, it falls back to the window alone', () => {

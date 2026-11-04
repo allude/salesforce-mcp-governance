@@ -7,7 +7,7 @@ import type {
   SalesforceProfile,
   ProfileGroupMapping,
 } from '@/types/governance';
-import { formatDateShort } from '@/components/ui/primitives';
+import { Timestamp } from '@/components/ui/primitives';
 import type { FlyoutState } from './FlyoutDrawer';
 import { importTargetFor, newAccessGroupDraft } from './accessGroupDraft';
 import { readGroupXmlFile } from './GroupEditorPanels';
@@ -336,7 +336,7 @@ export function AccessGroupsView({
                         </span>
                       </td>
                       <td className="mono" style={{ color: 'var(--t2)' }}>
-                        {formatDateShort(g.updatedAt)}
+                        <Timestamp iso={g.updatedAt} precision="date" />
                       </td>
                     </tr>
                   );

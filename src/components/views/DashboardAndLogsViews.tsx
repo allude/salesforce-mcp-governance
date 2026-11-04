@@ -14,7 +14,8 @@ import type {
   PortalUser,
   SalesforceConnectionSettings,
 } from '@/types/governance';
-import { MCP_TOOL_CATALOG, formatShortTime } from '@/components/ui/primitives';
+import { MCP_TOOL_CATALOG, StatusBadge, Switch, Timestamp } from '@/components/ui/primitives';
+import { statusTone, statusToneClass } from '@/components/ui/statusTone';
 import { PORTAL_PASSWORD_MIN_LENGTH } from '@/security/passwordPolicy';
 import type { FlyoutState } from './FlyoutDrawer';
 import { realTraffic } from './simulatedTraffic';
@@ -217,7 +218,7 @@ export function TrafficDashboardView({
           <div className="k-sub">
             <span>
               Allowed: <b style={{ color: 'var(--tx)' }}>{allowedCalls}</b> ·
-              Denied: <b style={{ color: 'var(--warn)' }}>{deniedCalls}</b>
+              Denied: <b className="txt-denied">{deniedCalls}</b>
             </span>
           </div>
         </div>
@@ -225,7 +226,7 @@ export function TrafficDashboardView({
         <div className="kpi">
           <div className="k-lbl">
             <span>Success rate</span>
-            <span className={`dot ${success.meetsTarget ? 'ok' : 'err'}`} />
+            <span className={`dot ${statusToneClass(statusTone(success.meetsTarget ? 'SUCCESS' : 'ERROR'))}`} />
           </div>
           <div className="k-val">{success.label}%</div>
           <div className="k-sub">
@@ -239,7 +240,7 @@ export function TrafficDashboardView({
         <div className="kpi">
           <div className="k-lbl">
             <span>Policy denials</span>
-            <span className="dot warn" />
+            <span className={`dot ${statusToneClass(statusTone('DENIED'))}`} />
           </div>
           <div className="k-val">{deniedCalls}</div>
           <div className="k-sub">
@@ -292,15 +293,11 @@ export function TrafficDashboardView({
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
               <div className="leg">
-                <span>
-                  <i style={{ background: 'rgba(0,163,255,0.8)' }} /> Allowed
-                </span>
-                <span>
-                  <i style={{ background: 'rgba(251,191,36,0.9)' }} /> Denied
-                </span>
-                <span>
-                  <i style={{ background: 'rgba(248,113,113,0.9)' }} /> Error
-                </span>
+                {(['ALLOWED', 'DENIED', 'ERROR'] as const).map((status) => (
+                  <span key={status}>
+                    <i className={statusToneClass(statusTone(status))} /> {status[0] + status.slice(1).toLowerCase()}
+                  </span>
+                ))}
               </div>
               <div className="seg">
                 {(['1h', '24h', '7d'] as const).map((k) => (
@@ -332,15 +329,15 @@ export function TrafficDashboardView({
                   >
                     <div className="b-stk" style={{ height: `${h}px` }}>
                       <div
-                        className="b-seg ok"
+                        className={`b-seg ${statusToneClass(statusTone('ALLOWED'))}`}
                         style={{ height: `${okH}px` }}
                       />
                       <div
-                        className="b-seg warn"
+                        className={`b-seg ${statusToneClass(statusTone('DENIED'))}`}
                         style={{ height: `${warnH}px` }}
                       />
                       <div
-                        className="b-seg err"
+                        className={`b-seg ${statusToneClass(statusTone('ERROR'))}`}
                         style={{ height: `${errH}px` }}
                       />
                     </div>
@@ -729,9 +726,7 @@ export function TrafficDashboardView({
                       {r.sfUsername} · {r.profileName}
                     </div>
                   </div>
-                  <span className="mono" style={{ color: 'var(--t3)' }}>
-                    {formatShortTime(r.timestamp)}
-                  </span>
+                  <Timestamp iso={r.timestamp} className="mono" />
                 </div>
               ))
             )}
@@ -1031,7 +1026,7 @@ export function CopilotMcpLogsView({
           </div>
           <div className="tbar-r">
             <span className="tag ok">
-              <span className="dot ok" /> PII redaction active
+              <span className="dot st-allowed" /> PII redaction active
             </span>
             <span className="mono" style={{ color: 'var(--t3)' }}>
               {rows.length} of {history.held.length} events
@@ -1074,14 +1069,14 @@ export function CopilotMcpLogsView({
                     }
                   >
                     <td className="mono" style={{ color: 'var(--t2)' }}>
-                      {formatShortTime(r.timestamp)}
+                      <Timestamp iso={r.timestamp} />
                     </td>
                     <td>
                       {r.sfUsername}
                       {r.simulated && (
                         <>
                           {' '}
-                          <span className="tag warn">SIMULATED</span>
+                          <span className="tag marker">SIMULATED</span>
                         </>
                       )}
                     </td>
@@ -1119,26 +1114,7 @@ export function CopilotMcpLogsView({
                       {r.latencyMs} ms
                     </td>
                     <td>
-                      <span
-                        className={`tag ${
-                          r.status === 'ALLOWED'
-                            ? 'ok'
-                            : r.status === 'DENIED'
-                              ? 'warn'
-                              : 'err'
-                        }`}
-                      >
-                        <span
-                          className={`dot ${
-                            r.status === 'ALLOWED'
-                              ? 'ok'
-                              : r.status === 'DENIED'
-                                ? 'warn'
-                                : 'err'
-                          }`}
-                        />
-                        {r.status}
-                      </span>
+                      <StatusBadge status={r.status} />
                     </td>
                   </tr>
                 ))
@@ -1313,7 +1289,7 @@ export function PortalAdminLogsView({
                     onClick={() => onOpenFlyout({ type: 'audit', data: r })}
                   >
                     <td className="mono" style={{ color: 'var(--t2)' }}>
-                      {r.timestamp.slice(0, 19).replace('T', ' ')}
+                      <Timestamp iso={r.timestamp} />
                     </td>
                     <td>{r.adminUsername}</td>
                     <td>
@@ -1419,12 +1395,10 @@ export function PortalAuthSettingsView({
               >
                 {oktaDraft.enabled ? 'Enabled' : 'Disabled'}
               </span>
-              <button
-                type="button"
-                className={`sw ${oktaDraft.enabled ? 'on' : ''}`}
-                onClick={() =>
-                  setOktaDraft({ ...oktaDraft, enabled: !oktaDraft.enabled })
-                }
+              <Switch
+                checked={oktaDraft.enabled}
+                label="Enable Okta OIDC SSO"
+                onCheckedChange={(enabled) => setOktaDraft({ ...oktaDraft, enabled })}
               />
             </div>
           </div>

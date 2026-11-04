@@ -52,6 +52,8 @@ import type {
 } from '@/types/governance';
 import {
   MCP_TOOL_CATALOG,
+  StatusBadge,
+  Switch,
   isSensitiveField,
 } from '@/components/ui/primitives';
 
@@ -863,12 +865,10 @@ export function FlyoutDrawer({
                               {g.description}
                             </div>
                           </div>
-                          <button
-                            type="button"
-                            className={`sw ${on ? 'on' : ''}`}
-                            onClick={() =>
-                              onToggleProfileGroup(liveProfile.id, g.id)
-                            }
+                          <Switch
+                            checked={on}
+                            label={`${on ? 'Remove' : 'Add'} ${liveProfile.name} ${on ? 'from' : 'to'} ${g.name}`}
+                            onCheckedChange={() => onToggleProfileGroup(liveProfile.id, g.id)}
                           />
                         </div>
                       );
@@ -1133,15 +1133,10 @@ export function FlyoutDrawer({
                 <dl className="kv">
                   <dt>Enabled for MCP</dt>
                   <dd>
-                    <button
-                      type="button"
-                      className={`sw ${liveObject.enabled ? 'on' : ''}`}
-                      onClick={() =>
-                        onToggleObject(
-                          liveObject.objectName,
-                          !liveObject.enabled
-                        )
-                      }
+                    <Switch
+                      checked={liveObject.enabled}
+                      label={`Enable ${liveObject.objectName} for MCP`}
+                      onCheckedChange={(next) => onToggleObject(liveObject.objectName, next)}
                     />
                   </dd>
                   <dt>Label</dt>
@@ -1383,16 +1378,10 @@ export function FlyoutDrawer({
                               {f.label}
                             </div>
                           </div>
-                          <button
-                            type="button"
-                            className={`sw ${f.enabled ? 'on' : ''}`}
-                            onClick={() =>
-                              onToggleField(
-                                liveObject.objectName,
-                                f.fieldName,
-                                !f.enabled
-                              )
-                            }
+                          <Switch
+                            checked={f.enabled}
+                            label={`Enable ${liveObject.objectName}.${f.fieldName} for MCP`}
+                            onCheckedChange={(next) => onToggleField(liveObject.objectName, f.fieldName, next)}
                           />
                         </div>
                       );
@@ -1864,7 +1853,9 @@ export function FlyoutDrawer({
                         <button
                           type="button"
                           className={`sw ${on ? 'on' : ''}`}
-                          aria-label={`${on ? 'Revoke' : 'Grant'} ${act.id}`}
+                          role="switch"
+                          aria-checked={on}
+                          aria-label={`Grant ${act.id}`}
                           onClick={() => {
                             const has = grpDraft.allowedActions.includes(
                               act.id
@@ -2161,8 +2152,10 @@ export function FlyoutDrawer({
                                       <button
                                         type="button"
                                         className={`sw ${vis ? 'on' : ''}`}
+                                        role="switch"
+                                        aria-checked={vis}
                                         disabled={Boolean(held)}
-                                        aria-label={`${vis ? 'Hide' : 'Show'} ${f.fieldName}`}
+                                        aria-label={`Show ${o.objectName}.${f.fieldName}`}
                                         onClick={() =>
                                           toggleGroupObjectField(
                                             o.objectName,
@@ -2322,12 +2315,10 @@ export function FlyoutDrawer({
                               {p.id}
                             </div>
                           </div>
-                          <button
-                            type="button"
-                            className={`sw ${on ? 'on' : ''}`}
-                            onClick={() =>
-                              onToggleProfileGroup(p.id, liveGroup.id)
-                            }
+                          <Switch
+                            checked={on}
+                            label={`${on ? 'Remove' : 'Add'} ${p.name} (${p.id}) ${on ? 'from' : 'to'} ${liveGroup.name}`}
+                            onCheckedChange={() => onToggleProfileGroup(p.id, liveGroup.id)}
                           />
                         </div>
                       );
@@ -2389,17 +2380,7 @@ export function FlyoutDrawer({
                   <dd className="mono">{flyout.data.latencyMs} ms</dd>
                   <dt>Result</dt>
                   <dd>
-                    <span
-                      className={`tag ${
-                        flyout.data.status === 'ALLOWED'
-                          ? 'ok'
-                          : flyout.data.status === 'DENIED'
-                            ? 'warn'
-                            : 'err'
-                      }`}
-                    >
-                      {flyout.data.status}
-                    </span>
+                    <StatusBadge status={flyout.data.status} />
                   </dd>
                 </dl>
               </div>
@@ -2460,9 +2441,10 @@ export function FlyoutDrawer({
                   <dd className="mono">{flyout.data.ipAddress}</dd>
                   <dt>Result</dt>
                   <dd>
-                    <span className={`tag ${portalAuditResult(flyout.data).tone}`}>
-                      {portalAuditResult(flyout.data).label}
-                    </span>
+                    <StatusBadge
+                      tone={portalAuditResult(flyout.data).tone}
+                      label={portalAuditResult(flyout.data).label}
+                    />
                   </dd>
                 </dl>
               </div>
@@ -2585,15 +2567,10 @@ export function FlyoutDrawer({
                 <div className="sec">
                   <div className="sec-h">
                     <span className="sec-t">Policy Evaluation Result</span>
-                    <span
-                      className={`tag ${
-                        simResult.evaluation.permitted ? 'ok' : 'err'
-                      }`}
-                    >
-                      {simResult.evaluation.permitted
-                        ? 'ALLOWED'
-                        : 'DENIED BY POLICY'}
-                    </span>
+                    <StatusBadge
+                      status={simResult.evaluation.permitted ? 'ALLOWED' : 'DENIED'}
+                      label={simResult.evaluation.permitted ? 'ALLOWED' : 'DENIED BY POLICY'}
+                    />
                   </div>
                   <dl className="kv" style={{ marginBottom: 10 }}>
                     <dt>Decision reason</dt>
