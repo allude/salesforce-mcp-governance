@@ -1629,3 +1629,188 @@ pre.code.hist-x {
   white-space: pre;
   word-break: normal;
 }
+
+/* Microsoft Copilot connector setup */
+.copy-row {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+}
+
+.copy-row .inp,
+.copy-row pre.code {
+  flex: 1;
+  min-width: 0;
+}
+
+a.ext {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-weight: 500;
+}
+
+a.ext:hover {
+  text-decoration: underline;
+}
+
+a.ext svg {
+  width: 11px;
+  height: 11px;
+}
+
+.note {
+  font-size: 12px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--bd);
+  margin: 0 0 12px;
+}
+
+.note.warn {
+  color: var(--warn);
+  background: var(--warn-d);
+  border-color: rgba(251, 191, 36, 0.3);
+}
+
+.chk-list.readiness {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  max-height: none;
+  background: transparent;
+}
+
+.chk-list.readiness .chk-row {
+  align-items: flex-start;
+  padding: 10px 14px;
+}
+
+.readiness-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+.readiness-row .dot {
+  margin-top: 5px;
+}
+
+.readiness-t {
+  font-weight: 500;
+  color: var(--tx);
+}
+
+.readiness-d {
+  font-size: 11.5px;
+  color: var(--t2);
+  margin-top: 2px;
+}
+
+.steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.step {
+  display: grid;
+  grid-template-columns: 26px 1fr;
+  gap: 12px;
+  padding: 16px 14px;
+  border-bottom: 1px solid var(--bd);
+}
+
+.step:last-child {
+  border-bottom: none;
+}
+
+.step-n {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--acc);
+  background: var(--acc-d);
+  border: 1px solid rgba(0, 163, 255, 0.3);
+}
+
+.step-b {
+  min-width: 0;
+  max-width: 92ch;
+  font-size: 12.5px;
+  color: var(--t2);
+}
+
+.step-h {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 2px 0 8px;
+}
+
+.step-h h3 {
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--tx);
+}
+
+.step-b p {
+  margin: 0 0 8px;
+}
+
+.step-b > ol,
+.step-b > ul {
+  margin: 0 0 8px;
+  padding-left: 18px;
+}
+
+.step-b li {
+  margin-bottom: 5px;
+}
+
+.step-b li > ul,
+.step-b li > ol {
+  margin-top: 4px;
+  padding-left: 18px;
+}
+
+.step-b strong {
+  color: var(--tx);
+  font-weight: 600;
+}
+
+.step-b .kv,
+.step-b pre.code {
+  margin: 8px 0;
+}
+
+.kv.wizard dd.cp {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.kv.wizard dd.cp .btn {
+  margin: -3px -4px -3px 0;
+}
+
+.step-act {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.copilot .tbl td {
+  vertical-align: top;
+}
