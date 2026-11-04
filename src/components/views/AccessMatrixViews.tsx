@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef } from 'react';
 import type {
   AccessGroup,
   SalesforceObjectConfig,
@@ -9,7 +9,10 @@ import type {
 } from '@/types/governance';
 import { formatDateShort } from '@/components/ui/primitives';
 import type { FlyoutState } from './FlyoutDrawer';
-import { newAccessGroupDraft } from './accessGroupDraft';
+import { importTargetFor, newAccessGroupDraft } from './accessGroupDraft';
+import { readGroupXmlFile } from './GroupEditorPanels';
+import { parseAccessGroupXml } from '@/groups/groupXml';
+import { groupAvailabilityIssues } from '@/groups/groupGrants';
 
 // ============================================================================
 // 1. ACCESS GROUPS VIEW
@@ -22,17 +25,52 @@ interface AccessGroupsViewProps {
   selectedFlyoutId?: string;
   onOpenFlyout: (flyout: FlyoutState) => void;
   onSeedEnterpriseMatrix?: () => void;
+  notify: (msg: string, isError?: boolean) => void;
 }
 
 export function AccessGroupsView({
   groups,
+  objects,
   profiles,
   mappings,
   selectedFlyoutId,
   onOpenFlyout,
   onSeedEnterpriseMatrix,
+  notify,
 }: AccessGroupsViewProps) {
   const [q, setQ] = useState('');
+  const importRef = useRef<HTMLInputElement | null>(null);
+
+  /**
+   * Opens an XML file in the group drawer for review: on the group it was exported from (or has its
+   * name), or as a new group. Nothing is saved until the admin saves it there.
+   */
+  const handleImportFile = async (file: File) => {
+    let text: string;
+    try {
+      text = await readGroupXmlFile(file);
+    } catch (err: any) {
+      notify(err?.message || `${file.name} could not be read.`, true);
+      return;
+    }
+    const parsed = parseAccessGroupXml(text);
+    if (!parsed.ok) {
+      notify(`${file.name} is not a valid Access Group file${parsed.line ? ` (line ${parsed.line})` : ''}: ${parsed.error}`, true);
+      return;
+    }
+    const target = importTargetFor(groups, parsed.group);
+    const { id: _fileId, ...importDraft } = parsed.group;
+    onOpenFlyout({
+      type: 'group',
+      data: {
+        id: target?.group.id,
+        importDraft,
+        importFileName: file.name,
+        importMatchedBy: target?.matchedBy || null,
+        importNonce: Date.now(),
+      },
+    });
+  };
 
   const getProfileGroupIds = (profileId: string): string[] => {
     const found = mappings.find((m) => m.profileId === profileId);
@@ -75,6 +113,25 @@ export function AccessGroupsView({
               Load enterprise groups
             </button>
           )}
+          <button
+            type="button"
+            className="btn"
+            title="Open an Access Group XML file to review, then update the matching group or create a new one"
+            onClick={() => importRef.current?.click()}
+          >
+            Import XML
+          </button>
+          <input
+            ref={importRef}
+            type="file"
+            accept=".xml,application/xml,text/xml"
+            style={{ display: 'none' }}
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              e.target.value = '';
+              if (file) handleImportFile(file);
+            }}
+          />
           <button type="button" className="btn pri" onClick={handleNewGroup}>
             + New group
           </button>
@@ -136,6 +193,13 @@ export function AccessGroupsView({
                     (op) =>
                       op.canRead || op.canCreate || op.canUpdate || op.canDelete
                   );
+                  const issues = groupAvailabilityIssues(g, objects);
+                  const unavailableCount = issues.filter((i) => i.status === 'unavailable').length;
+                  const brokenCount = issues.length - unavailableCount;
+                  const objectIssue = (objectName: string) =>
+                    issues.find((i) => i.kind === 'object' && i.objectName === objectName);
+                  const actionUnavailable = (id: string) =>
+                    issues.some((i) => i.kind === 'action' && i.name === id);
 
                   return (
                     <tr
@@ -158,6 +222,19 @@ export function AccessGroupsView({
                         >
                           {g.description}
                         </div>
+                        {issues.length > 0 && (
+                          <div
+                            style={{ display: 'flex', gap: 4, marginTop: 4 }}
+                            title={issues
+                              .map((i) => `${i.kind === 'field' ? `${i.objectName}.${i.name}` : i.name}: ${i.message}`)
+                              .join('\n')}
+                          >
+                            {unavailableCount > 0 && (
+                              <span className="tag warn">{unavailableCount} not available</span>
+                            )}
+                            {brokenCount > 0 && <span className="tag err">{brokenCount} broken</span>}
+                          </div>
+                        )}
                       </td>
                       <td>
                         <div
@@ -172,8 +249,10 @@ export function AccessGroupsView({
                             <span
                               key={a}
                               className={`tag mono ${
-                                a === 'delete_record' ? 'err' : ''
+                                actionUnavailable(a) ? 'warn' : a === 'delete_record' ? 'err' : ''
                               }`}
+                              style={actionUnavailable(a) ? { textDecoration: 'line-through' } : undefined}
+                              title={actionUnavailable(a) ? 'Not available: not an MCP tool on this server' : undefined}
                             >
                               {a}
                             </span>
@@ -207,11 +286,16 @@ export function AccessGroupsView({
                               ]
                                 .filter(Boolean)
                                 .join('');
+                              const issue = objectIssue(op.objectName);
                               return (
                                 <span
                                   key={op.objectName}
-                                  className="tag mono"
-                                  style={{ gap: 6 }}
+                                  className={`tag mono ${issue ? (issue.status === 'broken' ? 'err' : 'warn') : ''}`}
+                                  style={{
+                                    gap: 6,
+                                    ...(issue?.status === 'unavailable' ? { textDecoration: 'line-through' } : {}),
+                                  }}
+                                  title={issue ? `${issue.status === 'broken' ? 'Broken' : 'Not available'}: ${issue.message}` : undefined}
                                 >
                                   <b>{op.objectName}</b>
                                   <span

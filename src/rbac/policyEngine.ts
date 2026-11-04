@@ -113,6 +113,10 @@ export function resolveEffectiveProfilePermissions(
     if (!Array.isArray(grp.objectPermissions)) continue;
     for (const objPerm of grp.objectPermissions) {
       if (!objPerm || !objPerm.objectName) continue;
+      // Held after the object was deleted from Salesforce > Objects: shown to admins, never granted,
+      // even once the object is imported again, until an admin restores it. Held fields are kept in
+      // `removedFields`, outside `allowedFields`, so they are never read here.
+      if (objPerm.removed) continue;
       // An entry that grants no CRUD access grants nothing, including its field list. Without this,
       // its fields would be merged only when another group had already granted the object, so the
       // result would depend on the groups' (alphabetical) processing order.

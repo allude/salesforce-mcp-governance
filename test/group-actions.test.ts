@@ -1,6 +1,7 @@
 import './helpers/env.js';
-// A group's action IDs are matched exactly at /mcp, so an ID that names no tool silently denies it.
-// These tests keep the catalog, the MCP server, the portal defaults and POST /groups in agreement.
+// A group's action IDs are matched exactly at /mcp, so an ID that names no tool grants nothing. Such
+// an ID is kept on the group and reported as not available (it may come from an XML file of another
+// server). These tests keep the catalog, the MCP server, the portal defaults and POST /groups in agreement.
 import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
@@ -160,23 +161,57 @@ describe('controls that need a saved group', () => {
 });
 
 describe('POST /api/admin/groups', () => {
-  test('rejects unknown action IDs, naming them, and stores and audits nothing', async () => {
-    const name = `Rejected ${tag()}`;
-    const auditsBefore = store.getPortalAdminLogs(1_000_000).length;
+  test('keeps action IDs this server has no tool for and reports them as not available', async () => {
+    const name = `Kept ${tag()}`;
     const res = await postGroup({ name, allowedActions: ['soql_query', 'query_records', 'export_all_data'] });
-    assert.equal(res.status, 400);
-    assert.match(res.body.error, /query_records, export_all_data/);
-    assert.doesNotMatch(res.body.error, /Unknown MCP action IDs: soql_query/);
-    assert.ok(!store.getGroups().some((group) => group.name === name));
-    assert.equal(store.getPortalAdminLogs(1_000_000).length, auditsBefore);
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.deepEqual(res.body.group.allowedActions, ['soql_query', 'query_records', 'export_all_data']);
+    assert.deepEqual(
+      res.body.issues.map((issue: { name: string; reason: string }) => [issue.name, issue.reason]),
+      [
+        ['query_records', 'unknown_action'],
+        ['export_all_data', 'unknown_action'],
+      ]
+    );
+    assert.match(store.getPortalAdminLogs(1)[0].details, /2 not available/);
   });
 
-  test('an update cannot add an unknown ID to an existing group', async () => {
-    const existing = store.upsertGroup({ name: `Existing ${tag()}`, allowedActions: ['soql_query'], objectPermissions: [] });
-    const res = await postGroup({ ...existing, allowedActions: ['soql_query', 'query_records'] });
+  test('an unknown ID kept on a group is never offered or run at /mcp', async () => {
+    const mock = installSalesforceMock();
+    try {
+      const suffix = tag();
+      const profileId = `00e${crypto.randomBytes(6).toString('hex')}`;
+      const profileName = `Unknown Tool Profile ${suffix}`;
+      store.upsertProfile(profileId, profileName);
+      const existing = store.upsertGroup({ name: `Existing ${suffix}`, allowedActions: ['soql_query'], objectPermissions: [] });
+      const res = await postGroup({ ...existing, allowedActions: ['soql_query', 'query_records'] });
+      assert.equal(res.status, 200, JSON.stringify(res.body));
+      assert.deepEqual(store.getGroup(existing.id)?.allowedActions, ['soql_query', 'query_records']);
+      store.setProfileGroups(profileId, [existing.id]);
+      const token = `tok_unknown_${suffix}${tag()}`;
+      mock.addUser(token, {
+        userId: `005${crypto.randomBytes(6).toString('hex')}`,
+        organizationId: `00D${crypto.randomBytes(6).toString('hex')}`,
+        username: `unknown.${suffix}@acme.example.com`,
+        profileId,
+        profileName,
+        instanceUrl: `https://unknown-${suffix}.my.salesforce.com`,
+      });
+      const listed = await mcpRequest(server.baseUrl, token, 'tools/list');
+      assert.deepEqual(listed.body.result.tools.map((tool: { name: string }) => tool.name), ['soql_query']);
+      const called = await mcpRequest(server.baseUrl, token, 'tools/call', { name: 'query_records', arguments: {} });
+      assert.ok(called.body.error || called.body.result?.isError, JSON.stringify(called.body));
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test('an ID that cannot be a tool name is rejected rather than stored', async () => {
+    const name = `Bad ${tag()}`;
+    const res = await postGroup({ name, allowedActions: ['soql_query', "drop table'; --"] });
     assert.equal(res.status, 400);
-    const reloaded = store.getGroups().find((group) => group.id === existing.id);
-    assert.deepEqual(reloaded?.allowedActions, ['soql_query']);
+    assert.match(res.body.error, /not a valid MCP action ID/);
+    assert.ok(!store.getGroups().some((group) => group.name === name));
   });
 
   test('a non-string entry is rejected rather than stored', async () => {

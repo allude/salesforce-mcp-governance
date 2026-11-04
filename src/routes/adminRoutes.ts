@@ -29,8 +29,9 @@ import { parseObjectSyncPayload, parseProfileSyncPayload } from './orgSyncPayloa
 import { LogPageQueryError, parseMcpLogPageQuery, parsePortalLogPageQuery } from './logPageQuery.js';
 import { isSalesforceId, salesforceIdsMatch } from '../salesforce/ids.js';
 import { assertNotSimulatedOrgHost } from '../salesforce/simulatedOrg.js';
-import { AVAILABLE_MCP_ACTIONS, unknownMcpActionIds } from '../types/governance.js';
-import type { SalesforceConnectionSettings } from '../types/governance.js';
+import { ACCESS_GROUP_EDIT_SOURCES } from '../types/governance.js';
+import type { AccessGroupChangeSource, SalesforceConnectionSettings } from '../types/governance.js';
+import { groupAvailabilityIssues, normalizeMcpActions, normalizeObjectPermissions } from '../groups/groupGrants.js';
 import {
   evaluateMcpToolCall,
   resolveEffectiveProfilePermissions,
@@ -851,13 +852,27 @@ adminRouter.post('/objects', (req: Request, res: Response) => {
 adminRouter.put('/objects/:objectName/toggle', (req: Request, res: Response) => {
   const objectName = String(req.params.objectName);
   const { enabled } = req.body || {};
-  const updated = store.toggleObject(objectName, Boolean(enabled));
+  const actor = getAdminInfo(req);
+  const wasEnabled = store.getObjects().find((o) => o.objectName === objectName)?.enabled;
+  const updated = runInTransaction(() => {
+    const toggled = store.toggleObject(objectName, Boolean(enabled));
+    if (toggled && wasEnabled !== undefined && wasEnabled !== toggled.enabled) {
+      store.recordCatalogChangeOnGroups({
+        objectName,
+        describe: () =>
+          toggled.enabled
+            ? `${objectName} was enabled in Salesforce > Objects, so this group's grant on it is in force again.`
+            : `${objectName} was disabled in Salesforce > Objects, so this group's grant on it is not available until it is enabled.`,
+        change: { actor, source: 'objects' },
+      });
+    }
+    return toggled;
+  });
   if (!updated) {
     res.status(404).json({ error: `Object '${objectName}' not found.` });
     return;
   }
 
-  const actor = getAdminInfo(req);
   store.recordPortalAdminLog({
     adminUsername: actor.username,
     authMethod: actor.authMethod,
@@ -884,17 +899,31 @@ adminRouter.put(
     const objectName = String(req.params.objectName);
     const fieldName = String(req.params.fieldName);
     const { enabled } = req.body || {};
-    const updated = store.toggleObjectField(
-      objectName,
-      fieldName,
-      Boolean(enabled)
-    );
+    const actor = getAdminInfo(req);
+    const wasEnabled = store
+      .getObjects()
+      .find((o) => o.objectName === objectName)
+      ?.fields.find((f) => f.fieldName === fieldName)?.enabled;
+    const updated = runInTransaction(() => {
+      const toggled = store.toggleObjectField(objectName, fieldName, Boolean(enabled));
+      if (toggled && wasEnabled !== undefined && wasEnabled !== Boolean(enabled)) {
+        store.recordCatalogChangeOnGroups({
+          objectName,
+          fieldNames: [fieldName],
+          describe: () =>
+            enabled
+              ? `${objectName}.${fieldName} was enabled in Salesforce > Objects, so this group grants it again.`
+              : `${objectName}.${fieldName} was disabled in Salesforce > Objects, so this group's grant on it is not available until it is enabled.`,
+          change: { actor, source: 'objects' },
+        });
+      }
+      return toggled;
+    });
     if (!updated) {
       res.status(404).json({ error: `Field '${fieldName}' on object '${objectName}' not found.` });
       return;
     }
 
-    const actor = getAdminInfo(req);
     store.recordPortalAdminLog({
       adminUsername: actor.username,
       authMethod: actor.authMethod,
@@ -926,11 +955,25 @@ adminRouter.put(
       return;
     }
 
-    for (const f of targetObj.fields) {
-      store.toggleObjectField(objectName, f.fieldName, Boolean(enabled));
-    }
-
     const actor = getAdminInfo(req);
+    const changedFields = targetObj.fields.filter((f) => f.enabled !== Boolean(enabled)).map((f) => f.fieldName);
+    runInTransaction(() => {
+      for (const f of targetObj.fields) {
+        store.toggleObjectField(objectName, f.fieldName, Boolean(enabled));
+      }
+      if (changedFields.length > 0) {
+        store.recordCatalogChangeOnGroups({
+          objectName,
+          fieldNames: changedFields,
+          describe: (granted) =>
+            enabled
+              ? `All fields of ${objectName} were enabled in Salesforce > Objects, so this group grants ${granted.join(', ')} again.`
+              : `All fields of ${objectName} were disabled in Salesforce > Objects, so this group's grants on ${granted.join(', ')} are not available until they are enabled.`,
+          change: { actor, source: 'objects' },
+        });
+      }
+    });
+
     store.recordPortalAdminLog({
       adminUsername: actor.username,
       authMethod: actor.authMethod,
@@ -953,24 +996,28 @@ adminRouter.delete(
   (req: Request, res: Response) => {
     const objectName = String(req.params.objectName);
     const fieldName = String(req.params.fieldName);
-    const updated = store.deleteObjectField(objectName, fieldName);
-    if (!updated) {
+    const actor = getAdminInfo(req);
+    const deleted = store.deleteObjectFieldAndReport(objectName, fieldName, actor);
+    if (!deleted) {
       res.status(404).json({ error: `Field '${objectName}.${fieldName}' not found.` });
       return;
     }
 
-    const actor = getAdminInfo(req);
     store.recordPortalAdminLog({
       adminUsername: actor.username,
       authMethod: actor.authMethod,
       action: 'DELETE_FIELD',
       target: `${objectName}.${fieldName}`,
-      details: `Deleted field "${objectName}.${fieldName}" from MCP Server object schema.`,
+      details: `Deleted field "${objectName}.${fieldName}" from MCP Server object schema${
+        deleted.revokedGroups.length > 0
+          ? ` and revoked it from ${deleted.revokedGroups.length} Access Group(s), which keep it as not available: ${deleted.revokedGroups.join(', ')}`
+          : ''
+      }.`,
       ipAddress: actor.ip,
     });
 
     res.json({
-      object: updated,
+      object: deleted.object,
       objects: store.getObjects(),
     });
   }
@@ -978,24 +1025,22 @@ adminRouter.delete(
 
 adminRouter.delete('/objects/:objectName', (req: Request, res: Response) => {
   const objectName = String(req.params.objectName);
-  const revokedFrom = store
-    .getGroups()
-    .filter((g) => g.objectPermissions.some((p) => String(p.objectName).toLowerCase() === objectName.toLowerCase()));
-  const deleted = store.deleteObject(objectName);
+  const actor = getAdminInfo(req);
+  const deleted = store.deleteObjectAndReport(objectName, actor);
   if (!deleted) {
     res.status(404).json({ error: `Object '${objectName}' not found.` });
     return;
   }
 
-  const actor = getAdminInfo(req);
+  const { revokedGroups } = deleted;
   store.recordPortalAdminLog({
     adminUsername: actor.username,
     authMethod: actor.authMethod,
     action: 'DELETE_OBJECT',
     target: `Object: ${objectName}`,
     details: `Deleted Salesforce Object "${objectName}" and its fields from the MCP Server${
-      revokedFrom.length > 0
-        ? ` and revoked it from ${revokedFrom.length} Access Group(s): ${revokedFrom.map((g) => g.name).join(', ')}`
+      revokedGroups.length > 0
+        ? ` and revoked it from ${revokedGroups.length} Access Group(s), which keep it as not available: ${revokedGroups.join(', ')}`
         : ''
     }.`,
     ipAddress: actor.ip,
@@ -1135,7 +1180,7 @@ adminRouter.post('/objects/pull-apply', (req: Request, res: Response) => {
   try {
     // The audit entry shares the transaction: an applied change can never go unlogged.
     summary = runInTransaction(() => {
-      const applied = store.applyObjectsSyncFromOrg(parsed.value);
+      const applied = store.applyObjectsSyncFromOrg({ ...parsed.value, actor });
       store.recordPortalAdminLog({
         adminUsername: actor.username,
         authMethod: actor.authMethod,
@@ -1148,7 +1193,7 @@ adminRouter.post('/objects/pull-apply', (req: Request, res: Response) => {
           namesClause('Removed objects', applied.affected.objectsRemoved) +
           namesClause('Removed fields', applied.affected.fieldsRemoved) +
           namesClause('Kept as missing', [...applied.affected.objectsKeptMissing, ...applied.affected.fieldsKeptMissing]) +
-          namesClause('Access Groups that lost grants', applied.affected.groupsLosingGrants),
+          namesClause('Access Groups that lost grants (kept there as not available)', applied.affected.groupsLosingGrants),
         ipAddress: actor.ip,
       });
       return applied;
@@ -1169,37 +1214,55 @@ adminRouter.post('/objects/pull-apply', (req: Request, res: Response) => {
 // ============================================================================
 // 3. ACCESS MATRIX -> GROUPS & PROFILE-GROUP MATRIX
 // ============================================================================
+/** The detail an edit's history keeps: the file an import came from, or the version a restore loaded. */
+const MAX_SOURCE_DETAIL = 300;
+
+/**
+ * POST /api/admin/groups
+ * Creates or updates a group. Object, field and MCP action names that this server does not have are
+ * kept and reported as not available rather than rejected, so a group imported from another server,
+ * or one whose object was deleted, keeps what it names for an admin to review. `source` says which
+ * editor (or import) the save came from, for the group's history.
+ */
 adminRouter.post('/groups', (req: Request, res: Response) => {
-  const { id, name, description, allowedActions, objectPermissions } =
-    req.body || {};
-  if (!name) {
+  const { id, name, description, allowedActions, objectPermissions, source, sourceDetail } = req.body || {};
+  if (!name || !String(name).trim()) {
     res.status(400).json({ error: 'Group name is required.' });
     return;
   }
 
-  // An unknown ID grants nothing at /mcp, so storing one would only look like a working grant.
-  const unknownActions = Array.isArray(allowedActions) ? unknownMcpActionIds(allowedActions) : [];
-  if (unknownActions.length > 0) {
-    res.status(400).json({
-      error: `Unknown MCP action IDs: ${unknownActions.join(', ')}. Valid IDs: ${AVAILABLE_MCP_ACTIONS.map(
-        (a) => a.id
-      ).join(', ')}.`,
-    });
+  const actions = normalizeMcpActions(allowedActions);
+  if (!actions.ok) {
+    res.status(400).json({ error: actions.error });
     return;
   }
+  const perms = normalizeObjectPermissions(objectPermissions);
+  if (!perms.ok) {
+    res.status(400).json({ error: perms.error });
+    return;
+  }
+  const changeSource: AccessGroupChangeSource = (ACCESS_GROUP_EDIT_SOURCES as readonly string[]).includes(source)
+    ? source
+    : 'editor';
 
-  const isUpdate = Boolean(id && store.getGroups().some((g) => g.id === id));
+  const actor = getAdminInfo(req);
+  const isUpdate = Boolean(id && store.getGroup(String(id)));
   let saved;
   try {
-    saved = store.upsertGroup({
-      id: id ? String(id) : undefined,
-      name: String(name),
-      description: description ? String(description) : '',
-      allowedActions: Array.isArray(allowedActions) ? allowedActions : [],
-      objectPermissions: Array.isArray(objectPermissions)
-        ? objectPermissions
-        : [],
-    });
+    saved = store.upsertGroup(
+      {
+        id: id ? String(id) : undefined,
+        name: String(name),
+        description: description ? String(description) : '',
+        allowedActions: actions.value,
+        objectPermissions: perms.value,
+      },
+      {
+        actor,
+        source: changeSource,
+        sourceDetail: typeof sourceDetail === 'string' ? sourceDetail.slice(0, MAX_SOURCE_DETAIL) : '',
+      }
+    );
   } catch (err: any) {
     if (/UNIQUE constraint failed: access_groups\.name/.test(String(err?.message))) {
       res.status(409).json({ error: `An Access Group named "${String(name).trim()}" already exists.` });
@@ -1208,36 +1271,47 @@ adminRouter.post('/groups', (req: Request, res: Response) => {
     throw err;
   }
 
-  const actor = getAdminInfo(req);
+  const issues = groupAvailabilityIssues(saved, store.getObjects());
+  const unavailable = issues.filter((i) => i.status === 'unavailable').length;
+  const broken = issues.length - unavailable;
+  const via =
+    changeSource === 'xml_import'
+      ? ` from XML${sourceDetail ? ` (${String(sourceDetail).slice(0, MAX_SOURCE_DETAIL)})` : ''}`
+      : changeSource === 'xml_editor'
+        ? ' in the XML editor'
+        : changeSource === 'version_restore'
+          ? ' from an earlier version in its history'
+          : '';
   store.recordPortalAdminLog({
     adminUsername: actor.username,
     authMethod: actor.authMethod,
-    action: isUpdate ? 'UPDATE_GROUP' : 'CREATE_GROUP',
+    action: changeSource === 'xml_import' ? 'IMPORT_GROUP_XML' : isUpdate ? 'UPDATE_GROUP' : 'CREATE_GROUP',
     target: `Group: ${saved.name}`,
-    details: `${isUpdate ? 'Updated' : 'Created'} Access Group "${
-      saved.name
-    }" (${saved.allowedActions.length} MCP actions, ${
-      saved.objectPermissions.length
-    } objects configured).`,
+    details: `${isUpdate ? 'Updated' : 'Created'} Access Group "${saved.name}"${via} (${
+      saved.allowedActions.length
+    } MCP actions, ${saved.objectPermissions.length} objects configured${
+      unavailable > 0 ? `, ${unavailable} not available` : ''
+    }${broken > 0 ? `, ${broken} broken` : ''}).`,
     ipAddress: actor.ip,
   });
 
   res.json({
     group: saved,
     groups: store.getGroups(),
+    issues,
   });
 });
 
 adminRouter.delete('/groups/:id', (req: Request, res: Response) => {
   const id = String(req.params.id);
-  const existing = store.getGroups().find((g) => g.id === id);
-  const deleted = store.deleteGroup(id);
+  const existing = store.getGroup(id);
+  const actor = getAdminInfo(req);
+  const deleted = store.deleteGroup(id, { actor, source: 'editor' });
   if (!deleted) {
     res.status(404).json({ error: 'Group not found.' });
     return;
   }
 
-  const actor = getAdminInfo(req);
   store.recordPortalAdminLog({
     adminUsername: actor.username,
     authMethod: actor.authMethod,
@@ -1251,6 +1325,21 @@ adminRouter.delete('/groups/:id', (req: Request, res: Response) => {
     groups: store.getGroups(),
     profileGroupMappings: store.getProfileGroupMappings(),
   });
+});
+
+/**
+ * GET /api/admin/groups/:id/history
+ * The group's changes, newest first: edits, imports and restores, and changes in Salesforce > Objects
+ * to what it grants. Still readable after the group is deleted.
+ */
+adminRouter.get('/groups/:id/history', (req: Request, res: Response) => {
+  const id = String(req.params.id);
+  const history = store.getGroupHistory(id);
+  if (history.length === 0 && !store.getGroup(id)) {
+    res.status(404).json({ error: 'Group not found.' });
+    return;
+  }
+  res.json({ history });
 });
 
 /**
@@ -1937,8 +2026,9 @@ adminRouter.post('/workspace/seed-sample', (req: Request, res: Response) => {
     },
   ];
 
+  const seedActor = getAdminInfo(req);
   for (const g of sampleGroups) {
-    store.upsertGroup(g);
+    store.upsertGroup(g, { actor: seedActor, source: 'sample_data' });
   }
 
   // Assign profiles to groups

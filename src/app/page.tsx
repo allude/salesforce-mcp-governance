@@ -14,10 +14,11 @@ import type {
   SalesforceConnectionSettings,
   PortalUserSummary,
   AdminSession,
-  McpActionType,
-  GroupObjectPermission,
+  AccessGroupChangeSource,
+  AccessGroupHistoryEntry,
   NavViewId,
 } from '@/types/governance';
+import type { AccessGroupDraft } from '@/components/views/accessGroupDraft';
 import {
   TrafficDashboardView,
   type McpRequestStats,
@@ -622,22 +623,31 @@ export default function AdminPortalPage() {
     );
   };
 
-  const handleSaveGroup = async (group: {
-    id?: string;
-    name: string;
-    description: string;
-    allowedActions: McpActionType[];
-    objectPermissions: GroupObjectPermission[];
-  }) => {
+  const handleSaveGroup = async (
+    group: AccessGroupDraft & { source: AccessGroupChangeSource; sourceDetail: string }
+  ) => {
     const data = await apiFetch('/api/admin/groups', {
       method: 'POST',
       body: JSON.stringify(group),
     });
     if (data.groups) setGroups(data.groups);
     await fetchWorkspace();
-    notify(`Saved access group "${group.name}"`);
+    const notAvailable = Array.isArray(data.issues) ? data.issues.length : 0;
+    notify(
+      `Saved access group "${group.name}"${
+        notAvailable > 0 ? `, with ${notAvailable} item${notAvailable === 1 ? '' : 's'} not available or broken` : ''
+      }`
+    );
     return data.group;
   };
+
+  const handleLoadGroupHistory = useCallback(
+    async (groupId: string): Promise<AccessGroupHistoryEntry[]> => {
+      const data = await apiFetch(`/api/admin/groups/${encodeURIComponent(groupId)}/history`);
+      return data.history || [];
+    },
+    [apiFetch]
+  );
 
   const handleDeleteGroup = async (groupId: string) => {
     const data = await apiFetch(
@@ -1329,6 +1339,7 @@ export default function AdminPortalPage() {
               selectedFlyoutId={selectedFlyoutId}
               onOpenFlyout={(f) => setFlyout(f)}
               onSeedEnterpriseMatrix={requestSeedEnterpriseMatrix}
+              notify={notify}
             />
           )}
 
@@ -1452,6 +1463,7 @@ export default function AdminPortalPage() {
         }}
         onSaveGroup={reportFailure(handleSaveGroup)}
         onDeleteGroup={reportFailure(handleDeleteGroup)}
+        onLoadGroupHistory={handleLoadGroupHistory}
         onTestMcpCall={reportFailure(handleTestMcpCall)}
         onRefreshWorkspace={fetchWorkspace}
         notify={notify}
