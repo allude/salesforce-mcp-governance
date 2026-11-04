@@ -205,7 +205,7 @@ describe('POST /test-mcp-access', () => {
 });
 
 describe('/mcp', () => {
-  test('tools/call with a simulator token logs marked rows for allowed, denied and failed calls', async (t) => {
+  test('tools/call with a simulator token logs marked rows for an allowed call and calls denied by tool and by field', async (t) => {
     const sf = installSalesforceMock();
     t.after(() => sf.restore());
     const { profileId, profileName, objectName } = seedProfile();

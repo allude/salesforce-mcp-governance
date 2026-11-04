@@ -245,7 +245,7 @@ describe('the group drawer and the stricter POST /groups', () => {
     });
   });
 
-  test('a stored group the drawer loaded can be saved back unchanged, with its version', async () => {
+  test('a stored group the drawer loaded can be saved back without edits, with its version, which stores its grants normalized', async () => {
     const objectName = `Drawer_${tag()}__c`;
     store.upsertObjectWithFields({ objectName, fields: [{ fieldName: 'Id' }] });
     const stored = store.upsertGroup({

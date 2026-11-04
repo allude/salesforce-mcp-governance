@@ -686,14 +686,37 @@ describe('store: groups and profile-group mappings', () => {
     assert.equal(groups.some((g) => g.name === `Store Group ${suffix}`), false, 'no copy under the old name');
   });
 
-  test('a group starts at version 1 and every update, even one that changes nothing, adds one', (t) => {
+  test('a group starts at version 1 and every update that changes it adds one', (t) => {
     const created = newGroup('Store versions');
     t.after(() => store.deleteGroup(created.id));
     assert.equal(created.version, 1);
     const once = store.upsertGroup({ ...created, description: 'changed' });
-    const twice = store.upsertGroup(once);
+    const twice = store.upsertGroup({ ...once, allowedActions: ['soql_query'] });
     assert.deepEqual([once.version, twice.version], [2, 3]);
     assert.equal(rawGet<{ version: number }>('SELECT version FROM access_groups WHERE id = ?', created.id)?.version, 3);
+  });
+
+  test('an update that stores what is stored writes nothing: the version and updatedAt stay', (t) => {
+    const created = newGroup('Store unchanged');
+    t.after(() => store.deleteGroup(created.id));
+    const changed = store.upsertGroup({
+      ...created,
+      allowedActions: ['soql_query'],
+      objectPermissions: [
+        { objectName: 'Account', canRead: true, canCreate: false, canUpdate: false, canDelete: false, allowedFields: ['Id'] },
+      ],
+    });
+    // The name and description are stored trimmed, so surrounding spaces change nothing either.
+    const again = store.upsertGroup({ ...changed, name: ` ${changed.name} `, description: `${changed.description} ` });
+    assert.equal(again.version, changed.version);
+    assert.equal(again.updatedAt, changed.updatedAt);
+    assert.deepEqual(again, changed);
+
+    // Any one column that differs is a change.
+    const renamed = store.upsertGroup({ ...again, name: `${again.name} renamed` });
+    assert.equal(renamed.version, changed.version + 1);
+    const regranted = store.upsertGroup({ ...renamed, objectPermissions: [] });
+    assert.equal(regranted.version, changed.version + 2);
   });
 
   test('upsertGroup refuses an id no group has instead of creating a group under it', () => {

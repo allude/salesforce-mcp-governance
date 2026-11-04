@@ -432,10 +432,10 @@ describe('a write that changes nothing leaves the revision alone', () => {
       },
     ],
     [
-      'upsertGroup saving the group as it is, which still gives it a new version',
+      'upsertGroup saving the group as it is, which keeps its version',
       (t) => {
         const group = newGroup(t, [readGrant(newObject(t))]);
-        return () => assert.equal(store.upsertGroup(group).version, group.version + 1);
+        return () => assert.equal(store.upsertGroup(group).version, group.version);
       },
     ],
     [

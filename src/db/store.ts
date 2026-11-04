@@ -32,7 +32,13 @@ import { salesforceIdKey, salesforceIdsMatch } from '../salesforce/ids.js';
 import { isSimulatedOrgHost, isUninitialisedMcpTokenHost } from '../salesforce/simulatedOrg.js';
 import { soqlSkeleton } from '../mcp/soqlGuard.js';
 import { auditResultFromAction, PORTAL_AUDIT_RESULTS, type PortalAuditResult } from '../security/auditResult.js';
-import { malformedGrantReason, mergeGrants, spellingLookup, uniqueIgnoringCase } from '../rbac/groupGrants.js';
+import {
+  malformedGrantReason,
+  mergeGrants,
+  readableGrants,
+  spellingLookup,
+  uniqueIgnoringCase,
+} from '../rbac/groupGrants.js';
 import { decisionLogColumns, policySnapshotCatalog, type GatewayDecision } from '../rbac/decisionLog.js';
 import type { PolicyDecision, PolicySnapshot } from '../rbac/policyEngine.js';
 
@@ -102,8 +108,20 @@ export function runInTransaction<T>(fn: () => T): T {
 }
 
 /**
+ * A group's stored entries for a revocation: the entries of the column, or null when it does not hold
+ * a list. Revocation leaves such a column, and every entry malformedGrantReason refuses, as stored: the
+ * policy engine grants nothing for them, and rewriting them would lose what an operator may still want
+ * to recover by hand.
+ */
+function storedEntriesForRevocation(json: string): unknown[] | null {
+  const entries = parseStoredJson(json);
+  return Array.isArray(entries) ? entries : null;
+}
+
+/**
  * Deletes a field and revokes it from every Access Group, reporting which groups lost it.
- * While a case variant still exists the grants still refer to it and stay.
+ * While a case variant still exists the grants still refer to it and stay. Malformed entries and
+ * unreadable columns are skipped (see storedEntriesForRevocation).
  */
 function deleteFieldAndRevokeGrants(objName: string, fldName: string): { deleted: boolean; revokedGroups: string[] } {
   return runInTransaction(() => {
@@ -129,13 +147,14 @@ function deleteFieldAndRevokeGrants(objName: string, fldName: string): { deleted
     );
     const revokedGroups: string[] = [];
     for (const row of rows) {
-      const perms = JSON.parse(row.object_permissions_json || '[]') as GroupObjectPermission[];
+      const entries = storedEntriesForRevocation(row.object_permissions_json);
+      if (!entries) continue;
       let changed = false;
-      const kept = perms.map((p) => {
-        if (String(p.objectName).toLowerCase() !== objName.toLowerCase()) return p;
-        const allowedFields = (p.allowedFields || []).filter(
-          (f) => String(f).toLowerCase() !== fldName.toLowerCase()
-        );
+      const kept = entries.map((entry) => {
+        if (malformedGrantReason(entry) !== null) return entry;
+        const p = entry as GroupObjectPermission;
+        if (p.objectName.toLowerCase() !== objName.toLowerCase()) return p;
+        const allowedFields = (p.allowedFields || []).filter((f) => f.toLowerCase() !== fldName.toLowerCase());
         if (allowedFields.length === (p.allowedFields || []).length) return p;
         changed = true;
         return { ...p, allowedFields };
@@ -152,7 +171,8 @@ function deleteFieldAndRevokeGrants(objName: string, fldName: string): { deleted
 /**
  * Deletes an Object and its fields and revokes it from every Access Group, reporting which groups
  * lost it. Grants match objects case-insensitively; while a case variant (e.g. 'Account' after
- * deleting a stray 'account') still exists, the grants still refer to it and must stay.
+ * deleting a stray 'account') still exists, the grants still refer to it and must stay. Malformed
+ * entries and unreadable columns are skipped (see storedEntriesForRevocation).
  */
 function deleteObjectAndRevokeGrants(objectName: string): { deleted: boolean; revokedGroups: string[] } {
   return runInTransaction(() => {
@@ -174,9 +194,14 @@ function deleteObjectAndRevokeGrants(objectName: string): { deleted: boolean; re
     );
     const revokedGroups: string[] = [];
     for (const row of rows) {
-      const perms = JSON.parse(row.object_permissions_json || '[]') as GroupObjectPermission[];
-      const kept = perms.filter((p) => String(p.objectName).toLowerCase() !== objectName.toLowerCase());
-      if (kept.length !== perms.length) {
+      const entries = storedEntriesForRevocation(row.object_permissions_json);
+      if (!entries) continue;
+      const kept = entries.filter(
+        (entry) =>
+          malformedGrantReason(entry) !== null ||
+          (entry as GroupObjectPermission).objectName.toLowerCase() !== objectName.toLowerCase()
+      );
+      if (kept.length !== entries.length) {
         updateGroup.run(JSON.stringify(kept), now, row.id);
         revokedGroups.push(row.name);
       }
@@ -1977,6 +2002,11 @@ export const store = {
     return deleteObjectAndRevokeGrants(objectName).deleted;
   },
 
+  /** deleteObject, also naming the Access Groups that lost the Object, for its audit entry. */
+  deleteObjectRevokingGrants(objectName: string): { deleted: boolean; revokedGroups: string[] } {
+    return deleteObjectAndRevokeGrants(objectName);
+  },
+
   /**
    * Computes a non-destructive preview of Object & Field additions, updates, and removals
    * compared against the live Salesforce Org metadata.
@@ -1997,7 +2027,7 @@ export const store = {
       if (!pulled.existsInOrg) {
         const referencedInGroups = groups
           .filter((g) =>
-            g.objectPermissions.some(
+            readableGrants(g.objectPermissions).some(
               (op) => op.objectName.toLowerCase() === pulled.objectName.toLowerCase()
             )
           )
@@ -2038,7 +2068,7 @@ export const store = {
           if (!orgFieldMap.has(lf.fieldName.toLowerCase())) {
             const referencedInGroups = groups
               .filter((g) =>
-                g.objectPermissions.some(
+                readableGrants(g.objectPermissions).some(
                   (op) =>
                     op.objectName.toLowerCase() === pulled.objectName.toLowerCase() &&
                     op.allowedFields.some(
@@ -2282,26 +2312,40 @@ export const store = {
 
   /**
    * Creates a group when no id is given and updates the group with the given id, whose version then
-   * goes up by one. An id no group has is refused: it never creates a group.
+   * goes up by one. A save that would store exactly what is stored writes nothing, so its version and
+   * updatedAt stay and an editor that loaded that version can still save. An id no group has is
+   * refused: it never creates a group.
    */
   upsertGroup(input: GroupWrite & { id?: string }): AccessGroup {
     const requestedId = input.id?.trim();
     if (!requestedId) return this.createGroup(input);
 
-    const res = db.prepare(`
-      UPDATE access_groups SET
-        name = ?, description = ?, allowed_actions_json = ?, object_permissions_json = ?,
-        version = version + 1, updated_at = ?
-      WHERE id = ?
-    `).run(
-      input.name.trim(),
-      (input.description || '').trim(),
-      JSON.stringify(input.allowedActions || []),
-      JSON.stringify(input.objectPermissions || []),
-      new Date().toISOString(),
-      requestedId
-    );
-    if (res.changes === 0) throw new Error(`Unknown Access Group id: ${requestedId}`);
+    const next = {
+      name: input.name.trim(),
+      description: (input.description || '').trim(),
+      allowed_actions_json: JSON.stringify(input.allowedActions || []),
+      object_permissions_json: JSON.stringify(input.objectPermissions || []),
+    };
+    const stored = db
+      .prepare('SELECT name, description, allowed_actions_json, object_permissions_json FROM access_groups WHERE id = ?')
+      .get(requestedId) as typeof next | undefined;
+    if (!stored) throw new Error(`Unknown Access Group id: ${requestedId}`);
+    const unchanged = (Object.keys(next) as Array<keyof typeof next>).every((column) => stored[column] === next[column]);
+    if (!unchanged) {
+      db.prepare(`
+        UPDATE access_groups SET
+          name = ?, description = ?, allowed_actions_json = ?, object_permissions_json = ?,
+          version = version + 1, updated_at = ?
+        WHERE id = ?
+      `).run(
+        next.name,
+        next.description,
+        next.allowed_actions_json,
+        next.object_permissions_json,
+        new Date().toISOString(),
+        requestedId
+      );
+    }
     return this.getGroups().find((g) => g.id === requestedId)!;
   },
 

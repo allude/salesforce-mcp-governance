@@ -118,8 +118,7 @@ function buildWorld(t: TestContext, seed: number): World {
   const objectNames: string[] = [];
   t.after(() => {
     for (const id of profileIds) store.deleteProfile(id);
-    // Every generated world's groups go before any Object: deleting an Object revokes it from every
-    // group, and that revoke cannot read a stored null entry (a malformed entry some worlds hold).
+    // Every generated world's groups go before any Object, so an Object's delete has no grant left to revoke.
     for (const group of store.getGroups()) {
       if (group.id.startsWith('grp_diff_')) store.deleteGroup(group.id);
     }

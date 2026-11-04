@@ -86,7 +86,7 @@ APP_SECRET_KEY=<64-hex> ADMIN_BOOTSTRAP_PASSWORD=<strong> npm start
 | :--- | :--- |
 | `npm run typecheck` | `tsc --noEmit` over the backend, portal and tests |
 | `npm test` | Unit and integration suites (`test/*.test.ts`, `node:test`) plus the self-test (`src/test-self.ts`). Every suite uses its own throwaway SQLite database and mocks Salesforce at the network boundary. |
-| `npm run test:e2e` | Live smoke test (`scripts/smoke-e2e.sh`): builds, boots both servers on `:3001`/`:3000` against a temp database, checks the proxy, MCP auth, admin login, the policy simulator and the audit log, then shuts everything down. Ports 3000 and 3001 must be free. |
+| `npm run test:e2e` | Live smoke test (`scripts/smoke-e2e.sh`): builds, boots both servers on `:3001`/`:3000` against a temp database, checks the proxy, MCP auth, admin login, the policy simulator and the audit log, then shuts everything down. Ports 3000 and 3001 must be free, or set `SMOKE_PORTAL_PORT` / `SMOKE_BACKEND_PORT` to others. |
 | `npm run verify` | All of the above in order |
 
 ---
@@ -120,10 +120,18 @@ salesforce-mcp/
     ├── mcp/server.ts                  # Request-scoped MCP server: tool visibility + governed tool handlers
     ├── mcp/soqlGuard.ts               # Validates soql_query WHERE filters against the field allowlist
     ├── mcp/streamableHttp.ts          # Stateless Streamable HTTP (/mcp) handler and 401 challenge
+    ├── mcp/toolArguments.ts           # Reads tools/call arguments the same way for the policy and the handlers
     ├── rbac/policyEngine.ts           # Profile -> Group -> Tool / Object CRUD / Field policy engine
+    ├── rbac/groupGrants.ts            # Reads, checks and merges Access Group grants (shared with the portal)
+    ├── rbac/decisionLog.ts            # The names-only decision each MCP log row keeps
+    ├── rbac/policyViolation.ts        # Error for a field or filter outside the caller's allowlist
     ├── routes/adminRoutes.ts          # Admin REST API (imports, matrix, settings, users, simulator)
+    ├── routes/groupPayload.ts         # Checks POST /groups bodies and stores grants in the catalog's spelling
+    ├── routes/groupAuditDiff.ts       # The names-only diff an Access Group audit row keeps
     ├── salesforce/client.ts           # Token verification, Org ID lock, SSRF guard, REST client, simulator tokens
     ├── security/adminAuth.ts          # Admin session JWT, CSRF, Okta OIDC + PKCE + JWKS
+    ├── security/auditResult.ts        # SUCCESS / FAILED / DENIED of a Portal Admin log row (shared with the portal)
     ├── security/crypto.ts             # AES-256-GCM secrets at rest, timing-safe helpers, PKCE
+    ├── security/passwordPolicy.ts     # Minimum portal password length (shared with the portal)
     └── test-self.ts                   # Quick self-test against a throwaway database
 ```

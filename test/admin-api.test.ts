@@ -1239,6 +1239,58 @@ describe('Admin REST API', () => {
       assert.deepEqual([unversioned.body.group.description, unversioned.body.group.version], ['Last write', 3]);
     });
 
+    it('POST /groups saving a group unchanged keeps its version, answers 200 and is audited with an empty diff', async (t) => {
+      const admin = await signIn();
+      const objectName = addObject(t, 'Unchanged');
+      const created = await mutate(
+        admin,
+        'POST',
+        '/api/admin/groups',
+        { name: newGroupName('Unchanged'), description: 'Kept', allowedActions: ['soql_query'], objectPermissions: [readGrant(objectName)] },
+        'CREATE_GROUP'
+      );
+      const group = created.body.group as AccessGroup;
+      t.after(() => {
+        store.deleteGroup(group.id);
+      });
+      const revision = store.getPolicyRevision();
+
+      // Sent in another spelling, with spaces and without the false flags: parsed, it is what is stored.
+      const resave = await mutate(
+        admin,
+        'POST',
+        '/api/admin/groups',
+        {
+          id: group.id,
+          expectedVersion: group.version,
+          name: ` ${group.name} `,
+          description: group.description,
+          allowedActions: group.allowedActions,
+          objectPermissions: [{ objectName: objectName.toLowerCase(), canRead: true, allowedFields: ['id', 'NAME'] }],
+        },
+        'UPDATE_GROUP',
+        group.name
+      );
+
+      assert.deepEqual(resave.body.group, group, 'same version and updatedAt');
+      assert.deepEqual(resave.body.groups.find((g: AccessGroup) => g.id === group.id), group);
+      assert.deepEqual(resave.audit.diff, { before: {}, after: {} });
+      assert.equal(resave.audit.details, `Saved Access Group "${group.name}" (1 MCP actions, 1 objects configured) without changes.`);
+      assert.equal(store.getPolicyRevision(), revision);
+
+      // So an editor that loaded the group before the no-op save can still save its change.
+      const otherTab = await signIn();
+      const changed = await mutate(
+        otherTab,
+        'POST',
+        '/api/admin/groups',
+        { ...group, expectedVersion: group.version, description: 'Changed in the other tab' },
+        'UPDATE_GROUP'
+      );
+      assert.equal(changed.body.group.version, group.version + 1);
+      assert.match(changed.audit.details, /^Updated Access Group /);
+    });
+
     it('POST /groups answers a draft still holding an Object or field deleted since with the reload 409, not a 400', async (t) => {
       const admin = await signIn();
       const objectName = addObject(t, 'StaleEditor', ['Id', 'Name', 'Phone']);
@@ -1601,6 +1653,55 @@ describe('Admin REST API', () => {
       const seeded = res.body.groups.filter((g: any) => !groupsBefore.has(g.id)).map((g: any) => g.id);
       assert.deepEqual(seeded.sort(), ['grp-admin', 'grp-revops', 'grp-sales-ro', 'grp-sales-rw', 'grp-svc-cases']);
       assert.deepEqual(mappedGroupIds('00e5g000001B2k9AAC')?.sort(), ['grp-sales-ro', 'grp-sales-rw']);
+    });
+
+    it('POST /workspace/seed-sample answers 409 and loads nothing while another group has a sample name, in any case', async (t) => {
+      const admin = await signIn();
+      const sampleIds = ['grp-admin', 'grp-revops', 'grp-sales-ro', 'grp-sales-rw', 'grp-svc-cases'];
+      assert.ok(!store.getGroups().some((g) => sampleIds.includes(g.id)), 'precondition: no sample group is loaded');
+      const profilesBefore = new Set(store.getProfiles().map((p) => p.id));
+      t.after(() => {
+        for (const id of sampleIds) store.deleteGroup(id);
+        for (const profile of store.getProfiles().filter((p) => !profilesBefore.has(p.id))) store.deleteProfile(profile.id);
+      });
+      const state = () =>
+        JSON.stringify({ profiles: store.getProfiles(), groups: store.getGroups(), mappings: store.getProfileGroupMappings() });
+
+      for (const name of ['Platform Admin', 'SALES · READ-ONLY']) {
+        const holder = store.createGroup({ name, allowedActions: [], objectPermissions: [] });
+        const before = state();
+        const revision = store.getPolicyRevision();
+        const mark = auditMark();
+
+        const res = await call(admin, 'POST', '/api/admin/workspace/seed-sample', {});
+
+        assert.equal(res.status, 409, JSON.stringify(res.body));
+        assert.ok(
+          res.body.error.startsWith(`Access Group "${name}" already uses the name of the sample group "`),
+          res.body.error
+        );
+        assert.equal(state(), before);
+        assert.equal(store.getPolicyRevision(), revision);
+        assertNotAudited(mark, admin.ip);
+        store.deleteGroup(holder.id);
+      }
+
+      // With the names free it loads, and loading it again still answers 200.
+      await mutate(admin, 'POST', '/api/admin/workspace/seed-sample', {}, 'SEED_ENTERPRISE_MATRIX');
+      await mutate(admin, 'POST', '/api/admin/workspace/seed-sample', {}, 'SEED_ENTERPRISE_MATRIX');
+
+      // A sample group renamed to another one's exact name holds it while that one is saved: 409 too.
+      const readOnly = store.getGroups().find((g) => g.id === 'grp-sales-ro')!;
+      const admins = store.getGroups().find((g) => g.id === 'grp-admin')!;
+      store.upsertGroup({ ...readOnly, name: `Renamed ${RUN}` });
+      store.upsertGroup({ ...admins, name: readOnly.name });
+      const before = state();
+      const mark = auditMark();
+      const res = await call(admin, 'POST', '/api/admin/workspace/seed-sample', {});
+      assert.equal(res.status, 409, JSON.stringify(res.body));
+      assert.match(res.body.error, /because another Access Group has it, so no sample data was loaded/);
+      assert.equal(state(), before);
+      assertNotAudited(mark, admin.ip);
     });
   });
 

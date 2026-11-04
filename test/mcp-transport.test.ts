@@ -1285,3 +1285,142 @@ test('the -32700 parse error from /mcp carries the same CORS headers as every ot
   assert.equal(malformed.headers.get('access-control-allow-origin'), '*', 'parse error is unreadable cross-origin');
   assert.equal(malformed.headers.get('access-control-allow-credentials'), null);
 });
+
+// ---------------------------------------------------------------------------------------------
+// JSON-RPC batches. The MCP SDK's transport accepts an array of messages in one POST; nothing here
+// changes that. These tests record what it does, so a change in the SDK or the gateway shows up.
+// ---------------------------------------------------------------------------------------------
+
+/** POSTs `body` as it is to /mcp, a JSON-RPC batch when it is an array. */
+async function postBatch(h: Harness, token: string, body: unknown) {
+  const res = await fetch(`${h.server.baseUrl}/mcp`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/event-stream',
+      Authorization: `Bearer ${token}`,
+      'X-Forwarded-For': nextClientIp(),
+    },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  return { status: res.status, contentType: res.headers.get('content-type') ?? '', text };
+}
+
+/** A Profile whose group grants soql_query on a new Object's Id field only, and its simulator token. */
+function seedBatchCaller(t: TestContext): { token: string; objectName: string; profileId: string } {
+  const suffix = uid();
+  const objectName = `Batch_${suffix}__c`;
+  const profileId = sfId('00e');
+  const profileName = `Batch Profile ${suffix}`;
+  store.upsertObjectWithFields({ objectName, fields: [{ fieldName: 'Id' }, { fieldName: 'Name' }] });
+  const group = store.createGroup({
+    name: `Batch Group ${suffix}`,
+    allowedActions: ['soql_query'],
+    objectPermissions: [
+      { objectName, canRead: true, canCreate: false, canUpdate: false, canDelete: false, allowedFields: ['Id'] },
+    ],
+  });
+  store.upsertProfile(profileId, profileName);
+  store.setProfileGroups(profileId, [group.id]);
+  t.after(() => {
+    store.deleteProfile(profileId);
+    store.deleteGroup(group.id);
+    store.deleteObject(objectName);
+  });
+  return { token: createSimulatorToken({ profileId, profileName }), objectName, profileId };
+}
+
+test('a JSON-RPC batch on /mcp is answered as one array in request order, and each tools/call in it is decided and logged on its own', async (t) => {
+  const h = await startHarness(t);
+  const caller = seedBatchCaller(t);
+  const existing = logIds();
+
+  const res = await postBatch(h, caller.token, [
+    { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'soql_query', arguments: { objectName: caller.objectName, fields: ['Id'] } } },
+    { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'soql_query', arguments: { objectName: caller.objectName, fields: ['Name'] } } },
+    { jsonrpc: '2.0', id: 3, method: 'tools/list', params: {} },
+    // A notification has no id, so it gets no answer.
+    { jsonrpc: '2.0', method: 'notifications/initialized' },
+  ]);
+
+  assert.equal(res.status, 200, res.text);
+  assert.match(res.contentType, /^application\/json/);
+  const answers = JSON.parse(res.text) as any[];
+  assert.ok(Array.isArray(answers), res.text);
+  assert.deepEqual(answers.map((a) => a.id), [1, 2, 3]);
+  assert.notEqual(answers[0].result?.isError, true, JSON.stringify(answers[0]));
+  assert.equal(answers[1].result?.isError, true, 'the field outside the allowlist is denied');
+  assert.deepEqual(toolNames(answers[2]), ['soql_query']);
+
+  // One row per tools/call, each with its own decision; tools/list and the notification write none.
+  // Rows are written as the calls finish, so their order is not the batch order. The token was
+  // verified once, for the whole HTTP request, so both rows carry the same verificationMs.
+  const rows = rowsWrittenSince(existing);
+  assert.deepEqual(rows.map((row) => [row.profileId, row.toolName, row.status]).sort(), [
+    [caller.profileId, 'soql_query', 'ALLOWED'],
+    [caller.profileId, 'soql_query', 'DENIED'],
+  ]);
+  assert.equal(rows.find((row) => row.status === 'DENIED')?.decisionCode, 'FIELD_NOT_PERMITTED');
+  assert.equal(rows[0].verificationMs, rows[1].verificationMs);
+});
+
+test('a JSON-RPC batch with a refused token is one 401 and one rejected row, whatever the batch holds', async (t) => {
+  const h = await startHarness(t);
+  const caller = seedBatchCaller(t);
+  const [payload] = caller.token.split('.');
+  const existing = logIds();
+
+  const call = { jsonrpc: '2.0', method: 'tools/call', params: { name: 'soql_query', arguments: { objectName: caller.objectName, fields: ['Id'] } } };
+  const res = await postBatch(h, `${payload}.${crypto.randomBytes(32).toString('base64url')}`, [
+    { ...call, id: 1 },
+    { ...call, id: 2 },
+  ]);
+
+  assert.equal(res.status, 401, res.text);
+  assert.deepEqual(JSON.parse(res.text), {
+    jsonrpc: '2.0',
+    error: { code: -32001, message: 'Unauthorized: Invalid simulator token signature' },
+    id: null,
+  });
+  const rows = rowsWrittenSince(existing);
+  assert.equal(rows.length, 1, JSON.stringify(rows));
+  assertRejectedRow(rows[0], 'TOKEN_INVALID');
+  // As for a single request, the row's payload holds only the method, redacted.
+  assert.deepEqual(JSON.parse(rows[0].sanitizedRequestPayload), { method: '<REDACTED:string>' });
+});
+
+test('the SDK refuses an initialize inside a batch and a batch of more than 100 messages, and answers an empty batch with 202', async (t) => {
+  const h = await startHarness(t);
+  const caller = seedBatchCaller(t);
+  const existing = logIds();
+
+  const initialize = await postBatch(h, caller.token, [
+    {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'batch-test', version: '1' } },
+    },
+    { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
+  ]);
+  assert.equal(initialize.status, 400, initialize.text);
+  assert.equal(JSON.parse(initialize.text).error?.code, -32600);
+  assert.match(JSON.parse(initialize.text).error?.message, /Only one initialization request is allowed/);
+
+  const oversized = await postBatch(
+    h,
+    caller.token,
+    Array.from({ length: 101 }, (_, i) => ({ jsonrpc: '2.0', id: i + 1, method: 'tools/list', params: {} }))
+  );
+  assert.equal(oversized.status, 400, oversized.text);
+  assert.equal(JSON.parse(oversized.text).error?.code, -32600);
+  assert.match(JSON.parse(oversized.text).error?.message, /Batch must not exceed 100 messages/);
+
+  const empty = await postBatch(h, caller.token, []);
+  assert.equal(empty.status, 202, empty.text);
+  assert.equal(empty.text, '');
+
+  // None of them reached a tool, so none wrote a row.
+  assert.deepEqual(rowsWrittenSince(existing), []);
+});
