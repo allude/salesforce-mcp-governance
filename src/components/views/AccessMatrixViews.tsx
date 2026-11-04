@@ -10,7 +10,7 @@ import type {
 import { formatDateShort } from '@/components/ui/primitives';
 import type { FlyoutState } from './FlyoutDrawer';
 import { newAccessGroupDraft } from './accessGroupDraft';
-import { grantsAccess, readableGrants } from '@/rbac/groupGrants';
+import { effectiveGrants, grantsAccess, readableGrants } from '@/rbac/groupGrants';
 
 // ============================================================================
 // 1. ACCESS GROUPS VIEW
@@ -326,12 +326,9 @@ export function ProfileGroupMatrixView({
     const objSet = new Set<string>();
     for (const g of assigned) {
       (g.allowedActions || []).forEach((a) => actSet.add(a));
-      for (const op of readableGrants(g.objectPermissions)) {
-        const objMeta = objects.find((o) => o.objectName === op.objectName);
-        if (objMeta && !objMeta.enabled) continue;
-        if (grantsAccess(op)) {
-          objSet.add(op.objectName);
-        }
+      // As the policy engine reads them, so this never counts access /mcp does not give.
+      for (const op of effectiveGrants(g.objectPermissions, objects)) {
+        objSet.add(op.objectName);
       }
     }
     return {

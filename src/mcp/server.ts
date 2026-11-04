@@ -12,9 +12,9 @@ import {
   FIELD_VALUES_MESSAGE,
   RECORD_ID_MESSAGE,
   fieldValuesArgument,
+  loggedTargetObject,
   recordIdArgument,
   selectedFieldNames,
-  targetObjectArgument,
   whereClauseArgument,
 } from './toolArguments.js';
 import {
@@ -213,7 +213,9 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser, timing?:
     const receivedAt = timing?.receivedAt ?? performance.now();
     const toolName = request.params.name;
     const args = (request.params.arguments || {}) as Record<string, any>;
-    const targetObject = targetObjectArgument(args);
+    // Read so that it cannot throw: evaluatePolicy decides an objectName that cannot be read, and the
+    // call writes its row like any other.
+    const targetObject = loggedTargetObject(args);
 
     // One snapshot per call: the decision and the handler below act on the same policy.
     const snapshot = loadPolicySnapshot();

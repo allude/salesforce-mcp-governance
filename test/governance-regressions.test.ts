@@ -468,6 +468,34 @@ describe('Audit-log redaction', () => {
     // Stored as the tool_name column stores a name outside the catalog.
     assert.equal(stripped.toolName, '<invalid:len=20>');
   });
+
+  test('a key that is not a Salesforce API name is stored by its length, at every level, and keys never collide', () => {
+    // Parsed, as /mcp receives it, so that __proto__ is a key of its own.
+    const stripped = stripSensitivePayloadData(
+      JSON.parse(`{
+        "objectName": "Contact",
+        "fields": {
+          "jane.doe@example.com 555-12-3456": "x",
+          "john.roe@example.com 555-98-7654": "y",
+          "LastName": "Doe",
+          "__proto__": { "polluted": true }
+        },
+        "Jane Doe <jane@example.com>": "z",
+        "nested": [{ "ssn 123-45-6789": 1 }]
+      }`)
+    ) as Record<string, any>;
+    const text = JSON.stringify(stripped);
+    for (const leaked of ['jane', 'john', '555', 'Jane', 'ssn', '123-45']) assert.ok(!text.includes(leaked), text);
+    assert.deepEqual(stripped.fields, {
+      '<invalid:len=32>': '<REDACTED:string>',
+      '<invalid:len=32>#2': '<REDACTED:string>',
+      LastName: '<REDACTED:string>',
+      '<invalid:len=9>': { polluted: '<REDACTED:boolean>' },
+    });
+    assert.equal(Object.getPrototypeOf(stripped.fields), Object.prototype);
+    assert.equal(stripped['<invalid:len=27>'], '<REDACTED:string>');
+    assert.deepEqual(stripped.nested.sampleStructure, { '<invalid:len=15>': '<REDACTED:number>' });
+  });
 });
 
 describe('Okta callback errors', () => {

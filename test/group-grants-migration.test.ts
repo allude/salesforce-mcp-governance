@@ -172,6 +172,39 @@ describe('canonicalization of group grants on upgrade', () => {
     assert.deepEqual(storedGroups(asStored).grp_variants, { grants: CASE_VARIANT_GRANTS, version: 1 });
   });
 
+  test('an Object stored under two spellings keeps its entries as stored, so a merge cannot add Id', () => {
+    // As an older version could leave it: the real Opportunity, and a stray disabled 'opportunity' row
+    // with other fields. The engine reads only the enabled row; the Amount entry names a field of it,
+    // which the stray row does not have, so taken from that row's fields a merge would add Id.
+    const STRAY_VARIANT_GRANTS = [
+      { objectName: 'opportunity', canRead: true, allowedFields: ['Amount'] },
+      { objectName: 'Opportunity', canRead: true, allowedFields: ['Name'] },
+    ];
+    const upgraded = legacyDatabase('legacy-groups-stray-variant.sqlite');
+    withDb(upgraded, (db) => {
+      const object = db.prepare(
+        `INSERT INTO sf_objects (object_name, label, enabled, updated_at) VALUES (?, ?, ?, '2026-10-01T00:00:00.000Z')`
+      );
+      const field = db.prepare('INSERT INTO sf_object_fields (object_name, field_name, label) VALUES (?, ?, ?)');
+      object.run('Opportunity', 'Opportunity', 1);
+      for (const fieldName of ['Id', 'Name', 'Amount']) field.run('Opportunity', fieldName, fieldName);
+      object.run('opportunity', 'opportunity', 0);
+      for (const fieldName of ['id', 'Probability']) field.run('opportunity', fieldName, fieldName);
+      insertGroup(db, 'grp_pipeline', STRAY_VARIANT_GRANTS);
+      db.prepare('INSERT INTO profile_group_memberships (profile_id, group_id) VALUES (?, ?)').run(PROFILE_ID, 'grp_pipeline');
+    });
+    const asStored = path.join(testTmpDir, 'legacy-groups-stray-variant-as-stored.sqlite');
+    fs.copyFileSync(upgraded, asStored);
+    withDb(asStored, (db) => db.exec('ALTER TABLE access_groups ADD COLUMN version INTEGER NOT NULL DEFAULT 1'));
+
+    const before = bootAndResolve(asStored);
+    const after = bootAndResolve(upgraded);
+    assert.deepEqual(after, before);
+    const objects = (after as { objects: Array<{ objectName: string; allowedFields: string[] }> }).objects;
+    assert.deepEqual(objects.find((o) => o.objectName === 'Opportunity')?.allowedFields, ['Amount', 'Name']);
+    assert.deepEqual(storedGroups(upgraded).grp_pipeline, { grants: STRAY_VARIANT_GRANTS, version: 1 });
+  });
+
   test('runs once: a case variant written after the upgrade is left alone', () => {
     const dbPath = legacyDatabase('legacy-groups-once.sqlite');
     bootAndResolve(dbPath);

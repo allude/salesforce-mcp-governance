@@ -14,7 +14,7 @@ import type {
   RemovalResolutionAction,
 } from '@/types/governance';
 import { formatDateShort } from '@/components/ui/primitives';
-import { grantsAccess, readableGrants } from '@/rbac/groupGrants';
+import { effectiveGrants, grantsAccess, readableGrants } from '@/rbac/groupGrants';
 import type { FlyoutState } from './FlyoutDrawer';
 import { describeProfileDuplicate, profileSyncNeedsReview } from './profileSyncReview';
 import { profilesCsv } from './csvExport';
@@ -103,12 +103,8 @@ export function SalesforceProfilesView({
     for (const g of assigned) {
       (g.allowedActions || []).forEach((a) => actSet.add(a));
       // As the policy engine reads them, so this never counts access /mcp does not give.
-      for (const op of readableGrants(g.objectPermissions)) {
-        const objMeta = objects.find((o) => o.objectName === op.objectName);
-        if (objMeta && !objMeta.enabled) continue;
-        if (grantsAccess(op)) {
-          objSet.add(op.objectName);
-        }
+      for (const op of effectiveGrants(g.objectPermissions, objects)) {
+        objSet.add(op.objectName);
       }
     }
     return {

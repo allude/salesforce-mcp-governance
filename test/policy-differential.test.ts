@@ -10,8 +10,9 @@ import './helpers/env.js';
 //    arguments: the caller gets the same text, Salesforce gets the same requests, and the log row is
 //    the same.
 // The accepted differences, each asserted where it shows: a tool outside the object-scoped set ignores
-// objectName, so it gets what the old code gave it with no object; and a malformed argument is logged
-// DENIED where it was logged ERROR, since the call was refused (owner decision D12).
+// objectName, so it gets what the old code gave it with no object; a malformed argument is logged
+// DENIED where it was logged ERROR, since the call was refused (owner decision D12); and an objectName
+// that cannot be read as text, on which the old handler threw out unlogged, is decided and logged.
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -605,7 +606,28 @@ test('tools/call refuses, answers and calls Salesforce as the handlers it replac
       const nowEffect = { result: now.result, salesforce: now.salesforce, logRows: now.logRows };
       let expected: Omit<ToolCallEffect, 'loggedDecisions'> = before;
       if ('rpcError' in before.result) {
-        threw++; // String() of the objectName threw before any check, in both, as it always did
+        // String() of the objectName threw before any check in the old handler, so the call got a
+        // JSON-RPC error and no row. Now it is decided as a call without an objectName would be, refused
+        // where that one is refused for the missing objectName with the reason the read gave instead,
+        // and logged once with the arguments sent.
+        threw++;
+        assert.match(before.result.rpcError, /Cannot convert object to primitive value/, call);
+        assert.deepEqual([before.salesforce, before.logRows], [[], []], call);
+        assert.ok(args?.objectName !== undefined, `${call}: only an objectName can throw so`);
+        const { objectName: _unreadable, ...withoutObject } = args;
+        const asBefore = await callTool(legacy, tool, withoutObject);
+        const missing = JSON.stringify(`MCP Action '${tool}' requires an objectName argument.`);
+        const withReadError = (text: string) => text.replace(missing, JSON.stringify(decision.reason));
+        expected = {
+          ...asBefore,
+          result: 'text' in asBefore.result ? { ...asBefore.result, text: withReadError(asBefore.result.text) } : asBefore.result,
+          logRows: asBefore.logRows.map((row) => ({
+            ...row,
+            rawRequestPayload: args,
+            rawResponseSummary: JSON.parse(withReadError(JSON.stringify(row.rawResponseSummary))),
+          })),
+        };
+        assert.equal(expected.logRows.length, 1, `${call}: logged once`);
       } else if (
         !OBJECT_SCOPED_TOOLS.has(tool) &&
         args?.objectName !== undefined &&

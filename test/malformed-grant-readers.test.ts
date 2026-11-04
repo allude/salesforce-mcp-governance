@@ -2,7 +2,10 @@ import './helpers/env.js';
 // The readers of stored Access Group grants outside policy evaluation: the field and Object deletes
 // (Admin API and org sync), which revoke grants, and the org sync preview, which names the groups a
 // removal affects. A database from an older version can hold entries malformedGrantReason refuses and
-// columns that do not parse. None of these readers may fail on them, and none may rewrite them.
+// columns that do not parse. None of these readers may fail on them. A revocation takes the Object or
+// field from every entry that names the Object as text, malformed ones included: an older release run
+// on the database after a rollback reads some of those as grants, and its own revocation removed them.
+// It rewrites nothing else, and only a readable grant names its group in an audit entry or a preview.
 import { after, before, describe, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
@@ -37,6 +40,20 @@ const malformedEntries = (objectName: string): unknown[] => [
   { objectName, canRead: true, allowedFields: 'Secret__c' },
   { objectName, canRead: true, allowedFields: [1, 'Secret__c'] },
 ];
+
+/** The malformed entries once Secret__c is deleted: it leaves every allowedFields list naming it. */
+const malformedEntriesWithoutSecret = (objectName: string): unknown[] => [
+  null,
+  'text',
+  [],
+  { objectName: 7, canRead: true },
+  { objectName, canRead: 'true', allowedFields: [] },
+  { objectName, canRead: true, allowedFields: 'Secret__c' },
+  { objectName, canRead: true, allowedFields: [1] },
+];
+
+/** The malformed entries once the Object is deleted: those that name it as text go. */
+const malformedEntriesWithoutObject = (): unknown[] => [null, 'text', [], { objectName: 7, canRead: true }];
 
 const validEntry = (objectName: string) => ({
   objectName,
@@ -90,7 +107,7 @@ function arrange(t: TestContext) {
     store.deleteObject(objectName);
   });
 
-  const untouched = [malformedOnly, unparseable, notAList].map((g) => ({ id: g.id, ...storedColumn(g.id) }));
+  const untouched = [unparseable, notAList].map((g) => ({ id: g.id, ...storedColumn(g.id) }));
   return {
     objectName,
     mixed,
@@ -98,6 +115,7 @@ function arrange(t: TestContext) {
     malformedOnly,
     mixedVersion: storedColumn(mixed.id).version,
     validVersion: storedColumn(valid.id).version,
+    malformedOnlyVersion: storedColumn(malformedOnly.id).version,
     /** The groups no revocation may write: their column and version are exactly as planted. */
     assertUntouched() {
       for (const before of untouched) {
@@ -109,8 +127,8 @@ function arrange(t: TestContext) {
 
 const latestAudit = () => store.getPortalAdminLogs(1)[0];
 
-describe('deleting a field revokes it from readable grants only', () => {
-  test('DELETE /objects/:objectName/fields/:fieldName skips malformed entries and unreadable columns', async (t) => {
+describe('deleting a field revokes it from every entry naming its Object', () => {
+  test('DELETE /objects/:objectName/fields/:fieldName takes it from malformed entries too, and skips unreadable columns', async (t) => {
     const fx = arrange(t);
 
     const res = await adminFetch(server.baseUrl, session, `/api/admin/objects/${fx.objectName}/fields/Secret__c`, {
@@ -119,19 +137,20 @@ describe('deleting a field revokes it from readable grants only', () => {
 
     assert.equal(res.status, 200, JSON.stringify(res.body));
     assert.deepEqual(JSON.parse(storedColumn(fx.mixed.id).json), [
-      ...malformedEntries(fx.objectName),
+      ...malformedEntriesWithoutSecret(fx.objectName),
       { ...validEntry(fx.objectName), allowedFields: ['Id'] },
     ]);
     assert.deepEqual(JSON.parse(storedColumn(fx.valid.id).json), [{ ...validEntry(fx.objectName), allowedFields: ['Id'] }]);
+    assert.deepEqual(JSON.parse(storedColumn(fx.malformedOnly.id).json), malformedEntriesWithoutSecret(fx.objectName));
     assert.deepEqual(
-      [storedColumn(fx.mixed.id).version, storedColumn(fx.valid.id).version],
-      [fx.mixedVersion + 1, fx.validVersion + 1]
+      [storedColumn(fx.mixed.id).version, storedColumn(fx.valid.id).version, storedColumn(fx.malformedOnly.id).version],
+      [fx.mixedVersion + 1, fx.validVersion + 1, fx.malformedOnlyVersion + 1]
     );
     fx.assertUntouched();
     assert.equal(latestAudit().action, 'DELETE_FIELD');
   });
 
-  test('POST /objects/pull-apply removing a field skips them too, and names only the groups that lost it', async (t) => {
+  test('POST /objects/pull-apply removing a field does the same, and names only the groups that lost a grant', async (t) => {
     const fx = arrange(t);
 
     const res = await adminFetch(server.baseUrl, session, '/api/admin/objects/pull-apply', {
@@ -153,9 +172,10 @@ describe('deleting a field revokes it from readable grants only', () => {
 
     assert.equal(res.status, 200, JSON.stringify(res.body));
     assert.deepEqual(JSON.parse(storedColumn(fx.mixed.id).json), [
-      ...malformedEntries(fx.objectName),
+      ...malformedEntriesWithoutSecret(fx.objectName),
       { ...validEntry(fx.objectName), allowedFields: ['Id'] },
     ]);
+    assert.deepEqual(JSON.parse(storedColumn(fx.malformedOnly.id).json), malformedEntriesWithoutSecret(fx.objectName));
     fx.assertUntouched();
     const audit = latestAudit();
     assert.equal(audit.action, 'SYNC_OBJECTS_FROM_ORG');
@@ -165,18 +185,19 @@ describe('deleting a field revokes it from readable grants only', () => {
   });
 });
 
-describe('deleting an Object revokes it from readable grants only', () => {
-  test('DELETE /objects/:objectName keeps malformed entries, and its audit entry names the groups that lost a grant', async (t) => {
+describe('deleting an Object revokes every entry naming it', () => {
+  test('DELETE /objects/:objectName removes malformed entries naming it too, and its audit entry names the groups that lost a grant', async (t) => {
     const fx = arrange(t);
 
     const res = await adminFetch(server.baseUrl, session, `/api/admin/objects/${fx.objectName}`, { method: 'DELETE' });
 
     assert.equal(res.status, 200, JSON.stringify(res.body));
-    assert.deepEqual(JSON.parse(storedColumn(fx.mixed.id).json), malformedEntries(fx.objectName));
+    assert.deepEqual(JSON.parse(storedColumn(fx.mixed.id).json), malformedEntriesWithoutObject());
     assert.deepEqual(JSON.parse(storedColumn(fx.valid.id).json), []);
+    assert.deepEqual(JSON.parse(storedColumn(fx.malformedOnly.id).json), malformedEntriesWithoutObject());
     assert.deepEqual(
-      [storedColumn(fx.mixed.id).version, storedColumn(fx.valid.id).version],
-      [fx.mixedVersion + 1, fx.validVersion + 1]
+      [storedColumn(fx.mixed.id).version, storedColumn(fx.valid.id).version, storedColumn(fx.malformedOnly.id).version],
+      [fx.mixedVersion + 1, fx.validVersion + 1, fx.malformedOnlyVersion + 1]
     );
     fx.assertUntouched();
     const audit = latestAudit();
@@ -186,7 +207,7 @@ describe('deleting an Object revokes it from readable grants only', () => {
     assert.ok(!audit.details.includes(fx.malformedOnly.name), audit.details);
   });
 
-  test('POST /objects/pull-apply removing the Object keeps them too', async (t) => {
+  test('POST /objects/pull-apply removing the Object does the same', async (t) => {
     const fx = arrange(t);
 
     const res = await adminFetch(server.baseUrl, session, '/api/admin/objects/pull-apply', {
@@ -199,8 +220,9 @@ describe('deleting an Object revokes it from readable grants only', () => {
     });
 
     assert.equal(res.status, 200, JSON.stringify(res.body));
-    assert.deepEqual(JSON.parse(storedColumn(fx.mixed.id).json), malformedEntries(fx.objectName));
+    assert.deepEqual(JSON.parse(storedColumn(fx.mixed.id).json), malformedEntriesWithoutObject());
     assert.deepEqual(JSON.parse(storedColumn(fx.valid.id).json), []);
+    assert.deepEqual(JSON.parse(storedColumn(fx.malformedOnly.id).json), malformedEntriesWithoutObject());
     fx.assertUntouched();
     assert.doesNotMatch(latestAudit().details, new RegExp(fx.malformedOnly.name));
   });
@@ -214,11 +236,13 @@ describe('deleting an Object revokes it from readable grants only', () => {
       .run(variant, variant, new Date().toISOString());
     t.after(() => store.deleteObject(variant));
     const mixedBefore = storedColumn(fx.mixed.id);
+    const malformedOnlyBefore = storedColumn(fx.malformedOnly.id);
 
     const res = await adminFetch(server.baseUrl, session, `/api/admin/objects/${variant}`, { method: 'DELETE' });
 
     assert.equal(res.status, 200, JSON.stringify(res.body));
     assert.deepEqual(storedColumn(fx.mixed.id), mixedBefore);
+    assert.deepEqual(storedColumn(fx.malformedOnly.id), malformedOnlyBefore);
     fx.assertUntouched();
     assert.equal(latestAudit().details, `Deleted Salesforce Object "${variant}" and its fields from the MCP Server.`);
   });
@@ -252,6 +276,9 @@ describe('the org sync preview reads grants as the policy engine does', () => {
       [...objectGone.removedObjectsFromOrg[0].referencedInGroups].sort(),
       [fx.mixed.name, fx.valid.name].sort()
     );
+    // A preview changes nothing.
+    assert.deepEqual(JSON.parse(storedColumn(fx.malformedOnly.id).json), malformedEntries(fx.objectName));
+    assert.equal(storedColumn(fx.malformedOnly.id).version, fx.malformedOnlyVersion);
     fx.assertUntouched();
   });
 });

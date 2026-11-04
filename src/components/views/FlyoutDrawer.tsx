@@ -12,7 +12,7 @@ import {
   type WorkspaceSnapshot,
 } from './accessGroupDraft';
 import { isSalesforceId } from '@/salesforce/ids';
-import { grantsAccess, readableGrants } from '@/rbac/groupGrants';
+import { effectiveGrants, grantsAccess, readableGrants } from '@/rbac/groupGrants';
 import {
   ACCESS_GROUP_DESCRIPTION_MAX_LENGTH,
   ACCESS_GROUP_NAME_MAX_LENGTH,
@@ -299,9 +299,7 @@ export function FlyoutDrawer({
     for (const g of assignedGroups) {
       (g.allowedActions || []).forEach((a) => actions.add(a));
       // As the policy engine reads them, so this never shows access /mcp does not give.
-      for (const op of readableGrants(g.objectPermissions)) {
-        const objCfg = objects.find((o) => o.objectName === op.objectName);
-        if (objCfg && !objCfg.enabled) continue;
+      for (const op of effectiveGrants(g.objectPermissions, objects)) {
         if (!objMap[op.objectName]) {
           objMap[op.objectName] = { R: false, C: false, U: false, D: false };
         }

@@ -109,9 +109,9 @@ export function runInTransaction<T>(fn: () => T): T {
 
 /**
  * A group's stored entries for a revocation: the entries of the column, or null when it does not hold
- * a list. Revocation leaves such a column, and every entry malformedGrantReason refuses, as stored: the
- * policy engine grants nothing for them, and rewriting them would lose what an operator may still want
- * to recover by hand.
+ * a list. Revocation leaves such a column as stored, and every entry malformedGrantReason refuses that
+ * does not name the revoked Object as text (see namesObjectAsText): the policy engine grants nothing for
+ * them, and rewriting them would lose what an operator may still want to recover by hand.
  */
 function storedEntriesForRevocation(json: string): unknown[] | null {
   const entries = parseStoredJson(json);
@@ -119,9 +119,24 @@ function storedEntriesForRevocation(json: string): unknown[] | null {
 }
 
 /**
+ * Whether a stored entry, readable or not, names `objectName` as text, ignoring case. A revocation
+ * removes the Object or field from every such entry, malformed ones included: this release grants
+ * nothing for those, but an older release run on the database after a rollback reads one such as
+ * `canRead: "false"` as a grant, and its own revocation removed them, so a deleted and re-imported
+ * Object or field would otherwise get that access back there.
+ */
+function namesObjectAsText(entry: unknown, objectName: string): boolean {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+  const named = (entry as Record<string, unknown>).objectName;
+  return typeof named === 'string' && named.toLowerCase() === objectName.toLowerCase();
+}
+
+/**
  * Deletes a field and revokes it from every Access Group, reporting which groups lost it.
- * While a case variant still exists the grants still refer to it and stay. Malformed entries and
- * unreadable columns are skipped (see storedEntriesForRevocation).
+ * While a case variant still exists the grants still refer to it and stay. A malformed entry that
+ * names the Object loses the field too, from an allowedFields list, but its group is not reported:
+ * it granted nothing. Other malformed entries and unreadable columns are skipped (see
+ * storedEntriesForRevocation).
  */
 function deleteFieldAndRevokeGrants(objName: string, fldName: string): { deleted: boolean; revokedGroups: string[] } {
   return runInTransaction(() => {
@@ -150,18 +165,22 @@ function deleteFieldAndRevokeGrants(objName: string, fldName: string): { deleted
       const entries = storedEntriesForRevocation(row.object_permissions_json);
       if (!entries) continue;
       let changed = false;
+      let lostGrant = false;
       const kept = entries.map((entry) => {
-        if (malformedGrantReason(entry) !== null) return entry;
-        const p = entry as GroupObjectPermission;
-        if (p.objectName.toLowerCase() !== objName.toLowerCase()) return p;
-        const allowedFields = (p.allowedFields || []).filter((f) => f.toLowerCase() !== fldName.toLowerCase());
-        if (allowedFields.length === (p.allowedFields || []).length) return p;
+        if (!namesObjectAsText(entry, objName)) return entry;
+        const p = entry as Record<string, unknown>;
+        if (!Array.isArray(p.allowedFields)) return entry;
+        const allowedFields = p.allowedFields.filter(
+          (f) => typeof f !== 'string' || f.toLowerCase() !== fldName.toLowerCase()
+        );
+        if (allowedFields.length === p.allowedFields.length) return entry;
         changed = true;
+        if (malformedGrantReason(entry) === null) lostGrant = true;
         return { ...p, allowedFields };
       });
       if (changed) {
         updateGroup.run(JSON.stringify(kept), now, row.id);
-        revokedGroups.push(row.name);
+        if (lostGrant) revokedGroups.push(row.name);
       }
     }
     return { deleted: true, revokedGroups };
@@ -171,8 +190,9 @@ function deleteFieldAndRevokeGrants(objName: string, fldName: string): { deleted
 /**
  * Deletes an Object and its fields and revokes it from every Access Group, reporting which groups
  * lost it. Grants match objects case-insensitively; while a case variant (e.g. 'Account' after
- * deleting a stray 'account') still exists, the grants still refer to it and must stay. Malformed
- * entries and unreadable columns are skipped (see storedEntriesForRevocation).
+ * deleting a stray 'account') still exists, the grants still refer to it and must stay. A malformed
+ * entry that names the Object goes too, but its group is not reported: it granted nothing. Other
+ * malformed entries and unreadable columns are skipped (see storedEntriesForRevocation).
  */
 function deleteObjectAndRevokeGrants(objectName: string): { deleted: boolean; revokedGroups: string[] } {
   return runInTransaction(() => {
@@ -196,14 +216,10 @@ function deleteObjectAndRevokeGrants(objectName: string): { deleted: boolean; re
     for (const row of rows) {
       const entries = storedEntriesForRevocation(row.object_permissions_json);
       if (!entries) continue;
-      const kept = entries.filter(
-        (entry) =>
-          malformedGrantReason(entry) !== null ||
-          (entry as GroupObjectPermission).objectName.toLowerCase() !== objectName.toLowerCase()
-      );
-      if (kept.length !== entries.length) {
-        updateGroup.run(JSON.stringify(kept), now, row.id);
-        revokedGroups.push(row.name);
+      const revoked = entries.filter((entry) => namesObjectAsText(entry, objectName));
+      if (revoked.length > 0) {
+        updateGroup.run(JSON.stringify(entries.filter((entry) => !namesObjectAsText(entry, objectName))), now, row.id);
+        if (revoked.some((entry) => malformedGrantReason(entry) === null)) revokedGroups.push(row.name);
       }
     }
     return { deleted: true, revokedGroups };
@@ -616,7 +632,8 @@ function backfillLegacyAuditResults() {
  * Object (see mergeGrants, which also keeps the Id an entry naming no field of its Object gave).
  * Returns null when nothing changes. A malformed entry, an entry for an Object the catalog does not
  * have and a field it does not have are kept as they are: the engine grants nothing for them either
- * way. Names are not trimmed, because the engine does not trim them.
+ * way. So is an entry `objectSpelling` gives no name for. Names are not trimmed, because the engine
+ * does not trim them.
  */
 function canonicalGroupGrants(
   entries: unknown[],
@@ -666,6 +683,10 @@ function canonicalGroupGrants(
  * one transaction with it, like addSimulatedColumnAndMarkLegacyRows, so it happens once. Every group it
  * changes gets version 2, so a portal tab opened before the upgrade cannot save over the result. If it
  * changes any group, the policy revision goes up by one, like any other transaction that changes a group.
+ *
+ * An older version could also store one Object as two rows, 'Opportunity' and 'opportunity'. The engine
+ * reads the enabled one, which an admin can change, so a merge could take the Id an entry gives from the
+ * fields of a row the engine does not read: the entries for such an Object are left as stored.
  */
 function addGroupVersionAndCanonicalizeGrants() {
   runInTransaction(() => {
@@ -680,7 +701,13 @@ function addGroupVersionAndCanonicalizeGrants() {
     for (const row of fieldRows) {
       fieldNamesOf.set(row.object_name, [...(fieldNamesOf.get(row.object_name) ?? []), row.field_name]);
     }
-    const objectSpelling = spellingLookup(objectNames);
+    const catalogSpelling = spellingLookup(objectNames);
+    const rowsByLowerName = new Map<string, number>();
+    for (const name of objectNames) {
+      rowsByLowerName.set(name.toLowerCase(), (rowsByLowerName.get(name.toLowerCase()) ?? 0) + 1);
+    }
+    const objectSpelling = (name: string) =>
+      rowsByLowerName.get(name.toLowerCase()) === 1 ? catalogSpelling(name) : null;
 
     const rows = db.prepare('SELECT id, object_permissions_json FROM access_groups').all() as Array<{
       id: string;
@@ -697,6 +724,32 @@ function addGroupVersionAndCanonicalizeGrants() {
       if (canonical) update.run(JSON.stringify(canonical), now, row.id);
     }
   });
+}
+
+/**
+ * A group's version goes up with every change to it, so that the group editor, which saves with the
+ * version it loaded, is refused (409) rather than saving over a change made since. This release raises
+ * it in every statement that changes a group. An older release run on the database after a rollback
+ * does not (its saves and its revocations leave the column alone), and nor does a hand edit, so a
+ * trigger stored in the database raises it for them, on any connection: after an update that changes
+ * a policy column (one installPolicyRevision compares) and leaves the version as it was. Its own update
+ * changes only the version, which no policy trigger compares, and it names no TEMP table, so an older
+ * release's writes still succeed. It is made again on every boot, after the migration that adds the
+ * column, so it compares the columns the table has.
+ */
+function installGroupVersionTrigger() {
+  const changed = (db.prepare('PRAGMA table_info(access_groups)').all() as Array<{ name: string }>)
+    .filter((c) => !NON_POLICY_COLUMNS.has(c.name))
+    .map((c) => `OLD."${c.name}" IS NOT NEW."${c.name}"`)
+    .join(' OR ');
+  db.exec(`
+    DROP TRIGGER IF EXISTS main.group_version_unversioned_update;
+    CREATE TRIGGER main.group_version_unversioned_update AFTER UPDATE ON access_groups
+    WHEN NEW.version = OLD.version AND (${changed})
+    BEGIN
+      UPDATE access_groups SET version = version + 1 WHERE id = NEW.id;
+    END;
+  `);
 }
 
 /** A stored JSON column, or undefined when it does not parse. */
@@ -741,6 +794,7 @@ function runSchemaMigrations() {
   backfillLegacyAuditResults();
 
   addGroupVersionAndCanonicalizeGrants();
+  installGroupVersionTrigger();
 
   // After the column migrations above, so the simulated backfill has run once on a database from before
   // that column, and the copy carries every column they added. Neither rebuild runs again.
@@ -978,7 +1032,9 @@ function toPortalAdminLogRecord(r: any): PortalAdminLogRecord {
     target: r.target,
     details: r.details,
     ipAddress: r.ip_address,
-    result: r.result,
+    // A row an older release wrote since the last boot holds only the column default; it reads as the
+    // result backfillLegacyAuditResults will give it.
+    result: r.correlation_id === '' ? auditResultFromAction(r.action) : r.result,
     targetType: r.target_type,
     targetId: r.target_id,
     diff: parseAuditDiff(r.diff_json),
@@ -1048,6 +1104,20 @@ export function stripSensitivePayloadData(input: unknown): unknown {
   return stripPayloadLevel(input, true);
 }
 
+/**
+ * A payload key as stored. Keys are caller text too (the field names of create_record's `fields`, any
+ * argument name), so one that is not a Salesforce API name is stored by its length, as decision_json
+ * stores such a field name and target_object such an Object name. A number after it keeps two such
+ * keys of one level apart.
+ */
+function storedPayloadKey(key: string, level: Record<string, unknown>): string {
+  if (SALESFORCE_API_NAME_PATTERN.test(key)) return key;
+  const byLength = `<invalid:len=${key.length}>`;
+  let stored = byLength;
+  for (let n = 2; Object.hasOwn(level, stored); n++) stored = `${byLength}#${n}`;
+  return stored;
+}
+
 // Safe keys count only at the payload's top level. Below it, e.g. in the field-to-value map of
 // create_record and update_record, a key such as `status` or `limit` is a record field and its
 // value is customer data.
@@ -1079,6 +1149,7 @@ function stripPayloadLevel(input: unknown, topLevel: boolean): unknown {
     for (const [k, v] of Object.entries(input as Record<string, unknown>)) {
       const safe = topLevel && safeKeys.has(k);
       const storedName = topLevel ? STORED_NAME_KEYS.get(k) : undefined;
+      const key = storedPayloadKey(k, out);
       if (k === 'records' && Array.isArray(v)) {
         out.records = `[REDACTED ${v.length} RECORDS]`;
       } else if (topLevel && k === 'soql' && typeof v === 'string') {
@@ -1086,15 +1157,15 @@ function stripPayloadLevel(input: unknown, topLevel: boolean): unknown {
         out.soql = soqlSkeleton(v);
       } else if (storedName && typeof v === 'string') {
         // The check the tool_name and target_object columns use, so the payload keeps no text they refuse.
-        out[k] = storedName(v);
+        out[key] = storedName(v);
       } else if (safe && (typeof v === 'number' || typeof v === 'boolean' || isStructuralToken(v))) {
-        out[k] = v;
+        out[key] = v;
       } else if (Array.isArray(v) && safe && v.every(isStructuralToken)) {
-        out[k] = v;
+        out[key] = v;
       } else if (typeof v === 'object' && v !== null) {
-        out[k] = stripPayloadLevel(v, false);
+        out[key] = stripPayloadLevel(v, false);
       } else {
-        out[k] = `<REDACTED:${typeof v}>`;
+        out[key] = `<REDACTED:${typeof v}>`;
       }
     }
     return out;

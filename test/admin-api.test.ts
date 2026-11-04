@@ -1329,6 +1329,45 @@ describe('Admin REST API', () => {
       assert.match(refused.body.error, /^objectPermissions\[0\]\.objectName: Salesforce > Objects has no Object named /);
     });
 
+    it('POST /groups answers a draft loaded before an older release changed the group with the reload 409', async (t) => {
+      const admin = await signIn();
+      const objectName = addObject(t, 'OlderRelease', ['Id', 'Name']);
+      const created = await mutate(admin, 'POST', '/api/admin/groups', {
+        name: newGroupName('Older Release'),
+        allowedActions: ['list_enabled_objects'],
+        objectPermissions: [],
+      }, 'CREATE_GROUP');
+      const loaded = created.body.group as AccessGroup;
+      t.after(() => {
+        store.deleteGroup(loaded.id);
+      });
+      // An older release run on the database after a rollback saves the group as its upsert does,
+      // on a connection of its own, leaving the version column alone.
+      const olderRelease = new DatabaseSync(config.dbPath);
+      try {
+        olderRelease
+          .prepare(
+            `INSERT INTO access_groups (id, name, description, allowed_actions_json, object_permissions_json, updated_at)
+             VALUES (?, ?, 'ROLLBACK EDIT', '["list_enabled_objects","soql_query"]', ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+               name = excluded.name, description = excluded.description, allowed_actions_json = excluded.allowed_actions_json,
+               object_permissions_json = excluded.object_permissions_json, updated_at = excluded.updated_at`
+          )
+          .run(loaded.id, loaded.name, JSON.stringify([{ objectName, canRead: true, allowedFields: ['Name'] }]), new Date().toISOString());
+      } finally {
+        olderRelease.close();
+      }
+      const current = store.getGroups().find((g) => g.id === loaded.id)!;
+      assert.equal(current.version, loaded.version + 1);
+
+      const mark = auditMark();
+      const res = await call(admin, 'POST', '/api/admin/groups', { ...loaded, expectedVersion: loaded.version, description: 'From the stale tab' });
+      assert.equal(res.status, 409, JSON.stringify(res.body));
+      assert.match(res.body.error, /changed since it was loaded, so nothing was saved/);
+      assert.deepEqual(store.getGroups().find((g) => g.id === loaded.id), current);
+      assertNotAudited(mark, admin.ip);
+    });
+
     it('POST /groups with an id no group has answers 404 and creates nothing', async () => {
       const admin = await signIn();
       const id = `grp_missing_${RUN}`;
@@ -1702,6 +1741,17 @@ describe('Admin REST API', () => {
       assert.match(res.body.error, /because another Access Group has it, so no sample data was loaded/);
       assert.equal(state(), before);
       assertNotAudited(mark, admin.ip);
+
+      // The other way round, where the group holding the name is saved before the one it belongs to: 409 as well.
+      store.upsertGroup({ ...store.getGroups().find((g) => g.id === 'grp-admin')!, name: `Renamed admin ${RUN}` });
+      store.upsertGroup({ ...store.getGroups().find((g) => g.id === 'grp-sales-ro')!, name: admins.name });
+      const reversed = state();
+      const reversedMark = auditMark();
+      const refused = await call(admin, 'POST', '/api/admin/workspace/seed-sample', {});
+      assert.equal(refused.status, 409, JSON.stringify(refused.body));
+      assert.match(refused.body.error, /because another Access Group has it, so no sample data was loaded/);
+      assert.equal(state(), reversed);
+      assertNotAudited(reversedMark, admin.ip);
     });
   });
 

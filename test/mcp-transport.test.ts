@@ -1424,3 +1424,37 @@ test('the SDK refuses an initialize inside a batch and a batch of more than 100 
   // None of them reached a tool, so none wrote a row.
   assert.deepEqual(rowsWrittenSince(existing), []);
 });
+
+test('a tools/call whose params the SDK refuses gets a JSON-RPC error and writes no row, alone or in a batch', async (t) => {
+  const h = await startHarness(t);
+  const caller = seedBatchCaller(t);
+  const existing = logIds();
+
+  // `arguments` that is not an object and a `name` that is not text fail the SDK's CallToolRequestSchema
+  // before the gateway's handler runs, so no decision is made and nothing is logged.
+  const refused = [
+    { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'soql_query', arguments: [caller.objectName] } },
+    { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 42, arguments: { objectName: caller.objectName } } },
+  ];
+  for (const message of refused) {
+    const res = await postBatch(h, caller.token, message);
+    assert.equal(res.status, 200, res.text);
+    const answer = JSON.parse(res.text);
+    assert.equal(answer.id, message.id);
+    assert.equal(typeof answer.error?.code, 'number', res.text);
+    assert.equal(answer.result, undefined);
+  }
+  const batch = await postBatch(h, caller.token, [
+    ...refused,
+    { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'soql_query', arguments: { objectName: caller.objectName, fields: ['Id'] } } },
+  ]);
+  assert.equal(batch.status, 200, batch.text);
+  assert.deepEqual(
+    (JSON.parse(batch.text) as any[]).map((a) => [a.id, a.error === undefined]),
+    [[1, false], [2, false], [3, true]]
+  );
+
+  // Only the call the SDK passed on was decided, so only it wrote a row.
+  const rows = rowsWrittenSince(existing);
+  assert.deepEqual(rows.map((row) => [row.toolName, row.status]), [['soql_query', 'ALLOWED']]);
+});

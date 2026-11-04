@@ -268,6 +268,27 @@ describe('upgrading a database from before the structured audit columns', () => 
     );
   });
 
+  test('a row an older release writes while this one runs reads as the result its action implies, before any boot', () => {
+    // This process's database, written on a connection of its own as a release sharing the file during
+    // a rolling deploy writes it: the column defaults, SUCCESS and no correlation id.
+    withDb(config.dbPath, (db) => {
+      insertLegacyRow(db, `shared-failed-${tag()}`, 'LOGIN_FAILED');
+      insertLegacyRow(db, `shared-denied-${tag()}`, 'OKTA_LOGIN_DENIED');
+      insertLegacyRow(db, `shared-success-${tag()}`, 'LOGIN_SUCCESS');
+    });
+    const written = withDb(config.dbPath, (db) =>
+      db.prepare(`SELECT id, result FROM portal_admin_logs WHERE id LIKE 'shared-%' ORDER BY seq`).all()
+    ) as Array<{ id: string; result: string }>;
+    assert.deepEqual(written.map((r) => r.result), ['SUCCESS', 'SUCCESS', 'SUCCESS']);
+
+    const ids = written.map((r) => r.id);
+    const read = (rows: PortalAdminLogRecord[]) => ids.map((id) => rows.find((r) => r.id === id)?.result);
+    const expected = ['FAILED', 'DENIED', 'SUCCESS'];
+    assert.deepEqual(read(store.getPortalAdminLogs(1000)), expected);
+    assert.deepEqual(read(store.getPortalAdminLogPage({ limit: 1000 }).rows), expected);
+    assert.deepEqual(ids.map((id) => portalAuditResult(store.getPortalAdminLogs(1000).find((r) => r.id === id)!).tone), ['err', 'err', 'ok']);
+  });
+
   test('an upgraded database ends with the same table as a new one', () => {
     const upgraded = legacyDatabase('legacy-audit-schema.sqlite');
     const fresh = path.join(testTmpDir, 'fresh-audit-schema.sqlite');

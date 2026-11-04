@@ -72,6 +72,39 @@ export function readableGrants(entries: readonly unknown[] | undefined): GroupOb
 }
 
 /**
+ * The Salesforce > Objects row a grant's Object resolves to, by lower-case name: enabled rows only and,
+ * of several for one Object (a database from an older version can hold 'Account' and 'account'), the
+ * last in `objects` order. The policy engine resolves grants with this, and so do the portal's
+ * summaries of a Profile's access (effectiveGrants), so the two cannot disagree.
+ */
+export function enabledObjectsByLowerName<T extends { objectName: string; enabled: boolean }>(
+  objects: readonly T[]
+): Map<string, T> {
+  const byName = new Map<string, T>();
+  for (const object of objects) {
+    if (object.enabled) byName.set(object.objectName.toLowerCase(), object);
+  }
+  return byName;
+}
+
+/**
+ * A stored group's grants that give access on /mcp, for the portal's summaries of a Profile's access:
+ * the readable entries (readableGrants) that grant a flag and whose Object is enabled in Salesforce >
+ * Objects (enabledObjectsByLowerName), each named as the catalog spells its Object. An entry for an
+ * Object that is missing from the catalog, or disabled there, gives nothing on /mcp and is left out.
+ */
+export function effectiveGrants(
+  entries: readonly unknown[] | undefined,
+  objects: readonly { objectName: string; enabled: boolean }[]
+): GroupObjectPermission[] {
+  const enabled = enabledObjectsByLowerName(objects);
+  return readableGrants(entries).flatMap((grant) => {
+    const object = enabled.get(grant.objectName.toLowerCase());
+    return object && grantsAccess(grant) ? [{ ...grant, objectName: object.objectName }] : [];
+  });
+}
+
+/**
  * Finds a name's stored spelling in `names`: the same spelling if it is there, else the first that
  * differs only by case. Salesforce API names are case-insensitive.
  */

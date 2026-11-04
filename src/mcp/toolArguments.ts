@@ -12,9 +12,22 @@ const RECORD_ID_PATTERN = /^[a-zA-Z0-9]{15}(?:[a-zA-Z0-9]{3})?$/;
 export const RECORD_ID_MESSAGE = 'recordId must be a 15 or 18-character Salesforce Record ID.';
 export const FIELD_VALUES_MESSAGE = 'fields must be an object of field names to values.';
 
-/** The `objectName` argument as text, or '*' when there is none. It is also the call's log target. */
+/** The `objectName` argument as text, or '*' when there is none. */
 export function targetObjectArgument(args: ToolArguments): string {
   return args.objectName ? String(args.objectName) : '*';
+}
+
+/**
+ * The call's log target and the `targetObject` it is told about: targetObjectArgument, or '*' when the
+ * objectName cannot be read as text (String() of an object whose toString is not a function throws).
+ * evaluatePolicy refuses such a call as INPUT_INVALID, so it is still decided and logged.
+ */
+export function loggedTargetObject(args: ToolArguments): string {
+  try {
+    return targetObjectArgument(args);
+  } catch {
+    return '*';
+  }
 }
 
 /** The trimmed `recordId`, or null when it is not a 15 or 18-character Salesforce ID. */

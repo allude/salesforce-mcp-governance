@@ -875,6 +875,26 @@ describe('MCP tools/call end-to-end through HTTP /mcp with a mocked Salesforce o
       assert.deepEqual(Object.keys(JSON.parse(updateRow.sanitizedRequestPayload).fields), ['Name']);
     });
 
+    test('a written field name that is not an API name is stored by its length in the payload, as in the decision', async () => {
+      const typed = 'jane.doe@example.com 555-12-3456';
+      const outcome = await callTool(FULL, 'create_record', {
+        objectName: 'Account',
+        fields: { [typed]: 'x', Name: 'Doe' },
+      });
+
+      expectAccessDenied(outcome, 'create_record', /are not permitted/);
+      const row = expectAuditRow(outcome, FULL, 'create_record', 'DENIED', 'Account');
+      expectNothingSentToSalesforce(outcome);
+      assert.deepEqual(row.decision?.steps.at(-1)?.fieldNames, ['<invalid:len=32>']);
+      assert.deepEqual(JSON.parse(row.sanitizedRequestPayload), {
+        objectName: 'Account',
+        fields: { '<invalid:len=32>': '<REDACTED:string>', Name: '<REDACTED:string>' },
+      });
+      for (const stored of [row.sanitizedRequestPayload, row.sanitizedResponseSummary, JSON.stringify(row.decision)]) {
+        assert.ok(!stored.includes('jane.doe') && !stored.includes('555-12'), `audit row stored the typed field name: ${stored}`);
+      }
+    });
+
     test('update_record with a disallowed field is DENIED and nothing is sent', async () => {
       const outcome = await callTool(FULL, 'update_record', {
         objectName: 'Account',
@@ -1233,6 +1253,23 @@ describe('MCP tools/call end-to-end through HTTP /mcp with a mocked Salesforce o
         status: 'DENIED',
         target: 'Account',
       },
+      ...(['describe_object', 'soql_query'] as const).map((tool) => ({
+        // The same objectName: read before the decision, it once threw out of the handler unlogged.
+        path: `pre-execution denial (an objectName that cannot be read as text, ${tool})`,
+        caller: FULL,
+        tool,
+        args: { objectName: { toString: 1 } },
+        text: exactly({
+          error: 'ACCESS_DENIED',
+          tool,
+          targetObject: '*',
+          profileId: FULL.profileId,
+          profileName: FULL.profileName,
+          reason: 'Cannot convert object to primitive value',
+        }),
+        status: 'DENIED' as const,
+        target: '*',
+      })),
     ];
 
     for (const c of cases) {

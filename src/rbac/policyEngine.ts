@@ -22,7 +22,7 @@ import {
   type SalesforceObject,
   type SalesforceProfile,
 } from '../types/governance.js';
-import { GRANT_FLAGS, grantsAccess, malformedGrantReason } from './groupGrants.js';
+import { enabledObjectsByLowerName, GRANT_FLAGS, grantsAccess, malformedGrantReason } from './groupGrants.js';
 
 export { PolicyViolationError } from './policyViolation.js';
 
@@ -181,28 +181,26 @@ function mergeAssignedGroups(
   const assignedGroups = snapshot.groups.filter((g) => groupIds.has(g.id));
 
   const enabledObjectsMap = new Map(
-    snapshot.objects
-      .filter((o) => o.enabled)
-      .map((o) => {
-        const canonicalFieldMap = new Map<string, string>();
-        const missingInOrgFields = new Set<string>();
-        for (const f of o.fields) {
-          if (f.enabled) {
-            canonicalFieldMap.set(f.fieldName.toLowerCase(), f.fieldName);
-            if (f.missingInOrg) {
-              missingInOrgFields.add(f.fieldName);
-            }
+    Array.from(enabledObjectsByLowerName(snapshot.objects), ([lowerName, o]) => {
+      const canonicalFieldMap = new Map<string, string>();
+      const missingInOrgFields = new Set<string>();
+      for (const f of o.fields) {
+        if (f.enabled) {
+          canonicalFieldMap.set(f.fieldName.toLowerCase(), f.fieldName);
+          if (f.missingInOrg) {
+            missingInOrgFields.add(f.fieldName);
           }
         }
-        return [
-          o.objectName.toLowerCase(),
-          {
-            objectName: o.objectName,
-            canonicalFieldMap,
-            missingInOrgFields,
-          },
-        ];
-      })
+      }
+      return [
+        lowerName,
+        {
+          objectName: o.objectName,
+          canonicalFieldMap,
+          missingInOrgFields,
+        },
+      ] as const;
+    })
   );
 
   const allowedActions = new Set<string>();

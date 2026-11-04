@@ -1117,6 +1117,46 @@ describe('the revision in the database', () => {
     assert.equal(storedRevision(dbPath), 7);
   });
 
+  test('a group an older release changes after a rollback gets a new version, so a draft loaded before is stale', () => {
+    const dbPath = path.join(testTmpDir, 'revision-rollback-version.sqlite');
+    const created = `store.upsertObjectWithFields({ objectName: 'Account', fields: [{ fieldName: 'Id' }, { fieldName: 'Name' }] });
+      store.createGroup({ id: 'grp_partner', name: 'Partner Lite', allowedActions: ['list_enabled_objects'], objectPermissions: [] });`;
+    bootAndReadRevision(dbPath, created);
+    const version = () =>
+      withDb(dbPath, (db) => Number((db.prepare(`SELECT version FROM access_groups WHERE id = 'grp_partner'`).get() as { version: number }).version));
+    assert.equal(version(), 1);
+
+    // The older release's save: an upsert that leaves the version column alone.
+    const save = (description: string, objectPermissions: unknown[]) =>
+      asAnOlderRelease(dbPath, (db) => {
+        db.prepare(
+          `INSERT INTO access_groups (id, name, description, allowed_actions_json, object_permissions_json, updated_at)
+           VALUES ('grp_partner', 'Partner Lite', ?, '["list_enabled_objects","soql_query"]', ?, '2026-11-01T00:00:00.000Z')
+           ON CONFLICT(id) DO UPDATE SET
+             name = excluded.name, description = excluded.description, allowed_actions_json = excluded.allowed_actions_json,
+             object_permissions_json = excluded.object_permissions_json, updated_at = excluded.updated_at`
+        ).run(description, JSON.stringify(objectPermissions));
+      });
+    save('ROLLBACK EDIT', [{ objectName: 'Account', canRead: true, allowedFields: ['Name'] }]);
+    assert.equal(version(), 2);
+    // Its revocation, which rewrites the grants and nothing else.
+    asAnOlderRelease(dbPath, (db) => {
+      db.prepare(`UPDATE access_groups SET object_permissions_json = '[]', updated_at = '2026-11-01T00:00:01.000Z' WHERE id = 'grp_partner'`).run();
+    });
+    assert.equal(version(), 3);
+    // Saving what is stored changes nothing, so the version stays.
+    save('ROLLBACK EDIT', []);
+    assert.equal(version(), 3);
+
+    // Back on this release, which compares a draft's expectedVersion with this, a save raises it once.
+    bootAndReadRevision(
+      dbPath,
+      `const group = store.getGroups().find((g) => g.id === 'grp_partner');
+       store.upsertGroup({ ...group, description: 'Saved here' });`
+    );
+    assert.equal(version(), 4);
+  });
+
   test('an older release that only saved what was stored, or wrote outside the policy, leaves the revision alone', () => {
     const dbPath = path.join(testTmpDir, 'revision-rollback-noop.sqlite');
     const created = `store.createGroup({ id: 'grp_noop', name: 'Unchanged', allowedActions: ['soql_query'], objectPermissions: [] });

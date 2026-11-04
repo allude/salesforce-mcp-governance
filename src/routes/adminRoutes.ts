@@ -2100,6 +2100,10 @@ async function simulateMcpAccess(req: Request): Promise<{ record: () => void; bo
   };
 }
 
+/** The 409 of the sample matrix while a sample group holds another sample group's exact name. */
+const SAMPLE_NAME_HELD_BY_SAMPLE =
+  'A sample group cannot take its name, because another Access Group has it, so no sample data was loaded. Rename that group, then load the sample data again.';
+
 /**
  * POST /api/admin/workspace/seed-sample
  * Development only: creates sample Access Groups and replaces the group mappings of the sample
@@ -2370,13 +2374,16 @@ adminRouter.post('/workspace/seed-sample', (req: Request, res: Response) => {
     // revision, and never unlogged.
     conflict = runInTransaction(() => {
       // Group names are unique ignoring case, and a sample group always takes its own name. Another
-      // group using one is refused before anything is written, rather than renamed or duplicated.
+      // group using one is refused before anything is written, rather than renamed or duplicated. So is
+      // a sample group renamed to another one's exact name, whichever of the two is saved first.
       for (const sample of sampleGroups) {
-        const taken = store
-          .getGroups()
-          .find((g) => !sampleIds.has(g.id) && g.name.toLowerCase() === sample.name.toLowerCase());
+        const groups = store.getGroups();
+        const taken = groups.find((g) => !sampleIds.has(g.id) && g.name.toLowerCase() === sample.name.toLowerCase());
         if (taken) {
           return `Access Group "${taken.name}" already uses the name of the sample group "${sample.name}", so no sample data was loaded. Rename or delete that group, then load the sample data again.`;
+        }
+        if (groups.some((g) => sampleIds.has(g.id) && g.id !== sample.id && g.name === sample.name)) {
+          return SAMPLE_NAME_HELD_BY_SAMPLE;
         }
       }
 
@@ -2437,12 +2444,9 @@ adminRouter.post('/workspace/seed-sample', (req: Request, res: Response) => {
       return undefined;
     });
   } catch (err: any) {
-    // A sample group renamed to another sample group's exact name holds it while that one is saved.
+    // The check above refuses every name a save could collide on; this keeps the answer if one still does.
     if (/UNIQUE constraint failed: access_groups\.name/.test(String(err?.message))) {
-      res.status(409).json({
-        error:
-          'A sample group cannot take its name, because another Access Group has it, so no sample data was loaded. Rename that group, then load the sample data again.',
-      });
+      res.status(409).json({ error: SAMPLE_NAME_HELD_BY_SAMPLE });
       return;
     }
     throw err;

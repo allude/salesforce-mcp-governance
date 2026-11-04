@@ -11,7 +11,7 @@ import { FlyoutDrawer } from '../src/components/views/FlyoutDrawer.js';
 import { AccessGroupsView, ProfileGroupMatrixView } from '../src/components/views/AccessMatrixViews.js';
 import { SalesforceObjectsView, SalesforceProfilesView } from '../src/components/views/SalesforceViews.js';
 import { CommandPalette } from '../src/components/views/CommandPalette.js';
-import { readableGrants } from '../src/rbac/groupGrants.js';
+import { effectiveGrants, readableGrants } from '../src/rbac/groupGrants.js';
 import type { AccessGroup, SalesforceObject, SalesforceProfile } from '../src/types/governance.js';
 
 const catalogObject = (objectName: string, fieldNames: string[]): SalesforceObject => ({
@@ -68,7 +68,10 @@ const mappings = [{ profileId: profile.id, groupIds: [legacy.id, readers.id] }];
 
 const noop = async () => {};
 
-function renderDrawer(flyout: { type: 'profile' | 'object'; data: unknown }): string {
+function renderDrawer(
+  flyout: { type: 'profile' | 'object'; data: unknown },
+  policy: { groups: AccessGroup[]; mappings: typeof mappings } = { groups, mappings }
+): string {
   return renderToStaticMarkup(
     createElement(FlyoutDrawer, {
       flyout,
@@ -77,8 +80,8 @@ function renderDrawer(flyout: { type: 'profile' | 'object'; data: unknown }): st
       onNavigateView: () => {},
       profiles,
       objects,
-      groups,
-      mappings,
+      groups: policy.groups,
+      mappings: policy.mappings,
       sfSettings: null,
       onUpsertProfile: noop,
       onDeleteProfile: noop,
@@ -185,6 +188,67 @@ describe('portal summaries of stored groups', () => {
     );
     assert.ok(!rowWith(objectsHtml, '>Account<').includes('1 group'));
     assert.ok(rowWith(objectsHtml, '>Contact<').includes('1 group'));
+  });
+
+  test("a Profile's access leaves out grants on Objects missing from Salesforce > Objects, and matches names in any case", () => {
+    // Quote__c was never imported, so /mcp denies it; 'account' and 'ACCOUNT' are Account.
+    const uncatalogued: AccessGroup = {
+      id: 'grp-uncatalogued',
+      name: 'Uncatalogued Grants',
+      description: '',
+      allowedActions: ['soql_query'],
+      objectPermissions: [
+        { objectName: 'Quote__c', canRead: true, canCreate: false, canUpdate: false, canDelete: false, allowedFields: ['Id'] },
+        { objectName: 'account', canRead: true, canCreate: false, canUpdate: false, canDelete: false, allowedFields: ['Name'] },
+        { objectName: 'ACCOUNT', canRead: false, canCreate: false, canUpdate: true, canDelete: false, allowedFields: ['Name'] },
+      ],
+      version: 1,
+      updatedAt: '2026-10-01T00:00:00.000Z',
+    };
+    const policy = { groups: [uncatalogued], mappings: [{ profileId: profile.id, groupIds: [uncatalogued.id] }] };
+
+    const drawer = renderDrawer({ type: 'profile', data: profile }, policy);
+    assert.ok(drawer.includes('Object access (1)'), drawer);
+    assert.ok(drawer.includes('<span class="mono">Account</span>'), drawer);
+    assert.ok(!drawer.includes('Quote__c') && !drawer.includes('<span class="mono">account</span>'), drawer);
+
+    const matrix = renderToStaticMarkup(
+      createElement(ProfileGroupMatrixView, { profiles, objects, ...policy, onToggleProfileGroup: noop, onOpenFlyout: () => {} })
+    );
+    assert.ok(rowWith(matrix, profile.id).includes('1 actions · 1 objects'), rowWith(matrix, profile.id));
+
+    const profilesHtml = renderToStaticMarkup(
+      createElement(SalesforceProfilesView, {
+        profiles,
+        objects,
+        ...policy,
+        sfSettings: null,
+        onOpenFlyout: () => {},
+        onPreviewPullProfilesFromOrg: async () => ({}) as never,
+        onApplyPullProfilesFromOrg: noop,
+        onNavigateToOrgConnection: () => {},
+      })
+    );
+    assert.ok(rowWith(profilesHtml, profile.id).includes('1 actions · 1 objects'), rowWith(profilesHtml, profile.id));
+  });
+
+  test('effectiveGrants reads a group as the policy engine does, catalog row and spelling included', () => {
+    const catalog = [
+      { objectName: 'Account', enabled: true },
+      { objectName: 'Lead', enabled: false },
+      // Two rows for one Object, as an older version could store them: the last enabled one counts.
+      { objectName: 'Opportunity', enabled: true },
+      { objectName: 'opportunity', enabled: true },
+    ];
+    const grant = (objectName: string, flags: Record<string, boolean> = { canRead: true }) => ({ objectName, ...flags, allowedFields: [] });
+    assert.deepEqual(
+      effectiveGrants(
+        [grant('ACCOUNT'), grant('Lead'), grant('Ghost__c'), grant('OPPORTUNITY'), grant('Account', {}), { objectName: 'Account', canRead: 'true' }],
+        catalog
+      ).map((g) => g.objectName),
+      ['Account', 'opportunity']
+    );
+    assert.deepEqual(effectiveGrants(undefined, catalog), []);
   });
 
   test('the command palette counts the Objects each group grants', () => {
