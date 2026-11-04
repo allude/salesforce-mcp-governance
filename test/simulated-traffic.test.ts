@@ -156,7 +156,7 @@ describe('/mcp', () => {
 
     await mcpRequest(server.baseUrl, token, 'tools/call', { name: 'soql_query', arguments: { objectName, fields: ['Id'] } });
     await mcpRequest(server.baseUrl, token, 'tools/call', { name: 'delete_record', arguments: { objectName, recordId: '001000000000001AAA' } });
-    // A field outside the grant passes the tool check and is refused during execution, the third log site.
+    // A field outside the grant passes the tool and Object checks and is refused by the field check.
     await mcpRequest(server.baseUrl, token, 'tools/call', { name: 'soql_query', arguments: { objectName, fields: ['Secret__c'] } });
 
     const rows = rowsFor(profileId);

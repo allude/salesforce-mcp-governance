@@ -41,9 +41,14 @@ import { isSalesforceId, salesforceIdsMatch } from '../salesforce/ids.js';
 import { assertNotSimulatedOrgHost } from '../salesforce/simulatedOrg.js';
 import type { AccessGroup, SalesforceConnectionSettings } from '../types/governance.js';
 import {
-  evaluateMcpToolCall,
+  decisionLogStatus,
+  evaluatePolicy,
+  evaluateToolAccess,
+  loadPolicySnapshot,
+  policyEvaluationResult,
   resolveEffectiveProfilePermissions,
 } from '../rbac/policyEngine.js';
+import { targetObjectArgument } from '../mcp/toolArguments.js';
 
 export const adminRouter = Router();
 
@@ -1907,15 +1912,28 @@ async function runMcpAccessSimulation(req: Request, res: Response): Promise<void
   });
 
   const user = await resolveSalesforceUserFromToken(simToken);
+  const snapshot = loadPolicySnapshot();
   const effective = resolveEffectiveProfilePermissions(
     user.profileId,
-    user.profileName
+    user.profileName,
+    snapshot
   );
-  const evaluation = evaluateMcpToolCall(
-    user,
-    String(toolName || 'list_enabled_objects'),
-    targetObject ? String(targetObject) : undefined
-  );
+  // A sample payload is evaluated as the call's arguments, so the field, WHERE and argument checks
+  // apply as on /mcp. Without one, only the tool and the Object are checked. The Object is targetObject
+  // when it is given, whatever the payload names, so the logged target is always the one decided on;
+  // the payload's objectName counts only without one.
+  const simulatedTool = String(toolName || 'list_enabled_objects');
+  const hasSamplePayload = Boolean(samplePayload && typeof samplePayload === 'object' && !Array.isArray(samplePayload));
+  const args: Record<string, unknown> = {
+    ...(hasSamplePayload ? samplePayload : {}),
+    ...(targetObject ? { objectName: String(targetObject) } : {}),
+  };
+  const simulatedTarget = targetObjectArgument(args);
+  const decision = hasSamplePayload
+    ? evaluatePolicy(user, simulatedTool, args, snapshot)
+    : evaluateToolAccess(user, simulatedTool, targetObject ? String(targetObject) : undefined, snapshot);
+  const { decision: _decision, ...evaluation } = policyEvaluationResult(decision);
+  const status = decisionLogStatus(decision);
 
   // Also record this test call into the Copilot MCP log (with sensitive data stripped!)
   store.recordCopilotMcpLog({
@@ -1924,9 +1942,9 @@ async function runMcpAccessSimulation(req: Request, res: Response): Promise<void
     profileId: user.profileId,
     profileName: effective.profileName,
     matchedGroups: evaluation.matchedGroups,
-    toolName: String(toolName || 'list_enabled_objects'),
-    targetObject: String(targetObject || '*'),
-    status: evaluation.permitted ? 'ALLOWED' : 'DENIED',
+    toolName: simulatedTool,
+    targetObject: simulatedTarget,
+    status,
     latencyMs: Math.floor(18 + Math.random() * 65),
     rawRequestPayload: samplePayload || {
       objectName: targetObject || '*',
@@ -1946,7 +1964,7 @@ async function runMcpAccessSimulation(req: Request, res: Response): Promise<void
     authMethod: actor.authMethod,
     action: SIMULATE_MCP_CALL_ACTION,
     target: `Profile: ${effective.profileName} (${effective.profileId})`,
-    details: `Simulated ${String(toolName || 'list_enabled_objects')} on ${String(targetObject || '*')} as "${user.username}": ${evaluation.permitted ? 'ALLOWED' : 'DENIED'}.${config.isProd ? '' : ' A 15-minute simulator token was issued.'}`,
+    details: `Simulated ${simulatedTool} on ${simulatedTarget} as "${user.username}": ${status}.${config.isProd ? '' : ' A 15-minute simulator token was issued.'}`,
     ipAddress: actor.ip,
     correlationId: actor.correlationId,
   });
@@ -1955,6 +1973,7 @@ async function runMcpAccessSimulation(req: Request, res: Response): Promise<void
     // /mcp refuses simulator tokens in production, so none is handed out there.
     ...(config.isProd ? {} : { simulatorBearerToken: simToken }),
     evaluation,
+    decision,
     effectivePermissions: {
       profileId: effective.profileId,
       profileName: effective.profileName,

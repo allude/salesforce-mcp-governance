@@ -5,7 +5,7 @@
  * EXCLUDES. Anything else (subqueries, other objects, bind variables, comments) is rejected.
  */
 
-import { PolicyViolationError } from '../rbac/policyEngine.js';
+import { PolicyViolationError } from '../rbac/policyViolation.js';
 
 const MAX_WHERE_CLAUSE_LENGTH = 2000;
 
@@ -38,12 +38,25 @@ const TOKEN_PATTERN = new RegExp(
   'y'
 );
 
-export function assertSafeSoqlWhereClause(whereClause: string, allowedFields: string[]): void {
+/**
+ * What checkSoqlWhereClause found: the field names the clause uses (once each, ignoring case, as
+ * first written), or the first problem in reading order.
+ */
+export type WhereClauseCheck =
+  | { ok: true; fieldNames: string[] }
+  /** The clause cannot be read: too long, a character outside the grammar, or unbalanced parentheses. */
+  | { ok: false; problem: 'malformed'; message: string }
+  /** The clause names something that is not an allowed field. */
+  | { ok: false; problem: 'field'; fieldName: string; message: string };
+
+export function checkSoqlWhereClause(whereClause: string, allowedFields: readonly string[]): WhereClauseCheck {
+  const malformed = (message: string): WhereClauseCheck => ({ ok: false, problem: 'malformed', message });
   if (whereClause.length > MAX_WHERE_CLAUSE_LENGTH) {
-    throw new Error(`whereClause is longer than ${MAX_WHERE_CLAUSE_LENGTH} characters.`);
+    return malformed(`whereClause is longer than ${MAX_WHERE_CLAUSE_LENGTH} characters.`);
   }
 
   const permitted = new Set(['id', ...allowedFields.map((f) => f.toLowerCase())]);
+  const fieldNames = new Map<string, string>();
   let depth = 0;
   let position = 0;
 
@@ -51,7 +64,7 @@ export function assertSafeSoqlWhereClause(whereClause: string, allowedFields: st
     TOKEN_PATTERN.lastIndex = position;
     const match = TOKEN_PATTERN.exec(whereClause);
     if (!match || !match.groups) {
-      throw new Error(`whereClause contains an unsupported character at position ${position + 1}.`);
+      return malformed(`whereClause contains an unsupported character at position ${position + 1}.`);
     }
     position = TOKEN_PATTERN.lastIndex;
 
@@ -59,21 +72,35 @@ export function assertSafeSoqlWhereClause(whereClause: string, allowedFields: st
     if (punct === '(') depth++;
     if (punct === ')') {
       depth--;
-      if (depth < 0) throw new Error('whereClause has unbalanced parentheses.');
+      if (depth < 0) return malformed('whereClause has unbalanced parentheses.');
     }
 
     if (word) {
       const upper = word.toUpperCase();
       if (WHERE_KEYWORDS.has(upper) || DATE_LITERALS.has(upper) || DATE_N_LITERAL.test(upper)) continue;
       if (word.includes(':') || !permitted.has(word.toLowerCase())) {
-        throw new PolicyViolationError(`whereClause references '${word}', which is not an allowed field for this Profile.`);
+        return {
+          ok: false,
+          problem: 'field',
+          fieldName: word,
+          message: `whereClause references '${word}', which is not an allowed field for this Profile.`,
+        };
       }
+      if (!fieldNames.has(word.toLowerCase())) fieldNames.set(word.toLowerCase(), word);
     }
   }
 
   if (depth !== 0) {
-    throw new Error('whereClause has unbalanced parentheses.');
+    return malformed('whereClause has unbalanced parentheses.');
   }
+  return { ok: true, fieldNames: Array.from(fieldNames.values()) };
+}
+
+/** checkSoqlWhereClause as a guard: a field problem throws PolicyViolationError, any other an Error. */
+export function assertSafeSoqlWhereClause(whereClause: string, allowedFields: string[]): void {
+  const check = checkSoqlWhereClause(whereClause, allowedFields);
+  if (check.ok) return;
+  throw check.problem === 'field' ? new PolicyViolationError(check.message) : new Error(check.message);
 }
 
 /**

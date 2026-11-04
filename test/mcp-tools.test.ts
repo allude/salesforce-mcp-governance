@@ -132,6 +132,8 @@ interface ToolCallOutcome {
   isError: boolean;
   /** Parsed JSON text content of the tool result. */
   payload: any;
+  /** The text content exactly as the caller received it. */
+  text: string;
   /** Audit rows written while this call ran (all users, oldest first). */
   auditRows: CopilotMcpLogRecord[];
   /** Salesforce requests made for this call, excluding the token-verification lookups. */
@@ -191,6 +193,7 @@ async function callTool(caller: Caller, name: string, args?: Record<string, unkn
   return {
     isError: res.body.result.isError === true,
     payload: toolResultPayload(res.body),
+    text: res.body.result.content?.[0]?.text ?? '',
     auditRows,
     salesforceCalls: sf.calls.slice(sfCallsBefore).filter((c) => !isIdentityLookup(c)),
   };
@@ -725,7 +728,8 @@ describe('MCP tools/call end-to-end through HTTP /mcp with a mocked Salesforce o
 
         assert.equal(outcome.isError, true, `recordId ${recordId}: ${JSON.stringify(outcome.payload)}`);
         assert.match(String(outcome.payload?.error), /recordId/);
-        expectAuditRow(outcome, FULL, 'get_record', 'ERROR', 'Account');
+        // Refused arguments are logged DENIED: the call was refused, nothing failed.
+        expectAuditRow(outcome, FULL, 'get_record', 'DENIED', 'Account');
         expectNothingSentToSalesforce(outcome);
       }
     });
@@ -787,7 +791,7 @@ describe('MCP tools/call end-to-end through HTTP /mcp with a mocked Salesforce o
 
         assert.equal(outcome.isError, true, `${label}: ${JSON.stringify(outcome.payload)}`);
         assert.match(String(outcome.payload?.error), /fields/, label);
-        expectAuditRow(outcome, FULL, 'create_record', 'ERROR', 'Account');
+        expectAuditRow(outcome, FULL, 'create_record', 'DENIED', 'Account');
         expectNothingSentToSalesforce(outcome);
       }
     });
@@ -800,7 +804,7 @@ describe('MCP tools/call end-to-end through HTTP /mcp with a mocked Salesforce o
 
       assert.equal(outcome.isError, true, JSON.stringify(outcome.payload));
       expectNothingSentToSalesforce(outcome);
-      const row = expectAuditRow(outcome, FULL, 'create_record', 'ERROR', 'Account');
+      const row = expectAuditRow(outcome, FULL, 'create_record', 'DENIED', 'Account');
       assert.ok(
         !row.sanitizedRequestPayload.includes('Jane Array-Wrapped Doe'),
         `audit row stored a submitted record value: ${row.sanitizedRequestPayload}`
@@ -892,7 +896,7 @@ describe('MCP tools/call end-to-end through HTTP /mcp with a mocked Salesforce o
 
         assert.equal(outcome.isError, true, `${tool}: ${JSON.stringify(outcome.payload)}`);
         assert.match(String(outcome.payload?.error), /recordId/, tool);
-        expectAuditRow(outcome, FULL, tool, 'ERROR', 'Account');
+        expectAuditRow(outcome, FULL, tool, 'DENIED', 'Account');
         expectNothingSentToSalesforce(outcome);
       }
     });
@@ -1011,7 +1015,7 @@ describe('MCP tools/call end-to-end through HTTP /mcp with a mocked Salesforce o
       const calls: Array<[Caller, string, Record<string, unknown> | undefined, AuditStatus]> = [
         [FULL, 'soql_query', { objectName: 'Account', fields: ['Id'] }, 'ALLOWED'],
         [FULL, 'list_enabled_objects', undefined, 'ALLOWED'],
-        [FULL, 'get_record', { objectName: 'Account', recordId: 'abc' }, 'ERROR'],
+        [FULL, 'get_record', { objectName: 'Account', recordId: 'abc' }, 'DENIED'],
         [FULL, 'soql_query', { objectName: 'Account', fields: ['SSN__c'] }, 'DENIED'],
         [FULL, 'create_record', { fields: { Name: 'x' } }, 'DENIED'],
         [READ_ONLY, 'delete_record', { objectName: 'Account', recordId: RECORD_ID }, 'DENIED'],
@@ -1031,6 +1035,277 @@ describe('MCP tools/call end-to-end through HTTP /mcp with a mocked Salesforce o
           status,
         ])
       );
+    });
+  });
+
+  // Caller-facing payloads: every refusal is decided by evaluatePolicy before any Salesforce call, and
+  // the caller still gets the exact text it got when the field, WHERE and argument checks ran in the
+  // handlers. Only the log status of a malformed argument changed, from ERROR to DENIED.
+  describe('refusal payloads are byte-identical to the earlier handlers', () => {
+    const exactly = (body: Record<string, unknown>) => JSON.stringify(body, null, 2);
+    const fullNotGranted = (tool: string) =>
+      `MCP Action '${tool}' is not granted by any Group assigned to Profile '${READ_ONLY.profileName}' (Groups: ${READ_ONLY_GROUP.name}).`;
+    const cases: Array<{
+      path: string;
+      caller: Caller;
+      tool: string;
+      args: Record<string, unknown>;
+      text: string;
+      status: AuditStatus;
+      target: string;
+    }> = [
+      {
+        path: 'pre-execution denial (tool not granted)',
+        caller: READ_ONLY,
+        tool: 'delete_record',
+        args: { objectName: 'Account', recordId: RECORD_ID },
+        text: exactly({
+          error: 'ACCESS_DENIED',
+          tool: 'delete_record',
+          targetObject: 'Account',
+          profileId: READ_ONLY.profileId,
+          profileName: READ_ONLY.profileName,
+          reason: fullNotGranted('delete_record'),
+        }),
+        status: 'DENIED',
+        target: 'Account',
+      },
+      {
+        path: 'pre-execution denial (object not granted)',
+        caller: FULL,
+        tool: 'get_record',
+        // The record id is malformed too: access is decided first, as it always was.
+        args: { objectName: UNSHARED_OBJECT, recordId: 'abc' },
+        text: exactly({
+          error: 'ACCESS_DENIED',
+          tool: 'get_record',
+          targetObject: UNSHARED_OBJECT,
+          profileId: FULL.profileId,
+          profileName: FULL.profileName,
+          reason: `Object '${UNSHARED_OBJECT}' is either disabled in Salesforce > Objects or not permitted by Groups [${FULL_GROUP.name}].`,
+        }),
+        status: 'DENIED',
+        target: UNSHARED_OBJECT,
+      },
+      {
+        path: 'pre-execution denial (missing objectName)',
+        caller: FULL,
+        tool: 'soql_query',
+        args: { fields: ['Id'] },
+        text: exactly({
+          error: 'ACCESS_DENIED',
+          tool: 'soql_query',
+          targetObject: '*',
+          profileId: FULL.profileId,
+          profileName: FULL.profileName,
+          reason: "MCP Action 'soql_query' requires an objectName argument.",
+        }),
+        status: 'DENIED',
+        target: '*',
+      },
+      {
+        path: 'field denial',
+        caller: FULL,
+        tool: 'soql_query',
+        args: { objectName: 'account', fields: ['Id', 'AnnualRevenue', 'SSN__c'] },
+        text: exactly({
+          error: 'ACCESS_DENIED',
+          tool: 'soql_query',
+          targetObject: 'account',
+          reason: `Fields [AnnualRevenue, SSN__c] on Account are not permitted for Profile '${FULL.profileName}'.`,
+        }),
+        status: 'DENIED',
+        target: 'account',
+      },
+      {
+        path: 'field denial (written fields)',
+        caller: FULL,
+        tool: 'update_record',
+        args: { objectName: 'Account', recordId: RECORD_ID, fields: { AnnualRevenue: 1 } },
+        text: exactly({
+          error: 'ACCESS_DENIED',
+          tool: 'update_record',
+          targetObject: 'Account',
+          reason: `Fields [AnnualRevenue] on Account are not permitted for Profile '${FULL.profileName}'.`,
+        }),
+        status: 'DENIED',
+        target: 'Account',
+      },
+      {
+        path: 'WHERE denial',
+        caller: FULL,
+        tool: 'soql_query',
+        args: { objectName: 'Account', fields: ['Id'], whereClause: 'AnnualRevenue > 5000000' },
+        text: exactly({
+          error: 'ACCESS_DENIED',
+          tool: 'soql_query',
+          targetObject: 'Account',
+          reason: "whereClause references 'AnnualRevenue', which is not an allowed field for this Profile.",
+        }),
+        status: 'DENIED',
+        target: 'Account',
+      },
+      {
+        path: 'guard syntax error (unbalanced parentheses)',
+        caller: FULL,
+        tool: 'soql_query',
+        args: { objectName: 'Account', fields: ['Id'], whereClause: "(Name = 'Acme'" },
+        text: exactly({ error: 'whereClause has unbalanced parentheses.' }),
+        status: 'DENIED',
+        target: 'Account',
+      },
+      {
+        path: 'guard syntax error (unsupported character)',
+        caller: FULL,
+        tool: 'soql_query',
+        args: { objectName: 'Account', whereClause: "Name = 'Acme'; DELETE" },
+        text: exactly({ error: 'whereClause contains an unsupported character at position 14.' }),
+        status: 'DENIED',
+        target: 'Account',
+      },
+      {
+        path: 'argument error (record id)',
+        caller: FULL,
+        tool: 'delete_record',
+        args: { objectName: 'Account', recordId: '../../limits' },
+        text: exactly({ error: 'recordId must be a 15 or 18-character Salesforce Record ID.' }),
+        status: 'DENIED',
+        target: 'Account',
+      },
+      {
+        path: 'argument error (field values)',
+        caller: FULL,
+        tool: 'update_record',
+        args: { objectName: 'Account', recordId: RECORD_ID, fields: [] },
+        text: exactly({ error: 'fields must be an object of field names to values.' }),
+        status: 'DENIED',
+        target: 'Account',
+      },
+      {
+        path: 'pre-execution denial (objectName not an API name)',
+        caller: FULL,
+        tool: 'soql_query',
+        args: { objectName: 'ACCT-99812', fields: ['Id'] },
+        text: exactly({
+          error: 'ACCESS_DENIED',
+          tool: 'soql_query',
+          targetObject: 'ACCT-99812',
+          profileId: FULL.profileId,
+          profileName: FULL.profileName,
+          reason: `Object 'ACCT-99812' is either disabled in Salesforce > Objects or not permitted by Groups [${FULL_GROUP.name}].`,
+        }),
+        status: 'DENIED',
+        target: '<invalid:len=10>',
+      },
+      {
+        path: 'pre-execution denial (objectName not text)',
+        caller: FULL,
+        tool: 'describe_object',
+        args: { objectName: 42 },
+        text: exactly({
+          error: 'ACCESS_DENIED',
+          tool: 'describe_object',
+          targetObject: '42',
+          profileId: FULL.profileId,
+          profileName: FULL.profileName,
+          reason: `Object '42' is either disabled in Salesforce > Objects or not permitted by Groups [${FULL_GROUP.name}].`,
+        }),
+        status: 'DENIED',
+        target: '<invalid:len=2>',
+      },
+      {
+        // String() of an object whose toString is not a function throws; the handler's text for it stays.
+        path: 'argument error (a selected field that cannot be read as text)',
+        caller: FULL,
+        tool: 'soql_query',
+        args: { objectName: 'Account', fields: ['Id', { toString: 1 }] },
+        text: exactly({ error: 'Cannot convert object to primitive value' }),
+        status: 'DENIED',
+        target: 'Account',
+      },
+      {
+        path: 'argument error (a returned field that cannot be read as text)',
+        caller: FULL,
+        tool: 'get_record',
+        args: { objectName: 'Account', recordId: RECORD_ID, fields: [{ toString: 1, valueOf: 1 }] },
+        text: exactly({ error: 'Cannot convert object to primitive value' }),
+        status: 'DENIED',
+        target: 'Account',
+      },
+    ];
+
+    for (const c of cases) {
+      test(`${c.path}: the caller-facing text and isError are unchanged, logged ${c.status}`, async () => {
+        const outcome = await callTool(c.caller, c.tool, c.args);
+
+        assert.equal(outcome.isError, true);
+        assert.equal(outcome.text, c.text);
+        const row = expectAuditRow(outcome, c.caller, c.tool, c.status, c.target);
+        assert.deepEqual(row.matchedGroups, [c.caller === FULL ? FULL_GROUP.name : READ_ONLY_GROUP.name]);
+        expectNothingSentToSalesforce(outcome);
+      });
+    }
+
+    test('an Object stored under a name that is not an API name: the handler\'s text, logged ERROR as a policy fault', async (t) => {
+      // Saved before Object names were validated; the store refuses one now, so the read is faked.
+      const legacy = 'Legacy Object';
+      const objects = store.getObjects();
+      const groups = store.getGroups();
+      const field = (fieldName: string) => ({
+        objectName: legacy,
+        fieldName,
+        label: fieldName,
+        fieldType: 'Text',
+        isCustom: false,
+        required: false,
+        enabled: true,
+        missingInOrg: false,
+      });
+      t.mock.method(store, 'getObjects', () => [
+        ...objects,
+        {
+          objectName: legacy,
+          label: legacy,
+          isCustom: true,
+          enabled: true,
+          sourcePath: '',
+          fieldCount: 2,
+          enabledFieldCount: 2,
+          fields: [field('Id'), field('Name')],
+          updatedAt: '',
+        },
+      ]);
+      t.mock.method(store, 'getGroups', () =>
+        groups.map((g) =>
+          g.id === FULL_GROUP.id
+            ? {
+                ...g,
+                objectPermissions: [
+                  ...g.objectPermissions,
+                  { objectName: legacy, canRead: true, canCreate: false, canUpdate: false, canDelete: false, allowedFields: ['Name'] },
+                ],
+              }
+            : g
+        )
+      );
+
+      const outcome = await callTool(FULL, 'soql_query', { objectName: 'legacy object', fields: ['Name'] });
+
+      assert.equal(outcome.isError, true);
+      assert.equal(outcome.text, exactly({ error: "Object 'Legacy Object' is not a valid Salesforce API name." }));
+      expectAuditRow(outcome, FULL, 'soql_query', 'ERROR', '<invalid:len=13>');
+      expectNothingSentToSalesforce(outcome);
+    });
+
+    test('list_enabled_objects ignores an objectName, even one of an Object the caller is not granted', async () => {
+      for (const objectName of [UNSHARED_OBJECT, DISABLED_OBJECT]) {
+        const outcome = await callTool(FULL, 'list_enabled_objects', { objectName });
+
+        assert.equal(outcome.isError, false, JSON.stringify(outcome.payload));
+        assert.deepEqual(outcome.payload.assignedGroups, [FULL_GROUP.name]);
+        expectAuditRow(outcome, FULL, 'list_enabled_objects', 'ALLOWED', objectName);
+        expectNothingSentToSalesforce(outcome);
+      }
     });
   });
 

@@ -50,7 +50,7 @@ Returns `{ "status": "ok", "service": "salesforce-zero-trust-mcp", "transport": 
 
 ## 2. MCP Tools Catalog (Governed per Salesforce Profile)
 
-`tools/list` returns only the tools granted by the Access Groups mapped to the caller's Salesforce Profile. `tools/call` re-checks the tool, the target object's CRUD permission and every field before anything is sent to Salesforce, and writes one audit row per call (`ALLOWED`, `DENIED` or `ERROR`).
+`tools/list` returns only the tools granted by the Access Groups mapped to the caller's Salesforce Profile. `tools/call` re-checks the tool, the target object's CRUD permission, every field, the `whereClause` and the arguments before anything is sent to Salesforce (the decision pipeline in the [Security model](security-model.md)), and writes one audit row per call (`ALLOWED`, `DENIED` or `ERROR`).
 
 | Tool | Category | Arguments | What it does |
 | :--- | :--- | :--- | :--- |
@@ -63,7 +63,7 @@ Returns `{ "status": "ok", "service": "salesforce-zero-trust-mcp", "transport": 
 | `delete_record` | Delete | `{ "objectName": "Opportunity", "recordId": "006..." }` | `DELETE /services/data/<version>/sobjects/<object>/<id>` |
 
 Argument rules enforced by the server:
-* Every tool except `list_enabled_objects` requires `objectName`. The object must be enabled in **Salesforce > Objects** and granted by one of the caller's groups; it is matched case-insensitively and the canonical API name is used in the request.
+* Every tool except `list_enabled_objects` requires `objectName`; `list_enabled_objects` ignores one. The object must be enabled in **Salesforce > Objects** and granted by one of the caller's groups; it is matched case-insensitively and the canonical API name is used in the request.
 * Read tools need `canRead`, `create_record` needs `canCreate`, `update_record` needs `canUpdate`, `delete_record` needs `canDelete`.
 * Every requested or written field must be in the caller's allowed fields: the union of the groups' field lists, intersected with the fields enabled globally.
 * `whereClause` may only use allowed fields (plus `Id`), literals (strings, numbers, dates, date literals such as `LAST_N_DAYS:30`, `NULL`, `TRUE`, `FALSE`), comparison operators, `AND` / `OR` / `NOT`, `LIKE`, `IN`, `INCLUDES`, `EXCLUDES` and parentheses. Subqueries, relationship paths, bind variables and other syntax are rejected (`src/mcp/soqlGuard.ts`).
@@ -82,7 +82,7 @@ A denied call returns an MCP tool error (`isError: true`) and is logged as `DENI
   "reason": "MCP Action 'delete_record' is not granted by any Group assigned to Profile 'Read Only' (Groups: Readers)."
 }
 ```
-A field or filter outside the allowlist returns `{ "error": "ACCESS_DENIED", "tool", "targetObject", "reason" }`, also logged as `DENIED`. Salesforce API failures and invalid arguments return `{ "error": "<message>" }` and are logged as `ERROR`.
+A field or filter outside the allowlist returns `{ "error": "ACCESS_DENIED", "tool", "targetObject", "reason" }`, also logged as `DENIED`. Invalid arguments (a malformed `recordId`, a `fields` value that is not a map of field values, a field name that cannot be read as text, a `whereClause` that cannot be read) return `{ "error": "<message>" }` and are logged as `DENIED`, since the call was refused; a missing `objectName`, or one that is not an API name, gets the `ACCESS_DENIED` payload above. Salesforce API failures return `{ "error": "<message>" }` and are logged as `ERROR`, as is a call the policy could not be evaluated for (`{ "error": "The access policy could not be evaluated, so the call is refused." }`, or `{ "error": "Object '<name>' is not a valid Salesforce API name." }` for an Object stored under such a name before names were validated).
 
 ---
 
@@ -101,7 +101,7 @@ Rate limits: 300 Admin API requests per minute per admin session (per client IP 
 | `GET /api/admin/session` | Current sign-in state, the session's CSRF token, and whether Okta SSO is enabled. |
 | `POST /api/admin/login` | Username + password login for portal users (`{ "username", "password" }`, both strings; `400` otherwise). The bootstrap admin is seeded from `ADMIN_BOOTSTRAP_USERNAME` / `ADMIN_BOOTSTRAP_PASSWORD` (default `admin` / `admin123`). |
 | `POST /api/admin/logout` | Clears the session cookie. |
-| `GET /api/admin/overview` | Full portal state: `serverTime` (the server's clock as an ISO timestamp), stats (totals over every logged call: allowed, denied by policy, and Salesforce/argument errors), profiles, objects (with fields), groups, profile-group mappings, the Copilot MCP and Portal Admin log entries (each list holds the latest 150 ordinary rows plus the latest 50 simulated rows, merged newest first, and the Copilot MCP list also the latest 50 rejected-token rows; simulated rows carry `simulated: true` or the `SIMULATE_MCP_CALL` action, rejected-token rows the `unverified_caller` user and the `mcp_authenticate` tool), `logCaps` (those per-kind limits, which the Logs views state), `policyRevision` (the [policy revision](#policy-revision) the profiles, objects, groups and mappings are at), Okta settings (`hasClientSecret` only, never the secret), Salesforce settings and portal users. |
+| `GET /api/admin/overview` | Full portal state: `serverTime` (the server's clock as an ISO timestamp), stats (totals over every logged call: allowed, denied by the policy or for invalid arguments, and errors, which are Salesforce failures), profiles, objects (with fields), groups, profile-group mappings, the Copilot MCP and Portal Admin log entries (each list holds the latest 150 ordinary rows plus the latest 50 simulated rows, merged newest first, and the Copilot MCP list also the latest 50 rejected-token rows; simulated rows carry `simulated: true` or the `SIMULATE_MCP_CALL` action, rejected-token rows the `unverified_caller` user and the `mcp_authenticate` tool), `logCaps` (those per-kind limits, which the Logs views state), `policyRevision` (the [policy revision](#policy-revision) the profiles, objects, groups and mappings are at), Okta settings (`hasClientSecret` only, never the secret), Salesforce settings and portal users. |
 | `GET /api/admin/mcp-logs` | Read-only page of the whole Copilot MCP log, newest first: `{ "rows", "nextBefore" }`. Each row carries `seq`, its write order (the `/overview` rows carry it too). Pass `before=<nextBefore>` for the next older page; `nextBefore` is `null` after the oldest matching row. `limit` is 1 to 1000 (default 200). Optional filters: `status` (`ALLOWED`, `DENIED`, `ERROR`), `simulated` (`true`, `false`), `tool`, `object`. `400` for any malformed parameter. The portal uses it for **Load older** and for CSV exports. |
 | `GET /api/admin/portal-logs` | The same paging over the whole Portal Admin log, with optional `action` and `authMethod` (`password`, `okta_sso`) filters. Rows are described under [Portal Admin log rows](#portal-admin-log-rows). |
 | `POST /api/admin/profiles` | Add or update a Salesforce Profile (`{ "id": "00e...", "name": "..." }`). |
@@ -121,7 +121,47 @@ Rate limits: 300 Admin API requests per minute per admin session (per client IP 
 | `PUT /api/admin/sf-settings` | Update Salesforce settings (`instanceUrl`, `apiVersion`, `expectedOrgId`, `enforceOrgIdLock`, `sfdxObjectsFolderPath`). `400` if the instance URL is outside `SALESFORCE_ALLOWED_DOMAINS`, the API version is not like `v62.0`, the Org ID is not a `00D...` ID, or the lock is enabled without an Org ID. `instanceUrl` is where MCP verifies bearer tokens. The org connection routes record their own host in `syncInstanceUrl`. A real connect also writes that host to `instanceUrl` while it is uninitialised (blank, `login.salesforce.com`, `test.salesforce.com`, or the simulated host) and never changes any other value. A simulated connect never writes it. |
 | `POST /api/admin/portal-users` | Create or update a portal user (`{ "username", "displayName", "password", "role" }`). Usernames are case-insensitive; updating a password keeps the user's role and display name unless new ones are sent. The password must be at least 12 characters, and production refuses the publicly known default passwords (`400` either way). The role is stored but not enforced: every portal user has full access. |
 | `DELETE /api/admin/portal-users/:username` | Delete a portal user. The last remaining user cannot be deleted. |
-| `POST /api/admin/test-mcp-access` | Policy simulator: `{ "profileId", "toolName", "targetObject" }` returns the evaluation, the Profile's effective permissions and, outside production, a signed 15-minute `simulatorBearerToken`, and logs the simulated call in the Copilot MCP log. |
+| `POST /api/admin/test-mcp-access` | Policy simulator: `{ "profileId", "toolName", "targetObject", "samplePayload"?, "username"? }` returns the `evaluation` (`{ "permitted", "reason", "matchedGroups", "allowedFields", "objectName"?, "skippedGroupEntries"? }`, as before), the `decision` it was read from (see [Test-MCP-access decision](#test-mcp-access-decision)), the Profile's `effectivePermissions` and, outside production, a signed 15-minute `simulatorBearerToken`, and logs the simulated call in the Copilot MCP log (`ALLOWED`, `DENIED`, or `ERROR` for an `error` decision). A `samplePayload` object is evaluated as the call's arguments, as `/mcp` would evaluate them, so a field, filter or argument `/mcp` would refuse is refused here too. Without one, only the tool and Object stages are checked, as before. The Object evaluated is `targetObject` when it is given, whatever `objectName` the sample payload names (a different one, `null` or `""`); the payload's `objectName` is used only without a `targetObject`. Both log rows (the Copilot MCP row's target and the `SIMULATE_MCP_CALL` row's details) name the Object evaluated, or `*` when there is none. |
+
+### Test-MCP-access decision
+
+The simulator's `decision` is the policy engine's result for the simulated call, the same one `/mcp` acts on:
+
+```json
+{
+  "outcome": "denied",
+  "code": "FIELD_NOT_PERMITTED",
+  "reason": "Fields [SSN__c] on Case are not permitted for Profile 'Support'.",
+  "objectName": null,
+  "allowedFields": [],
+  "steps": [
+    { "stage": "tool", "result": "pass", "grantingGroupIds": [], "objectName": null, "fieldNames": [], "ruleId": null },
+    { "stage": "identity", "result": "pass", "grantingGroupIds": [], "objectName": null, "fieldNames": [], "ruleId": null },
+    { "stage": "groups", "result": "pass", "grantingGroupIds": [], "objectName": null, "fieldNames": [], "ruleId": null },
+    { "stage": "tool_grant", "result": "pass", "grantingGroupIds": ["grp_support"], "objectName": null, "fieldNames": [], "ruleId": null },
+    { "stage": "object", "result": "pass", "grantingGroupIds": ["grp_support"], "objectName": "Case", "fieldNames": [], "ruleId": null },
+    { "stage": "crud", "result": "pass", "grantingGroupIds": ["grp_support"], "objectName": "Case", "fieldNames": [], "ruleId": null },
+    { "stage": "fields", "result": "fail", "grantingGroupIds": [], "objectName": "Case", "fieldNames": ["SSN__c"], "ruleId": null }
+  ],
+  "assignedGroups": [{ "id": "grp_support", "name": "Support" }],
+  "decidingGroupIds": [],
+  "identity": { "callerProfileId": "00e5g000001D8pRAAU", "matchedProfileId": "00e5g000001D8pRAAU", "matchMethod": "id" },
+  "policyRevision": 42
+}
+```
+
+| Field | Meaning |
+| :--- | :--- |
+| `outcome` | `allowed`, `denied` (a permission refused it), `invalid` (the arguments are malformed) or `error` (the policy could not be evaluated; allows nothing). |
+| `code` | `ALLOWED`, `TOOL_UNKNOWN`, `PROFILE_UNREGISTERED`, `NO_GROUPS`, `TOOL_NOT_GRANTED`, `OBJECT_NOT_GRANTED`, `OBJECT_BLOCKED` (granted, but disabled or not listed in **Salesforce > Objects**), `CRUD_MISSING`, `FIELD_NOT_PERMITTED`, `WHERE_FIELD_NOT_PERMITTED`, `INPUT_INVALID` or `INTERNAL_ERROR`. `ROW_FILTER` is reserved. |
+| `reason` | The text the evaluation and `/mcp` give. |
+| `objectName`, `allowedFields` | The Object's catalog spelling and the caller's allowed fields on it, for an allowed call of an object-scoped tool; otherwise `null` and `[]`. |
+| `steps` | One per stage reached, in order (`tool`, `identity`, `groups`, `tool_grant`, then for object-scoped tools `object` and `crud`; with a sample payload, `fields` for the tools that select or write fields, `where` for `soql_query`, and last an `input` pass, which says the arguments were checked and passed); nothing after the step that failed. A malformed argument fails an `input` step. An `error` decision has no failed step: its steps are those passed before evaluation stopped. `grantingGroupIds` are the assigned groups that grant what the step checked, `fieldNames` the fields requested (on a pass) or refused (on a fail), and `ruleId` is reserved for row filters (`null`). |
+| `assignedGroups` | Every group mapped to the Profile. |
+| `decidingGroupIds` | For an allowed call, the groups named by its passing `tool_grant`, `object`, `crud` and `fields` steps; otherwise `[]`. |
+| `identity` | The caller's Profile ID, the registered Profile it matched (or `null`), and how: `id`, `name` (the Profile name fallback) or `none`. |
+| `policyRevision` | The [policy revision](#policy-revision) the decision was made on. |
+| `skippedGroupEntries` | Present only when a stored group entry was skipped as malformed (see the security model). |
 
 ### Portal Admin log rows
 

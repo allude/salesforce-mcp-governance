@@ -8,7 +8,7 @@ import path from 'node:path';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import { installSalesforceMock, type SalesforceMock } from './helpers/salesforceMock.js';
 import { mcpRequest, startTestServer, type AdminSession, type TestServer } from './helpers/server.js';
-import { store } from '../src/db/store.js';
+import { SIMULATE_MCP_CALL_ACTION, store } from '../src/db/store.js';
 import { adminRouter } from '../src/routes/adminRoutes.js';
 import { config, DEV_FALLBACK_SECRET_KEY, KNOWN_DEFAULT_PASSWORDS } from '../src/config.js';
 import { PORTAL_PASSWORD_MIN_LENGTH } from '../src/security/passwordPolicy.js';
@@ -1879,6 +1879,165 @@ describe('Admin REST API', () => {
         assert.equal(res.status, 200, JSON.stringify(res.body));
         assert.equal(res.body.evaluation.permitted, false, JSON.stringify(body));
         assert.match(res.body.evaluation.reason, reason);
+      }
+    });
+
+    it('returns the structured decision next to the evaluation, which keeps its shape', async () => {
+      const admin = await signIn();
+      const res = await call(admin, 'POST', '/api/admin/test-mcp-access', {
+        profileId: fx.profileId,
+        toolName: 'soql_query',
+        targetObject: fx.objectName.toLowerCase(),
+      });
+
+      assert.equal(res.status, 200, JSON.stringify(res.body));
+      const { evaluation, decision } = res.body;
+      assert.deepEqual(Object.keys(evaluation).sort(), ['allowedFields', 'matchedGroups', 'objectName', 'permitted', 'reason']);
+      assert.equal(decision.outcome, 'allowed');
+      assert.equal(decision.code, 'ALLOWED');
+      assert.equal(decision.objectName, fx.objectName);
+      assert.deepEqual(decision.assignedGroups, [{ id: fx.groupId, name: fx.groupName }]);
+      assert.deepEqual(decision.decidingGroupIds, [fx.groupId]);
+      assert.deepEqual(decision.identity, { callerProfileId: fx.profileId, matchedProfileId: fx.profileId, matchMethod: 'id' });
+      assert.equal(decision.policyRevision, store.getPolicyRevision());
+      // Without a sample payload only the tool and the Object are checked, as before.
+      assert.deepEqual(
+        decision.steps.map((s: any) => s.stage),
+        ['tool', 'identity', 'groups', 'tool_grant', 'object', 'crud']
+      );
+    });
+
+    it('evaluates a sample payload as the call\'s arguments, so a field outside the allowlist is denied', async () => {
+      const admin = await signIn();
+      const seen = new Set(copilotRowsFor(fx.profileId).map((row) => row.id));
+      const simulate = (samplePayload: unknown, toolName = 'soql_query') =>
+        call(admin, 'POST', '/api/admin/test-mcp-access', {
+          profileId: fx.profileId,
+          toolName,
+          targetObject: fx.objectName,
+          samplePayload,
+        });
+
+      // SSN__c is a field of the Object, enabled globally, but the group does not grant it.
+      const denied = await simulate({ fields: ['Id', 'SSN__c'] });
+      assert.equal(denied.status, 200, JSON.stringify(denied.body));
+      assert.equal(denied.body.evaluation.permitted, false);
+      assert.equal(
+        denied.body.evaluation.reason,
+        `Fields [SSN__c] on ${fx.objectName} are not permitted for Profile '${fx.profileName}'.`
+      );
+      assert.deepEqual(denied.body.evaluation.allowedFields, []);
+      assert.equal(denied.body.decision.outcome, 'denied');
+      assert.equal(denied.body.decision.code, 'FIELD_NOT_PERMITTED');
+      assert.deepEqual(denied.body.decision.steps.at(-1), {
+        stage: 'fields',
+        result: 'fail',
+        grantingGroupIds: [],
+        objectName: fx.objectName,
+        fieldNames: ['SSN__c'],
+        ruleId: null,
+      });
+
+      const whereDenied = await simulate({ objectName: fx.objectName, whereClause: "SSN__c = '123-45-6789'" });
+      assert.equal(whereDenied.body.decision.code, 'WHERE_FIELD_NOT_PERMITTED');
+      const malformed = await simulate({ objectName: fx.objectName, whereClause: "(Name = 'x'" });
+      assert.equal(malformed.body.decision.outcome, 'invalid');
+      assert.equal(malformed.body.decision.code, 'INPUT_INVALID');
+      assert.equal(malformed.body.evaluation.reason, 'whereClause has unbalanced parentheses.');
+
+      const allowed = await simulate({ fields: ['Id', 'Subject__c'], whereClause: "Name != null" });
+      assert.equal(allowed.body.evaluation.permitted, true, allowed.body.evaluation.reason);
+      // The last step, an 'input' pass, says the sample payload's arguments were checked.
+      assert.deepEqual(
+        allowed.body.decision.steps.map((s: any) => s.stage),
+        ['tool', 'identity', 'groups', 'tool_grant', 'object', 'crud', 'fields', 'where', 'input']
+      );
+
+      const rows = copilotRowsFor(fx.profileId)
+        .filter((row) => !seen.has(row.id))
+        .reverse();
+      assert.deepEqual(rows.map((r) => r.status), ['DENIED', 'DENIED', 'DENIED', 'ALLOWED']);
+      assert.ok(!JSON.stringify(rows).includes('123-45-6789'), 'the sample filter value was stored');
+    });
+
+    it('decides on the Object its log rows name: targetObject over a sample payload objectName, which only fills in a missing one', async () => {
+      const admin = await signIn();
+      // Enabled globally, but the group grants no access to it.
+      const ungranted = newObjectName('SimUngranted');
+      store.upsertObjectWithFields({ objectName: ungranted, fields: [{ fieldName: 'Id' }] });
+      try {
+        const cases: Array<{
+          label: string;
+          targetObject?: string;
+          samplePayload: Record<string, unknown>;
+          decidedOn: string;
+          code: string;
+          status: string;
+        }> = [
+          {
+            label: 'a sample payload naming a granted Object does not override an ungranted targetObject',
+            targetObject: ungranted,
+            samplePayload: { objectName: fx.objectName, fields: ['Id'] },
+            decidedOn: ungranted,
+            code: 'OBJECT_NOT_GRANTED',
+            status: 'DENIED',
+          },
+          {
+            label: 'a sample payload naming an ungranted Object does not override a granted targetObject',
+            targetObject: fx.objectName,
+            samplePayload: { objectName: ungranted, fields: ['Id'] },
+            decidedOn: fx.objectName,
+            code: 'ALLOWED',
+            status: 'ALLOWED',
+          },
+          {
+            label: 'a null objectName in the sample payload does not remove targetObject',
+            targetObject: fx.objectName,
+            samplePayload: { objectName: null, fields: ['Id'] },
+            decidedOn: fx.objectName,
+            code: 'ALLOWED',
+            status: 'ALLOWED',
+          },
+          {
+            label: 'without targetObject, the sample payload names the Object',
+            samplePayload: { objectName: fx.objectName, fields: ['Id'] },
+            decidedOn: fx.objectName,
+            code: 'ALLOWED',
+            status: 'ALLOWED',
+          },
+        ];
+
+        for (const c of cases) {
+          const seen = new Set(copilotRowsFor(fx.profileId).map((row) => row.id));
+          const mark = auditMark();
+          const res = await call(admin, 'POST', '/api/admin/test-mcp-access', {
+            profileId: fx.profileId,
+            toolName: 'soql_query',
+            ...(c.targetObject === undefined ? {} : { targetObject: c.targetObject }),
+            samplePayload: c.samplePayload,
+          });
+
+          assert.equal(res.status, 200, `${c.label}: ${JSON.stringify(res.body)}`);
+          const { decision } = res.body;
+          assert.equal(decision.code, c.code, `${c.label}: ${decision.reason}`);
+          const objectStep = decision.steps.find((s: any) => s.stage === 'object');
+          assert.equal(objectStep?.objectName, c.decidedOn, `${c.label}: the Object decided on`);
+
+          const rows = copilotRowsFor(fx.profileId).filter((row) => !seen.has(row.id));
+          assert.deepEqual(
+            rows.map((r) => ({ target: r.targetObject, status: r.status })),
+            [{ target: c.decidedOn, status: c.status }],
+            `${c.label}: the Copilot MCP row names the Object decided on`
+          );
+          const [audit] = auditRowsSince(mark, admin.ip).filter((row) => row.action === SIMULATE_MCP_CALL_ACTION);
+          assert.ok(
+            audit?.details.startsWith(`Simulated soql_query on ${c.decidedOn} as `),
+            `${c.label}: the admin log row names the Object decided on: ${audit?.details}`
+          );
+          assert.ok(audit.details.includes(`: ${c.status}.`), `${c.label}: ${audit.details}`);
+        }
+      } finally {
+        store.deleteObject(ungranted);
       }
     });
 
