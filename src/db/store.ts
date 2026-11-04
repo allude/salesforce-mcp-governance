@@ -13,6 +13,8 @@ import {
   GroupObjectPermission,
   ProfileGroupMapping,
   CopilotMcpLogRecord,
+  McpLogDecision,
+  McpLogKind,
   PortalAdminLogRecord,
   OktaSsoSettings,
   SalesforceConnectionSettings,
@@ -31,6 +33,8 @@ import { isSimulatedOrgHost, isUninitialisedMcpTokenHost } from '../salesforce/s
 import { soqlSkeleton } from '../mcp/soqlGuard.js';
 import { auditResultFromAction, PORTAL_AUDIT_RESULTS, type PortalAuditResult } from '../security/auditResult.js';
 import { malformedGrantReason, mergeGrants, spellingLookup, uniqueIgnoringCase } from '../rbac/groupGrants.js';
+import { decisionLogColumns, policySnapshotCatalog, type GatewayDecision } from '../rbac/decisionLog.js';
+import type { PolicyDecision, PolicySnapshot } from '../rbac/policyEngine.js';
 
 const dbDir = path.dirname(config.dbPath);
 if (!fs.existsSync(dbDir)) {
@@ -242,6 +246,66 @@ function readStoredPrivateKey(privateKeyEnc: string): { privateKeyPem: string; u
   }
 }
 
+/** The MCP log user for a bearer token that failed verification, so the caller is unknown. */
+export const UNVERIFIED_CALLER_USERNAME = 'unverified_caller';
+
+type LogTable = 'mcp_copilot_logs' | 'portal_admin_logs';
+
+/**
+ * The two log tables. A new database creates them from these, and rebuildLogTableWithSeq rebuilds an
+ * older one from the same text, so both end with the same table. `seq` is the write order: the order
+ * every reader lists rows in and the paging cursor. On mcp_copilot_logs, the columns after `simulated`
+ * describe how the call was decided and timed; '' (or '[]') and NULL mean "not recorded", which is what
+ * a row written before they existed holds. `kind` is the exception: it is filled in for every row (see
+ * classifyMcpLogKinds), and its default '' exists only so that an older release can still insert.
+ */
+const LOG_TABLE_COLUMNS: Record<LogTable, string> = {
+  mcp_copilot_logs: `
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    timestamp TEXT NOT NULL,
+    sf_username TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    profile_name TEXT NOT NULL,
+    matched_groups_json TEXT NOT NULL DEFAULT '[]',
+    tool_name TEXT NOT NULL,
+    target_object TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL,
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    sanitized_request_payload TEXT NOT NULL DEFAULT '{}',
+    sanitized_response_summary TEXT NOT NULL DEFAULT '{}',
+    simulated INTEGER NOT NULL DEFAULT 0,
+    kind TEXT NOT NULL DEFAULT '',
+    decision_json TEXT NOT NULL DEFAULT '',
+    decision_stage TEXT NOT NULL DEFAULT '',
+    decision_code TEXT NOT NULL DEFAULT '',
+    assigned_group_ids_json TEXT NOT NULL DEFAULT '[]',
+    deciding_group_ids_json TEXT NOT NULL DEFAULT '[]',
+    policy_revision INTEGER,
+    caller_profile_id TEXT NOT NULL DEFAULT '',
+    matched_profile_id TEXT NOT NULL DEFAULT '',
+    match_method TEXT NOT NULL DEFAULT '',
+    verification_ms INTEGER,
+    total_ms INTEGER
+  `,
+  portal_admin_logs: `
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    timestamp TEXT NOT NULL,
+    admin_username TEXT NOT NULL,
+    auth_method TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target TEXT NOT NULL,
+    details TEXT NOT NULL,
+    ip_address TEXT NOT NULL,
+    result TEXT NOT NULL DEFAULT 'SUCCESS',
+    target_type TEXT NOT NULL DEFAULT '',
+    target_id TEXT NOT NULL DEFAULT '',
+    diff_json TEXT NOT NULL DEFAULT '',
+    correlation_id TEXT NOT NULL DEFAULT ''
+  `,
+};
+
 db.exec(`
   PRAGMA journal_mode = WAL;
   PRAGMA foreign_keys = ON;
@@ -304,36 +368,9 @@ db.exec(`
     FOREIGN KEY (group_id) REFERENCES access_groups(id) ON DELETE CASCADE
   );
 
-  CREATE TABLE IF NOT EXISTS mcp_copilot_logs (
-    id TEXT PRIMARY KEY,
-    timestamp TEXT NOT NULL,
-    sf_username TEXT NOT NULL,
-    profile_id TEXT NOT NULL,
-    profile_name TEXT NOT NULL,
-    matched_groups_json TEXT NOT NULL DEFAULT '[]',
-    tool_name TEXT NOT NULL,
-    target_object TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL,
-    latency_ms INTEGER NOT NULL DEFAULT 0,
-    sanitized_request_payload TEXT NOT NULL DEFAULT '{}',
-    sanitized_response_summary TEXT NOT NULL DEFAULT '{}'
-  );
+  CREATE TABLE IF NOT EXISTS mcp_copilot_logs (${LOG_TABLE_COLUMNS.mcp_copilot_logs});
 
-  CREATE TABLE IF NOT EXISTS portal_admin_logs (
-    id TEXT PRIMARY KEY,
-    timestamp TEXT NOT NULL,
-    admin_username TEXT NOT NULL,
-    auth_method TEXT NOT NULL,
-    action TEXT NOT NULL,
-    target TEXT NOT NULL,
-    details TEXT NOT NULL,
-    ip_address TEXT NOT NULL,
-    result TEXT NOT NULL DEFAULT 'SUCCESS',
-    target_type TEXT NOT NULL DEFAULT '',
-    target_id TEXT NOT NULL DEFAULT '',
-    diff_json TEXT NOT NULL DEFAULT '',
-    correlation_id TEXT NOT NULL DEFAULT ''
-  );
+  CREATE TABLE IF NOT EXISTS portal_admin_logs (${LOG_TABLE_COLUMNS.portal_admin_logs});
 
   CREATE TABLE IF NOT EXISTS okta_config (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -462,6 +499,67 @@ function addSimulatedColumnAndMarkLegacyRows() {
        WHERE sf_username IN ('copilot.user@enterprise.com', 'alex.demo@company.my.salesforce.com')`
     ).run();
   });
+}
+
+/** The kind of an MCP log row written without one: classifyMcpLogKinds applies the same rule in SQL. */
+function mcpLogKind(simulated: boolean, sfUsername: string): McpLogKind {
+  if (simulated) return 'simulated';
+  return sfUsername === UNVERIFIED_CALLER_USERNAME ? 'rejected' : 'real';
+}
+
+const quoteIdentifier = (name: string) => `"${name.replace(/"/g, '""')}"`;
+
+/**
+ * Gives a log table an explicit write order, `seq INTEGER PRIMARY KEY AUTOINCREMENT`, in place of the
+ * implicit rowid its rows were listed and paged by: VACUUM may renumber the rowids of a table without an
+ * INTEGER PRIMARY KEY, and a column of its own is the order once rows can no longer be rewritten. It runs
+ * only when the column is missing, in one transaction: a new table is created from LOG_TABLE_COLUMNS
+ * (what a new database gets), every row is copied with its rowid as its seq, so the order and every
+ * paging cursor already handed out stay as they were, the old table is dropped, the new one renamed and
+ * the old table's indexes made again. Ids and every other value are copied unchanged, a column the old
+ * table lacks gets its default, and one only the old table has (none a release wrote) is kept.
+ */
+function rebuildLogTableWithSeq(table: LogTable) {
+  runInTransaction(() => {
+    const columnsOf = (name: string) =>
+      db.prepare(`PRAGMA table_info(${quoteIdentifier(name)})`).all() as Array<{ name: string; type: string }>;
+    const oldColumns = columnsOf(table);
+    if (oldColumns.some((c) => c.name === 'seq')) return;
+    const indexes = (
+      db
+        .prepare(`SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL`)
+        .all(table) as Array<{ sql: string }>
+    ).map((row) => row.sql);
+
+    const rebuilt = `${table}__with_seq`;
+    db.exec(`DROP TABLE IF EXISTS ${rebuilt}`);
+    db.exec(`CREATE TABLE ${rebuilt} (${LOG_TABLE_COLUMNS[table]})`);
+    const newNames = new Set(columnsOf(rebuilt).map((c) => c.name));
+    for (const column of oldColumns.filter((c) => !newNames.has(c.name))) {
+      db.exec(`ALTER TABLE ${rebuilt} ADD COLUMN ${quoteIdentifier(column.name)} ${column.type}`);
+    }
+    const copied = oldColumns.map((c) => quoteIdentifier(c.name)).join(', ');
+    db.exec(`INSERT INTO ${rebuilt} (seq, ${copied}) SELECT rowid, ${copied} FROM ${table} ORDER BY rowid`);
+    db.exec(`DROP TABLE ${table}`);
+    db.exec(`ALTER TABLE ${rebuilt} RENAME TO ${table}`);
+    for (const sql of indexes) db.exec(sql);
+  });
+}
+
+/**
+ * Gives every MCP log row without a kind the one its other columns imply (mcpLogKind): a simulator row
+ * is 'simulated', a refused token's row, logged as unverified_caller, 'rejected', and anything else
+ * 'real'. This release writes every row with its kind, so the rows without one are those written before
+ * the column existed and those an older release writes after a rollback; like backfillLegacyAuditResults
+ * it runs on every boot. Only the kind is filled in: their decision, identity and timing columns stay not
+ * recorded.
+ */
+function classifyMcpLogKinds() {
+  db.prepare(
+    `UPDATE mcp_copilot_logs
+     SET kind = CASE WHEN simulated <> 0 THEN 'simulated' WHEN sf_username = ? THEN 'rejected' ELSE 'real' END
+     WHERE kind = ''`
+  ).run(UNVERIFIED_CALLER_USERNAME);
 }
 
 /**
@@ -618,6 +716,12 @@ function runSchemaMigrations() {
   backfillLegacyAuditResults();
 
   addGroupVersionAndCanonicalizeGrants();
+
+  // After the column migrations above, so the simulated backfill has run once on a database from before
+  // that column, and the copy carries every column they added. Neither rebuild runs again.
+  rebuildLogTableWithSeq('mcp_copilot_logs');
+  rebuildLogTableWithSeq('portal_admin_logs');
+  classifyMcpLogKinds();
 }
 
 /**
@@ -751,8 +855,22 @@ repairConnectInstanceUrls();
 /** The portal admin log action written once per policy simulation. */
 export const SIMULATE_MCP_CALL_ACTION = 'SIMULATE_MCP_CALL';
 
-/** The MCP log user for a bearer token that failed verification, so the caller is unknown. */
-export const UNVERIFIED_CALLER_USERNAME = 'unverified_caller';
+const MCP_LOG_KINDS: readonly string[] = ['real', 'simulated', 'rejected'] satisfies McpLogKind[];
+const MCP_LOG_MATCH_METHODS: readonly string[] = ['id', 'name', 'none'];
+
+/** A stored decision, or null when none was recorded. A value that is not a JSON object reads as none. */
+function parseLoggedDecision(json: string): McpLogDecision | null {
+  const parsed = json ? parseStoredJson(json) : undefined;
+  return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as McpLogDecision) : null;
+}
+
+/** A stored list of ids; anything else reads as none. */
+function parseIdList(json: string): string[] {
+  const parsed = parseStoredJson(json);
+  return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === 'string') : [];
+}
+
+const storedNumberOrNull = (value: unknown) => (value === null || value === undefined ? null : Number(value));
 
 function toCopilotMcpLogRecord(r: any): CopilotMcpLogRecord {
   return {
@@ -769,7 +887,36 @@ function toCopilotMcpLogRecord(r: any): CopilotMcpLogRecord {
     sanitizedRequestPayload: r.sanitized_request_payload,
     sanitizedResponseSummary: r.sanitized_response_summary,
     ...(r.simulated ? { simulated: true as const } : {}),
+    seq: Number(r.seq),
+    // A row an older release wrote since the last boot has no kind yet; it reads as the one it will get.
+    kind: MCP_LOG_KINDS.includes(r.kind) ? r.kind : mcpLogKind(Boolean(r.simulated), r.sf_username),
+    decision: parseLoggedDecision(r.decision_json),
+    decisionStage: r.decision_stage,
+    decisionCode: r.decision_code,
+    assignedGroupIds: parseIdList(r.assigned_group_ids_json),
+    decidingGroupIds: parseIdList(r.deciding_group_ids_json),
+    policyRevision: storedNumberOrNull(r.policy_revision),
+    callerProfileId: r.caller_profile_id,
+    matchedProfileId: r.matched_profile_id,
+    matchMethod: MCP_LOG_MATCH_METHODS.includes(r.match_method) ? r.match_method : '',
+    verificationMs: storedNumberOrNull(r.verification_ms),
+    totalMs: storedNumberOrNull(r.total_ms),
   };
+}
+
+/**
+ * What decided a logged call. A policy decision comes with the snapshot it was made from: its names and
+ * ids are checked against that snapshot (policySnapshotCatalog), not against the tables when the row is
+ * written, so access revoked while the call ran does not unname the group, Object or Profile it was
+ * decided on. A GatewayDecision (a refused token or an outage) read no policy.
+ */
+type DecidedBy =
+  | { decision?: GatewayDecision; policySnapshot?: undefined }
+  | { decision: PolicyDecision; policySnapshot: PolicySnapshot };
+
+/** A duration as stored: whole non-negative milliseconds, or NULL (not recorded). */
+function storedMs(ms: number | undefined): number | null {
+  return typeof ms === 'number' && Number.isFinite(ms) && ms >= 0 ? Math.round(ms) : null;
 }
 
 /**
@@ -814,7 +961,7 @@ function toPortalAdminLogRecord(r: any): PortalAdminLogRecord {
   };
 }
 
-/** Keeps the rowid a log query selected as `seq`, the order rows were written in and the paging cursor. */
+/** Keeps a log row's `seq`, the order rows were written in and the paging cursor. */
 function withSeq<T>(toRecord: (r: any) => T): (r: any) => T & { seq: number } {
   return (r) => ({ ...toRecord(r), seq: Number(r.seq) });
 }
@@ -854,12 +1001,12 @@ function readLogPage<T>(
   const conditions = [...where];
   const bound: Record<string, string | number> = { ...params, limit: cursor.limit + 1 };
   if (cursor.before !== undefined) {
-    conditions.push('rowid < :before');
+    conditions.push('seq < :before');
     bound.before = cursor.before;
   }
   const filter = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
   const rows = db
-    .prepare(`SELECT rowid AS seq, * FROM ${table} ${filter} ORDER BY rowid DESC LIMIT :limit`)
+    .prepare(`SELECT * FROM ${table} ${filter} ORDER BY seq DESC LIMIT :limit`)
     .all(bound) as any[];
   const page = rows.slice(0, cursor.limit).map(withSeq(toRecord));
   return {
@@ -2288,7 +2435,7 @@ export const store = {
   // ============================================================================
   getCopilotMcpLogs(limit = 150): CopilotMcpLogRecord[] {
     const rows = db
-      .prepare('SELECT * FROM mcp_copilot_logs ORDER BY rowid DESC LIMIT ?')
+      .prepare('SELECT * FROM mcp_copilot_logs ORDER BY seq DESC LIMIT ?')
       .all(limit) as any[];
     return rows.map(toCopilotMcpLogRecord);
   },
@@ -2306,22 +2453,22 @@ export const store = {
     const rows = db
       .prepare(
         `SELECT * FROM (
-           SELECT rowid AS seq, * FROM mcp_copilot_logs
-           WHERE simulated = 0 AND sf_username <> :unverified ORDER BY rowid DESC LIMIT :realLimit
+           SELECT * FROM mcp_copilot_logs
+           WHERE simulated = 0 AND sf_username <> :unverified ORDER BY seq DESC LIMIT :realLimit
          )
          UNION ALL
          SELECT * FROM (
-           SELECT rowid AS seq, * FROM mcp_copilot_logs WHERE simulated <> 0 ORDER BY rowid DESC LIMIT :simulatedLimit
+           SELECT * FROM mcp_copilot_logs WHERE simulated <> 0 ORDER BY seq DESC LIMIT :simulatedLimit
          )
          UNION ALL
          SELECT * FROM (
-           SELECT rowid AS seq, * FROM mcp_copilot_logs
-           WHERE simulated = 0 AND sf_username = :unverified ORDER BY rowid DESC LIMIT :rejectedLimit
+           SELECT * FROM mcp_copilot_logs
+           WHERE simulated = 0 AND sf_username = :unverified ORDER BY seq DESC LIMIT :rejectedLimit
          )
          ORDER BY seq DESC`
       )
       .all({ unverified: UNVERIFIED_CALLER_USERNAME, realLimit, simulatedLimit, rejectedLimit }) as any[];
-    return rows.map(withSeq(toCopilotMcpLogRecord));
+    return rows.map(toCopilotMcpLogRecord);
   },
 
   /**
@@ -2372,13 +2519,19 @@ export const store = {
       .prepare(
         `SELECT timestamp FROM mcp_copilot_logs
          WHERE simulated = 0 AND sf_username <> ?
-         ORDER BY rowid DESC LIMIT 1`
+         ORDER BY seq DESC LIMIT 1`
       )
       .get(UNVERIFIED_CALLER_USERNAME) as { timestamp: string } | undefined;
     return row?.timestamp ?? null;
   },
 
-  recordCopilotMcpLog(input: {
+  /**
+   * Writes one MCP log row. Its kind follows from `simulated` and the user (mcpLogKind): a refused
+   * token is logged as UNVERIFIED_CALLER_USERNAME. The payloads go through stripSensitivePayloadData;
+   * the decision is reduced to names, ids and codes its policy snapshot holds (decisionLogColumns) and
+   * never goes through it, since it holds no value.
+   */
+  recordCopilotMcpLog(input: DecidedBy & {
     sfUsername: string;
     profileId: string;
     profileName: string;
@@ -2386,11 +2539,16 @@ export const store = {
     toolName: string;
     targetObject: string;
     status: 'ALLOWED' | 'DENIED' | 'ERROR';
-    latencyMs: number;
+    /** The latency of a row written without totalMs. */
+    latencyMs?: number;
     rawRequestPayload: unknown;
     rawResponseSummary: unknown;
     /** Callers pass this from a verified token or a server route, never from request input. */
     simulated?: boolean;
+    /** How long verifying the bearer token took, in ms; left out when the row's request verified none. */
+    verificationMs?: number;
+    /** Ms from the request's receipt to this row; latency_ms is written from it. */
+    totalMs?: number;
   }): CopilotMcpLogRecord {
     const id = `mcp_${Date.now().toString(36)}_${crypto.randomBytes(8).toString('hex')}`;
     const timestamp = new Date().toISOString();
@@ -2406,13 +2564,20 @@ export const store = {
     );
     const toolName = storedToolName(input.toolName);
     const targetObject = storedTargetObject(input.targetObject);
+    const simulated = input.simulated === true;
+    const decided = input.decision
+      ? decisionLogColumns(input.decision, policySnapshotCatalog(input.policySnapshot))
+      : null;
+    const totalMs = storedMs(input.totalMs);
 
-    db.prepare(`
+    const { lastInsertRowid } = db.prepare(`
       INSERT INTO mcp_copilot_logs (
         id, timestamp, sf_username, profile_id, profile_name, matched_groups_json,
         tool_name, target_object, status, latency_ms,
-        sanitized_request_payload, sanitized_response_summary, simulated
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        sanitized_request_payload, sanitized_response_summary, simulated, kind,
+        decision_json, decision_stage, decision_code, assigned_group_ids_json, deciding_group_ids_json,
+        policy_revision, caller_profile_id, matched_profile_id, match_method, verification_ms, total_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       timestamp,
@@ -2423,32 +2588,31 @@ export const store = {
       toolName,
       targetObject,
       input.status,
-      input.latencyMs,
+      totalMs ?? input.latencyMs ?? 0,
       sanitizedReq,
       sanitizedRes,
-      input.simulated ? 1 : 0
+      simulated ? 1 : 0,
+      mcpLogKind(simulated, input.sfUsername),
+      decided ? JSON.stringify(decided.decision) : '',
+      decided?.stage ?? '',
+      decided?.code ?? '',
+      JSON.stringify(decided?.assignedGroupIds ?? []),
+      JSON.stringify(decided?.decidingGroupIds ?? []),
+      decided?.policyRevision ?? null,
+      decided?.callerProfileId ?? '',
+      decided?.matchedProfileId ?? '',
+      decided?.matchMethod ?? '',
+      storedMs(input.verificationMs),
+      totalMs
     );
 
-    return {
-      id,
-      timestamp,
-      sfUsername: input.sfUsername,
-      profileId: input.profileId,
-      profileName: input.profileName,
-      matchedGroups: input.matchedGroups,
-      toolName,
-      targetObject,
-      status: input.status,
-      latencyMs: input.latencyMs,
-      sanitizedRequestPayload: sanitizedReq,
-      sanitizedResponseSummary: sanitizedRes,
-      ...(input.simulated ? { simulated: true as const } : {}),
-    };
+    // Read back, so the row returned is the one every reader returns.
+    return toCopilotMcpLogRecord(db.prepare('SELECT * FROM mcp_copilot_logs WHERE seq = ?').get(lastInsertRowid));
   },
 
   getPortalAdminLogs(limit = 150): PortalAdminLogRecord[] {
     const rows = db
-      .prepare('SELECT * FROM portal_admin_logs ORDER BY rowid DESC LIMIT ?')
+      .prepare('SELECT * FROM portal_admin_logs ORDER BY seq DESC LIMIT ?')
       .all(limit) as any[];
     return rows.map(toPortalAdminLogRecord);
   },
@@ -2461,11 +2625,11 @@ export const store = {
     const rows = db
       .prepare(
         `SELECT * FROM (
-           SELECT rowid AS seq, * FROM portal_admin_logs WHERE action <> :action ORDER BY rowid DESC LIMIT :otherLimit
+           SELECT * FROM portal_admin_logs WHERE action <> :action ORDER BY seq DESC LIMIT :otherLimit
          )
          UNION ALL
          SELECT * FROM (
-           SELECT rowid AS seq, * FROM portal_admin_logs WHERE action = :action ORDER BY rowid DESC LIMIT :simulationLimit
+           SELECT * FROM portal_admin_logs WHERE action = :action ORDER BY seq DESC LIMIT :simulationLimit
          )
          ORDER BY seq DESC`
       )

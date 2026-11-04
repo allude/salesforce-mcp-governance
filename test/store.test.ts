@@ -949,7 +949,8 @@ describe('store: groups and profile-group mappings', () => {
 // =============================================================================================
 describe('store: audit logs', () => {
   type CopilotLogInput = Parameters<typeof store.recordCopilotMcpLog>[0];
-  const copilotLog = (overrides: Partial<CopilotLogInput> = {}): CopilotLogInput => ({
+  // Rows written here carry no decision.
+  const copilotLog = (overrides: Partial<Omit<CopilotLogInput, 'decision' | 'policySnapshot'>> = {}): CopilotLogInput => ({
     sfUsername: `rep.${uid()}@acme.example.com`,
     profileId: `00eLOG${uid()}`,
     profileName: 'Store Test Profile',
@@ -1005,7 +1006,7 @@ describe('store: audit logs', () => {
 
     assert.deepEqual(first, newer);
     assert.deepEqual(second, older);
-    const { id, timestamp, sanitizedRequestPayload, sanitizedResponseSummary, ...fields } = first;
+    const { id, timestamp, seq, sanitizedRequestPayload, sanitizedResponseSummary, ...fields } = first;
     assert.deepEqual(fields, {
       sfUsername: newerInput.sfUsername,
       profileId: newerInput.profileId,
@@ -1015,7 +1016,21 @@ describe('store: audit logs', () => {
       targetObject: newerInput.targetObject,
       status: newerInput.status,
       latencyMs: newerInput.latencyMs,
+      // Written without a decision or timings: every one of those reads as not recorded.
+      kind: 'real',
+      decision: null,
+      decisionStage: '',
+      decisionCode: '',
+      assignedGroupIds: [],
+      decidingGroupIds: [],
+      policyRevision: null,
+      callerProfileId: '',
+      matchedProfileId: '',
+      matchMethod: '',
+      verificationMs: null,
+      totalMs: null,
     });
+    assert.equal(seq, Number(older.seq) + 1, 'seq is the write order');
     assert.ok(id && id !== older.id, 'each entry gets its own id');
     assert.ok(!Number.isNaN(Date.parse(timestamp)) && timestamp >= older.timestamp);
     assert.deepEqual(JSON.parse(sanitizedRequestPayload), { objectName: 'Account', limit: 10 });

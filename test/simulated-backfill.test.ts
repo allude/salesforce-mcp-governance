@@ -35,6 +35,13 @@ function insertRow(db: DatabaseSync, id: string, sfUsername: string) {
   ).run(id, sfUsername);
 }
 
+const kinds = (dbPath: string) =>
+  withDb(dbPath, (db) =>
+    Object.fromEntries(
+      (db.prepare('SELECT id, kind FROM mcp_copilot_logs').all() as Array<{ id: string; kind: string }>).map((r) => [r.id, r.kind])
+    )
+  );
+
 const simulatedFlags = (dbPath: string) =>
   withDb(dbPath, (db) =>
     Object.fromEntries(
@@ -85,10 +92,23 @@ describe('backfill of the simulated column', () => {
       rejected: 0,
       similar: 0,
     });
+    // The same boot gives the log table its seq and every row the kind its flags imply.
+    assert.deepEqual(kinds(dbPath), {
+      'route-default': 'simulated',
+      'token-default': 'simulated',
+      real: 'real',
+      rejected: 'rejected',
+      similar: 'real',
+    });
+    assert.deepEqual(
+      withDb(dbPath, (db) => (db.prepare('SELECT id FROM mcp_copilot_logs ORDER BY seq').all() as Array<{ id: string }>).map((r) => r.id)),
+      ['route-default', 'token-default', 'real', 'rejected', 'similar']
+    );
 
     withDb(dbPath, (db) => insertRow(db, 'later-real', 'copilot.user@enterprise.com'));
     bootStore(dbPath);
     assert.equal(simulatedFlags(dbPath)['later-real'], 0, 'the backfill must not run a second time');
+    assert.equal(kinds(dbPath)['later-real'], 'real');
   });
 
   test('does nothing to a database that already has the column', () => {

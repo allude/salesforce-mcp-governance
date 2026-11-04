@@ -4,23 +4,39 @@ import type { GroupObjectPermission } from '../types/governance.js';
 
 export const GRANT_FLAGS = ['canRead', 'canCreate', 'canUpdate', 'canDelete'] as const;
 
+const NOT_AN_OBJECT = 'the entry is not an object';
+const OBJECT_NAME_NOT_TEXT = 'objectName is not text';
+const flagNotBoolean = (flag: (typeof GRANT_FLAGS)[number]) => `${flag} is not true or false`;
+const FIELDS_NOT_NAMES = 'allowedFields is not a list of field names';
+
+/**
+ * Every reason malformedGrantReason gives. The MCP log stores a skipped entry's reason only when it is
+ * one of these, so no other text can reach it.
+ */
+export const MALFORMED_GRANT_REASONS: readonly string[] = [
+  NOT_AN_OBJECT,
+  OBJECT_NAME_NOT_TEXT,
+  ...GRANT_FLAGS.map(flagNotBoolean),
+  FIELDS_NOT_NAMES,
+];
+
 /**
  * Why a stored entry cannot be read as a grant, or null when it can. Such an entry is skipped whole
  * by the policy engine: it grants nothing, whatever part of it looks usable. The reason names a key
  * only, never a value.
  */
 export function malformedGrantReason(entry: unknown): string | null {
-  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return 'the entry is not an object';
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return NOT_AN_OBJECT;
   const grant = entry as Record<string, unknown>;
-  if (typeof grant.objectName !== 'string') return 'objectName is not text';
+  if (typeof grant.objectName !== 'string') return OBJECT_NAME_NOT_TEXT;
   for (const flag of GRANT_FLAGS) {
-    if (grant[flag] !== undefined && typeof grant[flag] !== 'boolean') return `${flag} is not true or false`;
+    if (grant[flag] !== undefined && typeof grant[flag] !== 'boolean') return flagNotBoolean(flag);
   }
   if (
     grant.allowedFields !== undefined &&
     !(Array.isArray(grant.allowedFields) && grant.allowedFields.every((field) => typeof field === 'string'))
   ) {
-    return 'allowedFields is not a list of field names';
+    return FIELDS_NOT_NAMES;
   }
   return null;
 }

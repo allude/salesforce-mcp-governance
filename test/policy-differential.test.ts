@@ -380,9 +380,14 @@ interface ToolCallEffect {
   result: { isError: boolean; text: string } | { rpcError: string };
   /** The Salesforce requests it made: method, path with query, body. */
   salesforce: string[];
-  /** The log rows it wrote, without their latency. */
-  logRows: Array<Omit<LogRow, 'latencyMs'>>;
+  /** The log rows it wrote, without their latency and what the legacy handler could not record. */
+  logRows: Array<Omit<LogRow, LoggedSince>>;
+  /** The decision each row recorded; the legacy handler recorded none. */
+  loggedDecisions: Array<LogRow['decision']>;
 }
+
+/** The timing and decision a row records now: the legacy handler wrote none of them. */
+type LoggedSince = 'latencyMs' | 'totalMs' | 'verificationMs' | 'decision';
 
 const DIFFERENTIAL_TOKEN = 'differential-test-token';
 
@@ -531,7 +536,19 @@ test('tools/call refuses, answers and calls Salesforce as the handlers it replac
       salesforce: sf.calls
         .slice(sfBefore)
         .map((c) => `${c.method} ${c.url.pathname}${c.url.search} ${JSON.stringify(c.body ?? null)}`),
-      logRows: logRows.slice(logBefore).map(({ latencyMs: _latencyMs, ...row }) => row),
+      logRows: logRows
+        .slice(logBefore)
+        .map(
+          ({
+            latencyMs: _latencyMs,
+            totalMs: _totalMs,
+            verificationMs: _verificationMs,
+            decision: _decision,
+            policySnapshot: _policySnapshot,
+            ...row
+          }) => row
+        ),
+      loggedDecisions: logRows.slice(logBefore).map((row) => row.decision),
     };
   }
 
@@ -584,7 +601,10 @@ test('tools/call refuses, answers and calls Salesforce as the handlers it replac
       codesSeen.add(decision.code);
       calls++;
 
-      let expected = before;
+      // Every row records the decision the call was made on; the legacy rows compare without it.
+      assert.deepEqual(now.loggedDecisions, now.logRows.map(() => decision), call);
+      const nowEffect = { result: now.result, salesforce: now.salesforce, logRows: now.logRows };
+      let expected: Omit<ToolCallEffect, 'loggedDecisions'> = before;
       if ('rpcError' in before.result) {
         threw++; // String() of the objectName threw before any check, in both, as it always did
       } else if (
@@ -617,7 +637,7 @@ test('tools/call refuses, answers and calls Salesforce as the handlers it replac
         assert.equal(decision.code, 'INPUT_INVALID', `${call}: refused as invalid input`);
         expected = { ...before, logRows: before.logRows.map((row) => ({ ...row, status: 'DENIED' as const })) };
       }
-      assert.deepEqual(now, expected, call);
+      assert.deepEqual(nowEffect, { result: expected.result, salesforce: expected.salesforce, logRows: expected.logRows }, call);
 
       if (now.salesforce.length > 0) toolsReachingSalesforce.add(tool);
       if (decision.code === 'INPUT_INVALID' && decision.reason === 'Cannot convert object to primitive value') unreadableArgument++;

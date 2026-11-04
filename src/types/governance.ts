@@ -146,6 +146,47 @@ export interface ProfileGroupMapping {
   groupIds: string[];
 }
 
+/** What an MCP log row records: a verified caller's call, a policy simulation, or a refused token. */
+export type McpLogKind = 'real' | 'simulated' | 'rejected';
+
+/** How the caller's Profile was matched to a registered one; '' on a row from before it was recorded. */
+export type McpLogMatchMethod = '' | 'id' | 'name' | 'none';
+
+/**
+ * One stage of a logged decision. It holds names and ids only: an Object or field name the synced
+ * catalog does not hold, and a group id no group has, are stored as `<invalid:len=N>`.
+ */
+export interface McpLogDecisionStep {
+  stage: string;
+  result: 'pass' | 'fail';
+  grantingGroupIds: string[];
+  /** The Object's catalog spelling; null when the step names none. */
+  objectName: string | null;
+  /** In the catalog's spelling, at most 200; fieldNamesDropped counts the rest. */
+  fieldNames: string[];
+  fieldNamesDropped?: number;
+}
+
+/**
+ * A row's decision (decision_json): what decided the call, never why in words and never a value.
+ * Stages are the policy engine's, or 'auth' (the token) and 'upstream' (Salesforce gave no verdict on
+ * it) for a request refused before any policy was read.
+ */
+export interface McpLogDecision {
+  outcome: 'allowed' | 'denied' | 'invalid' | 'error';
+  code: string;
+  /** The stage of the last step: the one that failed, or the last that passed for an allowed call. */
+  stage: string;
+  steps: McpLogDecisionStep[];
+  decidingGroupIds: string[];
+  matchMethod: 'id' | 'name' | 'none';
+  /** null when no policy was read (a refused token or an outage). */
+  policyRevision: number | null;
+  /** Stored group entries the engine skipped as malformed, at most 200; skippedEntriesDropped counts the rest. */
+  skippedEntries?: Array<{ groupId: string; index: number; reason: string }>;
+  skippedEntriesDropped?: number;
+}
+
 export interface CopilotMcpLogRecord {
   id: string;
   timestamp: string;
@@ -156,11 +197,26 @@ export interface CopilotMcpLogRecord {
   toolName: string;
   targetObject: string;
   status: 'ALLOWED' | 'DENIED' | 'ERROR';
-  latencyMs: number;
+  latencyMs: number; // total_ms on rows that have it, so it runs from request receipt
   sanitizedRequestPayload: string; // JSON with PII / record values stripped
   sanitizedResponseSummary: string; // JSON with record values stripped
   simulated?: true; // Present only on rows from the policy simulator, never on real traffic
-  seq?: number; // Write order (SQLite rowid) on rows from the Admin API log lists; the paging cursor
+  seq?: number; // Write order (the seq column), set by every reader; the paging cursor
+  // The decision and timing part of the row. The Admin API always sends these; they are optional so
+  // that the portal can still show a row from a server that predates them. On a row written before
+  // they existed, every one but kind is not recorded: '' for text, [] for lists, null otherwise.
+  kind?: McpLogKind;
+  decision?: McpLogDecision | null;
+  decisionStage?: string; // decision.stage, kept in a column of its own
+  decisionCode?: string; // decision.code, likewise
+  assignedGroupIds?: string[]; // The groups assigned to the caller's Profile when the call was decided
+  decidingGroupIds?: string[]; // For an allowed call, the groups that granted it
+  policyRevision?: number | null; // The policy revision the call was decided on
+  callerProfileId?: string; // The verified caller's Profile id ('' when there is none, or no caller)
+  matchedProfileId?: string; // The registered Profile the decision matched ('' when none)
+  matchMethod?: McpLogMatchMethod;
+  verificationMs?: number | null; // How long verifying the bearer token took
+  totalMs?: number | null; // From request receipt to the row
 }
 
 export interface PortalAdminLogRecord {
@@ -181,7 +237,7 @@ export interface PortalAdminLogRecord {
   targetId?: string; // The stable id of that target (a group id, a Profile id, a settings section); '' when none
   diff?: Record<string, unknown> | null; // Names, ids and flags of what changed, never a secret; null when not recorded
   correlationId?: string; // Shared by every row written while handling one Admin API request; '' is not an id
-  seq?: number; // Write order (SQLite rowid) on rows from the Admin API log lists; the paging cursor
+  seq?: number; // Write order (the seq column) on rows from the Admin API log lists; the paging cursor
 }
 
 export interface OktaSsoSettings {

@@ -6,10 +6,13 @@ import {
   resolveSalesforceUserFromToken,
   SalesforceUnavailableError,
   salesforceAuthorizationBase,
+  TokenInvalidError,
+  tokenRejectionCode,
 } from '../salesforce/client.js';
 import { VerificationBusyError } from '../salesforce/verificationGate.js';
+import { tokenRejectedDecision, UPSTREAM_UNAVAILABLE_DECISION } from '../rbac/decisionLog.js';
 import { parseBearerToken } from './bearer.js';
-import { createUserScopedMcpServer } from './server.js';
+import { createUserScopedMcpServer, elapsedMs } from './server.js';
 import { config } from '../config.js';
 import { store, UNVERIFIED_CALLER_USERNAME } from '../db/store.js';
 
@@ -22,6 +25,8 @@ export async function handleMcpStreamableHttpRequest(
   req: Request,
   res: Response
 ): Promise<void> {
+  // Every log row this request writes is timed from here, so its total includes the token verification.
+  const receivedAt = performance.now();
   const bearerToken = parseBearerToken(req.headers.authorization);
   if (!bearerToken) {
     const authUrl = salesforceAuthorizationBase();
@@ -45,15 +50,18 @@ export async function handleMcpStreamableHttpRequest(
     | undefined;
 
   let verifiedUser;
+  const verificationStartedAt = performance.now();
+  let verificationMs: number;
   try {
     // Refused like any invalid token, so it is logged and counts toward the failed-attempt limit.
     if (config.isProd && isSimulatorToken(bearerToken)) {
-      throw new Error('Simulator tokens are not accepted in production');
+      throw new TokenInvalidError('Simulator tokens are not accepted in production');
     }
     verifiedUser = await resolveSalesforceUserFromToken(
       bearerToken,
       instanceUrlHint
     );
+    verificationMs = elapsedMs(verificationStartedAt);
   } catch (err: any) {
     // Capacity, not a verdict on the token: no log row, and the client keeps its token and retries.
     if (err instanceof VerificationBusyError) {
@@ -65,8 +73,11 @@ export async function handleMcpStreamableHttpRequest(
     // but a token that verified before keeps its exemption, and the client is told to retry, not
     // that its token is invalid.
     const unavailable = err instanceof SalesforceUnavailableError;
+    const failedVerificationMs = elapsedMs(verificationStartedAt);
     if (!unavailable) forgetVerifiedToken(bearerToken);
     res.locals.tokenNotVerified = true;
+    // A refused token is DENIED at 'auth' with the reason's code; no verdict from Salesforce is an ERROR
+    // at 'upstream'. Either way the caller is unverified, so the row's kind is 'rejected'.
     store.recordCopilotMcpLog({
       sfUsername: UNVERIFIED_CALLER_USERNAME,
       profileId: 'unverified',
@@ -74,8 +85,10 @@ export async function handleMcpStreamableHttpRequest(
       matchedGroups: [],
       toolName: 'mcp_authenticate',
       targetObject: '*',
-      status: 'DENIED',
-      latencyMs: 1,
+      status: unavailable ? 'ERROR' : 'DENIED',
+      decision: unavailable ? UPSTREAM_UNAVAILABLE_DECISION : tokenRejectedDecision(tokenRejectionCode(err)),
+      verificationMs: failedVerificationMs,
+      totalMs: elapsedMs(receivedAt),
       rawRequestPayload: { method: req.body?.method || 'unknown' },
       rawResponseSummary: { error: err?.message || 'Token validation failed' },
     });
@@ -111,7 +124,7 @@ export async function handleMcpStreamableHttpRequest(
       enableJsonResponse: true,
     });
 
-    const mcpServer = createUserScopedMcpServer(verifiedUser);
+    const mcpServer = createUserScopedMcpServer(verifiedUser, { receivedAt, verificationMs });
 
     res.on('close', () => {
       transport.close().catch(() => {});

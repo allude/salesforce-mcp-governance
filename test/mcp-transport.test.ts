@@ -962,6 +962,173 @@ test('Org ID lock also applies to an identity that was cached before the lock wa
 });
 
 // ---------------------------------------------------------------------------------------------
+// 7b. The log row of a refused token
+// ---------------------------------------------------------------------------------------------
+
+/** The rows written since `existingIds` was taken. */
+function rowsWrittenSince(existingIds: Set<string>) {
+  return store.getCopilotMcpLogs(1_000_000).filter((row) => !existingIds.has(row.id));
+}
+
+const logIds = () => new Set(store.getCopilotMcpLogs(1_000_000).map((row) => row.id));
+
+/** POST /mcp tools/list, returning the body exactly as it came over the wire. */
+async function rawRpc(h: Harness, token: string, headers: Record<string, string> = {}) {
+  const res = await fetch(`${h.server.baseUrl}/mcp`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/event-stream',
+      Authorization: `Bearer ${token}`,
+      'X-Forwarded-For': nextClientIp(),
+      ...headers,
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+  });
+  return { status: res.status, headers: res.headers, text: await res.text() };
+}
+
+/** The 401 /mcp has always sent for a refused token: the reason in the challenge and in the body. */
+function expectedRejection(message: string) {
+  return {
+    status: 401,
+    challenge: `Bearer error="invalid_token", error_description="${message}", resource_metadata="${RESOURCE_METADATA_URL}"`,
+    text: JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message: `Unauthorized: ${message}` }, id: null }),
+  };
+}
+
+function assertRejectedRow(row: any, code: string) {
+  assert.equal(row.sfUsername, UNVERIFIED_CALLER_USERNAME);
+  assert.equal(row.toolName, 'mcp_authenticate');
+  assert.equal(row.status, 'DENIED');
+  assert.equal(row.kind, 'rejected');
+  assert.equal(row.decisionStage, 'auth');
+  assert.equal(row.decisionCode, code);
+  assert.deepEqual(row.decision, {
+    outcome: 'denied',
+    code,
+    stage: 'auth',
+    steps: [{ stage: 'auth', result: 'fail', grantingGroupIds: [], objectName: null, fieldNames: [] }],
+    decidingGroupIds: [],
+    matchMethod: 'none',
+    policyRevision: null,
+  });
+  assert.deepEqual(
+    [row.assignedGroupIds, row.decidingGroupIds, row.policyRevision, row.callerProfileId, row.matchedProfileId, row.matchMethod],
+    [[], [], null, '', '', 'none']
+  );
+  assert.ok(Number.isInteger(row.verificationMs) && row.verificationMs >= 1, `verificationMs ${row.verificationMs}`);
+  assert.ok(Number.isInteger(row.totalMs) && row.totalMs >= row.verificationMs, `totalMs ${row.totalMs} >= ${row.verificationMs}`);
+  assert.equal(row.latencyMs, row.totalMs, 'latency_ms is the total');
+}
+
+test('each refused token writes one DENIED row at auth with its code and timings, and the 401 is byte for byte as before', async (t) => {
+  const h = await startHarness(t);
+  preserveSalesforceSettings(t);
+  const seeded = seedProfile(t, ['list_enabled_objects']);
+  const lockedOrg = sfId('00D');
+
+  const cases: Array<{ label: string; code: string; message: string; send: () => Promise<Awaited<ReturnType<typeof rawRpc>>> }> = [
+    {
+      label: 'a token Salesforce does not know (userinfo 401)',
+      code: 'TOKEN_INVALID',
+      message: 'Salesforce token verification failed (HTTP 401)',
+      send: () => rawRpc(h, `tok_unknown_${uid()}${uid()}`),
+    },
+    {
+      label: 'a simulator token with a made-up signature',
+      code: 'TOKEN_INVALID',
+      message: 'Invalid simulator token signature',
+      send: () => {
+        const [payload] = createSimulatorToken({ profileId: seeded.profileId, profileName: seeded.profileName }).split('.');
+        return rawRpc(h, `${payload}.${crypto.randomBytes(32).toString('base64url')}`);
+      },
+    },
+    {
+      label: 'a simulator token in production',
+      code: 'TOKEN_INVALID',
+      message: 'Simulator tokens are not accepted in production',
+      send: async () => {
+        const token = createSimulatorToken({ profileId: seeded.profileId, profileName: seeded.profileName });
+        const mutable = config as { isProd: boolean };
+        mutable.isProd = true;
+        try {
+          return await rawRpc(h, token);
+        } finally {
+          mutable.isProd = false;
+        }
+      },
+    },
+    {
+      label: 'a token from an org the Org ID lock refuses',
+      code: 'ORG_LOCK_VIOLATION',
+      message: 'Salesforce org is not permitted by the Org ID lock',
+      send: async () => {
+        store.updateSalesforceSettings({ enforceOrgIdLock: true, expectedOrgId: lockedOrg });
+        try {
+          return await rawRpc(h, addSalesforceUser(h.sf, { organizationId: sfId('00D') }));
+        } finally {
+          store.updateSalesforceSettings({ enforceOrgIdLock: false });
+        }
+      },
+    },
+    {
+      label: 'an X-Salesforce-Instance-Url outside SALESFORCE_ALLOWED_DOMAINS',
+      code: 'INSTANCE_NOT_ALLOWED',
+      message: "Salesforce instance host 'evil.example.com' is not in SALESFORCE_ALLOWED_DOMAINS",
+      send: () => rawRpc(h, addSalesforceUser(h.sf), { 'X-Salesforce-Instance-Url': 'https://evil.example.com' }),
+    },
+    {
+      label: 'an X-Salesforce-Instance-Url naming a port',
+      code: 'INSTANCE_NOT_ALLOWED',
+      message: 'Salesforce instance URL must not name a port other than 443',
+      send: () => rawRpc(h, addSalesforceUser(h.sf), { 'X-Salesforce-Instance-Url': 'https://acme.my.salesforce.com:8443' }),
+    },
+  ];
+
+  for (const { label, code, message, send } of cases) {
+    await t.test(label, async () => {
+      const existing = logIds();
+      const res = await send();
+
+      const expected = expectedRejection(message);
+      assert.deepEqual({ status: res.status, challenge: challengeOf(res), text: res.text }, expected);
+      const rows = rowsWrittenSince(existing);
+      assert.equal(rows.length, 1, JSON.stringify(rows));
+      assertRejectedRow(rows[0], code);
+    });
+  }
+
+  // A request with no token at all is answered without a row, as before.
+  const existing = logIds();
+  assert.equal((await rpc(h, null, 'tools/list')).status, 401);
+  assert.deepEqual(rowsWrittenSince(existing), []);
+});
+
+test('a refused token row is timed from receipt: a slow Salesforce answer shows in verificationMs and totalMs', async (t) => {
+  const h = await startHarness(t);
+  const delayMs = 150;
+  const mockedFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: any, init?: any) => {
+    const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+    if (url.pathname === '/services/oauth2/userinfo') await new Promise((resolve) => setTimeout(resolve, delayMs));
+    return mockedFetch(input, init);
+  }) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = mockedFetch;
+  });
+
+  const existing = logIds();
+  const res = await rawRpc(h, `tok_slow_${uid()}${uid()}`);
+
+  assert.equal(res.status, 401);
+  const [row] = rowsWrittenSince(existing);
+  assertRejectedRow(row, 'TOKEN_INVALID');
+  assert.ok(row.verificationMs! >= delayMs, `verificationMs ${row.verificationMs} includes the ${delayMs} ms wait`);
+  assert.ok(row.totalMs! >= row.verificationMs!);
+});
+
+// ---------------------------------------------------------------------------------------------
 // 8. CORS
 // ---------------------------------------------------------------------------------------------
 

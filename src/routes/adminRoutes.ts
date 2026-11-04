@@ -49,6 +49,7 @@ import {
   resolveEffectiveProfilePermissions,
 } from '../rbac/policyEngine.js';
 import { targetObjectArgument } from '../mcp/toolArguments.js';
+import { elapsedMs } from '../mcp/server.js';
 
 export const adminRouter = Router();
 
@@ -1902,6 +1903,7 @@ adminRouter.post('/test-mcp-access', async (req: Request, res: Response) => {
 });
 
 async function runMcpAccessSimulation(req: Request, res: Response): Promise<void> {
+  const startedAt = performance.now();
   const { profileId, toolName, targetObject, samplePayload, username } =
     req.body || {};
   const profile = store.getProfileById(String(profileId || ''));
@@ -1935,7 +1937,8 @@ async function runMcpAccessSimulation(req: Request, res: Response): Promise<void
   const { decision: _decision, ...evaluation } = policyEvaluationResult(decision);
   const status = decisionLogStatus(decision);
 
-  // Also record this test call into the Copilot MCP log (with sensitive data stripped!)
+  // Also record this test call into the Copilot MCP log (with sensitive data stripped!), with its
+  // decision and how long the simulation took. No bearer token was verified for it.
   store.recordCopilotMcpLog({
     simulated: true,
     sfUsername: user.username,
@@ -1945,7 +1948,9 @@ async function runMcpAccessSimulation(req: Request, res: Response): Promise<void
     toolName: simulatedTool,
     targetObject: simulatedTarget,
     status,
-    latencyMs: Math.floor(18 + Math.random() * 65),
+    decision,
+    policySnapshot: snapshot,
+    totalMs: elapsedMs(startedAt),
     rawRequestPayload: samplePayload || {
       objectName: targetObject || '*',
       tool: toolName,

@@ -120,6 +120,26 @@ describe('rejected bearer tokens are limited per client IP', () => {
     assert.equal((await mcpRequest(server.baseUrl, junkToken(), 'tools/list', {}, client)).status, 429);
   });
 
+  test('every refused attempt up to the limit is one DENIED row at auth, TOKEN_INVALID, and a 429 writes none of any kind', async () => {
+    const client = freshClient();
+    const existing = new Set(store.getCopilotMcpLogs(1_000_000).map((row) => row.id));
+    await exhaust(client);
+    const rows = store.getCopilotMcpLogs(1_000_000).filter((row) => !existing.has(row.id));
+
+    assert.equal(rows.length, FAILED_TOKEN_LIMIT);
+    for (const row of rows) {
+      assert.deepEqual(
+        [row.status, row.kind, row.decisionStage, row.decisionCode, row.decision?.outcome, row.policyRevision],
+        ['DENIED', 'rejected', 'auth', 'TOKEN_INVALID', 'denied', null]
+      );
+      assert.ok(row.verificationMs !== null && row.totalMs !== null && row.totalMs! >= row.verificationMs!, JSON.stringify(row));
+    }
+
+    const blocked = await mcpRequest(server.baseUrl, junkToken(), 'tools/list', {}, client);
+    assert.equal(blocked.status, 429);
+    assert.equal(store.getCopilotMcpLogs(1_000_000).filter((row) => !existing.has(row.id)).length, FAILED_TOKEN_LIMIT);
+  });
+
   test('forged simulator tokens count like any other rejected token', async () => {
     const client = freshClient();
     for (let i = 0; i < FAILED_TOKEN_LIMIT; i++) {

@@ -164,7 +164,23 @@ function refusalPayload(
   };
 }
 
-export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server {
+/** When the HTTP request a server answers arrived, and how long its bearer token took to verify. */
+export interface McpRequestTiming {
+  /** performance.now() at receipt. Every tools/call row's totalMs runs from here to that call's row. */
+  receivedAt: number;
+  verificationMs: number;
+}
+
+/** Whole milliseconds since `since` (a performance.now() reading), rounded up and at least 1, as latency always was. */
+export function elapsedMs(since: number): number {
+  return Math.max(1, Math.ceil(performance.now() - since));
+}
+
+/**
+ * One MCP server per HTTP request, scoped to its verified caller. With `timing`, each tools/call row is
+ * timed from the request's receipt and records the token verification; without it, from the call itself.
+ */
+export function createUserScopedMcpServer(user: VerifiedSalesforceUser, timing?: McpRequestTiming): Server {
   const server = new Server(
     {
       name: 'salesforce-governance-mcp-server',
@@ -194,7 +210,7 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
 
   // 2. tools/call — Enforce Profile -> Group -> Object/Field permissions and log with stripped PII
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const startTime = Date.now();
+    const receivedAt = timing?.receivedAt ?? performance.now();
     const toolName = request.params.name;
     const args = (request.params.arguments || {}) as Record<string, any>;
     const targetObject = targetObjectArgument(args);
@@ -203,8 +219,16 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
     const snapshot = loadPolicySnapshot();
     const decision = evaluatePolicy(user, toolName, args, snapshot);
     const matchedGroups = decision.assignedGroups.map((g) => g.name);
+    // What every row of this call records besides its outcome: the decision, the snapshot it was made from
+    // (its names are checked against that, not the tables as they stand when the row is written) and the
+    // timings, each row's total measured when it is written.
+    const decided = () => ({
+      decision,
+      policySnapshot: snapshot,
+      verificationMs: timing?.verificationMs,
+      totalMs: elapsedMs(receivedAt),
+    });
     if (decision.outcome !== 'allowed') {
-      const latencyMs = Math.max(1, Date.now() - startTime);
       const refusal = refusalPayload(decision, toolName, targetObject, user);
       store.recordCopilotMcpLog({
         sfUsername: user.username,
@@ -215,7 +239,7 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
         toolName,
         targetObject,
         status: decisionLogStatus(decision),
-        latencyMs,
+        ...decided(),
         rawRequestPayload: args,
         rawResponseSummary: refusal.summary,
       });
@@ -387,7 +411,6 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
         }
       }
 
-      const latencyMs = Math.max(1, Date.now() - startTime);
       store.recordCopilotMcpLog({
         sfUsername: user.username,
         simulated: user.simulated,
@@ -397,7 +420,7 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
         toolName,
         targetObject,
         status: 'ALLOWED',
-        latencyMs,
+        ...decided(),
         rawRequestPayload: args,
         rawResponseSummary: responsePayload,
       });
@@ -413,7 +436,6 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
     } catch (err: any) {
       // The policy allowed the call, so what failed is the call itself: Salesforce, or an org that no
       // longer has any of the fields it writes.
-      const latencyMs = Math.max(1, Date.now() - startTime);
       store.recordCopilotMcpLog({
         sfUsername: user.username,
         simulated: user.simulated,
@@ -423,7 +445,7 @@ export function createUserScopedMcpServer(user: VerifiedSalesforceUser): Server 
         toolName,
         targetObject,
         status: 'ERROR',
-        latencyMs,
+        ...decided(),
         rawRequestPayload: args,
         rawResponseSummary: { error: err.message || 'Execution error' },
       });
