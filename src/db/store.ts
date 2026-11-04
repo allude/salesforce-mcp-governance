@@ -29,6 +29,9 @@ import {
   AccessGroupChangeSource,
   AccessGroupHistoryEntry,
   AccessGroupSnapshot,
+  SearchHit,
+  SearchHitKind,
+  ShellSummary,
 } from '../types/governance.js';
 import { describeGroupChanges } from '../groups/groupGrants.js';
 import {
@@ -3138,6 +3141,137 @@ export const store = {
       )
       .get(UNVERIFIED_CALLER_USERNAME) as { timestamp: string } | undefined;
     return row?.timestamp ?? null;
+  },
+
+  /**
+   * The shell's figures (GET /api/admin/summary), each from a COUNT query: the sidebar and header
+   * are polled every few seconds, so nothing here reads whole tables into memory.
+   */
+  getShellSummary(nowMs: number): Omit<ShellSummary, 'serverTime'> {
+    const count = (sql: string, ...params: Array<string | number>): number =>
+      Number((db.prepare(sql).get(...params) as { n: number }).n);
+    const since = new Date(nowMs - 24 * 3_600_000).toISOString();
+    const org = db
+      .prepare(
+        'SELECT connection_status, auth_mode, connected_org_id, last_connected_at FROM sf_connection_settings WHERE id = 1'
+      )
+      .get() as
+      | { connection_status: string; auth_mode: string; connected_org_id: string; last_connected_at: string | null }
+      | undefined;
+    const connectionStatus = (['connected', 'disconnected', 'error', 'not_verified'] as const).find(
+      (status) => status === org?.connection_status
+    ) ?? 'disconnected';
+    const counts = {
+      profiles: count('SELECT COUNT(*) AS n FROM sf_profiles'),
+      objects: count('SELECT COUNT(*) AS n FROM sf_objects'),
+      enabledObjects: count('SELECT COUNT(*) AS n FROM sf_objects WHERE enabled <> 0'),
+      fields: count('SELECT COUNT(*) AS n FROM sf_object_fields'),
+      groups: count('SELECT COUNT(*) AS n FROM access_groups'),
+      mappedProfiles: count('SELECT COUNT(DISTINCT profile_id) AS n FROM profile_group_memberships'),
+      portalUsers: count('SELECT COUNT(*) AS n FROM portal_users'),
+    };
+    const lastMcpCallAt = this.getLastRealMcpCallAt();
+    const steps = [
+      { id: 'org', label: 'Connect the Salesforce org', done: connectionStatus === 'connected' },
+      { id: 'profiles', label: 'Sync Profiles', done: counts.profiles > 0 },
+      { id: 'objects', label: 'Enable at least one SObject', done: counts.enabledObjects > 0 },
+      { id: 'groups', label: 'Create an Access Group', done: counts.groups > 0 },
+      { id: 'mappings', label: 'Map a Profile to a group', done: counts.mappedProfiles > 0 },
+      { id: 'first_call', label: 'Receive a verified MCP call', done: lastMcpCallAt !== null },
+    ];
+    return {
+      policyRevision: this.getPolicyRevision(),
+      lastMcpCallAt,
+      org: {
+        connectionStatus,
+        authMode: org?.auth_mode === 'simulated' ? 'simulated' : 'jwt_bearer',
+        connectedOrgId: org?.connected_org_id || '',
+        lastConnectedAt: org?.last_connected_at || null,
+      },
+      counts,
+      missingInOrg: {
+        profiles: count('SELECT COUNT(*) AS n FROM sf_profiles WHERE missing_in_org <> 0'),
+        objects: count('SELECT COUNT(*) AS n FROM sf_objects WHERE missing_in_org <> 0'),
+        fields: count('SELECT COUNT(*) AS n FROM sf_object_fields WHERE missing_in_org <> 0'),
+      },
+      badges: {
+        mcpDeniedOrError24h: count(
+          `SELECT COUNT(*) AS n FROM mcp_copilot_logs
+           WHERE simulated = 0 AND sf_username <> ? AND timestamp >= ? AND status IN ('DENIED', 'ERROR')`,
+          UNVERIFIED_CALLER_USERNAME,
+          since
+        ),
+        adminFailedOrDenied24h: count(
+          `SELECT COUNT(*) AS n FROM portal_admin_logs WHERE timestamp >= ? AND result IN ('FAILED', 'DENIED')`,
+          since
+        ),
+        groupWarnings: { available: false, reason: 'Group warnings arrive with group validation (Step 3).' },
+        postureFailing: { available: false, reason: 'Posture checks arrive with the security posture work (Step 5).' },
+      },
+      setup: { done: steps.filter((step) => step.done).length, total: steps.length, steps },
+    };
+  },
+
+  /**
+   * GET /api/admin/search: identifiers that contain `q` (case-insensitive), at most `perKind` of each
+   * kind. Log events match on their id only, so no log content, payload or setting can come back.
+   */
+  searchIdentifiers(q: string, perKind = 8): SearchHit[] {
+    const like = `%${q.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+    const rows = (sql: string, ...params: Array<string | number>) =>
+      db.prepare(sql).all(...params) as Array<{ id: string; label: string }>;
+    const hits: SearchHit[] = [];
+    const add = (kind: SearchHitKind, found: Array<{ id: string; label: string }>) =>
+      hits.push(...found.map((row) => ({ kind, id: String(row.id), label: String(row.label ?? '') })));
+    add(
+      'profile',
+      rows(
+        `SELECT id, name AS label FROM sf_profiles
+         WHERE id LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\' ORDER BY name LIMIT ?`,
+        like, like, perKind
+      )
+    );
+    add(
+      'object',
+      rows(
+        `SELECT object_name AS id, label FROM sf_objects
+         WHERE object_name LIKE ? ESCAPE '\\' OR label LIKE ? ESCAPE '\\' ORDER BY object_name LIMIT ?`,
+        like, like, perKind
+      )
+    );
+    add(
+      'field',
+      rows(
+        `SELECT object_name || '.' || field_name AS id, label FROM sf_object_fields
+         WHERE (object_name || '.' || field_name) LIKE ? ESCAPE '\\' OR label LIKE ? ESCAPE '\\'
+         ORDER BY object_name, field_name LIMIT ?`,
+        like, like, perKind
+      )
+    );
+    add(
+      'group',
+      rows(
+        `SELECT id, name AS label FROM access_groups
+         WHERE id LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\' ORDER BY name LIMIT ?`,
+        like, like, perKind
+      )
+    );
+    const needle = q.toLowerCase();
+    add(
+      'tool',
+      AVAILABLE_MCP_ACTIONS.filter((action) => action.id.includes(needle))
+        .slice(0, perKind)
+        .map((action) => ({ id: action.id, label: '' }))
+    );
+    add(
+      'mcp_event',
+      rows(`SELECT id, '' AS label FROM mcp_copilot_logs WHERE id LIKE ? ESCAPE '\\' ORDER BY seq DESC LIMIT ?`, like, perKind)
+    );
+    add(
+      'admin_event',
+      rows(`SELECT id, '' AS label FROM portal_admin_logs WHERE id LIKE ? ESCAPE '\\' ORDER BY seq DESC LIMIT ?`, like, perKind)
+    );
+    return hits;
   },
 
   /**

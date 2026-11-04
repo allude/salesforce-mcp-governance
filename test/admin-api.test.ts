@@ -385,6 +385,8 @@ describe('Admin REST API', () => {
 
       const attempts: Array<[string, string, unknown?]> = [
         ['GET', '/api/admin/overview'],
+        ['GET', '/api/admin/summary'],
+        ['GET', '/api/admin/search?q=admin'],
         ['POST', '/api/admin/profiles', { id: profileId, name: 'Unauthenticated' }],
         ['PUT', '/api/admin/okta', { enabled: true, clientSecret: `unauthenticated-${RUN}` }],
         ['POST', '/api/admin/test-mcp-access', { profileId: simulatedProfileId, toolName: 'list_enabled_objects' }],
@@ -1806,6 +1808,101 @@ describe('Admin REST API', () => {
       const second = await mutate(admin, 'PUT', '/api/admin/sf-settings', { expectedOrgId: orgId }, 'UPDATE_SF_SETTINGS');
       const { updatedAt: _second, ...afterSecond } = second.body.sfSettings;
       assert.deepEqual(afterSecond, { ...before, apiVersion: 'v59.0', expectedOrgId: orgId });
+    });
+  });
+
+  // ----------------------------------------------------------------------------------------------
+  describe('8b. Shell summary and identifier search', () => {
+    it('GET /summary needs a session but no CSRF token, and counts what the store holds', async () => {
+      const admin = await signIn();
+      const profileId = newProfileId();
+      store.upsertProfile(profileId, `Summary ${RUN}`);
+      try {
+        const res = await call({ ip: admin.ip, cookie: admin.cookie }, 'GET', '/api/admin/summary');
+        assert.equal(res.status, 200, JSON.stringify(res.body));
+        assert.equal(res.body.counts.profiles, store.getProfiles().length);
+        assert.equal(res.body.counts.groups, store.getGroups().length);
+        assert.equal(res.body.counts.enabledObjects, store.getObjects().filter((o) => o.enabled).length);
+        assert.equal(res.body.policyRevision, store.getPolicyRevision());
+        assert.equal(res.body.lastMcpCallAt, store.getLastRealMcpCallAt());
+        assert.equal(res.body.org.connectionStatus, store.getSalesforceSettings().connectionStatus);
+        assert.equal(res.body.setup.total, 6);
+        assert.equal(res.body.badges.groupWarnings.available, false);
+        assert.match(res.headers.get('etag') || '', /^"[A-Za-z0-9_-]+"$/);
+      } finally {
+        store.deleteProfile(profileId);
+      }
+    });
+
+    it('GET /summary answers 304 to an unchanged ETag and a new body once something changes', async () => {
+      const admin = await signIn();
+      const first = await call(admin, 'GET', '/api/admin/summary');
+      const etag = first.headers.get('etag') || '';
+      assert.ok(etag);
+
+      const unchanged = await fetch(`${server.baseUrl}/api/admin/summary`, {
+        headers: { 'X-Forwarded-For': admin.ip, Cookie: admin.cookie || '', 'If-None-Match': etag },
+      });
+      assert.equal(unchanged.status, 304);
+
+      const profileId = newProfileId();
+      store.upsertProfile(profileId, `Summary change ${RUN}`);
+      try {
+        const changed = await fetch(`${server.baseUrl}/api/admin/summary`, {
+          headers: { 'X-Forwarded-For': admin.ip, Cookie: admin.cookie || '', 'If-None-Match': etag },
+        });
+        assert.equal(changed.status, 200);
+        assert.notEqual(changed.headers.get('etag'), etag);
+      } finally {
+        store.deleteProfile(profileId);
+      }
+    });
+
+    it('GET /search needs a session but no CSRF token and answers identifiers only', async () => {
+      const admin = await signIn();
+      const profileId = newProfileId();
+      store.upsertProfile(profileId, `Searchable ${RUN}`);
+      try {
+        const res = await call({ ip: admin.ip, cookie: admin.cookie }, 'GET', `/api/admin/search?q=${encodeURIComponent(`searchable ${RUN}`)}`);
+        assert.equal(res.status, 200, JSON.stringify(res.body));
+        assert.deepEqual(res.body.hits, [{ kind: 'profile', id: profileId, label: `Searchable ${RUN}` }]);
+
+        const tools = await call(admin, 'GET', '/api/admin/search?q=soql');
+        assert.ok(tools.body.hits.some((hit: any) => hit.kind === 'tool' && hit.id === 'soql_query'));
+        for (const hit of tools.body.hits) assert.deepEqual(Object.keys(hit).sort(), ['id', 'kind', 'label']);
+
+        // LIKE wildcards are matched literally, not as patterns.
+        assert.deepEqual((await call(admin, 'GET', '/api/admin/search?q=%25%25')).body.hits, []);
+        assert.deepEqual((await call(admin, 'GET', '/api/admin/search?q=a')).body.hits, [], 'one character is too short');
+        assert.equal((await call(admin, 'GET', `/api/admin/search?q=${'x'.repeat(101)}`)).status, 400);
+        assert.equal((await call(admin, 'GET', '/api/admin/search?q=a&q=b')).status, 400);
+      } finally {
+        store.deleteProfile(profileId);
+      }
+    });
+
+    it('neither /summary nor /search returns a stored secret', async (t) => {
+      t.after(snapshotSettingsRow('okta_config'));
+      const admin = await signIn();
+      const clientSecret = `okta-summary-secret-${RUN}-${crypto.randomBytes(12).toString('hex')}`;
+      await mutate(
+        admin,
+        'PUT',
+        '/api/admin/okta',
+        { enabled: true, oktaDomain: `dev-${RUN}.okta.com`, clientId: `client-${RUN}`, clientSecret, adminGroup: 'MCP-Admins' },
+        'UPDATE_OKTA_SSO',
+        `dev-${RUN}.okta.com`
+      );
+      const bodies = [
+        await call(admin, 'GET', '/api/admin/summary'),
+        await call(admin, 'GET', `/api/admin/search?q=${encodeURIComponent(clientSecret.slice(0, 30))}`),
+        await call(admin, 'GET', '/api/admin/search?q=okta'),
+      ].map((res) => JSON.stringify(res.body));
+      for (const body of bodies) {
+        assert.ok(!body.includes(clientSecret), 'the Okta client secret leaked');
+        assert.ok(!/BEGIN [A-Z ]*PRIVATE KEY/.test(body), 'a private key leaked');
+        assert.ok(!body.includes(admin.csrfToken || 'no-token'), 'the CSRF token leaked');
+      }
     });
   });
 
