@@ -1161,23 +1161,27 @@ describe('Admin REST API', () => {
 
   // ----------------------------------------------------------------------------------------------
   describe('7. Groups and the profile-group matrix', () => {
-    const readAccounts = {
-      objectName: 'Account',
+    /** A Read grant on an object this test adds to Salesforce > Objects, as POST /groups stores it. */
+    const readGrant = (objectName: string) => ({
+      objectName,
       canRead: true,
       canCreate: false,
       canUpdate: false,
       canDelete: false,
       allowedFields: ['Id', 'Name'],
-    };
+    });
 
     it('POST /groups creates a group, and posting its id again updates it', async (t) => {
       const admin = await signIn();
+      const objectName = addObject(t, 'GroupReaders');
       const name = newGroupName('Account Readers');
+      // Not echoed as sent on purpose: the grant is stored as the catalog spells it, with every flag
+      // set and the unknown key dropped, and the group starts at version 1.
       const input = {
-        name,
-        description: 'Read Accounts',
+        name: `  ${name}  `,
+        description: ' Read Accounts ',
         allowedActions: ['list_enabled_objects', 'soql_query'],
-        objectPermissions: [readAccounts],
+        objectPermissions: [{ objectName: objectName.toUpperCase(), canRead: true, allowedFields: ['id', 'NAME'], note: 'dropped' }],
       };
 
       const created = await mutate(admin, 'POST', '/api/admin/groups', input, 'CREATE_GROUP', name);
@@ -1187,20 +1191,100 @@ describe('Admin REST API', () => {
       });
       assert.match(id, /^grp_/);
       const { id: _id, updatedAt: _updatedAt, ...stored } = created.body.group;
-      assert.deepEqual(stored, input);
+      assert.deepEqual(stored, {
+        name,
+        description: 'Read Accounts',
+        allowedActions: input.allowedActions,
+        objectPermissions: [readGrant(objectName)],
+        version: 1,
+      });
 
       const renamed = newGroupName('Account Editors');
       const update = {
         id,
+        expectedVersion: 1,
         name: renamed,
         description: 'Read and update Accounts',
         allowedActions: ['list_enabled_objects', 'soql_query', 'update_record'],
-        objectPermissions: [{ ...readAccounts, canUpdate: true }],
+        objectPermissions: [{ ...readGrant(objectName), canUpdate: true }],
       };
       const updated = await mutate(admin, 'POST', '/api/admin/groups', update, 'UPDATE_GROUP', renamed);
       const { updatedAt: _changedAt, ...storedUpdate } = updated.body.group;
-      assert.deepEqual(storedUpdate, update);
+      const { expectedVersion: _expected, ...updatedFields } = update;
+      assert.deepEqual(storedUpdate, { ...updatedFields, version: 2 });
       assert.equal(store.getGroups().filter((g) => g.id === id).length, 1);
+    });
+
+    it('POST /groups refuses an update built from an older version (409) and changes nothing', async (t) => {
+      const admin = await signIn();
+      const group = addGroup(t, 'Versioned');
+      const current = store.upsertGroup({ ...group, description: 'Changed in another tab' });
+      assert.equal(current.version, 2);
+
+      const mark = auditMark();
+      const stale = await call(admin, 'POST', '/api/admin/groups', {
+        ...group,
+        expectedVersion: group.version,
+        description: 'From the stale tab',
+      });
+
+      assert.equal(stale.status, 409);
+      assert.match(stale.body.error, /changed since it was loaded, so nothing was saved/);
+      assert.deepEqual(stale.body.group, current);
+      assert.deepEqual(store.getGroups().find((g) => g.id === group.id), current);
+      assertNotAudited(mark, admin.ip);
+
+      // Without expectedVersion (a client from before versions) the update is accepted.
+      const unversioned = await mutate(admin, 'POST', '/api/admin/groups', { ...group, description: 'Last write' }, 'UPDATE_GROUP');
+      assert.deepEqual([unversioned.body.group.description, unversioned.body.group.version], ['Last write', 3]);
+    });
+
+    it('POST /groups answers a draft still holding an Object or field deleted since with the reload 409, not a 400', async (t) => {
+      const admin = await signIn();
+      const objectName = addObject(t, 'StaleEditor', ['Id', 'Name', 'Phone']);
+      const created = await mutate(admin, 'POST', '/api/admin/groups', {
+        name: newGroupName('Stale Editor'),
+        allowedActions: ['soql_query'],
+        objectPermissions: [{ ...readGrant(objectName), allowedFields: ['Id', 'Name', 'Phone'] }],
+      }, 'CREATE_GROUP');
+      const loaded = created.body.group as AccessGroup;
+      t.after(() => {
+        store.deleteGroup(loaded.id);
+      });
+      // The editor's draft, built from the group as loaded, still names the field and the Object.
+      const saveLoaded = () =>
+        call(admin, 'POST', '/api/admin/groups', { ...loaded, expectedVersion: loaded.version, description: 'From the stale tab' });
+      const assertReloadConflict = async () => {
+        const mark = auditMark();
+        const current = store.getGroups().find((g) => g.id === loaded.id);
+        const res = await saveLoaded();
+        assert.equal(res.status, 409, JSON.stringify(res.body));
+        assert.match(res.body.error, /changed since it was loaded, so nothing was saved/);
+        assert.deepEqual(res.body.group, current);
+        assert.deepEqual(store.getGroups().find((g) => g.id === loaded.id), current);
+        assertNotAudited(mark, admin.ip);
+      };
+
+      // Deleting the field revokes it from the group, a change the editor never saw.
+      await mutate(admin, 'DELETE', `/api/admin/objects/${objectName}/fields/Phone`, undefined, 'DELETE_FIELD');
+      await assertReloadConflict();
+      await mutate(admin, 'DELETE', `/api/admin/objects/${objectName}`, undefined, 'DELETE_OBJECT');
+      await assertReloadConflict();
+
+      // Saved without a version, the same draft is checked against Salesforce > Objects as it is now.
+      const refused = await call(admin, 'POST', '/api/admin/groups', loaded);
+      assert.equal(refused.status, 400);
+      assert.match(refused.body.error, /^objectPermissions\[0\]\.objectName: Salesforce > Objects has no Object named /);
+    });
+
+    it('POST /groups with an id no group has answers 404 and creates nothing', async () => {
+      const admin = await signIn();
+      const id = `grp_missing_${RUN}`;
+      const mark = auditMark();
+      const res = await call(admin, 'POST', '/api/admin/groups', { id, name: newGroupName('Never Created') });
+      assert.deepEqual([res.status, res.body], [404, { error: 'Group not found.' }]);
+      assert.ok(!store.getGroups().some((g) => g.id === id));
+      assertNotAudited(mark, admin.ip);
     });
 
     it('POST /groups with the name of another group is refused with 400 or 409, not a 500', async (t) => {
@@ -1420,7 +1504,8 @@ describe('Admin REST API', () => {
     it('POST /groups whose audit entry cannot be written creates or changes nothing (500)', async (t) => {
       const admin = await signIn();
       const name = newGroupName('Unlogged Create');
-      const input = { name, description: 'Never saved', allowedActions: ['soql_query'], objectPermissions: [readAccounts] };
+      const objectName = addObject(t, 'UnloggedCreate');
+      const input = { name, description: 'Never saved', allowedActions: ['soql_query'], objectPermissions: [readGrant(objectName)] };
       t.after(() => {
         for (const group of store.getGroups().filter((g) => g.name === name)) store.deleteGroup(group.id);
       });
@@ -1433,7 +1518,7 @@ describe('Admin REST API', () => {
 
       // Nothing half-saved is left in the way: the retry creates it, and its row holds the whole group.
       const created = await mutate(admin, 'POST', '/api/admin/groups', input, 'CREATE_GROUP', name);
-      const { id: _id, updatedAt: _updatedAt, ...stored } = created.body.group;
+      const { id: _id, updatedAt: _updatedAt, version: _version, ...stored } = created.body.group;
       assert.deepEqual(created.audit.diff, { after: stored });
 
       const existing = created.body.group as AccessGroup;
@@ -1459,7 +1544,7 @@ describe('Admin REST API', () => {
       assert.deepEqual(mappedGroupIds(profileId), [group.id]);
 
       const deleted = await mutate(admin, 'DELETE', `/api/admin/groups/${group.id}`, undefined, 'DELETE_GROUP', group.name);
-      const { id: _id, updatedAt: _updatedAt, ...fields } = group;
+      const { id: _id, updatedAt: _updatedAt, version: _version, ...fields } = group;
       assert.deepEqual(deleted.audit.diff, { before: { ...fields, profileIds: [profileId] } });
     });
 

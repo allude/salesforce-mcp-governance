@@ -51,7 +51,8 @@ export function SalesforceOrgConnectionView({
 }: {
   sfSettings: SalesforceConnectionSettings;
   apiFetch: <T = any>(url: string, options?: RequestInit) => Promise<T>;
-  onRefresh: () => Promise<void>;
+  /** Reloads the workspace; what it answers is not used here. */
+  onRefresh: () => Promise<unknown>;
   onShowToast: (msg: string, isError?: boolean) => void;
   onNavigate: (view: NavViewId) => void;
   devToolsEnabled: boolean;

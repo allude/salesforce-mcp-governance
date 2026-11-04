@@ -34,7 +34,7 @@ function renderSyncDrawer(devToolsEnabled: boolean): string {
       onDeleteGroup: noop,
       devToolsEnabled,
       onTestMcpCall: noop,
-      onRefreshWorkspace: noop,
+      onRefreshWorkspace: async () => null,
       notify: () => {},
     })
   );

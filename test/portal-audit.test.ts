@@ -297,12 +297,24 @@ describe('the Admin API audit record', () => {
   let server: TestServer;
   let session: AdminSession;
 
+  // POST /groups accepts grants only for Objects and fields in Salesforce > Objects.
+  const CATALOG: Record<string, string[]> = {
+    Account: ['Id', 'Name', 'Phone'],
+    Contact: ['Id', 'Email'],
+    Opportunity: ['Id', 'Amount'],
+    Case: ['Id'],
+  };
+
   before(async () => {
     server = await startTestServer();
     session = await loginAsAdmin(server.baseUrl);
+    for (const [objectName, fields] of Object.entries(CATALOG)) {
+      store.upsertObjectWithFields({ objectName, fields: fields.map((fieldName) => ({ fieldName })) });
+    }
   });
 
   after(async () => {
+    for (const objectName of Object.keys(CATALOG)) store.deleteObject(objectName);
     await server.close();
   });
 
@@ -502,57 +514,88 @@ describe('the Admin API audit record', () => {
     assert.deepEqual(rowsFor(unchanged.headers.get('x-correlation-id'))[0].diff, { before: {}, after: {} });
   });
 
-  test('a group diff keeps each grant as names and flags only, whatever else the client sent with it', async (t) => {
+  test('a refused grant writes nothing, and its error names the entry but no value but the name typed', async () => {
+    const secret = `TOPSECRET-${tag()}`;
+    const email = `jane.${tag()}@example.com`;
+    const name = `Refused ${tag()}`;
+    const auditsBefore = store.getPortalAdminLogs(1_000_000).length;
+    const refusals: Array<[unknown, RegExp]> = [
+      [{ ...grant('Account', ['Name']), clientSecret: secret, canDelete: secret }, /^objectPermissions\[0\]\.canDelete must be true or false\.$/],
+      [`free text ${secret}`, /^objectPermissions\[0\] must be an object\.$/],
+      [{ objectName: { value: secret }, canRead: true }, /^objectPermissions\[0\]\.objectName must be the API name of an Object\.$/],
+      [{ ...grant('Account', ['Name']), allowedFields: ['Name', 7], sample: secret }, /^objectPermissions\[0\]\.allowedFields\[1\] must be a field API name\.$/],
+      [grant('Account', ['Name', email]), /^objectPermissions\[0\]\.allowedFields\[1\]: Object "Account" has no field named "jane\./],
+    ];
+    for (const [entry, error] of refusals) {
+      const res = await api('/api/admin/groups', { method: 'POST', body: { name, objectPermissions: [entry] } });
+      assert.equal(res.status, 400, JSON.stringify(res.body));
+      assert.match(res.body.error, error);
+      assert.ok(!res.body.error.includes(secret), res.body.error);
+    }
+    assert.ok(!store.getGroups().some((group) => group.name === name));
+    assert.equal(store.getPortalAdminLogs(1_000_000).length, auditsBefore);
+  });
+
+  test('a group diff keeps each stored grant as the policy engine reads it, as names and flags only', async (t) => {
+    // A group an older version saved, which stored its grants as they were sent.
     const secret = `TOPSECRET-${tag()}`;
     const email = `jane.${tag()}@example.com`;
     const badName = `Bad Name ${secret}`;
-    const created = await newGroup(t, {
+    const legacy = store.upsertGroup({
+      name: `Legacy ${tag()}`,
+      allowedActions: ['soql_query'],
       objectPermissions: [
-        { ...grant('Account', ['Name', email]), clientSecret: secret, sample: { Email: email }, canDelete: 'yes' },
+        { ...grant('Account', ['Name', email]), clientSecret: secret, sample: { Email: email } },
+        { ...grant('Contact', ['Id']), canDelete: 'yes' },
         `free text ${secret}`,
         { objectName: { value: secret }, canRead: true },
         { objectName: badName, canRead: true, allowedFields: [7, { secret }] },
-      ],
+        { objectName: badName, canRead: true },
+      ] as never,
     });
-    const group = created.body.group;
-    const cleared = await api('/api/admin/groups', { method: 'POST', body: { ...group, objectPermissions: [] } });
+    t.after(() => {
+      store.deleteGroup(legacy.id);
+    });
+    const cleared = await api('/api/admin/groups', { method: 'POST', body: { ...legacy, objectPermissions: [] } });
     assert.equal(cleared.status, 200, JSON.stringify(cleared.body));
-    const deleted = await api(`/api/admin/groups/${group.id}`, { method: 'DELETE' });
+    const deleted = await api(`/api/admin/groups/${legacy.id}`, { method: 'DELETE' });
     assert.equal(deleted.status, 200, JSON.stringify(deleted.body));
 
-    // A name that is not a Salesforce API name matches nothing in the catalog: it is kept by its length
-    // only. A flag counts as the policy engine reads it, by truthiness.
+    // The entries the engine skips (a flag that is not true or false, a non-object, a name or field
+    // list that is not text) grant nothing and are left out. A name that is not a Salesforce API name
+    // matches nothing in the catalog: it is kept by its length only.
     const audited = [
-      { ...grant('Account', ['Name', `<invalid:len=${email.length}>`]), canDelete: true },
-      { ...grant(`<invalid:len=${badName.length}>`, []) },
+      grant('Account', ['Name', `<invalid:len=${email.length}>`]),
+      grant(`<invalid:len=${badName.length}>`, []),
     ];
-    const [createRow] = rowsFor(created.headers.get('x-correlation-id'));
     const [clearRow] = rowsFor(cleared.headers.get('x-correlation-id'));
     const [deleteRow] = rowsFor(deleted.headers.get('x-correlation-id'));
-    assert.deepEqual((createRow.diff?.after as Record<string, unknown>).objectPermissions, audited);
     assert.deepEqual(clearRow.diff, { before: { objectPermissions: audited }, after: { objectPermissions: [] } });
-    for (const row of [createRow, clearRow, deleteRow]) {
+    for (const row of [clearRow, deleteRow]) {
       const stored = JSON.stringify(rawRow(row.id));
       assert.ok(!stored.includes(secret) && !stored.includes(email), stored);
     }
   });
 
-  test('a group diff cuts a name or description over 1,000 characters, and says so', async (t) => {
-    const description = `${'x'.repeat(1_000)}${'y'.repeat(4_000)}`;
-    const created = await newGroup(t, { description });
-    const group = created.body.group;
-    assert.equal(group.description, description);
-    assert.deepEqual(rowsFor(created.headers.get('x-correlation-id'))[0].diff, {
-      after: {
-        name: group.name,
-        description: 'x'.repeat(1_000),
-        allowedActions: ['soql_query'],
-        objectPermissions: [],
-        truncated: ['description'],
-      },
+  test('a description over 500 characters is refused, and a stored one over 1,000 is cut in the diff', async (t) => {
+    const tooLong = await api('/api/admin/groups', {
+      method: 'POST',
+      body: { name: `Audit ${tag()}`, description: 'x'.repeat(501) },
     });
+    assert.equal(tooLong.status, 400);
+    assert.match(tooLong.body.error, /at most 500 characters/);
 
-    const update = await api('/api/admin/groups', { method: 'POST', body: { ...group, description: 'Short again' } });
+    const atLimit = await newGroup(t, { description: ` ${'x'.repeat(500)} ` });
+    assert.equal(atLimit.body.group.description, 'x'.repeat(500));
+    assert.equal(rowsFor(atLimit.headers.get('x-correlation-id'))[0].diff?.truncated, undefined);
+
+    // An older version stored any length.
+    const description = `${'x'.repeat(1_000)}${'y'.repeat(4_000)}`;
+    const legacy = store.upsertGroup({ name: `Legacy ${tag()}`, description, allowedActions: ['soql_query'], objectPermissions: [] });
+    t.after(() => {
+      store.deleteGroup(legacy.id);
+    });
+    const update = await api('/api/admin/groups', { method: 'POST', body: { ...legacy, description: 'Short again' } });
     assert.equal(update.status, 200, JSON.stringify(update.body));
     assert.deepEqual(rowsFor(update.headers.get('x-correlation-id'))[0].diff, {
       before: { description: 'x'.repeat(1_000), truncated: ['description'] },

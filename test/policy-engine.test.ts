@@ -14,6 +14,7 @@ import {
   resolveEffectiveProfilePermissions,
   type PolicyEvaluationResult,
 } from '../src/rbac/policyEngine.js';
+import { mergeGrants } from '../src/rbac/groupGrants.js';
 import { assertSafeSoqlWhereClause } from '../src/mcp/soqlGuard.js';
 import { salesforceIdsMatch, type VerifiedSalesforceUser } from '../src/salesforce/client.js';
 import {
@@ -149,7 +150,7 @@ class PolicyFixture {
   }
 
   group(baseName: string, allowedActions: string[], objectPermissions: GroupObjectPermission[] = []): AccessGroup {
-    const group = store.upsertGroup({
+    const group = store.createGroup({
       id: `grp_policy_test_${this.tag}_${this.groupIds.length + 1}`,
       name: `${baseName} ${this.tag}`,
       allowedActions,
@@ -680,6 +681,105 @@ test('evaluateMcpToolCall: matches the object name case-insensitively and return
       assert.deepEqual(sorted(result.allowedFields), ['Name', 'Total__c']);
     }
   }
+});
+
+// Groups saved by an older version hold their grants as they were sent. The engine must neither grant
+// on a value that only looks like a flag nor throw on an entry it cannot read.
+test("evaluateMcpToolCall: a flag grants only when it is exactly true; an entry with any other value is skipped whole", (t) => {
+  const fx = new PolicyFixture(t);
+  const obj = fx.object('StrictFlags', { Id: true, Name: true });
+  const group = fx.group('Strict Flags', OBJECT_SCOPED_TOOLS, [
+    { ...grant(obj, { canDelete: true }, ['Id', 'Name']), canRead: 'false' } as never,
+  ]);
+  const user = fx.callerFor(fx.profile('Strict Flags Profile', [group]));
+
+  for (const tool of OBJECT_SCOPED_TOOLS) assertDenied(user, tool, obj, /either disabled .* or not permitted/);
+  assert.deepEqual(assertDenied(user, 'soql_query', obj, /not permitted/).skippedGroupEntries, [
+    { groupId: group.id, index: 0, reason: 'canRead is not true or false' },
+  ]);
+});
+
+test('resolveEffectiveProfilePermissions: skips each malformed stored entry, records why, and keeps the others', (t) => {
+  const warnings: string[] = [];
+  t.mock.method(console, 'warn', (message: string) => warnings.push(message));
+  const fx = new PolicyFixture(t);
+  const obj = fx.object('Malformed', { Id: true, Name: true, Secret__c: true });
+  const secret = `secret-${fx.tag}`;
+  const malformed = [
+    null,
+    `free text ${secret}`,
+    [obj],
+    { objectName: 7, canRead: true },
+    { ...grant(obj, { canRead: true }, ['Secret__c']), canUpdate: secret },
+    { ...grant(obj, { canRead: true }, []), allowedFields: secret },
+    { ...grant(obj, { canRead: true }, []), allowedFields: ['Secret__c', 7] },
+  ];
+  const group = fx.group('Malformed', ['soql_query'], [...malformed, grant(obj, { canRead: true }, ['Name'])] as never);
+  const profile = fx.profile('Malformed Profile', [group]);
+
+  const effective = resolveEffectiveProfilePermissions(profile.id);
+  assert.deepEqual(sorted([...(effective.objectPermissions.get(obj)?.allowedFields ?? [])]), ['Name']);
+  assert.deepEqual(effective.skippedGroupEntries, [
+    { groupId: group.id, index: 0, reason: 'the entry is not an object' },
+    { groupId: group.id, index: 1, reason: 'the entry is not an object' },
+    { groupId: group.id, index: 2, reason: 'the entry is not an object' },
+    { groupId: group.id, index: 3, reason: 'objectName is not text' },
+    { groupId: group.id, index: 4, reason: 'canUpdate is not true or false' },
+    { groupId: group.id, index: 5, reason: 'allowedFields is not a list of field names' },
+    { groupId: group.id, index: 6, reason: 'allowedFields is not a list of field names' },
+  ]);
+  const permitted = assertPermitted(fx.callerFor(profile), 'soql_query', obj);
+  assert.deepEqual(permitted.allowedFields, ['Name']);
+  assert.equal(permitted.skippedGroupEntries?.length, 7);
+
+  // Told once per entry and reason, by key only: evaluating again warns no more, and no value is logged.
+  resolveEffectiveProfilePermissions(profile.id);
+  assert.equal(warnings.length, 7);
+  for (const warning of warnings) {
+    assert.match(warning, new RegExp(`Access Group ${group.id}: object entry \\d is skipped`));
+    assert.ok(!warning.includes(secret), warning);
+  }
+});
+
+// POST /groups, the group editor and the upgrade migration merge a group's entries for one Object.
+test('mergeGrants: a merged entry gives what its entries gave one by one, including the Id fallback of each', (t) => {
+  const fx = new PolicyFixture(t);
+  const obj = fx.object('MergeId', { Id: true, Name: true, Phone: false });
+  const catalogFields = (objectName: string) => store.getObjectFieldNames(store.resolveObjectName(objectName)) ?? [];
+  let n = 0;
+  const effectiveFields = (entries: GroupObjectPermission[]) => {
+    n++;
+    const group = fx.group(`Merge Id ${n}`, ['soql_query'], entries);
+    const profile = fx.profile(`Merge Id ${n}`, [group]);
+    return sorted([...(resolveEffectiveProfilePermissions(profile.id).objectPermissions.get(obj)?.allowedFields ?? [])]);
+  };
+
+  const sameAccess: Array<[string, GroupObjectPermission[]]> = [
+    ['an entry with no field', [grant(obj.toLowerCase(), { canRead: true }, []), grant(obj, { canUpdate: true }, ['Name'])]],
+    ['an entry with only unknown fields', [grant(obj, { canCreate: true }, ['Gone__c']), grant(obj.toUpperCase(), { canRead: true }, ['name'])]],
+    ['an entry that only deletes, which has no fallback', [grant(obj, { canDelete: true }, []), grant(obj, { canRead: true }, ['Name'])]],
+    ['an entry that grants nothing', [grant(obj, {}, []), grant(obj, { canRead: true }, ['Name'])]],
+  ];
+  for (const [label, entries] of sameAccess) {
+    const merged = mergeGrants(entries, catalogFields);
+    assert.equal(merged.length, 1, label);
+    assert.deepEqual(effectiveFields(merged), effectiveFields(entries), label);
+  }
+  assert.deepEqual(mergeGrants(sameAccess[0][1], catalogFields)[0].allowedFields, ['Name', 'Id']);
+
+  // An entry whose fields all exist but are disabled falls back to Id only while they stay disabled,
+  // so no stored list gives the same in both states: the merged entry keeps the narrower one.
+  const disabledOnly = [grant(obj, { canRead: true }, ['Phone']), grant(obj, { canRead: true }, ['Name'])];
+  assert.deepEqual(effectiveFields(disabledOnly), ['Id', 'Name']);
+  assert.deepEqual(effectiveFields(mergeGrants(disabledOnly, catalogFields)), ['Name']);
+});
+
+test('evaluateMcpToolCall: a well-formed group adds no skippedGroupEntries property', (t) => {
+  const fx = new PolicyFixture(t);
+  const obj = fx.object('WellFormed', { Id: true });
+  const group = fx.group('Well Formed', ['soql_query'], [grant(obj, { canRead: true }, ['Id'])]);
+  const result = assertPermitted(fx.callerFor(fx.profile('Well Formed Profile', [group])), 'soql_query', obj);
+  assert.equal('skippedGroupEntries' in result, false);
 });
 
 test('evaluateMcpToolCall: permits list_enabled_objects without an object', (t) => {

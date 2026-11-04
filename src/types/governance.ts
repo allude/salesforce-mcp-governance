@@ -126,12 +126,18 @@ export interface GroupObjectPermission {
   allowedFields: string[]; // Field API names from SalesforceObjectField
 }
 
+/** The longest Access Group name and description POST /groups accepts, after trimming. */
+export const ACCESS_GROUP_NAME_MAX_LENGTH = 80;
+export const ACCESS_GROUP_DESCRIPTION_MAX_LENGTH = 500;
+
 export interface AccessGroup {
   id: string;
   name: string;
   description: string;
   allowedActions: string[]; // McpActionId[]
   objectPermissions: GroupObjectPermission[];
+  /** 1 when created, +1 on every saved change. POST /groups refuses an update built from another version. */
+  version: number;
   updatedAt: string;
 }
 

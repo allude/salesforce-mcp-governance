@@ -10,6 +10,7 @@ import type {
 import { formatDateShort } from '@/components/ui/primitives';
 import type { FlyoutState } from './FlyoutDrawer';
 import { newAccessGroupDraft } from './accessGroupDraft';
+import { grantsAccess, readableGrants } from '@/rbac/groupGrants';
 
 // ============================================================================
 // 1. ACCESS GROUPS VIEW
@@ -132,10 +133,8 @@ export function AccessGroupsView({
                   const assignedCount = profiles.filter((p) =>
                     getProfileGroupIds(p.id).includes(g.id)
                   ).length;
-                  const activeObjPerms = (g.objectPermissions || []).filter(
-                    (op) =>
-                      op.canRead || op.canCreate || op.canUpdate || op.canDelete
-                  );
+                  // As the policy engine reads them, so this never shows access /mcp does not give.
+                  const activeObjPerms = readableGrants(g.objectPermissions).filter(grantsAccess);
 
                   return (
                     <tr
@@ -327,10 +326,10 @@ export function ProfileGroupMatrixView({
     const objSet = new Set<string>();
     for (const g of assigned) {
       (g.allowedActions || []).forEach((a) => actSet.add(a));
-      for (const op of g.objectPermissions || []) {
+      for (const op of readableGrants(g.objectPermissions)) {
         const objMeta = objects.find((o) => o.objectName === op.objectName);
         if (objMeta && !objMeta.enabled) continue;
-        if (op.canRead || op.canCreate || op.canUpdate || op.canDelete) {
+        if (grantsAccess(op)) {
           objSet.add(op.objectName);
         }
       }
@@ -463,7 +462,7 @@ export function ProfileGroupMatrixView({
                       }}
                     >
                       {(g.allowedActions || []).length} actions ·{' '}
-                      {(g.objectPermissions || []).length} objects
+                      {readableGrants(g.objectPermissions).filter(grantsAccess).length} objects
                     </div>
                   </th>
                 ))}

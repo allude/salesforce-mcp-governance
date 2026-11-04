@@ -6,6 +6,7 @@ import type {
   SalesforceObjectConfig,
   AccessGroup,
 } from '@/types/governance';
+import { grantsAccess, readableGrants } from '@/rbac/groupGrants';
 import type { FlyoutState } from './FlyoutDrawer';
 import { newAccessGroupDraft } from './accessGroupDraft';
 
@@ -174,7 +175,7 @@ export function CommandPalette({
         id: `grp-${g.id}`,
         section: 'Access Groups',
         label: g.name,
-        meta: `${g.allowedActions.length} actions · ${g.objectPermissions.length} objects`,
+        meta: `${g.allowedActions.length} actions · ${readableGrants(g.objectPermissions).filter(grantsAccess).length} objects`,
         action: () => onOpenFlyout({ type: 'group', data: g }),
       });
     }

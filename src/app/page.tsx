@@ -42,6 +42,7 @@ import { mcpActivityStatus } from '@/components/views/mcpActivity';
 import { useModalDialog } from '@/components/views/useModalDialog';
 import { isCommandPaletteShortcut } from '@/components/views/shortcuts';
 import { estimateClockOffsetMs } from '@/components/views/trafficChart';
+import type { WorkspaceSnapshot } from '@/components/views/accessGroupDraft';
 import { DEFAULT_OVERVIEW_LOG_CAPS, logPageUrl, type OverviewLogCaps } from '@/components/views/logHistory';
 import {
   ENTERPRISE_MATRIX_WARNING,
@@ -259,7 +260,8 @@ export default function AdminPortalPage() {
     void refreshLoginOptions();
   }, [refreshLoginOptions]);
 
-  const fetchWorkspace = useCallback(async () => {
+  /** Reloads the workspace. Answers the groups and Objects it read (one snapshot), or null when it failed. */
+  const fetchWorkspace = useCallback(async (): Promise<WorkspaceSnapshot | null> => {
     try {
       const sentAt = Date.now();
       const res = await fetch('/api/admin/overview', {
@@ -267,9 +269,9 @@ export default function AdminPortalPage() {
       });
       if (res.status === 401) {
         handleSessionExpired();
-        return;
+        return null;
       }
-      if (!res.ok) return;
+      if (!res.ok) return null;
       const data = await readJsonBody(res);
       const receivedAt = Date.now();
       setClockOffsetMs(estimateClockOffsetMs(data.serverTime, sentAt, receivedAt));
@@ -287,8 +289,10 @@ export default function AdminPortalPage() {
       if (data.oktaSettings) setOktaSettings(data.oktaSettings);
       if (data.sfSettings) setSfSettings(data.sfSettings);
       if (data.portalUsers) setPortalUsers(data.portalUsers);
+      return { groups: data.groups || [], objects: data.objects || [] };
     } catch {
       // ignore transient poll error
+      return null;
     }
   }, [handleSessionExpired]);
 
@@ -335,7 +339,11 @@ export default function AdminPortalPage() {
         handleSessionExpired();
       }
       if (!res.ok) {
-        throw new Error(data.error || `Request failed (${res.status})`);
+        // The status and body ride along, for a caller that acts on a particular refusal (a 409 conflict).
+        throw Object.assign(new Error(data.error || `Request failed (${res.status})`), {
+          status: res.status,
+          body: data,
+        });
       }
       return data as T;
     },
@@ -613,14 +621,18 @@ export default function AdminPortalPage() {
 
   const handleSaveGroup = async (group: {
     id?: string;
+    version?: number;
     name: string;
     description: string;
     allowedActions: McpActionType[];
     objectPermissions: GroupObjectPermission[];
   }) => {
+    const { version, ...fields } = group;
     const data = await apiFetch('/api/admin/groups', {
       method: 'POST',
-      body: JSON.stringify(group),
+      // An update names the version it was built from, so a group changed elsewhere since is refused
+      // (409) instead of overwritten.
+      body: JSON.stringify(fields.id ? { ...fields, expectedVersion: version } : fields),
     });
     if (data.groups) setGroups(data.groups);
     await fetchWorkspace();

@@ -9,9 +9,12 @@ import { TOOL_INPUT_SCHEMAS } from '../src/mcp/server.js';
 import { AVAILABLE_MCP_ACTIONS, unknownMcpActionIds } from '../src/types/governance.js';
 import {
   DEFAULT_NEW_GROUP_ACTIONS,
+  groupDraftGrants,
   newAccessGroupDraft,
+  reloadedGroup,
   savedAccessGroup,
   splitMcpActions,
+  staleGroupFromError,
 } from '../src/components/views/accessGroupDraft.js';
 import {
   adminFetch,
@@ -143,7 +146,7 @@ describe('stored groups naming IDs that are not tools', () => {
 });
 
 describe('controls that need a saved group', () => {
-  const saved = { id: 'grp-1', name: 'Saved', description: '', allowedActions: [], objectPermissions: [], updatedAt: '' };
+  const saved = { id: 'grp-1', name: 'Saved', description: '', allowedActions: [], objectPermissions: [], version: 1, updatedAt: '' };
 
   test('a new group draft has no saved group, whatever its name', () => {
     assert.equal(savedAccessGroup([saved], undefined), null);
@@ -156,6 +159,109 @@ describe('controls that need a saved group', () => {
 
   test('a group in the saved list is found, from the list and not the stale drawer data', () => {
     assert.equal(savedAccessGroup([saved], saved.id), saved);
+  });
+});
+
+describe('the group drawer and the stricter POST /groups', () => {
+  const catalogObject = (objectName: string, fieldNames: string[]) => ({
+    objectName,
+    label: objectName,
+    isCustom: false,
+    enabled: true,
+    sourcePath: '',
+    fieldCount: fieldNames.length,
+    enabledFieldCount: fieldNames.length,
+    fields: fieldNames.map((fieldName) => ({
+      objectName,
+      fieldName,
+      label: fieldName,
+      fieldType: 'Text',
+      isCustom: false,
+      required: false,
+      enabled: true,
+    })),
+    updatedAt: '',
+  });
+
+  test('starts from the grants as the server stores them and names what it leaves out', () => {
+    const objects = [catalogObject('Account', ['Id', 'Name']), catalogObject('Contact', ['Id'])];
+    const { grants, dropped } = groupDraftGrants(
+      [
+        { objectName: 'account', canRead: true, allowedFields: ['ID', 'Gone__c'] },
+        { objectName: 'Ghost__c', canRead: true, allowedFields: ['Id'] },
+        { objectName: 'ACCOUNT', canUpdate: true, allowedFields: ['Name'] },
+        { objectName: 'Contact', canRead: 'false' },
+        null,
+      ],
+      objects
+    );
+    // Every grant the drawer shows, and nothing POST /groups would refuse, so the group can be saved.
+    assert.deepEqual(grants, [
+      { objectName: 'Account', canRead: true, canCreate: false, canUpdate: true, canDelete: false, allowedFields: ['Id', 'Name'] },
+    ]);
+    assert.deepEqual(dropped, ['Account.Gone__c', 'Ghost__c', 'entry 4', 'entry 5']);
+  });
+
+  test('a save refused because the group changed elsewhere hands the drawer the current group', () => {
+    const current = { id: 'grp-1', name: 'Saved', description: '', allowedActions: [], objectPermissions: [], version: 3, updatedAt: '' };
+    assert.deepEqual(staleGroupFromError(Object.assign(new Error('changed'), { status: 409, body: { group: current } })), current);
+    // A duplicate name is also a 409, but carries no group: there is nothing to reload.
+    assert.equal(staleGroupFromError(Object.assign(new Error('taken'), { status: 409, body: { error: 'taken' } })), null);
+    assert.equal(staleGroupFromError(Object.assign(new Error('bad'), { status: 400, body: { group: current } })), null);
+    assert.equal(staleGroupFromError(undefined), null);
+  });
+
+  test('"Reload group" rebuilds the draft from one fresh read of the workspace, so it keeps a grant on an Object added since', () => {
+    const conflict = {
+      id: 'grp-1',
+      name: 'Saved',
+      description: '',
+      allowedActions: [],
+      objectPermissions: [
+        { objectName: 'Added__c', canRead: true, canCreate: false, canUpdate: false, canDelete: false, allowedFields: ['Id'] },
+      ],
+      version: 2,
+      updatedAt: '',
+    };
+    const current = { ...conflict, version: 3 };
+    // The page's own Objects, read before another admin added Added__c and granted it: a draft built
+    // from them drops the grant, and saving it with the current version would revoke it.
+    const pageObjects = [catalogObject('Account', ['Id'])];
+    assert.deepEqual(groupDraftGrants(conflict.objectPermissions, pageObjects).dropped, ['Added__c']);
+
+    const workspace = { groups: [current], objects: [...pageObjects, catalogObject('Added__c', ['Id'])] };
+    const reloaded = reloadedGroup(conflict, workspace);
+    assert.ok(!('error' in reloaded), JSON.stringify(reloaded));
+    assert.equal(reloaded.group, current);
+    assert.deepEqual(groupDraftGrants(reloaded.group.objectPermissions, reloaded.objects), {
+      grants: conflict.objectPermissions,
+      dropped: [],
+    });
+
+    // Without a fresh read there is nothing safe to rebuild from.
+    assert.deepEqual(reloadedGroup(conflict, null), { error: 'Access Group "Saved" could not be reloaded. Try again.' });
+    assert.deepEqual(reloadedGroup(conflict, { ...workspace, groups: [] }), {
+      error: 'Access Group "Saved" was deleted elsewhere, so there is nothing to reload.',
+    });
+  });
+
+  test('a stored group the drawer loaded can be saved back unchanged, with its version', async () => {
+    const objectName = `Drawer_${tag()}__c`;
+    store.upsertObjectWithFields({ objectName, fields: [{ fieldName: 'Id' }] });
+    const stored = store.upsertGroup({
+      name: `Drawer ${tag()}`,
+      allowedActions: ['soql_query'],
+      objectPermissions: [
+        { objectName: objectName.toLowerCase(), canRead: true, canCreate: false, canUpdate: false, canDelete: false, allowedFields: ['id', 'Gone__c'] },
+      ],
+    });
+    const { grants } = groupDraftGrants(stored.objectPermissions, store.getObjects());
+    const res = await postGroup({ ...stored, objectPermissions: grants, expectedVersion: stored.version });
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.deepEqual(res.body.group.objectPermissions, [
+      { objectName, canRead: true, canCreate: false, canUpdate: false, canDelete: false, allowedFields: ['Id'] },
+    ]);
+    assert.equal(res.body.group.version, stored.version + 1);
   });
 });
 

@@ -36,9 +36,9 @@ import { config, KNOWN_DEFAULT_PASSWORDS } from '../config.js';
 import { parseObjectSyncPayload, parseProfileSyncPayload, type PayloadResult } from './orgSyncPayload.js';
 import { LogPageQueryError, parseMcpLogPageQuery, parsePortalLogPageQuery } from './logPageQuery.js';
 import { groupAuditFields, groupUpdateDiff } from './groupAuditDiff.js';
+import { parseGroupObjectPermissions, parseGroupSaveRequest } from './groupPayload.js';
 import { isSalesforceId, salesforceIdsMatch } from '../salesforce/ids.js';
 import { assertNotSimulatedOrgHost } from '../salesforce/simulatedOrg.js';
-import { AVAILABLE_MCP_ACTIONS, unknownMcpActionIds } from '../types/governance.js';
 import type { AccessGroup, SalesforceConnectionSettings } from '../types/governance.js';
 import {
   evaluateMcpToolCall,
@@ -1235,39 +1235,62 @@ adminRouter.post('/objects/pull-apply', (req: Request, res: Response) => {
 // ============================================================================
 // 3. ACCESS MATRIX -> GROUPS & PROFILE-GROUP MATRIX
 // ============================================================================
+/**
+ * POST /api/admin/groups
+ * Creates a group (no id) or updates the group with `id` (404 when there is none). The grants are
+ * checked against Salesforce > Objects and stored in the catalog's spelling (see groupPayload.ts).
+ * An update that sends `expectedVersion` is refused with 409 when the group has changed since, so a
+ * stale editor cannot undo a change it never saw. That check comes before the grants are checked:
+ * deleting an Object or field revokes it from its groups (a new version), and the draft of an editor
+ * that loaded the group earlier still names it, which must read as the reload 409, not a 400.
+ */
 adminRouter.post('/groups', (req: Request, res: Response) => {
-  const { id, name, description, allowedActions, objectPermissions } =
-    req.body || {};
-  if (!name) {
-    res.status(400).json({ error: 'Group name is required.' });
+  const parsed = parseGroupSaveRequest(req.body || {});
+  if (!parsed.ok) {
+    res.status(400).json({ error: parsed.error });
     return;
   }
-
-  // An unknown ID grants nothing at /mcp, so storing one would only look like a working grant.
-  const unknownActions = Array.isArray(allowedActions) ? unknownMcpActionIds(allowedActions) : [];
-  if (unknownActions.length > 0) {
-    res.status(400).json({
-      error: `Unknown MCP action IDs: ${unknownActions.join(', ')}. Valid IDs: ${AVAILABLE_MCP_ACTIONS.map(
-        (a) => a.id
-      ).join(', ')}.`,
-    });
-    return;
-  }
+  const request = parsed.value;
 
   const actor = getAdminInfo(req);
-  let saved: AccessGroup;
+  let outcome: { saved: AccessGroup } | { status: 400 | 404 | 409; body: Record<string, unknown> };
   try {
-    // The change and its audit entry share one transaction: a saved group can never go unlogged.
-    saved = runInTransaction(() => {
-      const before = id ? store.getGroups().find((g) => g.id === String(id).trim()) : undefined;
+    // The checks against the stored groups, the change and its audit entry share one transaction:
+    // a saved group can never go unlogged, nor be saved over a version the client did not load.
+    outcome = runInTransaction(() => {
+      const groups = store.getGroups();
+      const before = request.id ? groups.find((g) => g.id === request.id) : undefined;
+      if (request.id && !before) {
+        return { status: 404 as const, body: { error: 'Group not found.' } };
+      }
+      if (before && request.expectedVersion !== undefined && request.expectedVersion !== before.version) {
+        return {
+          status: 409 as const,
+          body: {
+            error: `Access Group "${before.name}" changed since it was loaded, so nothing was saved. Reload it and try again.`,
+            group: before,
+          },
+        };
+      }
+      const grants = parseGroupObjectPermissions(request.objectPermissions);
+      if (!grants.ok) {
+        return { status: 400 as const, body: { error: grants.error } };
+      }
+      // Names are unique ignoring case. A group that keeps its own name may still share it with a
+      // case variant an older version allowed, so that neither becomes impossible to save.
+      const nameTaken =
+        before?.name !== request.name &&
+        groups.some((g) => g.id !== before?.id && g.name.toLowerCase() === request.name.toLowerCase());
+      if (nameTaken) {
+        return { status: 409 as const, body: { error: `An Access Group named "${request.name}" already exists.` } };
+      }
+
       const group = store.upsertGroup({
-        id: id ? String(id) : undefined,
-        name: String(name),
-        description: description ? String(description) : '',
-        allowedActions: Array.isArray(allowedActions) ? allowedActions : [],
-        objectPermissions: Array.isArray(objectPermissions)
-          ? objectPermissions
-          : [],
+        id: before?.id,
+        name: request.name,
+        description: request.description,
+        allowedActions: request.allowedActions,
+        objectPermissions: grants.value,
       });
       store.recordPortalAdminLog({
         adminUsername: actor.username,
@@ -1285,18 +1308,22 @@ adminRouter.post('/groups', (req: Request, res: Response) => {
         targetId: group.id,
         diff: before ? groupUpdateDiff(before, group) : { after: groupAuditFields(group) },
       });
-      return group;
+      return { saved: group };
     });
   } catch (err: any) {
     if (/UNIQUE constraint failed: access_groups\.name/.test(String(err?.message))) {
-      res.status(409).json({ error: `An Access Group named "${String(name).trim()}" already exists.` });
+      res.status(409).json({ error: `An Access Group named "${request.name}" already exists.` });
       return;
     }
     throw err;
   }
 
+  if ('status' in outcome) {
+    res.status(outcome.status).json(outcome.body);
+    return;
+  }
   res.json({
-    group: saved,
+    group: outcome.saved,
     groups: store.getGroups(),
   });
 });
@@ -1945,11 +1972,15 @@ adminRouter.post('/workspace/seed-sample', (req: Request, res: Response) => {
   }
   const actor = getAdminInfo(req);
   const existingObjects = store.getObjects();
+  // Matched case-insensitively, and saved under the catalog's spelling, as POST /groups would save them.
+  const catalogObject = (objName: string) =>
+    existingObjects.find((o) => o.objectName.toLowerCase() === objName.toLowerCase());
   const objFieldNames = (objName: string, exclude: string[] = []): string[] => {
-    const found = existingObjects.find((o) => o.objectName === objName);
+    const found = catalogObject(objName);
     if (!found) return [];
+    const excluded = new Set(exclude.map((name) => name.toLowerCase()));
     return found.fields
-      .filter((f) => f.enabled && !exclude.includes(f.fieldName))
+      .filter((f) => f.enabled && !excluded.has(f.fieldName.toLowerCase()))
       .map((f) => f.fieldName);
   };
 
@@ -2197,7 +2228,14 @@ adminRouter.post('/workspace/seed-sample', (req: Request, res: Response) => {
   ];
 
   for (const g of sampleGroups) {
-    store.upsertGroup(g);
+    // A grant for an Object the catalog does not have could not be saved through POST /groups either.
+    const objectPermissions = g.objectPermissions.flatMap((p) => {
+      const found = catalogObject(p.objectName);
+      return found ? [{ ...p, objectName: found.objectName }] : [];
+    });
+    const sample = { ...g, objectPermissions };
+    if (store.getGroups().some((existing) => existing.id === g.id)) store.upsertGroup(sample);
+    else store.createGroup(sample);
   }
 
   // Assign profiles to groups

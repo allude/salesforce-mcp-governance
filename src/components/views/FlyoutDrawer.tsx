@@ -3,8 +3,20 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { portalAuditResult } from './portalAudit';
 import { DEFAULT_SIMULATED_USERNAME, trafficBurstCalls } from './simulatedTraffic';
-import { savedAccessGroup, splitMcpActions } from './accessGroupDraft';
+import {
+  groupDraftGrants,
+  reloadedGroup,
+  savedAccessGroup,
+  splitMcpActions,
+  staleGroupFromError,
+  type WorkspaceSnapshot,
+} from './accessGroupDraft';
 import { isSalesforceId } from '@/salesforce/ids';
+import { grantsAccess, readableGrants } from '@/rbac/groupGrants';
+import {
+  ACCESS_GROUP_DESCRIPTION_MAX_LENGTH,
+  ACCESS_GROUP_NAME_MAX_LENGTH,
+} from '@/types/governance';
 import type {
   SalesforceProfile,
   SalesforceObject,
@@ -68,6 +80,8 @@ interface FlyoutDrawerProps {
   onOpenOrgObjectCatalogModal?: () => void;
   onSaveGroup: (group: {
     id?: string;
+    /** The version the drawer loaded; sent as expectedVersion, so a group changed since is not overwritten. */
+    version?: number;
     name: string;
     description: string;
     allowedActions: McpActionType[];
@@ -83,7 +97,8 @@ interface FlyoutDrawerProps {
     username?: string;
     samplePayload?: Record<string, unknown>;
   }) => Promise<any>;
-  onRefreshWorkspace: () => Promise<void>;
+  /** Reloads the workspace; answers the groups and Objects it read, or null when it could not. */
+  onRefreshWorkspace: () => Promise<WorkspaceSnapshot | null>;
   notify: (msg: string) => void;
 }
 
@@ -157,12 +172,17 @@ export function FlyoutDrawer({
   // Group drawer state
   const [grpDraft, setGrpDraft] = useState<{
     id?: string;
+    version?: number;
     name: string;
     description: string;
     allowedActions: McpActionType[];
     objectPermissions: GroupObjectPermission[];
   } | null>(null);
   const [droppedActions, setDroppedActions] = useState<McpActionType[]>([]);
+  const [droppedGrants, setDroppedGrants] = useState<string[]>([]);
+  const [grpSaveError, setGrpSaveError] = useState('');
+  // The server's copy when a save was refused because the group changed since the drawer loaded it.
+  const [grpConflict, setGrpConflict] = useState<AccessGroup | null>(null);
   const [expandedObj, setExpandedObj] = useState<string | null>(null);
 
   // Simulator drawer state
@@ -171,6 +191,39 @@ export function FlyoutDrawer({
   const [simTool, setSimTool] = useState<McpActionType>('soql_query');
   const [simObject, setSimObject] = useState('Opportunity');
   const [simResult, setSimResult] = useState<any>(null);
+
+  /**
+   * Starts the drawer's draft from a group as stored (or from a new group's draft), with its grants
+   * checked against `catalog`: the page's Objects, unless a fresher read of them is given.
+   */
+  const loadGroupDraft = (group: any, catalog: readonly SalesforceObject[] = objects) => {
+    const { known, unknown } = splitMcpActions(group.allowedActions || []);
+    const { grants, dropped } = groupDraftGrants(group.objectPermissions || [], catalog);
+    setDroppedActions(unknown);
+    setDroppedGrants(dropped);
+    setGrpSaveError('');
+    setGrpConflict(null);
+    setGrpDraft({
+      id: group.id,
+      version: group.version,
+      name: group.name || '',
+      description: group.description || '',
+      allowedActions: known,
+      objectPermissions: grants,
+    });
+  };
+
+  /** "Reload group" after a refused save: rebuilds the draft from a fresh read of the workspace. */
+  const reloadGroupDraft = async (conflict: AccessGroup) => {
+    setBusy(true);
+    try {
+      const reloaded = reloadedGroup(conflict, await onRefreshWorkspace());
+      if ('error' in reloaded) setGrpSaveError(reloaded.error);
+      else loadGroupDraft(reloaded.group, reloaded.objects);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   useEffect(() => {
     setConfirmDelete(false);
@@ -186,22 +239,7 @@ export function FlyoutDrawer({
       setNewProfName('');
       setNewProfError('');
     } else if (flyout.type === 'group' && flyout.data) {
-      const liveGrp =
-        groups.find((g) => g.id === flyout.data.id) || flyout.data;
-      const { known, unknown } = splitMcpActions(liveGrp.allowedActions || []);
-      setDroppedActions(unknown);
-      setGrpDraft({
-        id: liveGrp.id,
-        name: liveGrp.name || '',
-        description: liveGrp.description || '',
-        allowedActions: known,
-        objectPermissions: (liveGrp.objectPermissions || []).map(
-          (op: GroupObjectPermission) => ({
-            ...op,
-            allowedFields: [...(op.allowedFields || [])],
-          })
-        ),
-      });
+      loadGroupDraft(groups.find((g) => g.id === flyout.data.id) || flyout.data);
     } else if (flyout.type === 'simulator') {
       const initProf =
         flyout.data?.profileId || profiles[0]?.id || '00e5g000001B2k9AAC';
@@ -260,7 +298,8 @@ export function FlyoutDrawer({
 
     for (const g of assignedGroups) {
       (g.allowedActions || []).forEach((a) => actions.add(a));
-      for (const op of g.objectPermissions || []) {
+      // As the policy engine reads them, so this never shows access /mcp does not give.
+      for (const op of readableGrants(g.objectPermissions)) {
         const objCfg = objects.find((o) => o.objectName === op.objectName);
         if (objCfg && !objCfg.enabled) continue;
         if (!objMap[op.objectName]) {
@@ -1010,13 +1049,10 @@ export function FlyoutDrawer({
 
               {(() => {
                 const usedBy = groups.filter((g) =>
-                  g.objectPermissions?.some(
+                  readableGrants(g.objectPermissions).some(
                     (op) =>
                       op.objectName === liveObject.objectName &&
-                      (op.canRead ||
-                        op.canCreate ||
-                        op.canUpdate ||
-                        op.canDelete)
+                      grantsAccess(op)
                   )
                 );
                 return (
@@ -1040,8 +1076,10 @@ export function FlyoutDrawer({
                     ) : (
                       <div className="chk-list">
                         {usedBy.map((g) => {
-                          const op = g.objectPermissions.find(
-                            (p) => p.objectName === liveObject.objectName
+                          const op = readableGrants(g.objectPermissions).find(
+                            (p) =>
+                              p.objectName === liveObject.objectName &&
+                              grantsAccess(p)
                           );
                           return (
                             <div
@@ -1410,11 +1448,28 @@ export function FlyoutDrawer({
           {flyout.type === 'group' && grpDraft && (
             <>
               <div className="sec">
+                {grpSaveError && (
+                  // The toast fades; this stays until the next save or reload.
+                  <div className="hint" role="alert" style={{ color: 'var(--err)', marginBottom: 8 }}>
+                    {grpSaveError}{' '}
+                    {grpConflict && (
+                      <button
+                        type="button"
+                        className="btn sm"
+                        disabled={busy}
+                        onClick={() => reloadGroupDraft(grpConflict)}
+                      >
+                        Reload group
+                      </button>
+                    )}
+                  </div>
+                )}
                 <div className="fld">
                   <label>Group name</label>
                   <input
                     className="inp"
                     value={grpDraft.name}
+                    maxLength={ACCESS_GROUP_NAME_MAX_LENGTH}
                     onChange={(e) =>
                       setGrpDraft({ ...grpDraft, name: e.target.value })
                     }
@@ -1425,6 +1480,7 @@ export function FlyoutDrawer({
                   <input
                     className="inp"
                     value={grpDraft.description}
+                    maxLength={ACCESS_GROUP_DESCRIPTION_MAX_LENGTH}
                     onChange={(e) =>
                       setGrpDraft({ ...grpDraft, description: e.target.value })
                     }
@@ -1546,6 +1602,14 @@ export function FlyoutDrawer({
                     Click R·C·U·D or expand fields
                   </span>
                 </div>
+                {droppedGrants.length > 0 && (
+                  <div className="hint" style={{ marginBottom: 8 }}>
+                    This group also held{' '}
+                    <span className="mono">{droppedGrants.join(', ')}</span>,
+                    which are not in Salesforce &gt; Objects or cannot be read,
+                    and grant nothing. Saving removes them.
+                  </div>
+                )}
                 <div className="chk-list" style={{ maxHeight: 340 }}>
                   {objects.map((o) => {
                     const perm = grpDraft.objectPermissions.find(
@@ -2233,11 +2297,16 @@ export function FlyoutDrawer({
                 disabled={busy || !grpDraft.name.trim()}
                 onClick={async () => {
                   setBusy(true);
+                  setGrpSaveError('');
+                  setGrpConflict(null);
                   try {
                     await onSaveGroup(grpDraft);
                     onClose();
-                  } catch {
-                    // The error toast is already showing; stay here so the admin can retry.
+                  } catch (err: any) {
+                    // The toast is showing too; stay here so the admin can read it and retry, or reload
+                    // the group when it changed elsewhere since this drawer loaded it.
+                    setGrpSaveError(err?.message || 'The group could not be saved.');
+                    setGrpConflict(staleGroupFromError(err));
                   } finally {
                     setBusy(false);
                   }

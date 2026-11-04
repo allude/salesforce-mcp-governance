@@ -1,7 +1,9 @@
-// What a Portal Admin log row records of an Access Group. A diff holds names, ids and flags only, and
-// the group arrives from the client as it was sent (POST /groups stores its grants unchecked), so each
-// grant is rebuilt here from the keys a grant has. Anything else sent with it never reaches the log.
+// What a Portal Admin log row records of an Access Group. A diff holds names, ids and flags only.
+// POST /groups now stores only checked grants, but a group saved by an older version holds its grants
+// as they were sent, so each grant is rebuilt here from the keys a grant has, as the policy engine
+// reads it. Anything else stored with it never reaches the log.
 import { SALESFORCE_API_NAME_PATTERN } from '../db/importers.js';
+import { malformedGrantReason } from '../rbac/groupGrants.js';
 import { AVAILABLE_MCP_ACTIONS, type AccessGroup } from '../types/governance.js';
 
 /** The longest group name or description a diff keeps. A longer one is cut, and the diff lists it under truncated. */
@@ -31,21 +33,22 @@ interface AuditedGroup {
 const auditedName = (value: string) =>
   SALESFORCE_API_NAME_PATTERN.test(value) ? value : `<invalid:len=${value.length}>`;
 
-/** A grant as the policy engine reads it, or null for an entry that names no object and so grants nothing. */
+/**
+ * A grant as the policy engine reads it, or null for an entry that grants nothing whatever it holds:
+ * one the engine skips as malformed, or one that names no object.
+ */
 function auditedGrant(entry: unknown): AuditedGrant | null {
-  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
-  const grant = entry as Record<string, unknown>;
-  if (typeof grant.objectName !== 'string' || !grant.objectName) return null;
+  if (malformedGrantReason(entry) !== null) return null;
+  const grant = entry as Record<string, unknown> & { objectName: string; allowedFields?: string[] };
+  if (!grant.objectName) return null;
   return {
     objectName: auditedName(grant.objectName),
-    // The policy engine reads the flags by truthiness, so that is what they grant.
-    canRead: Boolean(grant.canRead),
-    canCreate: Boolean(grant.canCreate),
-    canUpdate: Boolean(grant.canUpdate),
-    canDelete: Boolean(grant.canDelete),
-    allowedFields: Array.isArray(grant.allowedFields)
-      ? grant.allowedFields.filter((field): field is string => typeof field === 'string').map(auditedName)
-      : [],
+    // A flag grants only when it is exactly true; an absent one is false.
+    canRead: grant.canRead === true,
+    canCreate: grant.canCreate === true,
+    canUpdate: grant.canUpdate === true,
+    canDelete: grant.canDelete === true,
+    allowedFields: (grant.allowedFields ?? []).map(auditedName),
   };
 }
 

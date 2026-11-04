@@ -1,6 +1,7 @@
 import { store } from '../db/store.js';
 import { VerifiedSalesforceUser, salesforceIdsMatch } from '../salesforce/client.js';
 import { AVAILABLE_MCP_ACTIONS, GroupObjectPermission } from '../types/governance.js';
+import { grantsAccess, malformedGrantReason } from './groupGrants.js';
 
 /** Thrown when a permitted tool call asks for fields or filters outside the caller's allowlist. */
 export class PolicyViolationError extends Error {
@@ -8,6 +9,27 @@ export class PolicyViolationError extends Error {
     super(message);
     this.name = 'PolicyViolationError';
   }
+}
+
+/** A stored object entry of a group that the engine skipped whole, because it cannot be read as a grant. */
+export interface SkippedGroupEntry {
+  groupId: string;
+  /** The entry's position in the group's objectPermissions. */
+  index: number;
+  /** Which key is wrong, never its value, e.g. 'canRead is not true or false'. */
+  reason: string;
+}
+
+const warnedSkippedEntries = new Set<string>();
+
+/** Tells the operator once per group, entry and reason. The log names the key, never the stored value. */
+function warnSkippedEntry({ groupId, index, reason }: SkippedGroupEntry): void {
+  const key = `${groupId}\u0000${index}\u0000${reason}`;
+  if (warnedSkippedEntries.has(key)) return;
+  warnedSkippedEntries.add(key);
+  console.warn(
+    `[policy] Access Group ${groupId}: object entry ${index} is skipped and grants nothing (${reason}). Open the group in the portal and save it to remove the entry.`
+  );
 }
 
 export interface EffectiveProfilePermissions {
@@ -28,6 +50,8 @@ export interface EffectiveProfilePermissions {
       missingInOrgFields: Set<string>;
     }
   >;
+  /** Present only when a stored entry of an assigned group was skipped (see SkippedGroupEntry). */
+  skippedGroupEntries?: SkippedGroupEntry[];
 }
 
 /**
@@ -104,6 +128,8 @@ export function resolveEffectiveProfilePermissions(
     }
   >();
 
+  const skippedGroupEntries: SkippedGroupEntry[] = [];
+
   for (const grp of assignedGroups) {
     if (!Array.isArray(grp.allowedActions)) continue;
     for (const act of grp.allowedActions) {
@@ -111,12 +137,23 @@ export function resolveEffectiveProfilePermissions(
     }
 
     if (!Array.isArray(grp.objectPermissions)) continue;
-    for (const objPerm of grp.objectPermissions) {
-      if (!objPerm || !objPerm.objectName) continue;
+    for (const [index, entry] of (grp.objectPermissions as unknown[]).entries()) {
+      // POST /groups stores only well-formed entries, but an older version stored them as sent. One
+      // this cannot read is skipped whole (fail closed), never half-applied and never thrown on.
+      const reason = malformedGrantReason(entry);
+      if (reason) {
+        const skipped = { groupId: grp.id, index, reason };
+        skippedGroupEntries.push(skipped);
+        warnSkippedEntry(skipped);
+        continue;
+      }
+      const objPerm = entry as GroupObjectPermission;
+      if (!objPerm.objectName) continue;
       // An entry that grants no CRUD access grants nothing, including its field list. Without this,
       // its fields would be merged only when another group had already granted the object, so the
-      // result would depend on the groups' (alphabetical) processing order.
-      if (!(objPerm.canRead || objPerm.canCreate || objPerm.canUpdate || objPerm.canDelete)) continue;
+      // result would depend on the groups' (alphabetical) processing order. A flag grants only when
+      // it is exactly true.
+      if (!grantsAccess(objPerm)) continue;
 
       const globalObj = enabledObjectsMap.get(objPerm.objectName.toLowerCase());
       if (!globalObj) continue; // Object is disabled or removed in Salesforce -> Objects
@@ -131,10 +168,10 @@ export function resolveEffectiveProfilePermissions(
         missingInOrgFields: globalObj.missingInOrgFields,
       };
 
-      existing.canRead = existing.canRead || Boolean(objPerm.canRead);
-      existing.canCreate = existing.canCreate || Boolean(objPerm.canCreate);
-      existing.canUpdate = existing.canUpdate || Boolean(objPerm.canUpdate);
-      existing.canDelete = existing.canDelete || Boolean(objPerm.canDelete);
+      existing.canRead = existing.canRead || objPerm.canRead === true;
+      existing.canCreate = existing.canCreate || objPerm.canCreate === true;
+      existing.canUpdate = existing.canUpdate || objPerm.canUpdate === true;
+      existing.canDelete = existing.canDelete || objPerm.canDelete === true;
 
       let resolvedAnyField = false;
       for (const f of objPerm.allowedFields || []) {
@@ -151,7 +188,7 @@ export function resolveEffectiveProfilePermissions(
       // groups' (alphabetical) processing order.
       if (
         !resolvedAnyField &&
-        (objPerm.canRead || objPerm.canCreate || objPerm.canUpdate) &&
+        (objPerm.canRead === true || objPerm.canCreate === true || objPerm.canUpdate === true) &&
         globalObj.canonicalFieldMap.has('id')
       ) {
         existing.allowedFields.add(globalObj.canonicalFieldMap.get('id')!);
@@ -175,6 +212,7 @@ export function resolveEffectiveProfilePermissions(
     assignedGroups: assignedGroups.map((g) => ({ id: g.id, name: g.name })),
     allowedActions,
     objectPermissions,
+    ...(skippedGroupEntries.length > 0 ? { skippedGroupEntries } : {}),
   };
 }
 
@@ -185,6 +223,8 @@ export interface PolicyEvaluationResult {
   allowedFields: string[];
   /** Canonical API name of the permitted target object (set when an object-scoped call is permitted). */
   objectName?: string;
+  /** Present only when a stored entry of the caller's groups was skipped while resolving their access. */
+  skippedGroupEntries?: SkippedGroupEntry[];
 }
 
 // Tools that operate on one Salesforce object and must name it via `objectName`.
@@ -206,6 +246,18 @@ export function evaluateMcpToolCall(
     user.profileId,
     user.profileName
   );
+  const result = evaluateAgainst(effective, user, toolName, targetObject);
+  return effective.skippedGroupEntries
+    ? { ...result, skippedGroupEntries: effective.skippedGroupEntries }
+    : result;
+}
+
+function evaluateAgainst(
+  effective: EffectiveProfilePermissions,
+  user: VerifiedSalesforceUser,
+  toolName: string,
+  targetObject?: string
+): PolicyEvaluationResult {
   const groupNames = effective.assignedGroups.map((g) => g.name);
 
   if (!AVAILABLE_MCP_ACTIONS.some((a) => a.id === toolName)) {

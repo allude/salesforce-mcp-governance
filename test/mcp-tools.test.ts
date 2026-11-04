@@ -335,7 +335,7 @@ function seedGovernance(): void {
   store.upsertProfile(FULL.profileId, FULL.profileName);
   store.upsertProfile(READ_ONLY.profileId, READ_ONLY.profileName);
 
-  store.upsertGroup({
+  store.createGroup({
     id: FULL_GROUP.id,
     name: FULL_GROUP.name,
     description: 'mcp-tools.test.ts: every tool, full CRUD on Account',
@@ -368,7 +368,7 @@ function seedGovernance(): void {
       },
     ],
   });
-  store.upsertGroup({
+  store.createGroup({
     id: READ_ONLY_GROUP.id,
     name: READ_ONLY_GROUP.name,
     description: 'mcp-tools.test.ts: read-only Account access',

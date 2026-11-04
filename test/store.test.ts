@@ -685,6 +685,67 @@ describe('store: groups and profile-group mappings', () => {
     assert.equal(groups.some((g) => g.name === `Store Group ${suffix}`), false, 'no copy under the old name');
   });
 
+  test('a group starts at version 1 and every update, even one that changes nothing, adds one', (t) => {
+    const created = newGroup('Store versions');
+    t.after(() => store.deleteGroup(created.id));
+    assert.equal(created.version, 1);
+    const once = store.upsertGroup({ ...created, description: 'changed' });
+    const twice = store.upsertGroup(once);
+    assert.deepEqual([once.version, twice.version], [2, 3]);
+    assert.equal(rawGet<{ version: number }>('SELECT version FROM access_groups WHERE id = ?', created.id)?.version, 3);
+  });
+
+  test('upsertGroup refuses an id no group has instead of creating a group under it', () => {
+    const id = `grp_unknown_${uid()}`;
+    assert.throws(
+      () => store.upsertGroup({ id, name: `Store unknown ${uid()}`, allowedActions: [], objectPermissions: [] }),
+      new RegExp(`Unknown Access Group id: ${id}`)
+    );
+    assert.equal(rawCount('SELECT COUNT(*) AS n FROM access_groups WHERE id = ?', id), 0);
+  });
+
+  test('createGroup takes a fixed id for sample data, but never overwrites the group that has it', (t) => {
+    const id = `grp-fixed-${uid()}`;
+    const created = store.createGroup({ id, name: `Store fixed ${uid()}`, allowedActions: ['soql_query'], objectPermissions: [] });
+    t.after(() => store.deleteGroup(id));
+    assert.deepEqual([created.id, created.version], [id, 1]);
+    assert.throws(
+      () => store.createGroup({ id, name: `Store fixed ${uid()}`, allowedActions: [], objectPermissions: [] }),
+      /UNIQUE constraint failed: access_groups\.id/
+    );
+    assert.deepEqual(store.getGroups().find((g) => g.id === id), created);
+  });
+
+  test('revoking a deleted field or object from a group counts as an update of that group', (t) => {
+    const objectName = `StoreRevoke_${uid()}__c`;
+    store.upsertObjectWithFields({ objectName, fields: [{ fieldName: 'Id' }, { fieldName: 'Gone__c' }] });
+    const group = store.upsertGroup({
+      name: `Store revoke ${uid()}`,
+      allowedActions: [],
+      objectPermissions: [{ objectName, canRead: true, canCreate: false, canUpdate: false, canDelete: false, allowedFields: ['Id', 'Gone__c'] }],
+    });
+    t.after(() => store.deleteGroup(group.id));
+    const versionOf = () => store.getGroups().find((g) => g.id === group.id)!.version;
+
+    store.deleteObjectField(objectName, 'Gone__c');
+    assert.equal(versionOf(), 2);
+    store.deleteObject(objectName);
+    assert.equal(versionOf(), 3);
+  });
+
+  test('a group column that does not parse reads as an empty list, so no reader fails on it', (t) => {
+    const group = newGroup('Store unreadable');
+    t.after(() => store.deleteGroup(group.id));
+    const warn = t.mock.method(console, 'warn', () => {});
+    raw.prepare(`UPDATE access_groups SET object_permissions_json = '[{"objectName":', allowed_actions_json = '{}' WHERE id = ?`).run(group.id);
+
+    const read = store.getGroups().find((g) => g.id === group.id)!;
+    assert.deepEqual([read.objectPermissions, read.allowedActions], [[], []]);
+    store.getGroups();
+    assert.equal(warn.mock.callCount(), 2, 'one warning per group and column');
+    assert.ok(!String(warn.mock.calls[0].arguments[0]).includes('objectName'));
+  });
+
   test('upsertGroup round-trips allowedActions and objectPermissions through JSON', (t) => {
     const allowedActions = ['list_enabled_objects', 'soql_query', 'get_record', 'create_record'];
     const objectPermissions = [

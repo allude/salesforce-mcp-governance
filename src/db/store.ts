@@ -30,6 +30,7 @@ import { salesforceIdKey, salesforceIdsMatch } from '../salesforce/ids.js';
 import { isSimulatedOrgHost, isUninitialisedMcpTokenHost } from '../salesforce/simulatedOrg.js';
 import { soqlSkeleton } from '../mcp/soqlGuard.js';
 import { auditResultFromAction, PORTAL_AUDIT_RESULTS, type PortalAuditResult } from '../security/auditResult.js';
+import { malformedGrantReason, mergeGrants, spellingLookup, uniqueIgnoringCase } from '../rbac/groupGrants.js';
 
 const dbDir = path.dirname(config.dbPath);
 if (!fs.existsSync(dbDir)) {
@@ -102,7 +103,7 @@ function deleteFieldAndRevokeGrants(objName: string, fldName: string): { deleted
       object_permissions_json: string;
     }>;
     const updateGroup = db.prepare(
-      'UPDATE access_groups SET object_permissions_json = ?, updated_at = ? WHERE id = ?'
+      'UPDATE access_groups SET object_permissions_json = ?, version = version + 1, updated_at = ? WHERE id = ?'
     );
     const revokedGroups: string[] = [];
     for (const row of rows) {
@@ -147,7 +148,7 @@ function deleteObjectAndRevokeGrants(objectName: string): { deleted: boolean; re
       object_permissions_json: string;
     }>;
     const updateGroup = db.prepare(
-      'UPDATE access_groups SET object_permissions_json = ?, updated_at = ? WHERE id = ?'
+      'UPDATE access_groups SET object_permissions_json = ?, version = version + 1, updated_at = ? WHERE id = ?'
     );
     const revokedGroups: string[] = [];
     for (const row of rows) {
@@ -273,7 +274,8 @@ db.exec(`
     description TEXT NOT NULL DEFAULT '',
     allowed_actions_json TEXT NOT NULL DEFAULT '[]',
     object_permissions_json TEXT NOT NULL DEFAULT '[]',
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1
   );
 
   CREATE TABLE IF NOT EXISTS profile_group_memberships (
@@ -399,6 +401,103 @@ function backfillLegacyAuditResults() {
   });
 }
 
+/**
+ * Rewrites one group's grants with the catalog's spelling of their Object and field names, matched
+ * case-insensitively as the policy engine matches them, and merges the entries that then name the same
+ * Object (see mergeGrants, which also keeps the Id an entry naming no field of its Object gave).
+ * Returns null when nothing changes. A malformed entry, an entry for an Object the catalog does not
+ * have and a field it does not have are kept as they are: the engine grants nothing for them either
+ * way. Names are not trimmed, because the engine does not trim them.
+ */
+function canonicalGroupGrants(
+  entries: unknown[],
+  objectSpelling: (name: string) => string | null,
+  fieldNamesOf: (objectName: string) => readonly string[]
+): unknown[] | null {
+  const out: unknown[] = [];
+  const slots = new Map<string, { index: number; grants: GroupObjectPermission[] }>();
+  for (const entry of entries) {
+    if (malformedGrantReason(entry) !== null) {
+      out.push(entry);
+      continue;
+    }
+    const grant = entry as GroupObjectPermission;
+    const objectName = objectSpelling(grant.objectName);
+    if (!objectName) {
+      out.push(entry);
+      continue;
+    }
+    const field = spellingLookup(fieldNamesOf(objectName));
+    const renamed: GroupObjectPermission = {
+      ...grant,
+      objectName,
+      ...(Array.isArray(grant.allowedFields)
+        ? { allowedFields: uniqueIgnoringCase(grant.allowedFields.map((name) => field(name) ?? name)) }
+        : {}),
+    };
+    const key = objectName.toLowerCase();
+    const slot = slots.get(key);
+    if (slot) {
+      slot.grants.push(renamed);
+    } else {
+      slots.set(key, { index: out.length, grants: [renamed] });
+      out.push(renamed);
+    }
+  }
+  for (const { index, grants } of slots.values()) {
+    if (grants.length > 1) out[index] = mergeGrants(grants, fieldNamesOf)[0];
+  }
+  return JSON.stringify(out) === JSON.stringify(entries) ? null : out;
+}
+
+/**
+ * Before the version column, POST /groups stored Object and field names as sent, so a grant could name
+ * 'account' while Salesforce > Objects holds 'Account'. /mcp matches names case-insensitively and so
+ * honoured it, but the group editor showed no such grant. This runs only when the column is added, in
+ * one transaction with it, like addSimulatedColumnAndMarkLegacyRows, so it happens once. Every group it
+ * changes gets version 2, so a portal tab opened before the upgrade cannot save over the result.
+ */
+function addGroupVersionAndCanonicalizeGrants() {
+  runInTransaction(() => {
+    if (!ensureColumnExists('access_groups', 'version', 'INTEGER NOT NULL DEFAULT 1')) return;
+    const objectNames = (
+      db.prepare('SELECT object_name FROM sf_objects ORDER BY object_name').all() as Array<{ object_name: string }>
+    ).map((row) => row.object_name);
+    const fieldRows = db
+      .prepare('SELECT object_name, field_name FROM sf_object_fields ORDER BY object_name, field_name')
+      .all() as Array<{ object_name: string; field_name: string }>;
+    const fieldNamesOf = new Map<string, string[]>();
+    for (const row of fieldRows) {
+      fieldNamesOf.set(row.object_name, [...(fieldNamesOf.get(row.object_name) ?? []), row.field_name]);
+    }
+    const objectSpelling = spellingLookup(objectNames);
+
+    const rows = db.prepare('SELECT id, object_permissions_json FROM access_groups').all() as Array<{
+      id: string;
+      object_permissions_json: string;
+    }>;
+    const update = db.prepare(
+      'UPDATE access_groups SET object_permissions_json = ?, version = version + 1, updated_at = ? WHERE id = ?'
+    );
+    const now = new Date().toISOString();
+    for (const row of rows) {
+      const entries = parseStoredJson(row.object_permissions_json);
+      if (!Array.isArray(entries)) continue;
+      const canonical = canonicalGroupGrants(entries, objectSpelling, (name) => fieldNamesOf.get(name) ?? []);
+      if (canonical) update.run(JSON.stringify(canonical), now, row.id);
+    }
+  });
+}
+
+/** A stored JSON column, or undefined when it does not parse. */
+function parseStoredJson(json: string): unknown {
+  try {
+    return JSON.parse(json || '[]');
+  } catch {
+    return undefined;
+  }
+}
+
 function runSchemaMigrations() {
   ensureColumnExists('sf_profiles', 'missing_in_org', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumnExists('sf_objects', 'missing_in_org', 'INTEGER NOT NULL DEFAULT 0');
@@ -428,6 +527,8 @@ function runSchemaMigrations() {
   ensureColumnExists('portal_admin_logs', 'diff_json', "TEXT NOT NULL DEFAULT ''");
   ensureColumnExists('portal_admin_logs', 'correlation_id', "TEXT NOT NULL DEFAULT ''");
   backfillLegacyAuditResults();
+
+  addGroupVersionAndCanonicalizeGrants();
 }
 
 /**
@@ -885,6 +986,34 @@ export interface OktaConfigInput {
   clientSecret?: string;
   redirectUri?: string;
   adminGroup?: string;
+}
+
+/** What a group write stores, besides its id. */
+type GroupWrite = {
+  name: string;
+  description?: string;
+  allowedActions: string[];
+  objectPermissions: GroupObjectPermission[];
+};
+
+const warnedUnreadableGroupColumns = new Set<string>();
+
+/**
+ * A group's JSON list column. One that does not parse or holds no list reads as an empty list,
+ * which grants nothing, so that no reader (the policy engine above all) can fail on it. The
+ * operator is told once per group and column, without the stored text.
+ */
+function storedGroupList(groupId: string, column: string, json: string): any[] {
+  const value = parseStoredJson(json);
+  if (Array.isArray(value)) return value;
+  const key = `${groupId}\u0000${column}`;
+  if (!warnedUnreadableGroupColumns.has(key)) {
+    warnedUnreadableGroupColumns.add(key);
+    console.warn(
+      `[store] Access Group ${groupId} has an unreadable ${column}; it is read as an empty list and grants nothing until the group is saved again.`
+    );
+  }
+  return [];
 }
 
 export const store = {
@@ -1351,6 +1480,16 @@ export const store = {
         .prepare('SELECT object_name FROM sf_objects WHERE lower(object_name) = lower(?) ORDER BY object_name LIMIT 1')
         .get(name)) as { object_name: string } | undefined;
     return row?.object_name ?? name;
+  },
+
+  /** The field names of the object stored under exactly this name, or null when there is no such object. */
+  getObjectFieldNames(objectName: string): string[] | null {
+    if (!db.prepare('SELECT 1 FROM sf_objects WHERE object_name = ?').get(objectName)) return null;
+    return (
+      db
+        .prepare('SELECT field_name FROM sf_object_fields WHERE object_name = ? ORDER BY field_name')
+        .all(objectName) as Array<{ field_name: string }>
+    ).map((row) => row.field_name);
   },
 
   upsertObjectWithFields(input: {
@@ -1863,53 +2002,62 @@ export const store = {
       id: r.id,
       name: r.name,
       description: r.description,
-      allowedActions: JSON.parse(r.allowed_actions_json || '[]'),
-      objectPermissions: JSON.parse(r.object_permissions_json || '[]'),
+      allowedActions: storedGroupList(r.id, 'allowed_actions_json', r.allowed_actions_json),
+      objectPermissions: storedGroupList(r.id, 'object_permissions_json', r.object_permissions_json),
+      version: Number(r.version),
       updatedAt: r.updated_at,
     }));
   },
 
-  upsertGroup(input: {
-    id?: string;
-    name: string;
-    description?: string;
-    allowedActions: string[];
-    objectPermissions: GroupObjectPermission[];
-  }): AccessGroup {
-    const now = new Date().toISOString();
-    const requestedId = input.id?.trim();
-    // New groups get a random id, and a create is a plain INSERT, so it can never collide with
-    // (and silently overwrite) another group. Passing an id updates that group.
+  /**
+   * Creates a group. A create is a plain INSERT, so it can never collide with (and silently
+   * overwrite) another group. A new group gets a random id; `id` is for the sample matrix and tests,
+   * which need a fixed one.
+   */
+  createGroup(input: GroupWrite & { id?: string }): AccessGroup {
     const id =
-      requestedId ||
+      input.id?.trim() ||
       `grp_${input.name
         .trim()
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '_')}_${crypto.randomBytes(6).toString('hex')}`;
-
-    const insertSql = `
-      INSERT INTO access_groups (id, name, description, allowed_actions_json, object_permissions_json, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)`;
-    db.prepare(
-      requestedId
-        ? `${insertSql}
-      ON CONFLICT(id) DO UPDATE SET
-        name = excluded.name,
-        description = excluded.description,
-        allowed_actions_json = excluded.allowed_actions_json,
-        object_permissions_json = excluded.object_permissions_json,
-        updated_at = excluded.updated_at`
-        : insertSql
-    ).run(
+    db.prepare(`
+      INSERT INTO access_groups (id, name, description, allowed_actions_json, object_permissions_json, updated_at, version)
+      VALUES (?, ?, ?, ?, ?, ?, 1)
+    `).run(
       id,
       input.name.trim(),
       (input.description || '').trim(),
       JSON.stringify(input.allowedActions || []),
       JSON.stringify(input.objectPermissions || []),
-      now
+      new Date().toISOString()
     );
-
     return this.getGroups().find((g) => g.id === id)!;
+  },
+
+  /**
+   * Creates a group when no id is given and updates the group with the given id, whose version then
+   * goes up by one. An id no group has is refused: it never creates a group.
+   */
+  upsertGroup(input: GroupWrite & { id?: string }): AccessGroup {
+    const requestedId = input.id?.trim();
+    if (!requestedId) return this.createGroup(input);
+
+    const res = db.prepare(`
+      UPDATE access_groups SET
+        name = ?, description = ?, allowed_actions_json = ?, object_permissions_json = ?,
+        version = version + 1, updated_at = ?
+      WHERE id = ?
+    `).run(
+      input.name.trim(),
+      (input.description || '').trim(),
+      JSON.stringify(input.allowedActions || []),
+      JSON.stringify(input.objectPermissions || []),
+      new Date().toISOString(),
+      requestedId
+    );
+    if (res.changes === 0) throw new Error(`Unknown Access Group id: ${requestedId}`);
+    return this.getGroups().find((g) => g.id === requestedId)!;
   },
 
   deleteGroup(id: string): boolean {
