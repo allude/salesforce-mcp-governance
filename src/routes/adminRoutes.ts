@@ -1,4 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express';
+import crypto from 'node:crypto';
 import {
   MembershipChangeError,
   runInTransaction,
@@ -34,10 +35,11 @@ import {
 import { config, KNOWN_DEFAULT_PASSWORDS } from '../config.js';
 import { parseObjectSyncPayload, parseProfileSyncPayload, type PayloadResult } from './orgSyncPayload.js';
 import { LogPageQueryError, parseMcpLogPageQuery, parsePortalLogPageQuery } from './logPageQuery.js';
+import { groupAuditFields, groupUpdateDiff } from './groupAuditDiff.js';
 import { isSalesforceId, salesforceIdsMatch } from '../salesforce/ids.js';
 import { assertNotSimulatedOrgHost } from '../salesforce/simulatedOrg.js';
 import { AVAILABLE_MCP_ACTIONS, unknownMcpActionIds } from '../types/governance.js';
-import type { SalesforceConnectionSettings } from '../types/governance.js';
+import type { AccessGroup, SalesforceConnectionSettings } from '../types/governance.js';
 import {
   evaluateMcpToolCall,
   resolveEffectiveProfilePermissions,
@@ -226,16 +228,32 @@ const asyncRoute =
     handler(req, res).catch(next);
   };
 
+/**
+ * The id that ties together every Portal Admin log row one Admin API request writes. It is made here,
+ * once per request, and never taken from the client, so a caller cannot file its rows under another
+ * request's id. The response carries it as X-Correlation-Id.
+ */
+function correlationIdFor(res: Response): string {
+  if (typeof res.locals.correlationId !== 'string') {
+    res.locals.correlationId = crypto.randomUUID();
+    if (!res.headersSent) res.setHeader('X-Correlation-Id', res.locals.correlationId);
+  }
+  return res.locals.correlationId;
+}
+
 function getAdminInfo(req: Request): {
   username: string;
   authMethod: 'password' | 'okta_sso';
   ip: string;
+  correlationId: string | undefined;
 } {
   const session = (req as any).adminSession;
   return {
     username: session?.email || 'admin',
     authMethod: session?.authMethod === 'okta_oidc' ? 'okta_sso' : 'password',
     ip: req.ip || '127.0.0.1',
+    // Also reached before this router runs (a sync body the JSON parser refused), hence made on demand.
+    correlationId: req.res ? correlationIdFor(req.res) : undefined,
   };
 }
 
@@ -259,6 +277,7 @@ function recordSyncFailure(req: Request, action: string, target: string, reason:
     target,
     details: `Sync from Salesforce Org failed and changed nothing: ${reason.slice(0, 500)}`,
     ipAddress: actor.ip,
+    correlationId: actor.correlationId,
   });
 }
 
@@ -270,6 +289,12 @@ export function recordObjectSyncFailure(req: Request, reason: string): void {
 function recordProfileSyncFailure(req: Request, reason: string): void {
   recordSyncFailure(req, 'SYNC_PROFILES_FROM_ORG_FAILED', SYNC_PROFILES_TARGET, reason);
 }
+
+// First, so that every Admin API response names its request, the signed-out ones included.
+adminRouter.use((_req: Request, res: Response, next: NextFunction) => {
+  correlationIdFor(res);
+  next();
+});
 
 /**
  * GET /api/admin/session
@@ -332,6 +357,7 @@ adminRouter.post('/login', asyncRoute(async (req: Request, res: Response) => {
       target: 'Portal Auth',
       details: `Failed password login attempt for username "${attemptedUsername}".`,
       ipAddress: req.ip || '127.0.0.1',
+      correlationId: correlationIdFor(res),
     });
     res.status(401).json({ error: 'Invalid username or password.' });
     return;
@@ -352,6 +378,7 @@ adminRouter.post('/login', asyncRoute(async (req: Request, res: Response) => {
     target: 'Portal Auth',
     details: `User "${verifiedUser.username}" (${verifiedUser.role}) signed in with username and password.`,
     ipAddress: req.ip || '127.0.0.1',
+    correlationId: correlationIdFor(res),
   });
 
   res.json({
@@ -379,6 +406,7 @@ adminRouter.post('/logout', asyncRoute(async (req: Request, res: Response) => {
       target: 'Portal Auth',
       details: `User "${session.email}" signed out of the portal.`,
       ipAddress: req.ip || '127.0.0.1',
+      correlationId: correlationIdFor(res),
     });
   }
   clearAdminSessionCookie(res);
@@ -546,6 +574,9 @@ adminRouter.post('/profiles', (req: Request, res: Response) => {
       result.previousId ? ` Its ID was upgraded from "${result.previousId}", keeping its Access Groups.` : ''
     }`,
     ipAddress: actor.ip,
+    correlationId: actor.correlationId,
+    targetType: 'profile',
+    targetId: result.profile.id,
   });
 
   res.json({
@@ -593,6 +624,7 @@ adminRouter.post('/profiles/import-csv', (req: Request, res: Response) => {
       summary.namesKept ? ` ${summary.namesKept} kept their name because they are stored under two ID forms.` : ''
     }`,
     ipAddress: actor.ip,
+    correlationId: actor.correlationId,
   });
 
   res.json({
@@ -618,6 +650,9 @@ adminRouter.delete('/profiles/:id', (req: Request, res: Response) => {
     target: `Profile: ${existing?.name || id} (${id})`,
     details: `Deleted Salesforce Profile "${existing?.name || id}" (${id}).`,
     ipAddress: actor.ip,
+    correlationId: actor.correlationId,
+    targetType: 'profile',
+    targetId: id.trim(),
   });
 
   res.json({ profiles: store.getProfiles() });
@@ -716,6 +751,7 @@ adminRouter.post('/profiles/pull-apply', (req: Request, res: Response) => {
           namesClause('Access granted by merging duplicates', applied.affected.accessGranted) +
           namesClause('Duplicate rows left unchanged because their groups differ', applied.affected.duplicatesUnresolved),
         ipAddress: actor.ip,
+        correlationId: actor.correlationId,
       });
       return applied;
     });
@@ -767,6 +803,7 @@ adminRouter.post('/objects/import-sfdx-files', (req: Request, res: Response) => 
     target: 'Salesforce > Objects',
     details: `Imported ${summary.objectsImported} Salesforce Objects and ${summary.fieldsImported} Fields from uploaded SFDX objects folder.`,
     ipAddress: actor.ip,
+    correlationId: actor.correlationId,
   });
 
   res.json({
@@ -803,6 +840,7 @@ adminRouter.post('/objects/import-local-folder', (req: Request, res: Response) =
       target: summary.resolvedPath,
       details: `Synced ${summary.objectsImported} Objects and ${summary.fieldsImported} Fields from local SFDX directory "${summary.resolvedPath}".`,
       ipAddress: actor.ip,
+      correlationId: actor.correlationId,
     });
 
     res.json({
@@ -846,6 +884,9 @@ adminRouter.post('/objects', (req: Request, res: Response) => {
     target: `Object: ${saved.objectName}`,
     details: `Saved Salesforce Object "${saved.objectName}" (${saved.fields.length} fields).`,
     ipAddress: actor.ip,
+    correlationId: actor.correlationId,
+    targetType: 'object',
+    targetId: saved.objectName,
   });
 
   res.json({
@@ -876,6 +917,9 @@ adminRouter.put('/objects/:objectName/toggle', (req: Request, res: Response) => 
       updated.enabled ? 'ON (Enabled)' : 'OFF (Disabled)'
     }.`,
     ipAddress: actor.ip,
+    correlationId: actor.correlationId,
+    targetType: 'object',
+    targetId: updated.objectName,
   });
 
   res.json({
@@ -913,6 +957,9 @@ adminRouter.put(
         enabled ? 'ON (Enabled)' : 'OFF (Disabled)'
       }.`,
       ipAddress: actor.ip,
+      correlationId: actor.correlationId,
+      targetType: 'field',
+      targetId: `${objectName}.${fieldName}`,
     });
 
     res.json({
@@ -949,6 +996,9 @@ adminRouter.put(
         enabled ? 'ON (Enabled)' : 'OFF (Disabled)'
       }.`,
       ipAddress: actor.ip,
+      correlationId: actor.correlationId,
+      targetType: 'object',
+      targetId: targetObj.objectName,
     });
 
     res.json({
@@ -976,6 +1026,9 @@ adminRouter.delete(
       target: `${objectName}.${fieldName}`,
       details: `Deleted field "${objectName}.${fieldName}" from MCP Server object schema.`,
       ipAddress: actor.ip,
+      correlationId: actor.correlationId,
+      targetType: 'field',
+      targetId: `${objectName}.${fieldName}`,
     });
 
     res.json({
@@ -1008,6 +1061,9 @@ adminRouter.delete('/objects/:objectName', (req: Request, res: Response) => {
         : ''
     }.`,
     ipAddress: actor.ip,
+    correlationId: actor.correlationId,
+    targetType: 'object',
+    targetId: objectName,
   });
 
   res.json({ objects: store.getObjects() });
@@ -1159,6 +1215,7 @@ adminRouter.post('/objects/pull-apply', (req: Request, res: Response) => {
           namesClause('Kept as missing', [...applied.affected.objectsKeptMissing, ...applied.affected.fieldsKeptMissing]) +
           namesClause('Access Groups that lost grants', applied.affected.groupsLosingGrants),
         ipAddress: actor.ip,
+        correlationId: actor.correlationId,
       });
       return applied;
     });
@@ -1197,17 +1254,38 @@ adminRouter.post('/groups', (req: Request, res: Response) => {
     return;
   }
 
-  const isUpdate = Boolean(id && store.getGroups().some((g) => g.id === id));
-  let saved;
+  const actor = getAdminInfo(req);
+  let saved: AccessGroup;
   try {
-    saved = store.upsertGroup({
-      id: id ? String(id) : undefined,
-      name: String(name),
-      description: description ? String(description) : '',
-      allowedActions: Array.isArray(allowedActions) ? allowedActions : [],
-      objectPermissions: Array.isArray(objectPermissions)
-        ? objectPermissions
-        : [],
+    // The change and its audit entry share one transaction: a saved group can never go unlogged.
+    saved = runInTransaction(() => {
+      const before = id ? store.getGroups().find((g) => g.id === String(id).trim()) : undefined;
+      const group = store.upsertGroup({
+        id: id ? String(id) : undefined,
+        name: String(name),
+        description: description ? String(description) : '',
+        allowedActions: Array.isArray(allowedActions) ? allowedActions : [],
+        objectPermissions: Array.isArray(objectPermissions)
+          ? objectPermissions
+          : [],
+      });
+      store.recordPortalAdminLog({
+        adminUsername: actor.username,
+        authMethod: actor.authMethod,
+        action: before ? 'UPDATE_GROUP' : 'CREATE_GROUP',
+        target: `Group: ${group.name}`,
+        details: `${before ? 'Updated' : 'Created'} Access Group "${
+          group.name
+        }" (${group.allowedActions.length} MCP actions, ${
+          group.objectPermissions.length
+        } objects configured).`,
+        ipAddress: actor.ip,
+        correlationId: actor.correlationId,
+        targetType: 'group',
+        targetId: group.id,
+        diff: before ? groupUpdateDiff(before, group) : { after: groupAuditFields(group) },
+      });
+      return group;
     });
   } catch (err: any) {
     if (/UNIQUE constraint failed: access_groups\.name/.test(String(err?.message))) {
@@ -1217,20 +1295,6 @@ adminRouter.post('/groups', (req: Request, res: Response) => {
     throw err;
   }
 
-  const actor = getAdminInfo(req);
-  store.recordPortalAdminLog({
-    adminUsername: actor.username,
-    authMethod: actor.authMethod,
-    action: isUpdate ? 'UPDATE_GROUP' : 'CREATE_GROUP',
-    target: `Group: ${saved.name}`,
-    details: `${isUpdate ? 'Updated' : 'Created'} Access Group "${
-      saved.name
-    }" (${saved.allowedActions.length} MCP actions, ${
-      saved.objectPermissions.length
-    } objects configured).`,
-    ipAddress: actor.ip,
-  });
-
   res.json({
     group: saved,
     groups: store.getGroups(),
@@ -1239,22 +1303,35 @@ adminRouter.post('/groups', (req: Request, res: Response) => {
 
 adminRouter.delete('/groups/:id', (req: Request, res: Response) => {
   const id = String(req.params.id);
-  const existing = store.getGroups().find((g) => g.id === id);
-  const deleted = store.deleteGroup(id);
+  const actor = getAdminInfo(req);
+  // The delete and its audit entry share one transaction: a deleted group can never go unlogged.
+  const deleted = runInTransaction(() => {
+    const existing = store.getGroups().find((g) => g.id === id);
+    if (!existing) return false;
+    // Deleting the group also ends its memberships (ON DELETE CASCADE), so the diff names those Profiles.
+    const profileIds = store
+      .getProfileGroupMappings()
+      .filter((m) => m.groupIds.includes(id))
+      .map((m) => m.profileId);
+    if (!store.deleteGroup(id)) return false;
+    store.recordPortalAdminLog({
+      adminUsername: actor.username,
+      authMethod: actor.authMethod,
+      action: 'DELETE_GROUP',
+      target: `Group: ${existing.name}`,
+      details: `Deleted Access Group "${existing.name}".`,
+      ipAddress: actor.ip,
+      correlationId: actor.correlationId,
+      targetType: 'group',
+      targetId: id,
+      diff: { before: { ...groupAuditFields(existing), profileIds } },
+    });
+    return true;
+  });
   if (!deleted) {
     res.status(404).json({ error: 'Group not found.' });
     return;
   }
-
-  const actor = getAdminInfo(req);
-  store.recordPortalAdminLog({
-    adminUsername: actor.username,
-    authMethod: actor.authMethod,
-    action: 'DELETE_GROUP',
-    target: `Group: ${existing?.name || id}`,
-    details: `Deleted Access Group "${existing?.name || id}".`,
-    ipAddress: actor.ip,
-  });
 
   res.json({
     groups: store.getGroups(),
@@ -1365,6 +1442,10 @@ adminRouter.put(
               groupNames.length > 0 ? groupNames.join(', ') : 'None'
             }].` + membershipChangeClauses(change.added.map(groupName), change.removed.map(groupName)),
           ipAddress: actor.ip,
+          correlationId: actor.correlationId,
+          targetType: 'profile',
+          targetId: profile.id,
+          diff: { added: change.added, removed: change.removed },
         });
         return change;
       });
@@ -1424,6 +1505,10 @@ adminRouter.post('/groups/:id/profiles', (req: Request, res: Response) => {
           `Access Group "${group.name}" is mapped to ${count} Profile${count === 1 ? '' : 's'}.` +
           membershipChangeClauses(applied.added.map(profileLabel), applied.removed.map(profileLabel)),
         ipAddress: actor.ip,
+        correlationId: actor.correlationId,
+        targetType: 'group',
+        targetId: group.id,
+        diff: { added: applied.added, removed: applied.removed },
       });
       return applied;
     });
@@ -1459,6 +1544,9 @@ adminRouter.put('/okta', (req: Request, res: Response) => {
     target: `Okta SSO (${updated.oktaDomain || 'Disabled'})`,
     details: `Updated Okta SSO configuration (Enabled: ${updated.enabled}, Domain: ${updated.oktaDomain}).`,
     ipAddress: actor.ip,
+    correlationId: actor.correlationId,
+    targetType: 'settings',
+    targetId: 'okta',
   });
   res.json({ oktaSettings: updated });
 });
@@ -1489,6 +1577,9 @@ adminRouter.put('/sf-settings', (req: Request, res: Response) => {
     target: 'Salesforce Org Connection',
     details: `Updated Salesforce Org connection settings (Mode: ${updated.authMode}, Login URL: ${updated.loginUrl}, User: ${updated.username || 'Not set'}, OrgId: ${updated.expectedOrgId || 'Any'}, Instance: ${updated.instanceUrl}). ${auditChanges(saved.before, updated, saved.privateKeyReplaced)}`,
     ipAddress: actor.ip,
+    correlationId: actor.correlationId,
+    targetType: 'settings',
+    targetId: 'salesforce_connection',
   });
   res.json({ sfSettings: updated });
 });
@@ -1513,6 +1604,9 @@ adminRouter.post('/sf-settings/generate-cert', (req: Request, res: Response) => 
         target: 'Salesforce JWT Certificate',
         details: 'Refused to overwrite a stored private key that cannot be decrypted: the request did not confirm it.',
         ipAddress: actor.ip,
+        correlationId: actor.correlationId,
+        targetType: 'settings',
+        targetId: 'salesforce_connection',
       });
       res.status(409).json({
         error:
@@ -1537,6 +1631,9 @@ adminRouter.post('/sf-settings/generate-cert', (req: Request, res: Response) => 
       target: 'Salesforce JWT Certificate',
       details: `Generated new 2048-bit RSA Private Key & X.509 Certificate (SHA-256: ${bundle.fingerprintSha256.slice(0, 23)}...) for Salesforce Connected App. ${auditChanges(before, updated, privateKeyReplaced)} undecryptableKeyDestroyed: ${replacesUndecryptableKey}.`,
       ipAddress: actor.ip,
+      correlationId: actor.correlationId,
+      targetType: 'settings',
+      targetId: 'salesforce_connection',
     });
 
     res.json({
@@ -1569,6 +1666,9 @@ adminRouter.post(
         target: 'Salesforce Org Connection',
         details: `Salesforce JWT connection failed: ${errMsg} ${changes}`,
         ipAddress: actor.ip,
+        correlationId: actor.correlationId,
+        targetType: 'settings',
+        targetId: 'salesforce_connection',
       });
 
     let input: SalesforceSettingsInput;
@@ -1616,6 +1716,9 @@ adminRouter.post(
             : 'OAuth 2.0 JWT Bearer'
         }. ${auditChanges(stored, updated, privateKeyReplaced)}`,
         ipAddress: actor.ip,
+        correlationId: actor.correlationId,
+        targetType: 'settings',
+        targetId: 'salesforce_connection',
       });
 
       res.json({
@@ -1673,6 +1776,9 @@ adminRouter.post('/sf-settings/disconnect', (req: Request, res: Response) => {
     target: 'Salesforce Org Connection',
     details: 'Disconnected Salesforce Org metadata sync connection.',
     ipAddress: actor.ip,
+    correlationId: actor.correlationId,
+    targetType: 'settings',
+    targetId: 'salesforce_connection',
   });
 
   res.json({ sfSettings: updated });
@@ -1711,6 +1817,9 @@ adminRouter.post('/portal-users', (req: Request, res: Response) => {
     target: `Portal User: ${saved.username}`,
     details: `Created or updated portal administrator "${saved.username}" (${saved.role}).`,
     ipAddress: actor.ip,
+    correlationId: actor.correlationId,
+    targetType: 'portal_user',
+    targetId: saved.username,
   });
 
   res.json({ portalUsers: store.getPortalUsers() });
@@ -1719,7 +1828,9 @@ adminRouter.post('/portal-users', (req: Request, res: Response) => {
 adminRouter.delete('/portal-users/:username', (req: Request, res: Response) => {
   const username = String(req.params.username);
   try {
-    if (!store.deletePortalUser(username)) {
+    // The row is filed under the stored username, as the create was, whatever spelling the URL used.
+    const storedUsername = store.findPortalUsername(username);
+    if (storedUsername === undefined || !store.deletePortalUser(storedUsername)) {
       res.status(404).json({ error: `Portal user '${username}' not found.` });
       return;
     }
@@ -1731,6 +1842,9 @@ adminRouter.delete('/portal-users/:username', (req: Request, res: Response) => {
       target: `Portal User: ${username}`,
       details: `Deleted portal user "${username}".`,
       ipAddress: actor.ip,
+      correlationId: actor.correlationId,
+      targetType: 'portal_user',
+      targetId: storedUsername,
     });
     res.json({ portalUsers: store.getPortalUsers() });
   } catch (err: any) {
@@ -1802,6 +1916,7 @@ async function runMcpAccessSimulation(req: Request, res: Response): Promise<void
     target: `Profile: ${effective.profileName} (${effective.profileId})`,
     details: `Simulated ${String(toolName || 'list_enabled_objects')} on ${String(targetObject || '*')} as "${user.username}": ${evaluation.permitted ? 'ALLOWED' : 'DENIED'}.${config.isProd ? '' : ' A 15-minute simulator token was issued.'}`,
     ipAddress: actor.ip,
+    correlationId: actor.correlationId,
   });
 
   res.json({
@@ -2120,6 +2235,7 @@ adminRouter.post('/workspace/seed-sample', (req: Request, res: Response) => {
     target: 'Access Matrix & Governance Policy',
     details: `Loaded reference Enterprise Governance Matrix (${sampleGroups.length} Access Groups and Profile-to-Group mappings).`,
     ipAddress: actor.ip,
+    correlationId: actor.correlationId,
   });
 
   res.json({

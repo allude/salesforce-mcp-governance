@@ -1,6 +1,10 @@
-/** Portal Admin log rows have no result column: failures are recorded under their own action names. */
-export function portalAuditResult(action: string): { label: string; tone: 'ok' | 'err' } {
-  if (/_FAILED$/.test(action)) return { label: 'FAILED', tone: 'err' };
-  if (/_DENIED$/.test(action)) return { label: 'DENIED', tone: 'err' };
-  return { label: 'SUCCESS', tone: 'ok' };
+import { auditResultFromAction, type PortalAuditResult } from '@/security/auditResult';
+
+/** The Result shown for a Portal Admin log row: its stored result, or the action-name rule for a row without one. */
+export function portalAuditResult(record: { action: string; result?: PortalAuditResult }): {
+  label: PortalAuditResult;
+  tone: 'ok' | 'err';
+} {
+  const label = record.result ?? auditResultFromAction(record.action);
+  return { label, tone: label === 'SUCCESS' ? 'ok' : 'err' };
 }

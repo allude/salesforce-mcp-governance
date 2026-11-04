@@ -171,6 +171,31 @@ describe('POST /api/admin/groups', () => {
     assert.equal(store.getPortalAdminLogs(1_000_000).length, auditsBefore);
   });
 
+  test('a rejected group request writes no row, though its response still names the request', async () => {
+    const taken = store.upsertGroup({ name: `Taken ${tag()}`, allowedActions: [], objectPermissions: [] });
+    const send = (path: string, method: string, body?: unknown) =>
+      adminFetch(server.baseUrl, session, `/api/admin${path}`, { method, body });
+    const auditsBefore = store.getPortalAdminLogs(1_000_000).length;
+
+    const rejected = [
+      await postGroup({ allowedActions: ['soql_query'] }),
+      await postGroup({ name: `Unknown ${tag()}`, allowedActions: ['query_records'] }),
+      await postGroup({ name: taken.name, allowedActions: ['soql_query'] }),
+      await send(`/groups/grp_missing_${tag()}`, 'DELETE'),
+      await send(`/groups/grp_missing_${tag()}/profiles`, 'POST', { add: [] }),
+      await send(`/groups/${taken.id}/profiles`, 'POST', {}),
+    ];
+
+    assert.deepEqual(rejected.map((res) => res.status), [400, 400, 409, 404, 404, 400]);
+    const ids = rejected.map((res) => res.headers.get('x-correlation-id'));
+    assert.ok(ids.every((id) => typeof id === 'string' && id.length > 0), `every response names its request: ${ids}`);
+    assert.equal(new Set(ids).size, ids.length);
+    const logs = store.getPortalAdminLogs(1_000_000);
+    assert.equal(logs.length, auditsBefore);
+    assert.deepEqual(logs.filter((row) => ids.includes(row.correlationId ?? null)), []);
+    assert.deepEqual(store.getGroups().filter((group) => group.name === taken.name).map((group) => group.id), [taken.id]);
+  });
+
   test('an update cannot add an unknown ID to an existing group', async () => {
     const existing = store.upsertGroup({ name: `Existing ${tag()}`, allowedActions: ['soql_query'], objectPermissions: [] });
     const res = await postGroup({ ...existing, allowedActions: ['soql_query', 'query_records'] });

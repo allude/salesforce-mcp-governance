@@ -224,7 +224,7 @@ try {
     const statuses = res.json.copilotLogs.map((l) => `${l.toolName}:${l.status}`);
     assert.ok(statuses.includes('soql_query:ALLOWED'), statuses.join(', '));
     assert.ok(statuses.includes('delete_record:DENIED'), statuses.join(', '));
-    assert.ok(res.json.portalLogs.some((l) => l.action === 'LOGIN_SUCCESS'));
+    assert.ok(res.json.portalLogs.some((l) => l.action === 'LOGIN_SUCCESS' && l.result === 'SUCCESS' && l.correlationId));
   });
 
   console.log(`\n✔ live E2E smoke test passed (${passed} checks)`);

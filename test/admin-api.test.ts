@@ -1394,6 +1394,113 @@ describe('Admin REST API', () => {
       assertNotAudited(mark, admin.ip);
     });
 
+    /**
+     * Makes the next Portal Admin log write throw, as a full disk or a locked database would. The
+     * returned function puts the real writer back, for the retry.
+     */
+    function failNextAuditWrite(t: TestContext): () => void {
+      const realRecord = store.recordPortalAdminLog;
+      let failed = false;
+      const mocked = t.mock.method(store, 'recordPortalAdminLog', function (this: typeof store, input: Parameters<typeof realRecord>[0]) {
+        if (!failed) {
+          failed = true;
+          throw new Error('audit write failed');
+        }
+        return realRecord.call(this, input);
+      });
+      return () => mocked.mock.restore();
+    }
+
+    /** The request answered 500 through the shared error handler, and wrote no audit row. */
+    function assertRolledBack(res: ApiResponse, mark: string | undefined, session: Session): void {
+      assert.deepEqual([res.status, res.body], [500, { error: 'Internal server error' }]);
+      assertNotAudited(mark, session.ip);
+    }
+
+    it('POST /groups whose audit entry cannot be written creates or changes nothing (500)', async (t) => {
+      const admin = await signIn();
+      const name = newGroupName('Unlogged Create');
+      const input = { name, description: 'Never saved', allowedActions: ['soql_query'], objectPermissions: [readAccounts] };
+      t.after(() => {
+        for (const group of store.getGroups().filter((g) => g.name === name)) store.deleteGroup(group.id);
+      });
+
+      let mark = auditMark();
+      let restore = failNextAuditWrite(t);
+      assertRolledBack(await call(admin, 'POST', '/api/admin/groups', input), mark, admin);
+      restore();
+      assert.ok(!store.getGroups().some((g) => g.name === name), 'the group must not have been created');
+
+      // Nothing half-saved is left in the way: the retry creates it, and its row holds the whole group.
+      const created = await mutate(admin, 'POST', '/api/admin/groups', input, 'CREATE_GROUP', name);
+      const { id: _id, updatedAt: _updatedAt, ...stored } = created.body.group;
+      assert.deepEqual(created.audit.diff, { after: stored });
+
+      const existing = created.body.group as AccessGroup;
+      const update = { ...input, id: existing.id, name: newGroupName('Unlogged Update'), allowedActions: ['delete_record'] };
+      mark = auditMark();
+      restore = failNextAuditWrite(t);
+      assertRolledBack(await call(admin, 'POST', '/api/admin/groups', update), mark, admin);
+      restore();
+      assert.deepEqual(store.getGroups().find((g) => g.id === existing.id), existing, 'the group must be unchanged');
+    });
+
+    it('DELETE /groups/:id whose audit entry cannot be written keeps the group and its mappings (500)', async (t) => {
+      const admin = await signIn();
+      const profileId = addProfile(t);
+      const group = addGroup(t, 'Unlogged Delete');
+      store.setProfileGroups(profileId, [group.id]);
+
+      const mark = auditMark();
+      const restore = failNextAuditWrite(t);
+      assertRolledBack(await call(admin, 'DELETE', `/api/admin/groups/${group.id}`), mark, admin);
+      restore();
+      assert.deepEqual(store.getGroups().find((g) => g.id === group.id), group);
+      assert.deepEqual(mappedGroupIds(profileId), [group.id]);
+
+      const deleted = await mutate(admin, 'DELETE', `/api/admin/groups/${group.id}`, undefined, 'DELETE_GROUP', group.name);
+      const { id: _id, updatedAt: _updatedAt, ...fields } = group;
+      assert.deepEqual(deleted.audit.diff, { before: { ...fields, profileIds: [profileId] } });
+    });
+
+    it('PUT /profile-groups/:profileId whose audit entry cannot be written leaves the mapping as it was (500)', async (t) => {
+      const admin = await signIn();
+      const profileId = addProfile(t);
+      const kept = addGroup(t, 'Unlogged Kept');
+      const added = addGroup(t, 'Unlogged Added');
+      store.setProfileGroups(profileId, [kept.id]);
+      const url = `/api/admin/profile-groups/${profileId}`;
+      const change = { add: [added.id], remove: [kept.id] };
+
+      const mark = auditMark();
+      const restore = failNextAuditWrite(t);
+      assertRolledBack(await call(admin, 'PUT', url, change), mark, admin);
+      restore();
+      assert.deepEqual(mappedGroupIds(profileId), [kept.id]);
+
+      // Had any of it been applied, the retry would report less than the whole change.
+      const retried = await mutate(admin, 'PUT', url, change, 'UPDATE_PROFILE_GROUPS', profileId);
+      assert.deepEqual(retried.audit.diff, { added: [added.id], removed: [kept.id] });
+    });
+
+    it('POST /groups/:id/profiles whose audit entry cannot be written leaves every membership as it was (500)', async (t) => {
+      const admin = await signIn();
+      const [member, joining] = [addProfile(t), addProfile(t)];
+      const group = addGroup(t, 'Unlogged Bulk');
+      store.setProfileGroups(member, [group.id]);
+      const url = `/api/admin/groups/${group.id}/profiles`;
+      const change = { add: [joining], remove: [member] };
+
+      const mark = auditMark();
+      const restore = failNextAuditWrite(t);
+      assertRolledBack(await call(admin, 'POST', url, change), mark, admin);
+      restore();
+      assert.deepEqual([mappedGroupIds(member), mappedGroupIds(joining)], [[group.id], []]);
+
+      const retried = await mutate(admin, 'POST', url, change, 'UPDATE_PROFILE_GROUPS', group.name);
+      assert.deepEqual(retried.audit.diff, { added: [joining], removed: [member] });
+    });
+
     it('POST /workspace/seed-sample loads the sample groups and maps the sample profiles to them', async (t) => {
       const admin = await signIn();
       const profilesBefore = new Set(store.getProfiles().map((p) => p.id));

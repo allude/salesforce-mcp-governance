@@ -1158,7 +1158,7 @@ describe('store: audit logs', () => {
 
     assert.deepEqual(first, withIp);
     assert.deepEqual(second, withoutIp);
-    const { id, timestamp, ...fields } = second;
+    const { id, timestamp, correlationId, ...fields } = second;
     assert.deepEqual(fields, {
       adminUsername,
       authMethod: 'password',
@@ -1166,8 +1166,12 @@ describe('store: audit logs', () => {
       target: 'Store tests',
       details: 'IP address not given',
       ipAddress: '127.0.0.1',
+      result: 'SUCCESS',
+      targetType: '',
+      targetId: '',
+      diff: null,
     });
-    assert.ok(id && !Number.isNaN(Date.parse(timestamp)));
+    assert.ok(id && !Number.isNaN(Date.parse(timestamp)) && correlationId);
     assert.equal(first.ipAddress, '203.0.113.7');
     assert.equal(
       rawGet<{ ip_address: string }>('SELECT ip_address FROM portal_admin_logs WHERE id = ?', withoutIp.id)?.ip_address,

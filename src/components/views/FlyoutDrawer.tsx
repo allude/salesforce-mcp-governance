@@ -1910,8 +1910,8 @@ export function FlyoutDrawer({
                   <dd className="mono">{flyout.data.ipAddress}</dd>
                   <dt>Result</dt>
                   <dd>
-                    <span className={`tag ${portalAuditResult(String(flyout.data.action)).tone}`}>
-                      {portalAuditResult(String(flyout.data.action)).label}
+                    <span className={`tag ${portalAuditResult(flyout.data).tone}`}>
+                      {portalAuditResult(flyout.data).label}
                     </span>
                   </dd>
                 </dl>

@@ -1,3 +1,5 @@
+import type { PortalAuditResult } from '../security/auditResult.js';
+
 export type NavViewId =
   | 'dashboard'
   | 'sf-profiles'
@@ -164,6 +166,15 @@ export interface PortalAdminLogRecord {
   target: string;
   details: string;
   ipAddress: string;
+  // The structured part of the row. The Admin API always sends these; they are optional so that the
+  // portal can still show a row from a server that predates them (the Result then follows the action name).
+  // A row written before these columns existed has '' for targetType, targetId and correlationId and a
+  // null diff: not recorded. Its result follows the action name.
+  result?: PortalAuditResult;
+  targetType?: string; // e.g. 'group', 'profile', 'settings'; '' when the action has no single target
+  targetId?: string; // The stable id of that target (a group id, a Profile id, a settings section); '' when none
+  diff?: Record<string, unknown> | null; // Names, ids and flags of what changed, never a secret; null when not recorded
+  correlationId?: string; // Shared by every row written while handling one Admin API request; '' is not an id
   seq?: number; // Write order (SQLite rowid) on rows from the Admin API log lists; the paging cursor
 }
 

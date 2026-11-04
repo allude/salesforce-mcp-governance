@@ -29,6 +29,7 @@ import {
 import { salesforceIdKey, salesforceIdsMatch } from '../salesforce/ids.js';
 import { isSimulatedOrgHost, isUninitialisedMcpTokenHost } from '../salesforce/simulatedOrg.js';
 import { soqlSkeleton } from '../mcp/soqlGuard.js';
+import { auditResultFromAction, PORTAL_AUDIT_RESULTS, type PortalAuditResult } from '../security/auditResult.js';
 
 const dbDir = path.dirname(config.dbPath);
 if (!fs.existsSync(dbDir)) {
@@ -306,7 +307,12 @@ db.exec(`
     action TEXT NOT NULL,
     target TEXT NOT NULL,
     details TEXT NOT NULL,
-    ip_address TEXT NOT NULL
+    ip_address TEXT NOT NULL,
+    result TEXT NOT NULL DEFAULT 'SUCCESS',
+    target_type TEXT NOT NULL DEFAULT '',
+    target_id TEXT NOT NULL DEFAULT '',
+    diff_json TEXT NOT NULL DEFAULT '',
+    correlation_id TEXT NOT NULL DEFAULT ''
   );
 
   CREATE TABLE IF NOT EXISTS okta_config (
@@ -370,6 +376,29 @@ function addSimulatedColumnAndMarkLegacyRows() {
   });
 }
 
+/**
+ * Before the result column, a row's outcome was only its action name's suffix, which is still the rule
+ * for a row written without one. A row with no correlation id was written by a release that predates
+ * these columns (recordPortalAdminLog always sets one), so its result is only the column default. Such
+ * rows are given the rule's result on every boot, not only on the one that adds the column: an older
+ * release run on this database after a rollback writes them too. A row this version wrote is never
+ * touched. The other structured columns stay empty on those rows.
+ */
+function backfillLegacyAuditResults() {
+  runInTransaction(() => {
+    const actions = db
+      .prepare(`SELECT DISTINCT action FROM portal_admin_logs WHERE correlation_id = '' AND result = 'SUCCESS'`)
+      .all() as Array<{ action: string }>;
+    const setResult = db.prepare(
+      `UPDATE portal_admin_logs SET result = ? WHERE action = ? AND correlation_id = '' AND result = 'SUCCESS'`
+    );
+    for (const { action } of actions) {
+      const result = auditResultFromAction(action);
+      if (result !== 'SUCCESS') setResult.run(result, action);
+    }
+  });
+}
+
 function runSchemaMigrations() {
   ensureColumnExists('sf_profiles', 'missing_in_org', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumnExists('sf_objects', 'missing_in_org', 'INTEGER NOT NULL DEFAULT 0');
@@ -391,6 +420,14 @@ function runSchemaMigrations() {
   ensureColumnExists('sf_connection_settings', 'sync_instance_url', "TEXT NOT NULL DEFAULT ''");
 
   addSimulatedColumnAndMarkLegacyRows();
+
+  // In the order CREATE TABLE lists them, so an upgraded database ends with the same table as a new one.
+  ensureColumnExists('portal_admin_logs', 'result', "TEXT NOT NULL DEFAULT 'SUCCESS'");
+  ensureColumnExists('portal_admin_logs', 'target_type', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('portal_admin_logs', 'target_id', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('portal_admin_logs', 'diff_json', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('portal_admin_logs', 'correlation_id', "TEXT NOT NULL DEFAULT ''");
+  backfillLegacyAuditResults();
 }
 
 /**
@@ -545,6 +582,30 @@ function toCopilotMcpLogRecord(r: any): CopilotMcpLogRecord {
   };
 }
 
+/**
+ * The longest diff_json a Portal Admin log row keeps. The log cannot be cleared and /overview sends its
+ * latest rows on every poll, so a larger diff is replaced by a note of its length; the row itself, with
+ * its action, target and details, is still written.
+ */
+const AUDIT_DIFF_MAX_LENGTH = 64 * 1024;
+
+function storedAuditDiff(diff: Record<string, unknown> | undefined): string {
+  if (!diff) return '';
+  const json = JSON.stringify(diff);
+  return json.length > AUDIT_DIFF_MAX_LENGTH ? JSON.stringify({ truncated: true, length: json.length }) : json;
+}
+
+/** A stored diff, or null when none was recorded. A value that is not a JSON object reads as none. */
+function parseAuditDiff(diffJson: string): Record<string, unknown> | null {
+  if (!diffJson) return null;
+  try {
+    const parsed = JSON.parse(diffJson);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 function toPortalAdminLogRecord(r: any): PortalAdminLogRecord {
   return {
     id: r.id,
@@ -555,6 +616,11 @@ function toPortalAdminLogRecord(r: any): PortalAdminLogRecord {
     target: r.target,
     details: r.details,
     ipAddress: r.ip_address,
+    result: r.result,
+    targetType: r.target_type,
+    targetId: r.target_id,
+    diff: parseAuditDiff(r.diff_json),
+    correlationId: r.correlation_id,
   };
 }
 
@@ -899,20 +965,29 @@ export const store = {
     return this.getPortalUsers().find((u) => u.username === targetUsername)!;
   },
 
-  deletePortalUser(username: string): boolean {
+  /**
+   * The stored username that `username` names, matched like sign-in does (trimmed, any case), or
+   * undefined. It resolves one exact row, preferring an exact-case match, so case variants left by
+   * older versions stay apart. deletePortalUser deletes that row.
+   */
+  findPortalUsername(username: string): string | undefined {
     const requested = username.trim();
-    // Resolve one exact row (preferring an exact-case match), so case variants left by older
-    // versions are never deleted together and the last-administrator guard always holds.
     const target = db
       .prepare(
         'SELECT username FROM portal_users WHERE lower(username) = lower(?) ORDER BY (username = ?) DESC LIMIT 1'
       )
       .get(requested, requested) as { username: string } | undefined;
-    if (!target) return false;
+    return target?.username;
+  },
+
+  deletePortalUser(username: string): boolean {
+    // One exact row, so case variants are never deleted together and the last-administrator guard always holds.
+    const target = this.findPortalUsername(username);
+    if (target === undefined) return false;
     if (this.getPortalUsers().length <= 1) {
       throw new Error('Cannot delete the last remaining portal administrator account.');
     }
-    const res = db.prepare('DELETE FROM portal_users WHERE username = ?').run(target.username);
+    const res = db.prepare('DELETE FROM portal_users WHERE username = ?').run(target);
     return res.changes > 0;
   },
 
@@ -2163,15 +2238,36 @@ export const store = {
     target: string;
     details: string;
     ipAddress?: string;
+    /** Defaults to the action-name rule: *_FAILED is FAILED, *_DENIED is DENIED, anything else SUCCESS. */
+    result?: PortalAuditResult;
+    /** What the action changed, by a stable id, e.g. 'group' and the group's id. */
+    targetType?: string;
+    targetId?: string;
+    /**
+     * Names, ids and flags of what changed, stored as JSON. Never a secret, a password, a key or a token.
+     * One over 64 KB is stored as { truncated: true, length } instead.
+     */
+    diff?: Record<string, unknown>;
+    /** The id of the Admin API request that wrote this row. A row written without one gets its own. */
+    correlationId?: string;
   }): PortalAdminLogRecord {
+    const result = input.result ?? auditResultFromAction(input.action);
+    if (!PORTAL_AUDIT_RESULTS.includes(result)) {
+      throw new Error(`Unknown audit result '${result}'.`);
+    }
     const id = `adm_${Date.now().toString(36)}_${crypto.randomBytes(8).toString('hex')}`;
     const timestamp = new Date().toISOString();
     const ip = input.ipAddress || '127.0.0.1';
+    const targetType = input.targetType || '';
+    const targetId = input.targetId || '';
+    const diffJson = storedAuditDiff(input.diff);
+    const correlationId = input.correlationId || crypto.randomUUID();
 
     db.prepare(`
       INSERT INTO portal_admin_logs (
-        id, timestamp, admin_username, auth_method, action, target, details, ip_address
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        id, timestamp, admin_username, auth_method, action, target, details, ip_address,
+        result, target_type, target_id, diff_json, correlation_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       timestamp,
@@ -2180,7 +2276,12 @@ export const store = {
       input.action,
       input.target,
       input.details,
-      ip
+      ip,
+      result,
+      targetType,
+      targetId,
+      diffJson,
+      correlationId
     );
 
     return {
@@ -2192,6 +2293,11 @@ export const store = {
       target: input.target,
       details: input.details,
       ipAddress: ip,
+      result,
+      targetType,
+      targetId,
+      diff: parseAuditDiff(diffJson),
+      correlationId,
     };
   },
 

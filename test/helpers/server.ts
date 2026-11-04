@@ -48,14 +48,15 @@ export async function adminFetch(
   baseUrl: string,
   session: AdminSession,
   path: string,
-  init: { method?: string; body?: unknown } = {}
-): Promise<{ status: number; body: any }> {
+  init: { method?: string; body?: unknown; headers?: Record<string, string> } = {}
+): Promise<{ status: number; headers: Headers; body: any }> {
   const res = await fetch(`${baseUrl}${path}`, {
     method: init.method || 'GET',
     headers: {
       Cookie: session.cookie,
       'X-CSRF-Token': session.csrfToken,
       ...(init.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      ...init.headers,
     },
     body: init.body !== undefined ? JSON.stringify(init.body) : undefined,
   });
@@ -66,7 +67,7 @@ export async function adminFetch(
   } catch {
     // leave as text
   }
-  return { status: res.status, body };
+  return { status: res.status, headers: res.headers, body };
 }
 
 let rpcId = 0;
