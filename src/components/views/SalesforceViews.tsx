@@ -14,6 +14,7 @@ import type {
   RemovalResolutionAction,
 } from '@/types/governance';
 import { Switch, Timestamp } from '@/components/ui/primitives';
+import { useControllable } from '@/components/ui/useControllable';
 import { effectiveGrants, grantsAccess, readableGrants } from '@/rbac/groupGrants';
 import type { FlyoutState } from './FlyoutDrawer';
 import { describeProfileDuplicate, profileSyncNeedsReview } from './profileSyncReview';
@@ -580,6 +581,14 @@ interface SalesforceObjectsViewProps {
     removeFields: Array<{ objectName: string; fieldName: string }>;
   }) => Promise<void>;
   onNavigateToOrgConnection: () => void;
+  /** Filters the page keeps in the URL; the free-text search stays local. */
+  routeFilters?: ObjectRouteFilters;
+  onRouteFiltersChange?: (filters: ObjectRouteFilters) => void;
+}
+
+export interface ObjectRouteFilters {
+  status: 'all' | 'enabled' | 'disabled';
+  kind: 'all' | 'std' | 'custom';
 }
 
 export function SalesforceObjectsView({
@@ -595,12 +604,20 @@ export function SalesforceObjectsView({
   onPreviewPullObjectsFromOrg,
   onApplyPullObjectsFromOrg,
   onNavigateToOrgConnection,
+  routeFilters,
+  onRouteFiltersChange,
 }: SalesforceObjectsViewProps) {
   const [q, setQ] = useState('');
-  const [statusFilter, setStatusFilter] = useState<
-    'all' | 'enabled' | 'disabled'
-  >('all');
-  const [kindFilter, setKindFilter] = useState<'all' | 'std' | 'custom'>('all');
+  const [statusFilter, setStatusFilter] = useControllable<ObjectRouteFilters['status']>(
+    routeFilters?.status,
+    routeFilters && onRouteFiltersChange ? (status) => onRouteFiltersChange({ ...routeFilters, status }) : undefined,
+    'all'
+  );
+  const [kindFilter, setKindFilter] = useControllable<ObjectRouteFilters['kind']>(
+    routeFilters?.kind,
+    routeFilters && onRouteFiltersChange ? (kind) => onRouteFiltersChange({ ...routeFilters, kind }) : undefined,
+    'all'
+  );
 
   // Org Object Catalog & Reconciliation Modal state
   const [catalogOpen, setCatalogOpen] = useState(false);

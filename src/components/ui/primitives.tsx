@@ -453,6 +453,7 @@ export function Drawer({
   children,
   footer,
   label = 'Details drawer',
+  bare = false,
 }: {
   open: boolean;
   onClose: () => void;
@@ -461,6 +462,8 @@ export function Drawer({
   children: React.ReactNode;
   footer?: React.ReactNode;
   label?: string;
+  /** The caller lays out its own .fly-b body and .fly-f footer. */
+  bare?: boolean;
 }) {
   const modal = useModalDialog<HTMLElement, HTMLButtonElement>(open, onClose);
   const titleId = React.useId();
@@ -495,7 +498,7 @@ export function Drawer({
             ✕
           </button>
         </div>
-        <div className="fly-b">{children}</div>
+        {bare ? children : <div className="fly-b">{children}</div>}
         {footer}
       </aside>
     </>

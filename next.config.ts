@@ -21,6 +21,15 @@ const nextConfig: NextConfig = {
       },
     ];
   },
+  async redirects() {
+    // A view's bare section path goes to its first tab (307, query kept). Portal paths only.
+    return [
+      { source: '/org', destination: '/org/connection', permanent: false },
+      { source: '/access-groups', destination: '/access-groups/groups', permanent: false },
+      { source: '/logs', destination: '/logs/mcp', permanent: false },
+      { source: '/settings', destination: '/settings/security', permanent: false },
+    ];
+  },
   async rewrites() {
     // Read when the rewrites are built: at `next dev` startup, and at `next build` for `next start`.
     const backendUrl = process.env.MCP_BACKEND_URL || 'http://localhost:3001';

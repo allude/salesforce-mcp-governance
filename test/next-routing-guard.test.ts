@@ -19,6 +19,7 @@ import {
   isInterceptionRouteAppPath,
 } from 'next/dist/shared/lib/router/utils/interception-routes.js';
 import nextConfig from '../next.config.js';
+import { ROUTE_LIST } from '../src/components/shell/routes.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // Required, not imported: an ESM default import of this CommonJS module gets its whole exports object.
@@ -102,5 +103,38 @@ describe('Next.js routes next to the proxied backend', () => {
       ...proxiedPrefixes.flatMap((prefix) => [prefix, `${prefix}/`, `${prefix}/x`]),
     ];
     for (const pathname of backendPaths) assert.deepEqual(appliedHeaderKeys(pathname), [], pathname);
+  });
+
+  test('there is no proxy.ts or middleware, which would run in front of the proxied backend', () => {
+    for (const dir of ['', 'src']) {
+      for (const name of ['proxy', 'middleware']) {
+        for (const ext of ['ts', 'tsx', 'js', 'mjs']) {
+          const file = path.join(REPO_ROOT, dir, `${name}.${ext}`);
+          assert.equal(fs.existsSync(file), false, file);
+        }
+      }
+    }
+  });
+
+  test('every portal route in the route map has a page, outside the proxied prefixes, with its headers', () => {
+    const appFiles = tree(path.join(REPO_ROOT, 'src/app'));
+    const pages = new Set(appFiles.filter((f) => /(^|\/)page\.tsx$/.test(f)).map((f) => appUrlPath(f.replace(/\/?page\.tsx$/, '') || '/')));
+    for (const route of ROUTE_LIST) {
+      assert.ok(pages.has(route.path), `${route.path} has a page`);
+      const sample = route.path.replace('[groupId]', 'grp_x');
+      assert.equal(isProxied(sample), false, sample);
+      const keys = appliedHeaderKeys(sample);
+      assert.ok(keys.includes('X-Frame-Options') && keys.includes('Content-Security-Policy'), sample);
+    }
+  });
+
+  test('section redirects stay on portal paths and land on a route in the map', () => {
+    assert.ok(routes.redirects.length > 0);
+    const paths = new Set(ROUTE_LIST.map((r) => r.path));
+    for (const r of routes.redirects) {
+      if ((r as { internal?: boolean }).internal) continue; // Next's own trailing-slash rule
+      assert.equal(isProxied(r.source), false, r.source);
+      assert.ok(paths.has(r.destination), r.destination);
+    }
   });
 });

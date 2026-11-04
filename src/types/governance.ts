@@ -1,17 +1,5 @@
 import type { PortalAuditResult } from '../security/auditResult.js';
 
-export type NavViewId =
-  | 'dashboard'
-  | 'sf-profiles'
-  | 'sf-objects'
-  | 'matrix-groups'
-  | 'matrix-profile-groups'
-  | 'logs-copilot'
-  | 'logs-portal'
-  | 'settings-auth'
-  | 'settings-salesforce'
-  | 'connect-copilot';
-
 export const AVAILABLE_MCP_ACTIONS = [
   {
     id: 'list_enabled_objects',

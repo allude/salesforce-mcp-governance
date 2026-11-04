@@ -1,8 +1,8 @@
 'use client';
 
+import type { RouteId } from '@/components/shell/routes';
 import React, { useState, useEffect, useRef } from 'react';
 import { portalAuditResult } from './portalAudit';
-import { DEFAULT_SIMULATED_USERNAME, trafficBurstCalls } from './simulatedTraffic';
 import {
   downloadTextFile,
   draftSaveSource,
@@ -51,11 +51,13 @@ import type {
   GroupObjectPermission,
 } from '@/types/governance';
 import {
+  Drawer,
   MCP_TOOL_CATALOG,
   StatusBadge,
   Switch,
   isSensitiveField,
 } from '@/components/ui/primitives';
+import { useDraftActions, useDraftRegistration } from '@/components/shell/draftContext';
 
 export type FlyoutType =
   | 'profile'
@@ -77,7 +79,8 @@ interface FlyoutDrawerProps {
   flyout: FlyoutState | null;
   onClose: () => void;
   onOpenFlyout: (next: FlyoutState) => void;
-  onNavigateView: (view: string, filterUser?: string) => void;
+  /** Goes to a route; for logs-mcp, `filterUser` filters it to that Salesforce username. */
+  onNavigateView: (route: RouteId, filterUser?: string) => void;
   profiles: SalesforceProfile[];
   objects: SalesforceObject[];
   groups: AccessGroup[];
@@ -112,15 +115,8 @@ interface FlyoutDrawerProps {
   ) => Promise<AccessGroup | void>;
   onDeleteGroup: (groupId: string) => Promise<void>;
   onLoadGroupHistory: (groupId: string) => Promise<AccessGroupHistoryEntry[]>;
-  /** From the server: false in production, where the traffic burst is hidden. */
+  /** From the server: false in production, where development-only sync sources are hidden. */
   devToolsEnabled: boolean;
-  onTestMcpCall: (payload: {
-    profileId: string;
-    toolName: string;
-    targetObject: string;
-    username?: string;
-    samplePayload?: Record<string, unknown>;
-  }) => Promise<any>;
   /** Reloads the workspace; answers the groups and Objects it read, or null when it could not. */
   onRefreshWorkspace: () => Promise<WorkspaceSnapshot | null>;
   notify: (msg: string, isError?: boolean) => void;
@@ -156,7 +152,6 @@ export function FlyoutDrawer({
   onSaveGroup,
   onDeleteGroup,
   onLoadGroupHistory,
-  onTestMcpCall,
   onRefreshWorkspace,
   notify,
   devToolsEnabled,
@@ -196,6 +191,8 @@ export function FlyoutDrawer({
 
   // Group drawer state. The Visual and XML views edit the same draft; Save sends it from either.
   const [grpDraft, setGrpDraft] = useState<AccessGroupDraft | null>(null);
+  /** A new group's draft as it opened, so only an edit to it counts as unsaved. */
+  const [grpNewBaseline, setGrpNewBaseline] = useState<string | null>(null);
   // What the stored group holds that POST /groups would refuse: left out of the draft, so saving removes it.
   const [droppedActions, setDroppedActions] = useState<string[]>([]);
   const [droppedGrants, setDroppedGrants] = useState<string[]>([]);
@@ -219,12 +216,6 @@ export function FlyoutDrawer({
   } | null>(null);
   const [showPending, setShowPending] = useState(false);
 
-  // Simulator drawer state
-  const [simProfileId, setSimProfileId] = useState('');
-  const [simUsername, setSimUsername] = useState(DEFAULT_SIMULATED_USERNAME);
-  const [simTool, setSimTool] = useState<McpActionType>('soql_query');
-  const [simObject, setSimObject] = useState('Opportunity');
-  const [simResult, setSimResult] = useState<any>(null);
 
   /**
    * Starts the drawer's draft from a group as stored (or from a new group's draft, or from an imported
@@ -243,6 +234,7 @@ export function FlyoutDrawer({
     setXmlNotice(null);
     setXmlEdited(false);
     setGrpDraft(draft);
+    setGrpNewBaseline(draft.id ? null : JSON.stringify(draft));
     return draft;
   };
 
@@ -270,6 +262,44 @@ export function FlyoutDrawer({
     }
   };
 
+  // What the group draft holds unsaved, whether or not the drawer is open: the shell keeps the draft
+  // (PolicyDraft) and shows it in the Unsaved Policy Changes bar on every view.
+  const storedDraftGroup = grpDraft?.id ? savedAccessGroup(groups, grpDraft.id) : null;
+  const groupDraftChanges = !grpDraft
+    ? 0
+    : storedDraftGroup
+      ? describeGroupChanges(storedDraftGroup, grpDraft).length
+      : grpDraft.id
+        ? 0 // a group deleted elsewhere: nothing to save it over
+        : grpImport || JSON.stringify(grpDraft) !== grpNewBaseline
+          ? 1
+          : 0;
+  const draftActions = useDraftActions();
+  useDraftRegistration(
+    grpDraft && groupDraftChanges > 0
+      ? {
+          key: `group:${grpDraft.id || 'new'}`,
+          scope: 'policy',
+          label: `Group "${grpDraft.name || 'New Access Group'}"`,
+          count: groupDraftChanges,
+        }
+      : null,
+    {
+      discard: () => {
+        setGrpDraft(null);
+        setGrpImport(null);
+        setGrpOrigin(null);
+        setGrpSaveError('');
+        setGrpConflict(null);
+        setShowPending(false);
+      },
+      review: () => {
+        if (!grpDraft) return;
+        onOpenFlyout({ type: 'group', data: grpDraft.id ? { id: grpDraft.id } : { ...grpDraft } });
+      },
+    }
+  );
+
   useEffect(() => {
     setConfirmDelete(false);
     setFieldQuery('');
@@ -287,6 +317,12 @@ export function FlyoutDrawer({
       // An import opens on the file's content, aimed at the group it matched (or a new one). Only a
       // group this server has can be its target: an update naming any other id is refused (404).
       const imported = flyout.data.importDraft as AccessGroupDraft | undefined;
+      // Reopening the group whose unsaved draft the shell kept (the drawer was closed by Back, or by
+      // "Close and keep draft") picks the draft up again instead of reloading the stored group.
+      if (!imported && grpDraft && groupDraftChanges > 0 && (grpDraft.id ?? null) === (flyout.data.id ?? null)) {
+        setShowPending(true);
+        return;
+      }
       const stored = groups.find((g) => g.id === flyout.data.id);
       const target = imported ? stored : undefined;
       loadGroupDraft(
@@ -305,29 +341,8 @@ export function FlyoutDrawer({
             }
           : null
       );
-    } else if (flyout.type === 'simulator') {
-      const initProf =
-        flyout.data?.profileId || profiles[0]?.id || '00e5g000001B2k9AAC';
-      setSimProfileId(initProf);
-      if (flyout.data?.username) setSimUsername(flyout.data.username);
-      if (flyout.data?.toolName) setSimTool(flyout.data.toolName);
-      if (flyout.data?.targetObject && flyout.data.targetObject !== '*') {
-        setSimObject(flyout.data.targetObject);
-      } else if (objects[0]?.objectName) {
-        setSimObject(objects[0].objectName);
-      }
-      setSimResult(null);
     }
   }, [flyout?.type, flyout?.data?.id, flyout?.data?.objectName, flyout?.data?.importNonce]);
-
-  useEffect(() => {
-    if (!flyout) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [flyout, onClose]);
 
   if (!flyout) return null;
 
@@ -699,24 +714,6 @@ export function FlyoutDrawer({
     setGrpDraft(setAvailableFields(grpDraft, objMeta, enableAll));
   };
 
-  const handleRunBurst = async () => {
-    setBusy(true);
-    try {
-      const sampleCalls = trafficBurstCalls(profiles.map((p) => p.id));
-      let lastRes = null;
-      for (const call of sampleCalls) {
-        lastRes = await onTestMcpCall(call);
-      }
-      setSimResult(lastRes);
-      await onRefreshWorkspace();
-      notify('Simulated 6 Copilot MCP traffic events');
-    } catch {
-      // The error toast is already showing; stay here so the admin can retry.
-    } finally {
-      setBusy(false);
-    }
-  };
-
   let title = '';
   let subtitle = '';
   if (flyout.type === 'profile' && liveProfile) {
@@ -747,9 +744,6 @@ export function FlyoutDrawer({
   } else if (flyout.type === 'audit' && flyout.data) {
     title = `${flyout.data.action} · ${flyout.data.target}`;
     subtitle = `Portal audit event · ${flyout.data.id}`;
-  } else if (flyout.type === 'simulator') {
-    title = 'Live MCP Policy Simulator';
-    subtitle = 'Evaluate Profile-to-Group RBAC & generate Copilot test traffic';
   }
 
   const csvRows = flyout.type === 'import' ? parseCsvRows(csvText) : [];
@@ -758,22 +752,9 @@ export function FlyoutDrawer({
   );
 
   return (
-    <>
-      <div className="scrim" onClick={onClose} />
-      <aside className="fly" aria-label="Details drawer">
-        <div className="fly-h">
-          <div>
-            <div className="fly-t">{title}</div>
-            <div className="fly-s">{subtitle}</div>
-          </div>
-          <button
-            className="btn gh sm"
-            onClick={onClose}
-            title="Close (Esc)"
-          >
-            ✕
-          </button>
-        </div>
+    // A modal (useModalDialog via Drawer): Escape, the scrim and ✕ all go through onClose, which is
+    // the shell's unsaved-changes guard; Cmd/Ctrl+K cannot open the palette behind it.
+    <Drawer open onClose={onClose} title={title} subtitle={subtitle} bare>
 
         <div className="fly-b">
           {/* 1. PROFILE DRAWER */}
@@ -1579,7 +1560,7 @@ export function FlyoutDrawer({
                         className="btn"
                         onClick={() => {
                           onClose();
-                          onNavigateView('sf-connection');
+                          onNavigateView('org-connection');
                         }}
                       >
                         Configure JWT Connection
@@ -2458,157 +2439,6 @@ export function FlyoutDrawer({
           )}
 
           {/* 9. LIVE MCP POLICY SIMULATOR */}
-          {flyout.type === 'simulator' && (
-            <>
-              <div className="sec">
-                <div className="fld">
-                  <label>Caller Salesforce Profile</label>
-                  <select
-                    className="inp"
-                    value={simProfileId}
-                    onChange={(e) => setSimProfileId(e.target.value)}
-                  >
-                    {profiles.map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {p.name} ({p.id})
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="fld">
-                  <label>Simulated Copilot User</label>
-                  <input
-                    className="inp"
-                    value={simUsername}
-                    onChange={(e) => setSimUsername(e.target.value)}
-                    placeholder={DEFAULT_SIMULATED_USERNAME}
-                  />
-                  <div style={{ fontSize: 11, color: 'var(--t3)', marginTop: 4 }}>
-                    Logged as simulated:&lt;name&gt; and tagged SIMULATED.
-                  </div>
-                </div>
-                <div
-                  style={{
-                    display: 'grid',
-                    gridTemplateColumns: '1fr 1fr',
-                    gap: 10,
-                  }}
-                >
-                  <div className="fld">
-                    <label>MCP Tool</label>
-                    <select
-                      className="inp mono"
-                      value={simTool}
-                      onChange={(e) =>
-                        setSimTool(e.target.value as McpActionType)
-                      }
-                    >
-                      {MCP_TOOL_CATALOG.map((t) => (
-                        <option key={t.id} value={t.id}>
-                          {t.label} ({t.risk})
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div className="fld">
-                    <label>Target SObject</label>
-                    <select
-                      className="inp mono"
-                      value={simObject}
-                      onChange={(e) => setSimObject(e.target.value)}
-                    >
-                      {objects.map((o) => (
-                        <option key={o.objectName} value={o.objectName}>
-                          {o.objectName} {!o.enabled ? '(Disabled)' : ''}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                </div>
-                <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
-                  <button
-                    type="button"
-                    className="btn pri"
-                    disabled={busy}
-                    onClick={async () => {
-                      setBusy(true);
-                      try {
-                        const res = await onTestMcpCall({
-                          profileId: simProfileId,
-                          toolName: simTool,
-                          targetObject: simObject,
-                          username: simUsername,
-                        });
-                        setSimResult(res);
-                        await onRefreshWorkspace();
-                      } catch {
-                        // The error toast is already showing; stay here so the admin can retry.
-                      } finally {
-                        setBusy(false);
-                      }
-                    }}
-                  >
-                    Run MCP Policy Check
-                  </button>
-                  {devToolsEnabled && (
-                    <button
-                      type="button"
-                      className="btn"
-                      disabled={busy}
-                      onClick={handleRunBurst}
-                    >
-                      Run 6-Event Traffic Burst
-                    </button>
-                  )}
-                </div>
-              </div>
-
-              {simResult?.evaluation && (
-                <div className="sec">
-                  <div className="sec-h">
-                    <span className="sec-t">Policy Evaluation Result</span>
-                    <StatusBadge
-                      status={simResult.evaluation.permitted ? 'ALLOWED' : 'DENIED'}
-                      label={simResult.evaluation.permitted ? 'ALLOWED' : 'DENIED BY POLICY'}
-                    />
-                  </div>
-                  <dl className="kv" style={{ marginBottom: 10 }}>
-                    <dt>Decision reason</dt>
-                    <dd>{simResult.evaluation.reason}</dd>
-                    <dt>Matched groups</dt>
-                    <dd>
-                      {(simResult.evaluation.matchedGroups || []).length > 0
-                        ? simResult.evaluation.matchedGroups.join(', ')
-                        : 'None'}
-                    </dd>
-                    <dt>Allowed fields</dt>
-                    <dd className="mono">
-                      {(simResult.evaluation.allowedFields || []).length > 0
-                        ? `${simResult.evaluation.allowedFields.length} fields (${simResult.evaluation.allowedFields.slice(0, 6).join(', ')}${simResult.evaluation.allowedFields.length > 6 ? '…' : ''})`
-                        : '0 fields'}
-                    </dd>
-                  </dl>
-                  {simResult.simulatorBearerToken && (
-                    <div>
-                      <div
-                        style={{
-                          fontSize: 11,
-                          color: 'var(--t3)',
-                          marginBottom: 4,
-                        }}
-                      >
-                        Signed Simulator Bearer Token (for{' '}
-                        <span className="mono">POST /mcp</span>):
-                      </div>
-                      <pre className="code">
-                        {simResult.simulatorBearerToken}
-                      </pre>
-                    </div>
-                  )}
-                </div>
-              )}
-            </>
-          )}
         </div>
 
         {/* FOOTER */}
@@ -2779,6 +2609,14 @@ export function FlyoutDrawer({
                   setGrpConflict(null);
                   try {
                     await onSaveGroup({ ...grpDraft, ...draftSaveSource(grpOrigin, xmlEdited) });
+                    // Saved: nothing is unsaved any more. Clear the registration now, before the close
+                    // guard reads it (a new group's draft would otherwise still differ from its blank
+                    // baseline and ask to be kept, and saving it again would create a second group).
+                    draftActions?.clear(`group:${grpDraft.id || 'new'}`);
+                    setGrpDraft(null);
+                    setGrpImport(null);
+                    setGrpOrigin(null);
+                    setShowPending(false);
                     onClose();
                   } catch (err: any) {
                     // The toast is showing too; stay here so the admin can read it and retry, or reload
@@ -2800,8 +2638,10 @@ export function FlyoutDrawer({
                   type="button"
                   className="btn"
                   onClick={() => {
-                    onNavigateView('traffic', flyout.data.sfUsername);
+                    // Close first: closing writes the URL, which would cancel a navigation already started.
+                    const username = flyout.data.sfUsername;
                     onClose();
+                    onNavigateView('logs-mcp', username);
                   }}
                 >
                   Filter by this user
@@ -2826,7 +2666,6 @@ export function FlyoutDrawer({
             </button>
           </div>
         </div>
-      </aside>
-    </>
+    </Drawer>
   );
 }

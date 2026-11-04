@@ -1,5 +1,6 @@
 'use client';
 
+import type { RouteId } from '@/components/shell/routes';
 import React, { useState, useMemo } from 'react';
 import type {
   CopilotMcpLogEntry,
@@ -16,6 +17,10 @@ import type {
 } from '@/types/governance';
 import { MCP_TOOL_CATALOG, StatusBadge, Switch, Timestamp } from '@/components/ui/primitives';
 import { statusTone, statusToneClass } from '@/components/ui/statusTone';
+import { OrgStatus } from './OrgStatus';
+import { useDraftRegistration } from '@/components/shell/draftContext';
+import { useControllable } from '@/components/ui/useControllable';
+import { changedFieldCount } from '@/components/shell/formDraft';
 import { PORTAL_PASSWORD_MIN_LENGTH } from '@/security/passwordPolicy';
 import type { FlyoutState } from './FlyoutDrawer';
 import { realTraffic } from './simulatedTraffic';
@@ -74,7 +79,10 @@ interface TrafficDashboardProps {
   mappings?: ProfileGroupMapping[];
   sfSettings?: SalesforceConnectionSettings | null;
   selectedFlyoutId?: string;
-  onNavigateTab: (tab: string) => void;
+  onNavigateTab: (route: RouteId) => void;
+  /** The chart window, when the page keeps it (in the URL). */
+  range?: TrafficRange;
+  onRangeChange?: (range: TrafficRange) => void;
   onOpenFlyout: (flyout: FlyoutState) => void;
   onSeedEnterpriseMatrix?: () => void;
 }
@@ -94,8 +102,10 @@ export function TrafficDashboardView({
   onNavigateTab,
   onOpenFlyout,
   onSeedEnterpriseMatrix,
+  range: rangeProp,
+  onRangeChange,
 }: TrafficDashboardProps) {
-  const [range, setRange] = useState<TrafficRange>('24h');
+  const [range, setRange] = useControllable<TrafficRange>(rangeProp, onRangeChange, '24h');
 
   const getProfileGroupIds = (profileId: string): string[] => {
     const found = mappings.find((m) => m.profileId === profileId);
@@ -159,12 +169,6 @@ export function TrafficDashboardView({
     .filter((l) => l.status === 'DENIED')
     .slice(0, 5);
 
-  const totalFields = objects.reduce((acc, o) => acc + o.fields.length, 0);
-  const enabledFields = objects.reduce(
-    (acc, o) => acc + o.fields.filter((f) => f.enabled).length,
-    0
-  );
-
   return (
     <div>
       <div className="ph">
@@ -193,14 +197,14 @@ export function TrafficDashboardView({
           <button
             type="button"
             className="btn"
-            onClick={() => onNavigateTab('traffic')}
+            onClick={() => onNavigateTab('logs-mcp')}
           >
             View traffic log
           </button>
           <button
             type="button"
             className="btn pri"
-            onClick={() => onNavigateTab('matrix')}
+            onClick={() => onNavigateTab('access-matrix')}
           >
             Configure access matrix
           </button>
@@ -377,7 +381,7 @@ export function TrafficDashboardView({
                   borderRadius: 6,
                   cursor: 'pointer',
                 }}
-                onClick={() => onNavigateTab('matrix')}
+                onClick={() => onNavigateTab('access-matrix')}
               >
                 <div>
                   <div
@@ -419,7 +423,7 @@ export function TrafficDashboardView({
                   borderRadius: 6,
                   cursor: 'pointer',
                 }}
-                onClick={() => onNavigateTab('objects')}
+                onClick={() => onNavigateTab('org-objects')}
               >
                 <div>
                   <div
@@ -460,7 +464,7 @@ export function TrafficDashboardView({
                   borderRadius: 6,
                   cursor: 'pointer',
                 }}
-                onClick={() => onNavigateTab('objects')}
+                onClick={() => onNavigateTab('org-objects')}
               >
                 <div>
                   <div
@@ -495,7 +499,7 @@ export function TrafficDashboardView({
                   borderRadius: 6,
                   cursor: 'pointer',
                 }}
-                onClick={() => onNavigateTab('groups')}
+                onClick={() => onNavigateTab('access-groups')}
               >
                 <div>
                   <div
@@ -529,27 +533,18 @@ export function TrafficDashboardView({
                 borderRadius: 6,
                 cursor: 'pointer',
               }}
-              onClick={() => onNavigateTab('sf-connection')}
+              onClick={() => onNavigateTab('org-connection')}
             >
               <div>
                 <div
                   style={{ display: 'flex', alignItems: 'center', gap: 6 }}
                 >
-                  <span
-                    className={`dot ${
-                      sfSettings?.connectionStatus === 'connected'
-                        ? 'ok'
-                        : 'warn'
-                    }`}
+                  <b>Salesforce Org JWT:</b>
+                  <OrgStatus
+                    status={sfSettings?.connectionStatus}
+                    orgId={sfSettings?.connectedOrgId}
+                    simulated={sfSettings?.authMode === 'simulated'}
                   />
-                  <b>
-                    Salesforce Org JWT:{' '}
-                    {sfSettings?.connectionStatus === 'connected'
-                      ? `Connected (${sfSettings.connectedOrgId})`
-                      : sfSettings?.connectionStatus === 'not_verified'
-                      ? 'Not verified'
-                      : 'Disconnected'}
-                  </b>
                 </div>
                 <div
                   style={{
@@ -568,22 +563,6 @@ export function TrafficDashboardView({
               <span className="tag">Org JWT &rarr;</span>
             </div>
 
-            <div
-              style={{
-                display: 'flex',
-                justifyContent: 'space-between',
-                padding: '6px 4px 0',
-                fontSize: 11.5,
-                color: 'var(--t3)',
-              }}
-            >
-              <span>Config summary</span>
-              <span className="mono">
-                {objects.filter((o) => o.enabled).length}/{objects.length}{' '}
-                objects · {enabledFields}/{totalFields} fields · {groups.length}{' '}
-                groups
-              </span>
-            </div>
           </div>
         </div>
       </div>
@@ -702,7 +681,7 @@ export function TrafficDashboardView({
             <button
               type="button"
               className="btn gh sm"
-              onClick={() => onNavigateTab('traffic')}
+              onClick={() => onNavigateTab('logs-mcp')}
             >
               View in log &rarr;
             </button>
@@ -889,6 +868,20 @@ interface CopilotMcpLogsViewProps {
   fetchLogPage: FetchLogPage<CopilotMcpLogEntry>;
   onNotify: (msg: string, isError?: boolean) => void;
   onOpenFlyout: (flyout: FlyoutState) => void;
+  /** Filters the page keeps in the URL; the free-text search stays local. */
+  routeFilters?: McpLogRouteFilters;
+  onRouteFiltersChange?: (filters: McpLogRouteFilters) => void;
+}
+
+export interface McpLogRouteFilters {
+  status: 'all' | 'ALLOWED' | 'DENIED' | 'ERROR';
+  tool: string;
+  object: string;
+}
+
+export interface AdminLogRouteFilters {
+  method: 'all' | 'okta_sso' | 'password';
+  action: string;
 }
 
 export function CopilotMcpLogsView({
@@ -900,13 +893,25 @@ export function CopilotMcpLogsView({
   fetchLogPage,
   onNotify,
   onOpenFlyout,
+  routeFilters,
+  onRouteFiltersChange,
 }: CopilotMcpLogsViewProps) {
   const [q, setQ] = useState(initialSearch);
-  const [statusFilter, setStatusFilter] = useState<
-    'all' | 'ALLOWED' | 'DENIED' | 'ERROR'
-  >('all');
-  const [toolFilter, setToolFilter] = useState('all');
-  const [objFilter, setObjFilter] = useState('all');
+  const [statusFilter, setStatusFilter] = useControllable<'all' | 'ALLOWED' | 'DENIED' | 'ERROR'>(
+    routeFilters?.status,
+    routeFilters && onRouteFiltersChange ? (status) => onRouteFiltersChange({ ...routeFilters, status }) : undefined,
+    'all'
+  );
+  const [toolFilter, setToolFilter] = useControllable<string>(
+    routeFilters?.tool,
+    routeFilters && onRouteFiltersChange ? (tool) => onRouteFiltersChange({ ...routeFilters, tool }) : undefined,
+    'all'
+  );
+  const [objFilter, setObjFilter] = useControllable<string>(
+    routeFilters?.object,
+    routeFilters && onRouteFiltersChange ? (object) => onRouteFiltersChange({ ...routeFilters, object }) : undefined,
+    'all'
+  );
   const history = useOlderLogRows(logs, fetchLogPage, onNotify);
   const { exporting, exportRows } = useLogExport(fetchLogPage, onNotify);
 
@@ -1138,6 +1143,8 @@ interface PortalAdminLogsViewProps {
   fetchLogPage: FetchLogPage<PortalAdminLogEntry>;
   onNotify: (msg: string, isError?: boolean) => void;
   onOpenFlyout: (flyout: FlyoutState) => void;
+  routeFilters?: AdminLogRouteFilters;
+  onRouteFiltersChange?: (filters: AdminLogRouteFilters) => void;
 }
 
 export function PortalAdminLogsView({
@@ -1147,12 +1154,20 @@ export function PortalAdminLogsView({
   fetchLogPage,
   onNotify,
   onOpenFlyout,
+  routeFilters,
+  onRouteFiltersChange,
 }: PortalAdminLogsViewProps) {
   const [q, setQ] = useState('');
-  const [method, setMethod] = useState<'all' | 'okta_sso' | 'password'>(
+  const [method, setMethod] = useControllable<'all' | 'okta_sso' | 'password'>(
+    routeFilters?.method,
+    routeFilters && onRouteFiltersChange ? (next) => onRouteFiltersChange({ ...routeFilters, method: next }) : undefined,
     'all'
   );
-  const [actionFilter, setActionFilter] = useState('all');
+  const [actionFilter, setActionFilter] = useControllable<string>(
+    routeFilters?.action,
+    routeFilters && onRouteFiltersChange ? (action) => onRouteFiltersChange({ ...routeFilters, action }) : undefined,
+    'all'
+  );
   const history = useOlderLogRows(logs, fetchLogPage, onNotify);
   const { exporting, exportRows } = useLogExport(fetchLogPage, onNotify);
 
@@ -1336,6 +1351,9 @@ interface PortalAuthSettingsViewProps {
   onDeletePortalUser: (username: string) => Promise<void>;
 }
 
+/** The Okta form fields an admin edits; the secret is counted on its own. */
+const OKTA_FORM_FIELDS = ['enabled', 'oktaDomain', 'issuer', 'clientId', 'redirectUri', 'adminGroup'] as const;
+
 export function PortalAuthSettingsView({
   oktaSettings,
   portalUsers,
@@ -1367,6 +1385,20 @@ export function PortalAuthSettingsView({
     );
   }, [oktaSettings]);
 
+  // Unsaved Okta edits show in the shell's "Unsaved security changes (N)" bar and are guarded.
+  const oktaChanges = changedFieldCount(oktaDraft, oktaSettings, OKTA_FORM_FIELDS) + (oktaClientSecret ? 1 : 0);
+  useDraftRegistration(
+    oktaChanges > 0 ? { key: 'form:okta', scope: 'security', label: 'Okta SSO settings', count: oktaChanges } : null,
+    {
+      discard: () => {
+        setOktaDraft(oktaSettings);
+        setOktaClientSecret('');
+        setOktaIssuerEdited(false);
+      },
+      review: () => document.getElementById('okta-settings-card')?.scrollIntoView({ block: 'start' }),
+    }
+  );
+
   return (
     <div>
       <div className="ph">
@@ -1381,7 +1413,7 @@ export function PortalAuthSettingsView({
 
       <div className="g2">
         {/* Okta SSO Card */}
-        <div className="card">
+        <div className="card" id="okta-settings-card">
           <div className="card-h">
             <div>
               <div className="card-t">Okta OIDC Single Sign-On</div>

@@ -1,5 +1,8 @@
 'use client';
 
+import type { RouteId } from '@/components/shell/routes';
+import { useDraftRegistration } from '@/components/shell/draftContext';
+import { changedFieldCount } from '@/components/shell/formDraft';
 import React, { useEffect, useState, useRef } from 'react';
 import {
   KeyRound,
@@ -21,7 +24,6 @@ import {
 } from 'lucide-react';
 import {
   SalesforceConnectionSettings,
-  NavViewId,
 } from '@/types/governance';
 import { Card, Badge, StatusBadge, Switch } from '@/components/ui/primitives';
 import { useModalDialog } from './useModalDialog';
@@ -54,7 +56,7 @@ export function SalesforceOrgConnectionView({
   /** Reloads the workspace; what it answers is not used here. */
   onRefresh: () => Promise<unknown>;
   onShowToast: (msg: string, isError?: boolean) => void;
-  onNavigate: (view: NavViewId) => void;
+  onNavigate: (route: RouteId) => void;
   devToolsEnabled: boolean;
 }) {
   const [activeTab, setActiveTab] = useState<'connect' | 'guide'>('connect');
@@ -108,6 +110,41 @@ export function SalesforceOrgConnectionView({
   const statusBadge = connectionStatusBadge(
     sfSettings.connectionStatus,
     sfSettings.connectedOrgId
+  );
+
+  // Unsaved connection edits show in the shell's "Unsaved connection changes (N)" bar and are guarded.
+  const savedForm = {
+    authMode: sfSettings.authMode || 'jwt_bearer',
+    loginUrl: sfSettings.loginUrl || 'https://login.salesforce.com',
+    clientId: sfSettings.clientId || '',
+    username: sfSettings.username || '',
+    apiVersion: sfSettings.apiVersion || 'v62.0',
+    expectedOrgId: sfSettings.expectedOrgId || '',
+    enforceOrgIdLock: Boolean(sfSettings.enforceOrgIdLock),
+    mcpTokenHost: sfSettings.instanceUrl || '',
+  };
+  const draftForm = { authMode, loginUrl, clientId, username, apiVersion, expectedOrgId, enforceOrgIdLock, mcpTokenHost };
+  const connectionChanges =
+    changedFieldCount(draftForm, savedForm, Object.keys(savedForm) as Array<keyof typeof savedForm>) +
+    (privateKeyInput.trim() ? 1 : 0);
+  useDraftRegistration(
+    connectionChanges > 0
+      ? { key: 'form:connection', scope: 'connection', label: 'Org connection settings', count: connectionChanges }
+      : null,
+    {
+      discard: () => {
+        setAuthMode(savedForm.authMode);
+        setLoginUrl(savedForm.loginUrl);
+        setClientId(savedForm.clientId);
+        setUsername(savedForm.username);
+        setApiVersion(savedForm.apiVersion);
+        setExpectedOrgId(savedForm.expectedOrgId);
+        setEnforceOrgIdLock(savedForm.enforceOrgIdLock);
+        setMcpTokenHost(savedForm.mcpTokenHost);
+        setPrivateKeyInput('');
+      },
+      review: () => window.scrollTo({ top: 0 }),
+    }
   );
 
   // A connect may initialise the host, so the input follows what the server holds.
@@ -376,7 +413,7 @@ export function SalesforceOrgConnectionView({
             <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
-                onClick={() => onNavigate('sf-profiles')}
+                onClick={() => onNavigate('org-profiles')}
                 className="inline-flex items-center gap-1.5 rounded-lg bg-white px-3 py-1.5 text-xs font-semibold text-emerald-900 shadow-2xs ring-1 ring-emerald-300 transition hover:bg-emerald-100/50"
               >
                 <span>Pull Profiles</span>
@@ -384,7 +421,7 @@ export function SalesforceOrgConnectionView({
               </button>
               <button
                 type="button"
-                onClick={() => onNavigate('sf-objects')}
+                onClick={() => onNavigate('org-objects')}
                 className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-700 px-3 py-1.5 text-xs font-semibold text-white shadow-2xs transition hover:bg-emerald-800"
               >
                 <span>Pull Objects &amp; Fields</span>
@@ -1113,7 +1150,7 @@ export function SalesforceOrgConnectionView({
                     Click <strong>Connect &amp; Verify Salesforce Org</strong>, then visit{' '}
                     <button
                       type="button"
-                      onClick={() => onNavigate('sf-profiles')}
+                      onClick={() => onNavigate('org-profiles')}
                       className="font-semibold text-indigo-600 underline"
                     >
                       Salesforce &gt; Profiles
@@ -1121,7 +1158,7 @@ export function SalesforceOrgConnectionView({
                     and{' '}
                     <button
                       type="button"
-                      onClick={() => onNavigate('sf-objects')}
+                      onClick={() => onNavigate('org-objects')}
                       className="font-semibold text-indigo-600 underline"
                     >
                       Salesforce &gt; Objects
