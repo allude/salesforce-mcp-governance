@@ -1,5 +1,6 @@
 import type { Metadata } from 'next';
 import './globals.css';
+import { THEME_BOOT_SCRIPT } from '@/components/shell/portalClient';
 
 export const metadata: Metadata = {
   title: 'Salesforce MCP · Admin Control Plane',
@@ -13,8 +14,10 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en" data-theme="dark">
+    <html lang="en" data-theme="dark" suppressHydrationWarning>
       <head>
+        {/* Sets data-theme before the first paint (stored choice, else the system's). */}
+        <script dangerouslySetInnerHTML={{ __html: THEME_BOOT_SCRIPT }} />
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link
           rel="preconnect"
