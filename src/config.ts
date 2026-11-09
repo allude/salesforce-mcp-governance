@@ -69,6 +69,8 @@ export function resolveBootstrapAdmin(
   username: string;
   password: string;
   usesDefaultPassword: boolean;
+  /** Base32 authenticator secret enrolled for the bootstrap account at startup if it has none ('' = none). */
+  totpSecret: string;
 } {
   if (env.ADMIN_BOOTSTRAP_EMAIL) {
     warn('[config] ADMIN_BOOTSTRAP_EMAIL is no longer read; set ADMIN_BOOTSTRAP_USERNAME instead.');
@@ -79,6 +81,7 @@ export function resolveBootstrapAdmin(
     username: (env.ADMIN_BOOTSTRAP_USERNAME || env.ADMIN_USERNAME || DEFAULT_BOOTSTRAP_ADMIN.username).trim(),
     password,
     usesDefaultPassword: KNOWN_DEFAULT_PASSWORDS.includes(password),
+    totpSecret: (env.ADMIN_BOOTSTRAP_TOTP_SECRET || '').replace(/[\s=-]/g, '').toUpperCase(),
   };
 }
 
@@ -100,6 +103,10 @@ export function buildConfig(env: Env) {
   return {
     // Express MCP + Admin API backend port. The Next.js portal on :3000 proxies to it.
     port: parseInt(env.PORT || '3001', 10),
+    // Where the backend listens. Loopback by default: only the portal's proxy on this machine should
+    // reach it. Production refuses any other address unless ALLOW_PUBLIC_BACKEND=true (see index.ts).
+    host: (env.MCP_BACKEND_HOST || '127.0.0.1').trim(),
+    allowPublicBackend: env.ALLOW_PUBLIC_BACKEND === 'true',
     // Public origin clients use (the Next.js portal, which proxies /mcp, /api/admin, /auth/okta, /.well-known).
     baseUrl: (env.BASE_URL || 'http://localhost:3000').replace(/\/+$/, ''),
     nodeEnv,
@@ -112,6 +119,9 @@ export function buildConfig(env: Env) {
 
     // Bootstrap Admin Credentials (break-glass / initial setup before Okta SSO)
     bootstrapAdmin: resolveBootstrapAdmin(env),
+    // Production closes password sign-in while Okta SSO is enabled; set BREAK_GLASS_ENABLED=true to
+    // reopen it (e.g. during an Okta outage). Every such sign-in is logged and warned about.
+    breakGlassEnabled: env.BREAK_GLASS_ENABLED === 'true',
 
     // Initial Okta settings, seeded into the database on first start (then edited in the Admin Portal)
     okta: {

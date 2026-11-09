@@ -327,6 +327,7 @@ describe('config: resolveBootstrapAdmin', () => {
       username: DEFAULT_BOOTSTRAP_ADMIN.username,
       password: DEFAULT_BOOTSTRAP_ADMIN.password,
       usesDefaultPassword: true,
+      totpSecret: '',
     });
   });
 
@@ -336,7 +337,15 @@ describe('config: resolveBootstrapAdmin', () => {
       username: 'breakglass',
       password,
       usesDefaultPassword: false,
+      totpSecret: '',
     });
+  });
+
+  test('ADMIN_BOOTSTRAP_TOTP_SECRET is normalised to bare upper-case base32 (spaces, dashes and padding dropped)', () => {
+    assert.equal(
+      resolveBootstrapAdmin({ ADMIN_BOOTSTRAP_TOTP_SECRET: ' jbsw y3dp-ehpk 3pxp== ' }).totpSecret,
+      'JBSWY3DPEHPK3PXP'
+    );
   });
 
   test('legacy ADMIN_USERNAME is used when ADMIN_BOOTSTRAP_USERNAME is absent, and loses when both are set', () => {

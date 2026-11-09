@@ -13,7 +13,7 @@ import {
   type FakeSalesforceUser,
   type SalesforceMock,
 } from './helpers/salesforceMock.js';
-import { mcpRequest, startTestServer, type TestServer } from './helpers/server.js';
+import { loginAsAdmin, mcpRequest, startTestServer, type TestServer } from './helpers/server.js';
 
 // Covers the /mcp transport and Bearer-token handling:
 // src/mcp/streamableHttp.ts, src/salesforce/client.ts and the CORS / discovery wiring in src/index.ts.
@@ -1126,6 +1126,213 @@ test('a refused token row is timed from receipt: a slow Salesforce answer shows 
   assertRejectedRow(row, 'TOKEN_INVALID');
   assert.ok(row.verificationMs! >= delayMs, `verificationMs ${row.verificationMs} includes the ${delayMs} ms wait`);
   assert.ok(row.totalMs! >= row.verificationMs!);
+});
+
+/** Runs the rest of the test as production; restored afterwards. */
+function asProduction(t: TestContext): void {
+  const mutable = config as { isProd: boolean };
+  const previous = mutable.isProd;
+  mutable.isProd = true;
+  t.after(() => {
+    mutable.isProd = previous;
+  });
+}
+
+test('Org ID lock in production: every token is refused until an expected Org ID is saved, whatever the stored switch says', async (t) => {
+  const h = await startHarness(t);
+  preserveSalesforceSettings(t);
+  store.updateSalesforceSettings({ enforceOrgIdLock: false, expectedOrgId: '' });
+  const seeded = seedProfile(t, ['list_enabled_objects']);
+  const token = addSalesforceUser(h.sf, { profileId: seeded.profileId, profileName: seeded.profileName });
+  asProduction(t);
+
+  const res = await rpc(h, token, 'tools/list');
+  assert.equal(res.status, 401, JSON.stringify(res.body));
+  assert.match(String(res.body?.error?.message), /Org ID lock/);
+  assert.equal(store.getSalesforceSettings().orgIdLockRequired, true, 'production reports the lock as required');
+});
+
+test('Org ID lock in production: with the switch stored off, only the expected org is accepted', async (t) => {
+  const h = await startHarness(t);
+  preserveSalesforceSettings(t);
+  const orgId = sfId('00D');
+  store.updateSalesforceSettings({ enforceOrgIdLock: false, expectedOrgId: orgId });
+  const seeded = seedProfile(t, ['list_enabled_objects']);
+  const insider = addSalesforceUser(h.sf, { organizationId: orgId, profileId: seeded.profileId, profileName: seeded.profileName });
+  const outsider = addSalesforceUser(h.sf, { profileId: seeded.profileId, profileName: seeded.profileName });
+  asProduction(t);
+
+  const accepted = await rpc(h, insider, 'tools/list');
+  assert.equal(accepted.status, 200, JSON.stringify(accepted.body));
+  assert.deepEqual(toolNames(accepted.body), ['list_enabled_objects']);
+  const refused = await rpc(h, outsider, 'tools/list');
+  assert.equal(refused.status, 401, JSON.stringify(refused.body));
+});
+
+test('In production the X-Salesforce-Instance-Url hint is ignored: the token is verified at the stored instance only', async (t) => {
+  const h = await startHarness(t);
+  preserveSalesforceSettings(t);
+  const orgId = sfId('00D');
+  store.updateSalesforceSettings({
+    instanceUrl: 'https://acme.my.salesforce.com',
+    expectedOrgId: orgId,
+  });
+  const seeded = seedProfile(t, ['list_enabled_objects']);
+  const token = addSalesforceUser(h.sf, { organizationId: orgId, profileId: seeded.profileId, profileName: seeded.profileName });
+  asProduction(t);
+
+  const res = await rpc(h, token, 'tools/list', {}, { 'X-Salesforce-Instance-Url': 'https://attacker-dev-ed.develop.my.salesforce.com' });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  const userinfoHosts = callsBearing(h.sf, token)
+    .filter((call) => call.url.pathname === '/services/oauth2/userinfo')
+    .map((call) => call.url.hostname);
+  assert.deepEqual(userinfoHosts, ['acme.my.salesforce.com']);
+});
+
+test('A caller from another org whose Profile has a registered Profile\'s name gets nothing (no name fallback for Salesforce ids)', async (t) => {
+  const h = await startHarness(t);
+  preserveSalesforceSettings(t);
+  store.updateSalesforceSettings({ enforceOrgIdLock: false });
+  const seeded = seedProfile(t, ['list_enabled_objects', 'describe_object']);
+  // Another org's "System Administrator" has another id but the same name.
+  const token = addSalesforceUser(h.sf, { profileId: sfId('00e'), profileName: seeded.profileName });
+
+  const list = await rpc(h, token, 'tools/list');
+  assert.equal(list.status, 200, JSON.stringify(list.body));
+  assert.deepEqual(toolNames(list.body), []);
+  const call = await rpc(h, token, 'tools/call', { name: 'list_enabled_objects', arguments: {} });
+  assert.match(String(call.body?.result?.content?.[0]?.text), /PROFILE_UNREGISTERED|not registered/);
+});
+
+// ---------------------------------------------------------------------------------------------
+// 7c. Token introspection: tokens must be issued to the MCP connected app
+// ---------------------------------------------------------------------------------------------
+
+/** Configures the MCP connected app's credentials (and the mock's), cleared again after the test. */
+function configureMcpApp(t: TestContext, h: Harness, secret = `secret_${uid()}`): { clientId: string; clientSecret: string } {
+  const credentials = { clientId: `MCP_APP_${uid()}`, clientSecret: secret };
+  store.updateMcpClientCredentials(credentials);
+  h.sf.setIntrospectionClient(credentials);
+  t.after(() => store.updateMcpClientCredentials({ clientId: '' }));
+  return credentials;
+}
+
+function introspectCalls(sf: SalesforceMock, token: string) {
+  return sf.calls.filter(
+    (call) =>
+      call.url.pathname === '/services/oauth2/introspect' &&
+      new URLSearchParams(typeof call.body === 'string' ? call.body : '').get('token') === token
+  );
+}
+
+test('without MCP connected app credentials, tokens are verified by userinfo alone (no introspection)', async (t) => {
+  const h = await startHarness(t);
+  const seeded = seedProfile(t, ['list_enabled_objects']);
+  const token = addSalesforceUser(h.sf, { profileId: seeded.profileId, profileName: seeded.profileName, clientId: 'SOME_OTHER_APP' });
+
+  const res = await rpc(h, token, 'tools/list');
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(introspectCalls(h.sf, token).length, 0);
+  assert.equal(store.getSalesforceSettings().mcpClientId, '');
+});
+
+test('with MCP connected app credentials, only tokens issued to that app are accepted', async (t) => {
+  const h = await startHarness(t);
+  preserveSalesforceSettings(t);
+  store.updateSalesforceSettings({ enforceOrgIdLock: false });
+  const seeded = seedProfile(t, ['list_enabled_objects']);
+  const app = configureMcpApp(t, h);
+  const ours = addSalesforceUser(h.sf, { profileId: seeded.profileId, profileName: seeded.profileName, clientId: app.clientId });
+  const theirs = addSalesforceUser(h.sf, { profileId: seeded.profileId, profileName: seeded.profileName, clientId: 'ANOTHER_CONNECTED_APP' });
+
+  const accepted = await rpc(h, ours, 'tools/list');
+  assert.equal(accepted.status, 200, JSON.stringify(accepted.body));
+  assert.deepEqual(toolNames(accepted.body), ['list_enabled_objects']);
+  const [call] = introspectCalls(h.sf, ours);
+  assert.ok(call, 'the token was introspected');
+  const form = new URLSearchParams(call.body as string);
+  assert.equal(form.get('client_id'), app.clientId);
+  assert.equal(form.get('token_type_hint'), 'access_token');
+  assert.equal(call.authorization, '', 'the token travels in the form body, not as a Bearer header');
+
+  const refused = await rpc(h, theirs, 'tools/list');
+  assert.equal(refused.status, 401, JSON.stringify(refused.body));
+  assert.ok(challengeOf(refused).includes('error="invalid_token"'), challengeOf(refused));
+  assert.equal(userinfoCallCount(h.sf, theirs), 0, 'a token for another app is refused before userinfo');
+
+  // Refused again without asking Salesforce.
+  const callsBefore = introspectCalls(h.sf, theirs).length;
+  assert.equal((await rpc(h, theirs, 'tools/list')).status, 401);
+  assert.equal(introspectCalls(h.sf, theirs).length, callsBefore);
+});
+
+test('with MCP connected app credentials, an inactive token is refused', async (t) => {
+  const h = await startHarness(t);
+  configureMcpApp(t, h);
+  const unknownToken = `tok_transport_${uid()}${uid()}`;
+
+  const res = await rpc(h, unknownToken, 'tools/list');
+  assert.equal(res.status, 401, JSON.stringify(res.body));
+  assert.equal(introspectCalls(h.sf, unknownToken).length, 1);
+  assert.equal(userinfoCallCount(h.sf, unknownToken), 0);
+});
+
+test('when Salesforce refuses the MCP connected app credentials, every token is refused (fails closed)', async (t) => {
+  const h = await startHarness(t);
+  preserveSalesforceSettings(t);
+  store.updateSalesforceSettings({ enforceOrgIdLock: false });
+  const seeded = seedProfile(t, ['list_enabled_objects']);
+  const app = configureMcpApp(t, h);
+  h.sf.setIntrospectionClient({ clientId: app.clientId, clientSecret: 'rotated-in-salesforce' });
+  const token = addSalesforceUser(h.sf, { profileId: seeded.profileId, profileName: seeded.profileName, clientId: app.clientId });
+
+  const res = await rpc(h, token, 'tools/list');
+  assert.equal(res.status, 401, JSON.stringify(res.body));
+  assert.equal(userinfoCallCount(h.sf, token), 0);
+});
+
+test('PUT /api/admin/sf-settings saves the MCP connected app credentials without ever returning or logging the secret', async (t) => {
+  const h = await startHarness(t);
+  const admin = createPortalAdmin(t);
+  const session = await loginAsAdmin(h.server.baseUrl, admin.username, admin.password);
+  t.after(() => store.updateMcpClientCredentials({ clientId: '' }));
+  const put = (body: Record<string, unknown>) =>
+    fetch(`${h.server.baseUrl}/api/admin/sf-settings`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: session.cookie,
+        'X-CSRF-Token': session.csrfToken,
+        'X-Forwarded-For': CLIENT_IP,
+      },
+      body: JSON.stringify(body),
+    });
+  const clientId = `MCP_APP_${uid()}`;
+  const secret = `secret_${uid()}${uid()}`;
+
+  const missingSecret = await put({ mcpClientId: clientId });
+  assert.equal(missingSecret.status, 400, await missingSecret.text());
+
+  const saved = await put({ mcpClientId: clientId, mcpClientSecret: secret });
+  const savedText = await saved.text();
+  assert.equal(saved.status, 200, savedText);
+  assert.ok(!savedText.includes(secret), 'the secret is never returned');
+  const settings = JSON.parse(savedText).sfSettings;
+  assert.equal(settings.mcpClientId, clientId);
+  assert.equal(settings.hasMcpClientSecret, true);
+  assert.deepEqual(store.getMcpIntrospectionCredentials(), { clientId, clientSecret: secret });
+
+  // A blank secret keeps the stored one; a blank key turns introspection off.
+  assert.equal((await put({ mcpClientId: clientId, mcpClientSecret: '' })).status, 200);
+  assert.equal(store.getMcpIntrospectionCredentials()?.clientSecret, secret);
+  const cleared = await put({ mcpClientId: '' });
+  assert.equal(cleared.status, 200, await cleared.text());
+  assert.equal(store.getMcpIntrospectionCredentials(), null);
+  assert.equal(store.getSalesforceSettings().hasMcpClientSecret, false);
+
+  const auditRows = store.getPortalAdminLogs(50).filter((row) => row.action === 'UPDATE_SF_SETTINGS');
+  assert.ok(auditRows.some((row) => row.details.includes(clientId)), 'the key change is audited');
+  assert.ok(auditRows.every((row) => !row.details.includes(secret)), 'the secret is never audited');
 });
 
 // ---------------------------------------------------------------------------------------------

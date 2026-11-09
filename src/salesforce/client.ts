@@ -212,10 +212,16 @@ function refuseSimulatedTokenHost(url: string): void {
   }
 }
 
-/** Rejects identities from any org other than the configured one when the Org ID lock is on. */
-function enforceOrgIdLock(organizationId: string): void {
+/**
+ * Rejects identities from any org other than the configured one. Production always enforces the lock,
+ * whatever the stored setting says, and refuses every token until an expected Org ID is saved: a free
+ * Developer Edition org is otherwise all it takes to get a token that verifies here. Outside production
+ * the lock applies only when it is turned on.
+ */
+export function enforceOrgIdLock(organizationId: string): void {
   const { enforceOrgIdLock, expectedOrgId } = store.getSalesforceSettings();
-  if (enforceOrgIdLock && expectedOrgId && !salesforceIdsMatch(organizationId, expectedOrgId)) {
+  if (!config.isProd && !enforceOrgIdLock) return;
+  if (!expectedOrgId || !salesforceIdsMatch(organizationId, expectedOrgId)) {
     throw new OrgLockViolationError();
   }
 }
@@ -286,6 +292,11 @@ export function wasTokenRecentlyVerified(bearerToken: string): boolean {
 /** Verifications running and waiting at the gate, for tests and diagnostics. */
 export function verificationGateStats(): { active: number; queued: number } {
   return verificationGate.stats();
+}
+
+/** Drops every cached identity, so the next request with each token is verified again. */
+export function forgetCachedIdentities(): void {
+  identityCache.clear();
 }
 
 /**
@@ -372,6 +383,63 @@ export async function resolveSalesforceUserFromToken(
   });
 }
 
+/**
+ * Asks Salesforce whether the token is active and which connected app it was issued to
+ * (RFC 7662, POST /services/oauth2/introspect, authenticated as the MCP connected app). Returns null
+ * when introspection is not configured, else the org and user the token belongs to.
+ */
+async function introspectToken(
+  bearerToken: string,
+  rejectionKey: string,
+  host: string
+): Promise<{ orgId: string; userId: string } | null> {
+  let credentials: { clientId: string; clientSecret: string } | null;
+  try {
+    credentials = store.getMcpIntrospectionCredentials();
+  } catch (err) {
+    throw new TokenInvalidError(
+      `Token introspection is configured but unusable: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  if (!credentials) return null;
+
+  let res: Response;
+  try {
+    res = await fetch(`${host}/services/oauth2/introspect`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
+      body: new URLSearchParams({
+        token: bearerToken,
+        token_type_hint: 'access_token',
+        client_id: credentials.clientId,
+        client_secret: credentials.clientSecret,
+      }).toString(),
+      signal: AbortSignal.timeout(VERIFICATION_TIMEOUT_MS),
+    });
+  } catch (err) {
+    throw new SalesforceUnavailableError(isAbort(err) ? 'timed out' : 'not reachable');
+  }
+  if (res.status >= 500 || res.status === 429) throw new SalesforceUnavailableError(`HTTP ${res.status}`);
+  if (!res.ok) {
+    // The MCP app's own credentials were refused: a configuration fault, but no token is accepted.
+    throw new TokenInvalidError(`Salesforce token introspection was refused (HTTP ${res.status}); check the MCP connected app credentials`);
+  }
+  const info = await readVerificationJson(res);
+  if (info?.active !== true) {
+    rememberRejectedToken(rejectionKey);
+    throw new TokenInvalidError('Salesforce token is not active');
+  }
+  if (typeof info.client_id !== 'string' || info.client_id !== credentials.clientId) {
+    // A token for another connected app never becomes one for this app.
+    rememberRejectedToken(rejectionKey);
+    throw new TokenInvalidError('Salesforce token was not issued to the MCP connected app');
+  }
+  // `sub` is the identity URL: https://login.salesforce.com/id/<orgId>/<userId>
+  const ids = /\/id\/([a-zA-Z0-9]{15,18})\/([a-zA-Z0-9]{15,18})\/?$/.exec(String(info.sub || ''));
+  if (!ids) throw new TokenInvalidError('Salesforce token introspection did not name the user');
+  return { orgId: ids[1], userId: ids[2] };
+}
+
 async function verifyWithSalesforce(
   bearerToken: string,
   tokenHash: string,
@@ -380,6 +448,10 @@ async function verifyWithSalesforce(
   fallbackInstanceUrl: string,
   storedApiVersion: string
 ): Promise<VerifiedSalesforceUser> {
+  // 1b. With the MCP connected app's credentials configured, the token must also be active and issued
+  // to that app. userinfo alone accepts a token any connected app in the org was given.
+  const introspected = await introspectToken(bearerToken, rejectionKey, baseLoginUrl);
+
   // 2. Call Salesforce OIDC /services/oauth2/userinfo to verify token & get user_id + custom_domain
   const userInfoRes = await fetchForVerification(`${baseLoginUrl}/services/oauth2/userinfo`, {
     Authorization: `Bearer ${bearerToken}`,
@@ -400,6 +472,9 @@ async function verifyWithSalesforce(
   const orgId: string = userInfo.organization_id;
   if (typeof userId !== 'string' || !userId || typeof orgId !== 'string' || !orgId) {
     throw new TokenInvalidError('Salesforce userinfo response is missing user_id or organization_id');
+  }
+  if (introspected && (!salesforceIdsMatch(introspected.orgId, orgId) || !salesforceIdsMatch(introspected.userId, userId))) {
+    throw new TokenInvalidError('Salesforce token introspection and userinfo name different users');
   }
   enforceOrgIdLock(orgId);
 

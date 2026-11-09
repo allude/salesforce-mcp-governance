@@ -3,6 +3,7 @@
 // oracle for test/policy-differential.test.ts and must not be edited to match the new engine.
 import { store } from '../../src/db/store.js';
 import { VerifiedSalesforceUser, salesforceIdsMatch } from '../../src/salesforce/client.js';
+import { isSalesforceId } from '../../src/salesforce/ids.js';
 import { AVAILABLE_MCP_ACTIONS, GroupObjectPermission } from '../../src/types/governance.js';
 import { grantsAccess, malformedGrantReason } from '../../src/rbac/groupGrants.js';
 
@@ -70,7 +71,8 @@ export function resolveEffectiveProfilePermissions(
   const matchedProfile =
     profiles.find((p) => salesforceIdsMatch(p.id, profileId)) ||
     (profileNameHint
-      ? profiles.find((p) => p.name.toLowerCase() === profileNameHint.toLowerCase())
+      ? // Mirrors the engine: a Profile registered under a Salesforce id is never matched by name.
+        profiles.find((p) => !isSalesforceId(p.id) && p.name.toLowerCase() === profileNameHint.toLowerCase())
       : undefined);
 
   if (!matchedProfile) {

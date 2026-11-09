@@ -25,6 +25,7 @@ import {
   ProfileSyncDiffPreview,
   ObjectSyncDiffPreview,
   PortalUserSummary,
+  AdminSessionRecord,
   AVAILABLE_MCP_ACTIONS,
   AccessGroupChangeSource,
   AccessGroupHistoryEntry,
@@ -475,6 +476,7 @@ const LOG_TABLE_COLUMNS: Record<LogTable, string> = {
 db.exec(`
   PRAGMA journal_mode = WAL;
   PRAGMA foreign_keys = ON;
+  PRAGMA busy_timeout = 5000;
 
   CREATE TABLE IF NOT EXISTS portal_users (
     username TEXT PRIMARY KEY,
@@ -485,6 +487,20 @@ db.exec(`
     created_at TEXT NOT NULL,
     last_login_at TEXT
   );
+
+  -- Server-side record of every admin session cookie, so a session can be revoked (sign-out, a deleted
+  -- user) and expires when idle. Times are epoch milliseconds.
+  CREATE TABLE IF NOT EXISTS admin_sessions (
+    jti TEXT PRIMARY KEY,
+    subject TEXT NOT NULL,
+    auth_method TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    reauthenticated_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    revoked_at INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_admin_sessions_subject ON admin_sessions (auth_method, subject);
 
   CREATE TABLE IF NOT EXISTS sf_profiles (
     id TEXT PRIMARY KEY,
@@ -940,7 +956,23 @@ function sameStoredJson(a: string, b: string): boolean {
   return JSON.stringify(left, sortedKeys) === JSON.stringify(right, sortedKeys);
 }
 
+/** PBKDF2-HMAC-SHA512 iterations for new hashes (OWASP 2023 guidance). */
+export const PASSWORD_ITERATIONS = 210_000;
+/** What every hash stored before the iteration count was recorded used. */
+const LEGACY_PASSWORD_ITERATIONS = 100_000;
+
 function runSchemaMigrations() {
+  // Second factor for password sign-in (AES-GCM encrypted base32 secret; '' when not enrolled), the
+  // last 30-second step a code was accepted for (replay guard), a secret awaiting confirmation, and the
+  // PBKDF2 iteration count each hash was made with (older rows used 100,000).
+  // The MCP connected app's Consumer Key and (encrypted) Secret: when set, /mcp tokens are verified by
+  // token introspection and must have been issued to that app.
+  ensureColumnExists('sf_connection_settings', 'mcp_client_id', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('sf_connection_settings', 'mcp_client_secret_enc', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('portal_users', 'totp_secret_enc', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('portal_users', 'totp_last_step', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumnExists('portal_users', 'totp_pending_secret_enc', "TEXT NOT NULL DEFAULT ''");
+  ensureColumnExists('portal_users', 'password_iterations', `INTEGER NOT NULL DEFAULT ${LEGACY_PASSWORD_ITERATIONS}`);
   ensureColumnExists('sf_profiles', 'missing_in_org', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumnExists('sf_objects', 'missing_in_org', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumnExists('sf_object_fields', 'missing_in_org', 'INTEGER NOT NULL DEFAULT 0');
@@ -1063,8 +1095,44 @@ export function repairConnectInstanceUrls() {
 
 runSchemaMigrations();
 
-function hashPassword(password: string, salt: string): string {
-  return crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
+export interface PasswordHash {
+  hash: string;
+  salt: string;
+  iterations: number;
+}
+
+/** Synchronous: only for startup checks and seeding, never on a request path (it blocks the event loop). */
+function hashPassword(password: string, salt: string, iterations: number = PASSWORD_ITERATIONS): string {
+  return crypto.pbkdf2Sync(password, salt, iterations, 64, 'sha512').toString('hex');
+}
+
+const pbkdf2Async = (password: string, salt: string, iterations: number) =>
+  new Promise<Buffer>((resolve, reject) =>
+    crypto.pbkdf2(password, salt, iterations, 64, 'sha512', (err, key) => (err ? reject(err) : resolve(key)))
+  );
+
+/** Hashes a new password on the libuv thread pool, so /mcp keeps answering while it runs. */
+export async function hashNewPassword(password: string): Promise<PasswordHash> {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = (await pbkdf2Async(password, salt, PASSWORD_ITERATIONS)).toString('hex');
+  return { hash, salt, iterations: PASSWORD_ITERATIONS };
+}
+
+function portalUserSummary(row: any): PortalUserSummary {
+  return {
+    username: row.username,
+    displayName: row.display_name,
+    role: row.role,
+    createdAt: row.created_at,
+    lastLoginAt: row.last_login_at ?? null,
+    totpEnrolled: Boolean(row.totp_secret_enc),
+  };
+}
+
+async function passwordMatches(password: string, row: { password_hash: string; password_salt: string; password_iterations?: number }): Promise<boolean> {
+  const computed = await pbkdf2Async(password, row.password_salt, row.password_iterations || LEGACY_PASSWORD_ITERATIONS);
+  const stored = Buffer.from(row.password_hash, 'hex');
+  return computed.length === stored.length && crypto.timingSafeEqual(computed, stored);
 }
 
 /**
@@ -1074,12 +1142,12 @@ function hashPassword(password: string, salt: string): string {
  */
 function enforceNoKnownDefaultPasswords() {
   const rows = db
-    .prepare('SELECT username, password_hash, password_salt FROM portal_users')
-    .all() as Array<{ username: string; password_hash: string; password_salt: string }>;
+    .prepare('SELECT username, password_hash, password_salt, password_iterations FROM portal_users')
+    .all() as Array<{ username: string; password_hash: string; password_salt: string; password_iterations: number }>;
   for (const row of rows) {
     const stored = Buffer.from(row.password_hash, 'hex');
     const usesKnownPassword = KNOWN_DEFAULT_PASSWORDS.some((known) => {
-      const candidate = Buffer.from(hashPassword(known, row.password_salt), 'hex');
+      const candidate = Buffer.from(hashPassword(known, row.password_salt, row.password_iterations || LEGACY_PASSWORD_ITERATIONS), 'hex');
       return candidate.length === stored.length && crypto.timingSafeEqual(candidate, stored);
     });
     if (!usesKnownPassword) continue;
@@ -1087,9 +1155,10 @@ function enforceNoKnownDefaultPasswords() {
     const bootstrap = config.bootstrapAdmin;
     if (row.username.toLowerCase() === bootstrap.username.toLowerCase() && !bootstrap.usesDefaultPassword) {
       const salt = crypto.randomBytes(16).toString('hex');
-      db.prepare('UPDATE portal_users SET password_hash = ?, password_salt = ? WHERE username = ?').run(
+      db.prepare('UPDATE portal_users SET password_hash = ?, password_salt = ?, password_iterations = ? WHERE username = ?').run(
         hashPassword(bootstrap.password, salt),
         salt,
+        PASSWORD_ITERATIONS,
         row.username
       );
       console.warn(`[store] Rotated portal user '${row.username}' off a publicly known default password (ADMIN_BOOTSTRAP_PASSWORD).`);
@@ -1099,6 +1168,28 @@ function enforceNoKnownDefaultPasswords() {
       `FATAL: Portal user '${row.username}' uses a publicly known default password. Set ADMIN_BOOTSTRAP_USERNAME=${row.username} and a strong ADMIN_BOOTSTRAP_PASSWORD to rotate it at startup.`
     );
   }
+}
+
+/**
+ * Production requires an authenticator code for every password sign-in, and a first deploy has no
+ * signed-in admin to enroll one, so ADMIN_BOOTSTRAP_TOTP_SECRET enrolls it for the bootstrap account at
+ * startup, once (an account that already has one keeps it; `npm run portal:totp` replaces or resets).
+ */
+function enrollBootstrapAuthenticator() {
+  const secret = config.bootstrapAdmin.totpSecret;
+  if (!secret) return;
+  if (!/^[A-Z2-7]{16,}$/.test(secret)) {
+    throw new Error('FATAL: ADMIN_BOOTSTRAP_TOTP_SECRET must be a base32 secret of at least 16 characters (80 bits).');
+  }
+  const row = db
+    .prepare('SELECT username, totp_secret_enc FROM portal_users WHERE lower(username) = lower(?)')
+    .get(config.bootstrapAdmin.username) as { username: string; totp_secret_enc: string } | undefined;
+  if (!row || row.totp_secret_enc) return;
+  db.prepare("UPDATE portal_users SET totp_secret_enc = ?, totp_last_step = 0, totp_pending_secret_enc = '' WHERE username = ?").run(
+    encryptSecret(secret),
+    row.username
+  );
+  console.warn(`[store] Enrolled ADMIN_BOOTSTRAP_TOTP_SECRET as the authenticator of portal user '${row.username}'.`);
 }
 
 function initializeSystemSingletons() {
@@ -1118,12 +1209,13 @@ function initializeSystemSingletons() {
     const salt = crypto.randomBytes(16).toString('hex');
     const hash = hashPassword(password, salt);
     db.prepare(`
-      INSERT INTO portal_users (username, display_name, password_hash, password_salt, role, created_at)
-      VALUES (?, 'Portal Administrator', ?, ?, 'Super Admin', ?)
-    `).run(username, hash, salt, now);
+      INSERT INTO portal_users (username, display_name, password_hash, password_salt, password_iterations, role, created_at)
+      VALUES (?, 'Portal Administrator', ?, ?, ?, 'Super Admin', ?)
+    `).run(username, hash, salt, PASSWORD_ITERATIONS, now);
   } else if (config.isProd) {
     enforceNoKnownDefaultPasswords();
   }
+  enrollBootstrapAuthenticator();
 
   const oktaCount = (
     db.prepare('SELECT COUNT(*) as cnt FROM okta_config').get() as { cnt: number }
@@ -1267,6 +1359,34 @@ function parseAuditDiff(diffJson: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+function toSalesforceObjectField(f: any): SalesforceObjectField {
+  return {
+    objectName: f.object_name,
+    fieldName: f.field_name,
+    label: f.label,
+    fieldType: f.field_type,
+    isCustom: Boolean(f.is_custom),
+    required: Boolean(f.required),
+    enabled: Boolean(f.enabled),
+    missingInOrg: Boolean(f.missing_in_org),
+  };
+}
+
+function toSalesforceObject(o: any, fields: SalesforceObjectField[]): SalesforceObject {
+  return {
+    objectName: o.object_name,
+    label: o.label,
+    isCustom: Boolean(o.is_custom),
+    enabled: Boolean(o.enabled),
+    sourcePath: o.source_path,
+    fieldCount: fields.length,
+    enabledFieldCount: fields.filter((f) => f.enabled).length,
+    fields,
+    missingInOrg: Boolean(o.missing_in_org),
+    updatedAt: o.updated_at,
+  };
 }
 
 function toPortalAdminLogRecord(r: any): PortalAdminLogRecord {
@@ -1599,32 +1719,147 @@ export const store = {
   // ============================================================================
   // 1. PORTAL USERS & AUTHENTICATION
   // ============================================================================
-  verifyPortalUserCredentials(username: string, password: string): PortalUserSummary | null {
+  /**
+   * Checks a username and password. PBKDF2 runs on the thread pool, so a burst of sign-in attempts does
+   * not stall /mcp. A correct password whose hash used fewer iterations than PASSWORD_ITERATIONS is
+   * rehashed. This is the first factor only: the caller checks the authenticator code and then records
+   * the sign-in with recordPortalUserLogin.
+   */
+  async verifyPortalUserCredentials(username: string, password: string): Promise<PortalUserSummary | null> {
     const row = db
       .prepare('SELECT * FROM portal_users WHERE lower(username) = lower(?)')
       .get(username.trim()) as any;
     if (!row) {
       // Spend the same PBKDF2 time for unknown usernames so response timing does not reveal them.
-      hashPassword(password, 'unknown-user-timing-equalizer');
+      await pbkdf2Async(password, 'unknown-user-timing-equalizer', PASSWORD_ITERATIONS);
       return null;
     }
+    if (!(await passwordMatches(password, row))) return null;
 
-    const computed = hashPassword(password, row.password_salt);
-    const a = Buffer.from(computed, 'hex');
-    const b = Buffer.from(row.password_hash, 'hex');
-    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-      return null;
+    if ((row.password_iterations || LEGACY_PASSWORD_ITERATIONS) < PASSWORD_ITERATIONS) {
+      const upgraded = await hashNewPassword(password);
+      // Only if the password was not changed meanwhile.
+      db.prepare(
+        'UPDATE portal_users SET password_hash = ?, password_salt = ?, password_iterations = ? WHERE username = ? AND password_hash = ?'
+      ).run(upgraded.hash, upgraded.salt, upgraded.iterations, row.username, row.password_hash);
     }
+    return portalUserSummary(row);
+  },
 
-    const now = new Date().toISOString();
-    db.prepare('UPDATE portal_users SET last_login_at = ? WHERE username = ?').run(now, row.username);
+  /** Stamps a completed sign-in (both factors). */
+  recordPortalUserLogin(username: string): void {
+    db.prepare('UPDATE portal_users SET last_login_at = ? WHERE username = ?').run(new Date().toISOString(), username);
+  },
+
+  /** The decrypted authenticator secret and last accepted step of an account, or null when it has none. */
+  getPortalUserTotp(username: string): { secret: string; lastStep: number } | null {
+    const row = db
+      .prepare('SELECT totp_secret_enc, totp_last_step FROM portal_users WHERE username = ?')
+      .get(username) as { totp_secret_enc: string; totp_last_step: number } | undefined;
+    if (!row?.totp_secret_enc) return null;
+    return { secret: decryptSecret(row.totp_secret_enc), lastStep: row.totp_last_step || 0 };
+  },
+
+  /**
+   * Records that a code for `step` was accepted. Compare-and-set, so two requests racing with the same
+   * code cannot both succeed: only the one that moves the step forward returns true.
+   */
+  consumePortalUserTotpStep(username: string, step: number): boolean {
+    const res = db
+      .prepare('UPDATE portal_users SET totp_last_step = ? WHERE username = ? AND totp_last_step < ?')
+      .run(step, username, step);
+    return res.changes > 0;
+  },
+
+  /** Enrolls (or replaces) an account's authenticator outright. For the CLI and for new accounts. */
+  setPortalUserTotp(username: string, secret: string): void {
+    db.prepare(
+      "UPDATE portal_users SET totp_secret_enc = ?, totp_last_step = 0, totp_pending_secret_enc = '' WHERE username = ?"
+    ).run(encryptSecret(secret), username);
+  },
+
+  /** Removes an account's authenticator (CLI reset). */
+  clearPortalUserTotp(username: string): void {
+    db.prepare(
+      "UPDATE portal_users SET totp_secret_enc = '', totp_last_step = 0, totp_pending_secret_enc = '' WHERE username = ?"
+    ).run(username);
+  },
+
+  /** Stores a secret that becomes the account's authenticator once a code from it is confirmed. */
+  setPortalUserPendingTotp(username: string, secret: string): void {
+    db.prepare('UPDATE portal_users SET totp_pending_secret_enc = ? WHERE username = ?').run(encryptSecret(secret), username);
+  },
+
+  getPortalUserPendingTotp(username: string): string | null {
+    const row = db.prepare('SELECT totp_pending_secret_enc FROM portal_users WHERE username = ?').get(username) as
+      | { totp_pending_secret_enc: string }
+      | undefined;
+    return row?.totp_pending_secret_enc ? decryptSecret(row.totp_pending_secret_enc) : null;
+  },
+
+  /** Makes the pending secret the account's authenticator, with `step` already used. */
+  activatePortalUserPendingTotp(username: string, step: number): boolean {
+    const res = db
+      .prepare(
+        "UPDATE portal_users SET totp_secret_enc = totp_pending_secret_enc, totp_last_step = ?, totp_pending_secret_enc = '' WHERE username = ? AND totp_pending_secret_enc <> ''"
+      )
+      .run(step, username);
+    return res.changes > 0;
+  },
+
+  // ---------------------------------------------------------------------------------------------
+  // Admin sessions (server-side record of each session cookie; see security/adminAuth.ts)
+  // ---------------------------------------------------------------------------------------------
+  createAdminSession(input: { jti: string; subject: string; authMethod: string; nowMs: number; expiresAtMs: number }): void {
+    // Expired and long-revoked rows are pruned as new sessions start, so the table stays small.
+    db.prepare('DELETE FROM admin_sessions WHERE expires_at < ?').run(input.nowMs);
+    db.prepare(`
+      INSERT INTO admin_sessions (jti, subject, auth_method, created_at, last_seen_at, reauthenticated_at, expires_at, revoked_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+    `).run(input.jti, input.subject, input.authMethod, input.nowMs, input.nowMs, input.nowMs, input.expiresAtMs);
+  },
+
+  getAdminSession(jti: string): AdminSessionRecord | null {
+    const row = db.prepare('SELECT * FROM admin_sessions WHERE jti = ?').get(jti) as any;
+    if (!row) return null;
     return {
-      username: row.username,
-      displayName: row.display_name,
-      role: row.role,
+      jti: row.jti,
+      subject: row.subject,
+      authMethod: row.auth_method,
       createdAt: row.created_at,
-      lastLoginAt: now,
+      lastSeenAt: row.last_seen_at,
+      reauthenticatedAt: row.reauthenticated_at,
+      expiresAt: row.expires_at,
+      revokedAt: row.revoked_at ?? null,
     };
+  },
+
+  touchAdminSession(jti: string, nowMs: number): void {
+    db.prepare('UPDATE admin_sessions SET last_seen_at = ? WHERE jti = ? AND revoked_at IS NULL').run(nowMs, jti);
+  },
+
+  markAdminSessionReauthenticated(jti: string, nowMs: number): void {
+    db.prepare('UPDATE admin_sessions SET reauthenticated_at = ?, last_seen_at = ? WHERE jti = ? AND revoked_at IS NULL').run(
+      nowMs,
+      nowMs,
+      jti
+    );
+  },
+
+  revokeAdminSession(jti: string, nowMs: number = Date.now()): void {
+    db.prepare('UPDATE admin_sessions SET revoked_at = ? WHERE jti = ? AND revoked_at IS NULL').run(nowMs, jti);
+  },
+
+  /** Ends every session of one account (a deleted or re-keyed portal user). Returns how many were open. */
+  /** Ends every open session of this account, except `exceptJti` (the session making the change). */
+  revokeAdminSessionsFor(authMethod: string, subject: string, nowMs: number = Date.now(), exceptJti = ''): number {
+    return Number(
+      db
+        .prepare(
+          'UPDATE admin_sessions SET revoked_at = ? WHERE auth_method = ? AND lower(subject) = lower(?) AND revoked_at IS NULL AND jti != ?'
+        )
+        .run(nowMs, authMethod, subject, exceptJti).changes
+    );
   },
 
   portalUserExists(username: string): boolean {
@@ -1635,24 +1870,33 @@ export const store = {
 
   getPortalUsers(): PortalUserSummary[] {
     const rows = db.prepare('SELECT * FROM portal_users ORDER BY username ASC').all() as any[];
-    return rows.map((r) => ({
-      username: r.username,
-      displayName: r.display_name,
-      role: r.role,
-      createdAt: r.created_at,
-      lastLoginAt: r.last_login_at,
-    }));
+    return rows.map(portalUserSummary);
   },
 
+  /**
+   * Creates or updates an account. Request handlers pass `passwordHash` from hashNewPassword (hashed
+   * off the event loop); `password` hashes synchronously and is for seeding and tests.
+   */
   upsertPortalUser(input: {
     username: string;
     displayName?: string;
-    password: string;
+    password?: string;
+    passwordHash?: PasswordHash;
     role?: string;
   }): PortalUserSummary {
     const now = new Date().toISOString();
-    const salt = crypto.randomBytes(16).toString('hex');
-    const hash = hashPassword(input.password, salt);
+    let salt: string;
+    let hash: string;
+    let iterations: number;
+    if (input.passwordHash) {
+      ({ salt, hash, iterations } = input.passwordHash);
+    } else if (typeof input.password === 'string') {
+      salt = crypto.randomBytes(16).toString('hex');
+      iterations = PASSWORD_ITERATIONS;
+      hash = hashPassword(input.password, salt, iterations);
+    } else {
+      throw new Error('upsertPortalUser needs a password or a password hash.');
+    }
     const uname = input.username.trim();
     // Sign-in matches usernames case-insensitively, so 'Admin' and 'admin' are the same account.
     const existing = db
@@ -1662,14 +1906,15 @@ export const store = {
     const displayName = input.displayName?.trim() || existing?.display_name || uname;
     const role = input.role?.trim() || existing?.role || 'Admin';
     db.prepare(`
-      INSERT INTO portal_users (username, display_name, password_hash, password_salt, role, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO portal_users (username, display_name, password_hash, password_salt, password_iterations, role, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(username) DO UPDATE SET
         display_name = excluded.display_name,
         password_hash = excluded.password_hash,
         password_salt = excluded.password_salt,
+        password_iterations = excluded.password_iterations,
         role = excluded.role
-    `).run(targetUsername, displayName, hash, salt, role, now);
+    `).run(targetUsername, displayName, hash, salt, iterations, role, now);
     return this.getPortalUsers().find((u) => u.username === targetUsername)!;
   },
 
@@ -1696,6 +1941,11 @@ export const store = {
       throw new Error('Cannot delete the last remaining portal administrator account.');
     }
     const res = db.prepare('DELETE FROM portal_users WHERE username = ?').run(target);
+    // Its open sessions end with it (verifyAdminSessionFromRequest also checks the account exists).
+    db.prepare("UPDATE admin_sessions SET revoked_at = ? WHERE auth_method = 'local_bootstrap' AND subject = ? AND revoked_at IS NULL").run(
+      Date.now(),
+      target
+    );
     return res.changes > 0;
   },
 
@@ -2020,34 +2270,24 @@ export const store = {
     const fieldsByObj = new Map<string, SalesforceObjectField[]>();
     for (const f of fieldRows) {
       const list = fieldsByObj.get(f.object_name) || [];
-      list.push({
-        objectName: f.object_name,
-        fieldName: f.field_name,
-        label: f.label,
-        fieldType: f.field_type,
-        isCustom: Boolean(f.is_custom),
-        required: Boolean(f.required),
-        enabled: Boolean(f.enabled),
-        missingInOrg: Boolean(f.missing_in_org),
-      });
+      list.push(toSalesforceObjectField(f));
       fieldsByObj.set(f.object_name, list);
     }
 
-    return objRows.map((o) => {
-      const fields = fieldsByObj.get(o.object_name) || [];
-      return {
-        objectName: o.object_name,
-        label: o.label,
-        isCustom: Boolean(o.is_custom),
-        enabled: Boolean(o.enabled),
-        sourcePath: o.source_path,
-        fieldCount: fields.length,
-        enabledFieldCount: fields.filter((f) => f.enabled).length,
-        fields,
-        missingInOrg: Boolean(o.missing_in_org),
-        updatedAt: o.updated_at,
-      };
-    });
+    return objRows.map((o) => toSalesforceObject(o, fieldsByObj.get(o.object_name) || []));
+  },
+
+  /**
+   * One object, stored under exactly this name, or null. Reads only its own rows: getObjects() reads
+   * every object and field, which made a large import quadratic when each upsert returned through it.
+   */
+  getObject(objectName: string): SalesforceObject | null {
+    const row = db.prepare('SELECT * FROM sf_objects WHERE object_name = ?').get(objectName) as any;
+    if (!row) return null;
+    const fieldRows = db
+      .prepare('SELECT * FROM sf_object_fields WHERE object_name = ? ORDER BY field_name ASC')
+      .all(objectName) as any[];
+    return toSalesforceObject(row, fieldRows.map(toSalesforceObjectField));
   },
 
   /**
@@ -2199,7 +2439,7 @@ export const store = {
         );
       }
 
-      return this.getObjects().find((o) => o.objectName === objName)!;
+      return this.getObject(objName)!;
     });
   },
 
@@ -2289,7 +2529,7 @@ export const store = {
       now,
       objectName
     );
-    return this.getObjects().find((o) => o.objectName === objectName) || null;
+    return this.getObject(objectName);
   },
 
   /** Returns null when the object has no such field. */
@@ -2298,7 +2538,7 @@ export const store = {
       'UPDATE sf_object_fields SET enabled = ? WHERE object_name = ? AND field_name = ?'
     ).run(enabled ? 1 : 0, objectName, fieldName);
     if (res.changes === 0) return null;
-    return this.getObjects().find((o) => o.objectName === objectName) || null;
+    return this.getObject(objectName);
   },
 
   /**
@@ -2320,7 +2560,7 @@ export const store = {
     const fldName = fieldName.trim();
     const result = deleteFieldAndRevokeGrants(objName, fldName, { actor, source: 'objects' });
     if (!result.deleted) return null;
-    const object = this.getObjects().find((o) => o.objectName === objName);
+    const object = this.getObject(objName);
     return object ? { object, revokedGroups: result.revokedGroups } : null;
   },
 
@@ -3467,6 +3707,10 @@ export const store = {
       syncInstanceUrl: row.sync_instance_url || '',
       apiVersion: row.api_version || 'v62.0',
       enforceOrgIdLock: Boolean(row.enforce_org_id_lock),
+      // Production enforces the lock whatever is stored (salesforce/client.ts enforceOrgIdLock).
+      orgIdLockRequired: config.isProd,
+      mcpClientId: row.mcp_client_id || '',
+      hasMcpClientSecret: Boolean(row.mcp_client_secret_enc),
       sfdxObjectsFolderPath: row.sfdx_objects_folder_path || '',
       updatedAt: row.updated_at,
     };
@@ -3482,6 +3726,41 @@ export const store = {
       ...base,
       privateKeyPem,
     };
+  },
+
+  /**
+   * The MCP connected app's credentials for token introspection, or null when not configured. Throws
+   * when a secret is stored but the current APP_SECRET_KEY cannot decrypt it, so verification fails
+   * closed instead of silently skipping the client check.
+   */
+  getMcpIntrospectionCredentials(): { clientId: string; clientSecret: string } | null {
+    const row = db
+      .prepare('SELECT mcp_client_id, mcp_client_secret_enc FROM sf_connection_settings WHERE id = 1')
+      .get() as { mcp_client_id: string; mcp_client_secret_enc: string } | undefined;
+    if (!row?.mcp_client_id) return null;
+    if (!row.mcp_client_secret_enc) throw new Error('The MCP connected app Consumer Secret is not set.');
+    return { clientId: row.mcp_client_id, clientSecret: decryptSecret(row.mcp_client_secret_enc) };
+  },
+
+  /**
+   * Saves the MCP connected app's credentials. A blank clientId turns introspection off (and drops the
+   * secret); a blank or missing clientSecret keeps the stored one.
+   */
+  updateMcpClientCredentials(input: { clientId?: string; clientSecret?: string }): void {
+    const current = db
+      .prepare('SELECT mcp_client_id, mcp_client_secret_enc FROM sf_connection_settings WHERE id = 1')
+      .get() as { mcp_client_id: string; mcp_client_secret_enc: string };
+    const clientId = (input.clientId ?? current.mcp_client_id).trim();
+    const secretEnc = !clientId
+      ? ''
+      : input.clientSecret !== undefined && input.clientSecret.trim() !== ''
+      ? encryptSecret(input.clientSecret.trim())
+      : current.mcp_client_secret_enc;
+    db.prepare('UPDATE sf_connection_settings SET mcp_client_id = ?, mcp_client_secret_enc = ?, updated_at = ? WHERE id = 1').run(
+      clientId,
+      secretEnc,
+      new Date().toISOString()
+    );
   },
 
   updateSalesforceSettings(

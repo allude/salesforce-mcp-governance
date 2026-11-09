@@ -45,9 +45,11 @@ export async function handleMcpStreamableHttpRequest(
     return;
   }
 
-  const instanceUrlHint = req.headers['x-salesforce-instance-url'] as
-    | string
-    | undefined;
+  // The client does not choose where its token is verified in production: the stored instance URL
+  // (the org's My Domain) is the only host asked. Outside production the hint helps test other orgs.
+  const rawInstanceUrlHint = req.headers['x-salesforce-instance-url'];
+  const instanceUrlHint =
+    !config.isProd && typeof rawInstanceUrlHint === 'string' ? rawInstanceUrlHint : undefined;
 
   let verifiedUser;
   const verificationStartedAt = performance.now();

@@ -1,6 +1,6 @@
 import { store } from '../db/store.js';
 import type { VerifiedSalesforceUser } from '../salesforce/client.js';
-import { salesforceIdsMatch } from '../salesforce/ids.js';
+import { isSalesforceId, salesforceIdsMatch } from '../salesforce/ids.js';
 import { checkSoqlWhereClause, type WhereClauseCheck } from '../mcp/soqlGuard.js';
 import {
   API_NAME_PATTERN,
@@ -154,10 +154,14 @@ function mergeAssignedGroups(
 ): MergedPolicy {
   const profiles = snapshot.profiles;
   const matchedById = profiles.find((p) => salesforceIdsMatch(p.id, profileId));
+  // A Profile registered under its Salesforce id is matched by that id only. Every org has Profiles
+  // named "System Administrator", "Standard User" and so on, so a name match there would hand this
+  // policy to a caller from any org. Only a Profile registered under an id that is not a Salesforce id
+  // (the CSV import and older rows allow one) can be matched by name, since it has no id to match.
   const matchedProfile =
     matchedById ||
     (profileNameHint
-      ? profiles.find((p) => p.name.toLowerCase() === profileNameHint.toLowerCase())
+      ? profiles.find((p) => !isSalesforceId(p.id) && p.name.toLowerCase() === profileNameHint.toLowerCase())
       : undefined);
 
   const toolGrants = new Map<string, Set<string>>();

@@ -50,13 +50,14 @@ interface PortalUserRow {
   display_name: string;
   password_hash: string;
   password_salt: string;
+  password_iterations: number;
   role: string;
   created_at: string;
   last_login_at: string | null;
 }
 
-const pbkdf2Sha512Hex = (password: string, salt: string) =>
-  crypto.pbkdf2Sync(password, salt, 100_000, 64, 'sha512').toString('hex');
+const pbkdf2Sha512Hex = (password: string, salt: string, iterations = 210_000) =>
+  crypto.pbkdf2Sync(password, salt, iterations, 64, 'sha512').toString('hex');
 
 /** Runs `fn` (synchronously), then writes the singleton row (id = 1) of `table` back exactly as it was. */
 function restoringSingleton<T>(table: 'okta_config' | 'sf_connection_settings', fn: () => T): T {
@@ -377,23 +378,42 @@ describe('store: bootstrap admin and portal users', () => {
     );
   });
 
-  test('verifyPortalUserCredentials accepts the bootstrap password with a case-insensitive username', () => {
+  test('verifyPortalUserCredentials accepts the bootstrap password with a case-insensitive username', async () => {
     for (const username of ['admin', 'ADMIN', '  Admin  ']) {
-      const user = store.verifyPortalUserCredentials(username, BOOTSTRAP_PASSWORD);
+      const user = await store.verifyPortalUserCredentials(username, BOOTSTRAP_PASSWORD);
       assert.ok(user, `sign-in as "${username}" should succeed`);
       assert.equal(user.username, BOOTSTRAP_USERNAME);
       assert.equal(user.role, 'Super Admin');
-      assert.ok(user.lastLoginAt && !Number.isNaN(Date.parse(user.lastLoginAt)), 'lastLoginAt is set');
     }
+    // The password is only the first factor: the sign-in is stamped once it completes.
+    store.recordPortalUserLogin(BOOTSTRAP_USERNAME);
     const stored = store.getPortalUsers().find((u) => u.username === BOOTSTRAP_USERNAME);
-    assert.ok(stored?.lastLoginAt, 'the last sign-in time is persisted');
+    assert.ok(stored?.lastLoginAt && !Number.isNaN(Date.parse(stored.lastLoginAt)), 'the last sign-in time is persisted');
   });
 
-  test('verifyPortalUserCredentials returns null for a wrong password or an unknown user', () => {
-    assert.equal(store.verifyPortalUserCredentials(BOOTSTRAP_USERNAME, 'wrong-password'), null);
-    assert.equal(store.verifyPortalUserCredentials(BOOTSTRAP_USERNAME, BOOTSTRAP_PASSWORD.toUpperCase()), null);
-    assert.equal(store.verifyPortalUserCredentials(BOOTSTRAP_USERNAME, ''), null);
-    assert.equal(store.verifyPortalUserCredentials(`nobody-${uid()}`, BOOTSTRAP_PASSWORD), null);
+  test('verifyPortalUserCredentials returns null for a wrong password or an unknown user', async () => {
+    assert.equal(await store.verifyPortalUserCredentials(BOOTSTRAP_USERNAME, 'wrong-password'), null);
+    assert.equal(await store.verifyPortalUserCredentials(BOOTSTRAP_USERNAME, BOOTSTRAP_PASSWORD.toUpperCase()), null);
+    assert.equal(await store.verifyPortalUserCredentials(BOOTSTRAP_USERNAME, ''), null);
+    assert.equal(await store.verifyPortalUserCredentials(`nobody-${uid()}`, BOOTSTRAP_PASSWORD), null);
+  });
+
+  test('a correct password stored with the old 100,000 iterations is rehashed at 210,000 on sign-in', async (t) => {
+    const username = `store-legacy-${uid()}`;
+    t.after(() => store.deletePortalUser(username));
+    store.upsertPortalUser({ username, displayName: 'Legacy Hash', password: 'Legacy-Passw0rd!' });
+    const salt = crypto.randomBytes(16).toString('hex');
+    raw
+      .prepare('UPDATE portal_users SET password_hash = ?, password_salt = ?, password_iterations = 100000 WHERE username = ?')
+      .run(pbkdf2Sha512Hex('Legacy-Passw0rd!', salt, 100_000), salt, username);
+
+    assert.equal(await store.verifyPortalUserCredentials(username, 'Wrong-Passw0rd!'), null);
+    assert.equal(rawGet<PortalUserRow>('SELECT * FROM portal_users WHERE username = ?', username)?.password_iterations, 100_000, 'a wrong password changes nothing');
+    assert.equal((await store.verifyPortalUserCredentials(username, 'Legacy-Passw0rd!'))?.username, username);
+    const row = rawGet<PortalUserRow>('SELECT * FROM portal_users WHERE username = ?', username)!;
+    assert.equal(row.password_iterations, 210_000);
+    assert.equal(row.password_hash, pbkdf2Sha512Hex('Legacy-Passw0rd!', row.password_salt, 210_000));
+    assert.ok(await store.verifyPortalUserCredentials(username, 'Legacy-Passw0rd!'), 'the upgraded hash still verifies');
   });
 
   test('stores the bootstrap password as a salted PBKDF2-SHA512 hash, never as plaintext', () => {
@@ -407,7 +427,7 @@ describe('store: bootstrap admin and portal users', () => {
     assert.equal(row.password_hash, pbkdf2Sha512Hex(BOOTSTRAP_PASSWORD, row.password_salt));
   });
 
-  test('upsertPortalUser re-hashes the password with a fresh salt on every save', (t) => {
+  test('upsertPortalUser re-hashes the password with a fresh salt on every save', async (t) => {
     const username = `store-rehash-${uid()}`;
     const readRow = () => rawGet<PortalUserRow>('SELECT * FROM portal_users WHERE username = ?', username);
     t.after(() => store.deletePortalUser(username));
@@ -424,11 +444,11 @@ describe('store: bootstrap admin and portal users', () => {
     assert.equal(second.password_hash, pbkdf2Sha512Hex('First-Passw0rd!', second.password_salt));
 
     store.upsertPortalUser({ username, displayName: 'Rehash Test', password: 'Second-Passw0rd!' });
-    assert.equal(store.verifyPortalUserCredentials(username, 'First-Passw0rd!'), null);
-    assert.equal(store.verifyPortalUserCredentials(username, 'Second-Passw0rd!')?.username, username);
+    assert.equal(await store.verifyPortalUserCredentials(username, 'First-Passw0rd!'), null);
+    assert.equal((await store.verifyPortalUserCredentials(username, 'Second-Passw0rd!'))?.username, username);
   });
 
-  test('upsertPortalUser treats usernames case-insensitively, like sign-in does', (t) => {
+  test('upsertPortalUser treats usernames case-insensitively, like sign-in does', async (t) => {
     const username = `store-case-${uid()}`;
     const shouted = username.toUpperCase();
     t.after(() => {
@@ -447,11 +467,11 @@ describe('store: bootstrap admin and portal users', () => {
       1,
       `expected a single account, found ${accounts.length}: ${accounts.map((u) => u.username).join(', ')}`
     );
-    assert.equal(store.verifyPortalUserCredentials(username, 'Original-Passw0rd!'), null, 'the old password stops working');
-    assert.ok(store.verifyPortalUserCredentials(username, 'Rotated-Passw0rd!'), 'the rotated password works');
+    assert.equal(await store.verifyPortalUserCredentials(username, 'Original-Passw0rd!'), null, 'the old password stops working');
+    assert.ok(await store.verifyPortalUserCredentials(username, 'Rotated-Passw0rd!'), 'the rotated password works');
   });
 
-  test('deletePortalUser deletes a user while another administrator remains', () => {
+  test('deletePortalUser deletes a user while another administrator remains', async () => {
     const username = `store-delete-${uid()}`;
     store.upsertPortalUser({ username, displayName: 'Delete Test', password: 'Delete-Passw0rd!' });
 
@@ -459,7 +479,7 @@ describe('store: bootstrap admin and portal users', () => {
     assert.equal(store.deletePortalUser(username), true);
 
     assert.equal(store.getPortalUsers().some((u) => u.username === username), false);
-    assert.equal(store.verifyPortalUserCredentials(username, 'Delete-Passw0rd!'), null);
+    assert.equal(await store.verifyPortalUserCredentials(username, 'Delete-Passw0rd!'), null);
   });
 
   test('deletePortalUser refuses to delete the last remaining portal administrator', () => {
@@ -1417,6 +1437,9 @@ describe('store: Salesforce connection settings', () => {
       syncInstanceUrl: '',
       apiVersion: process.env.SALESFORCE_API_VERSION || 'v62.0',
       enforceOrgIdLock: false,
+      orgIdLockRequired: false,
+      mcpClientId: '',
+      hasMcpClientSecret: false,
       sfdxObjectsFolderPath: '',
     });
     assert.ok(!Number.isNaN(Date.parse(sfSettingsAtLoad.updatedAt)));

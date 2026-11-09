@@ -17,6 +17,7 @@ import type {
   AccessGroupChangeSource,
   AccessGroupHistoryEntry,
   NavViewId,
+  TotpSetup,
 } from '@/types/governance';
 import type { AccessGroupDraft, WorkspaceSnapshot } from '@/components/views/accessGroupDraft';
 import {
@@ -121,8 +122,12 @@ function toAdminSession(user: any): AdminSession {
     role: user.role || user.groups?.[0] || 'Platform Admin',
     authMethod: user.authMethod,
     groups: user.groups,
+    totpEnrolled: user.totpEnrolled === true,
   };
 }
+
+/** Where an Okta session confirms it is still the same person (prompt=login), coming back here. */
+const OKTA_REAUTH_URL = '/auth/okta/login?reauth=1';
 
 export default function AdminPortalPage() {
   // Session & Auth state
@@ -135,6 +140,20 @@ export default function AdminPortalPage() {
   const savingProfileIds = useRef<Set<string>>(new Set());
   const [loginError, setLoginError] = useState('');
   const [loginBusy, setLoginBusy] = useState(false);
+  const [loginTotp, setLoginTotp] = useState('');
+  // From /api/admin/session: production closes password sign-in while Okta is on (unless break-glass is
+  // enabled) and asks every password sign-in for an authenticator code.
+  const [passwordLoginEnabled, setPasswordLoginEnabled] = useState(true);
+  const [totpRequired, setTotpRequired] = useState(false);
+
+  // Step-up: a sensitive change answered 403 REAUTH_REQUIRED; the dialog confirms it is still the same
+  // person and the change is sent again. The resolver lets apiFetch wait for the answer.
+  const [reauthPrompt, setReauthPrompt] = useState<{ authMethod: string } | null>(null);
+  const [reauthPassword, setReauthPassword] = useState('');
+  const [reauthTotp, setReauthTotp] = useState('');
+  const [reauthError, setReauthError] = useState('');
+  const [reauthBusy, setReauthBusy] = useState(false);
+  const reauthResolver = useRef<((confirmed: boolean) => void) | null>(null);
 
   // Navigation & UI state
   const [view, setView] = useState<ActiveView>('dashboard');
@@ -176,6 +195,26 @@ export default function AdminPortalPage() {
   const [devToolsEnabled, setDevToolsEnabled] = useState(false);
   const [seedConfirmOpen, setSeedConfirmOpen] = useState(false);
   const seedConfirmModal = useModalDialog(seedConfirmOpen, () => setSeedConfirmOpen(false));
+  const closeReauth = useCallback((confirmed: boolean) => {
+    reauthResolver.current?.(confirmed);
+    reauthResolver.current = null;
+    setReauthPrompt(null);
+    setReauthPassword('');
+    setReauthTotp('');
+    setReauthError('');
+  }, []);
+  const reauthModal = useModalDialog(Boolean(reauthPrompt), () => closeReauth(false));
+
+  /** Opens the step-up dialog; resolves true once the server has marked the session as just confirmed. */
+  const requestReauth = useCallback((authMethod: string): Promise<boolean> => {
+    // A newer refusal takes over an open prompt; the change that was waiting reports it was not made.
+    reauthResolver.current?.(false);
+    return new Promise<boolean>((resolve) => {
+      reauthResolver.current = resolve;
+      setReauthError('');
+      setReauthPrompt({ authMethod });
+    });
+  }, []);
 
   const notify = useCallback((msg: string, isError = false) => {
     setToast({ msg, isError });
@@ -253,6 +292,8 @@ export default function AdminPortalPage() {
       const res = await fetch('/api/admin/session', { credentials: 'include' });
       const data = await readJsonBody(res);
       setOktaEnabled(Boolean(data.oktaSso?.enabled));
+      setPasswordLoginEnabled(data.passwordLogin?.enabled !== false);
+      setTotpRequired(data.passwordLogin?.totpRequired === true);
     } catch {
       // keep the previous value
     }
@@ -263,9 +304,11 @@ export default function AdminPortalPage() {
     setFlyout(null);
     setCsrfToken('');
     setLoginPassword('');
+    setLoginTotp('');
+    closeReauth(false);
     setLoginError('Your session has ended. Please sign in again.');
     void refreshLoginOptions();
-  }, [refreshLoginOptions]);
+  }, [refreshLoginOptions, closeReauth]);
 
   /** Reloads the workspace. Answers the groups and Objects it read (one snapshot), or null when it failed. */
   const fetchWorkspace = useCallback(async (): Promise<WorkspaceSnapshot | null> => {
@@ -319,7 +362,8 @@ export default function AdminPortalPage() {
         return fetch(url, { ...options, credentials: 'include', headers });
       };
 
-      let res = await send(csrfToken);
+      let token = csrfToken;
+      let res = await send(token);
       let data = await readJsonBody(res);
 
       // Signed in again in another tab: pick up the session's current CSRF token and retry once,
@@ -339,9 +383,24 @@ export default function AdminPortalPage() {
               `This browser is now signed in as "${current.user?.username}" (another tab). The change was not applied; review it and try again.`
             );
           }
-          res = await send(current.csrfToken);
+          token = current.csrfToken;
+          res = await send(token);
           data = await readJsonBody(res);
         }
+      }
+
+      // A sensitive change needs a recent sign-in. The server refused it before changing anything, so
+      // once the same person confirms, sending it again is safe.
+      if (res.status === 403 && data.code === 'REAUTH_REQUIRED') {
+        const confirmed = await requestReauth(String(data.authMethod || session?.authMethod || 'local_bootstrap'));
+        if (!confirmed) {
+          throw Object.assign(new Error('Not changed: confirm your sign-in to make this change.'), {
+            status: 403,
+            body: data,
+          });
+        }
+        res = await send(token);
+        data = await readJsonBody(res);
       }
 
       if (res.status === 401) {
@@ -356,8 +415,40 @@ export default function AdminPortalPage() {
       }
       return data as T;
     },
-    [csrfToken, session, fetchWorkspace, handleSessionExpired]
+    [csrfToken, session, fetchWorkspace, handleSessionExpired, requestReauth]
   );
+
+  const handleReauthSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setReauthError('');
+    setReauthBusy(true);
+    try {
+      // Not apiFetch: a refused password is this dialog's answer, not a reason to sign out.
+      const res = await fetch('/api/admin/reauth', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+        body: JSON.stringify({
+          password: reauthPassword,
+          ...(reauthTotp.trim() ? { totp: reauthTotp.trim() } : {}),
+        }),
+      });
+      const data = await readJsonBody(res);
+      if (res.status === 401) {
+        handleSessionExpired();
+        return;
+      }
+      if (!res.ok) {
+        setReauthError(data.error || `Confirmation failed (${res.status})`);
+        return;
+      }
+      closeReauth(true);
+    } catch (err: any) {
+      setReauthError(err?.message || 'Confirmation failed');
+    } finally {
+      setReauthBusy(false);
+    }
+  };
 
   // Check session on mount
   useEffect(() => {
@@ -382,6 +473,8 @@ export default function AdminPortalPage() {
           );
         }
         setOktaEnabled(Boolean(data.oktaSso?.enabled));
+        setPasswordLoginEnabled(data.passwordLogin?.enabled !== false);
+        setTotpRequired(data.passwordLogin?.totpRequired === true);
         if (data.authenticated && data.user) {
           setSession(toAdminSession(data.user));
           if (data.csrfToken) setCsrfToken(data.csrfToken);
@@ -425,6 +518,7 @@ export default function AdminPortalPage() {
         body: JSON.stringify({
           username: loginUsername,
           password: loginPassword,
+          ...(loginTotp.trim() ? { totp: loginTotp.trim() } : {}),
         }),
       });
       const data = await readJsonBody(res);
@@ -433,6 +527,7 @@ export default function AdminPortalPage() {
       }
       setSession(toAdminSession(data.user));
       setLoginPassword('');
+      setLoginTotp('');
       if (data.csrfToken) setCsrfToken(data.csrfToken);
       await fetchWorkspace();
       notify(`Signed in as ${data.user.name}`);
@@ -455,6 +550,7 @@ export default function AdminPortalPage() {
     setFlyout(null);
     setCsrfToken('');
     setLoginPassword('');
+    setLoginTotp('');
     void refreshLoginOptions();
   };
 
@@ -867,6 +963,7 @@ export default function AdminPortalPage() {
                   <span className="dot ok" />
                   Continue with Okta SSO
                 </a>
+                {passwordLoginEnabled && (
                 <div
                   style={{
                     display: 'flex',
@@ -885,9 +982,18 @@ export default function AdminPortalPage() {
                     style={{ flex: 1, height: 1, background: 'var(--bd)' }}
                   />
                 </div>
+                )}
               </>
             )}
 
+            {!passwordLoginEnabled && (
+              <p style={{ fontSize: 11.5, color: 'var(--t3)', margin: 0 }}>
+                Password sign-in is closed while Okta SSO is on. A break-glass account works only when the
+                server is started with BREAK_GLASS_ENABLED=true.
+              </p>
+            )}
+
+            {passwordLoginEnabled && (
             <form onSubmit={handlePasswordLogin}>
               <div className="fld">
                 <label>Username</label>
@@ -927,6 +1033,23 @@ export default function AdminPortalPage() {
                   onChange={(e) => setLoginPassword(e.target.value)}
                 />
               </div>
+              <div className="fld">
+                <label htmlFor="login-totp">
+                  Authenticator code{totpRequired ? '' : ' (if your account has one)'}
+                </label>
+                <input
+                  id="login-totp"
+                  className="inp mono"
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  pattern="[0-9]{6}"
+                  maxLength={6}
+                  placeholder="123456"
+                  required={totpRequired}
+                  value={loginTotp}
+                  onChange={(e) => setLoginTotp(e.target.value.replace(/\D/g, ''))}
+                />
+              </div>
               <button
                 type="submit"
                 className="btn"
@@ -936,6 +1059,7 @@ export default function AdminPortalPage() {
                 Sign in with password
               </button>
             </form>
+            )}
           </div>
         </div>
       </div>
@@ -1424,6 +1548,24 @@ export default function AdminPortalPage() {
                 if (data.portalUsers) setPortalUsers(data.portalUsers);
                 await fetchWorkspace();
                 notify(`Saved administrator "${user.username}"`);
+                return (data.totpSetup as TotpSetup | undefined) ?? null;
+              })}
+              currentAccount={
+                session.authMethod === 'local_bootstrap'
+                  ? { username: session.username, totpEnrolled: Boolean(session.totpEnrolled) }
+                  : null
+              }
+              onStartTotpSetup={reportFailure(async () => {
+                return apiFetch<TotpSetup>('/api/admin/account/totp/setup', { method: 'POST' });
+              })}
+              onConfirmTotp={reportFailure(async (code: string) => {
+                await apiFetch('/api/admin/account/totp/confirm', {
+                  method: 'POST',
+                  body: JSON.stringify({ code }),
+                });
+                setSession((current) => (current ? { ...current, totpEnrolled: true } : current));
+                await fetchWorkspace();
+                notify('Authenticator app enrolled. Sign-ins now ask for its code.');
               })}
               onDeletePortalUser={reportFailureAndStop(async (username) => {
                 const data = await apiFetch(
@@ -1539,6 +1681,102 @@ export default function AdminPortalPage() {
                   Replace mappings and load
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* STEP-UP: confirm it is still the same person before a sensitive change */}
+      {reauthPrompt && (
+        <div className="cmdk-scrim" onClick={reauthModal.close}>
+          <div
+            ref={reauthModal.dialogRef}
+            className="cmdk-box"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="reauth-title"
+            aria-describedby="reauth-body"
+            tabIndex={-1}
+            style={{ maxWidth: 420 }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="card-h">
+              <div className="card-t" id="reauth-title">
+                Confirm it&apos;s you
+              </div>
+            </div>
+            <div className="card-b">
+              {reauthPrompt.authMethod === 'okta_oidc' ? (
+                <>
+                  <p id="reauth-body" style={{ fontSize: 12.5, color: 'var(--t2)' }}>
+                    This change needs a sign-in from the last 10 minutes. Sign in with Okta again, then repeat
+                    the change; it has not been applied.
+                  </p>
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>
+                    <button
+                      ref={reauthModal.initialFocusRef}
+                      type="button"
+                      className="btn"
+                      onClick={reauthModal.close}
+                    >
+                      Cancel
+                    </button>
+                    <a className="btn pri" href={OKTA_REAUTH_URL}>
+                      Sign in with Okta
+                    </a>
+                  </div>
+                </>
+              ) : (
+                <form onSubmit={handleReauthSubmit}>
+                  <p id="reauth-body" style={{ fontSize: 12.5, color: 'var(--t2)' }}>
+                    This change needs a sign-in from the last 10 minutes. Enter your password
+                    {session?.totpEnrolled || totpRequired ? ' and authenticator code' : ''} to continue.
+                  </p>
+                  {reauthError && (
+                    <p role="alert" style={{ fontSize: 12, color: 'var(--err)' }}>
+                      {reauthError}
+                    </p>
+                  )}
+                  <div className="fld">
+                    <label htmlFor="reauth-password">Password</label>
+                    <input
+                      id="reauth-password"
+                      type="password"
+                      className="inp mono"
+                      autoComplete="current-password"
+                      value={reauthPassword}
+                      onChange={(e) => setReauthPassword(e.target.value)}
+                    />
+                  </div>
+                  {(session?.totpEnrolled || totpRequired) && (
+                    <div className="fld">
+                      <label htmlFor="reauth-totp">Authenticator code</label>
+                      <input
+                        id="reauth-totp"
+                        className="inp mono"
+                        inputMode="numeric"
+                        autoComplete="one-time-code"
+                        maxLength={6}
+                        value={reauthTotp}
+                        onChange={(e) => setReauthTotp(e.target.value.replace(/\D/g, ''))}
+                      />
+                    </div>
+                  )}
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>
+                    <button
+                      ref={reauthModal.initialFocusRef}
+                      type="button"
+                      className="btn"
+                      onClick={reauthModal.close}
+                    >
+                      Cancel
+                    </button>
+                    <button type="submit" className="btn pri" disabled={reauthBusy || !reauthPassword}>
+                      {reauthBusy ? 'Confirming…' : 'Confirm and continue'}
+                    </button>
+                  </div>
+                </form>
+              )}
             </div>
           </div>
         </div>

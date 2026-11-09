@@ -438,7 +438,11 @@ describe('Admin REST API', () => {
     it('forged session JWTs are rejected: public dev key, alg "none", expired, wrong audience or issuer', async () => {
       assert.notEqual(config.appSecretKey, DEV_FALLBACK_SECRET_KEY, 'tests must run with a private APP_SECRET_KEY');
       const now = Math.floor(Date.now() / 1000);
+      // Every session cookie names a server-side record; this one is real, so only the cookie is forged.
+      const jti = `forged-test-${crypto.randomBytes(6).toString('hex')}`;
+      store.createAdminSession({ jti, subject: 'admin', authMethod: 'local_bootstrap', nowMs: Date.now(), expiresAtMs: Date.now() + 3_600_000 });
       const claims = {
+        jti,
         sub: 'portal_admin',
         email: 'admin',
         name: 'Portal Administrator',
@@ -459,6 +463,10 @@ describe('Admin REST API', () => {
         expired: hs256SessionCookie({ ...claims, iat: now - 7200, exp: now - 60 }, config.appSecretKey),
         wrongAudience: hs256SessionCookie({ ...claims, aud: 'another-app' }, config.appSecretKey),
         wrongIssuer: hs256SessionCookie({ ...claims, iss: 'another-issuer' }, config.appSecretKey),
+        // Signed with the server's own key, but naming no session the server started: a stolen
+        // APP_SECRET_KEY alone no longer mints sessions.
+        unknownSession: hs256SessionCookie({ ...claims, jti: 'no-such-session' }, config.appSecretKey),
+        noSessionId: hs256SessionCookie({ ...claims, jti: undefined }, config.appSecretKey),
       };
       const ip = newClientIp();
       const statuses: Record<string, number> = {};
@@ -473,6 +481,8 @@ describe('Admin REST API', () => {
         expired: 401,
         wrongAudience: 401,
         wrongIssuer: 401,
+        unknownSession: 401,
+        noSessionId: 401,
       });
     });
   });
@@ -1828,7 +1838,7 @@ describe('Admin REST API', () => {
       const entry = created.body.portalUsers.find((u: any) => u.username === username);
       assert.deepEqual({ displayName: entry?.displayName, role: entry?.role }, { displayName: 'Ops Admin', role: 'Admin' });
       for (const user of created.body.portalUsers) {
-        assert.deepEqual(Object.keys(user).sort(), ['createdAt', 'displayName', 'lastLoginAt', 'role', 'username']);
+        assert.deepEqual(Object.keys(user).sort(), ['createdAt', 'displayName', 'lastLoginAt', 'role', 'totpEnrolled', 'username']);
       }
       assert.ok(!JSON.stringify(created.body).includes(password));
 

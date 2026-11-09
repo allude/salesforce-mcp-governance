@@ -49,9 +49,12 @@ Everything has a development default. The ones that matter:
 | :--- | :--- | :--- |
 | `PORT` | `3001` | Backend port when you run it directly (`node dist/index.js`, `tsx src/index.ts`). `npm run dev` uses `MCP_BACKEND_PORT` (default `3001`) and `PORTAL_PORT` (default `3000`) instead. |
 | `BASE_URL` | `http://localhost:3000` | Public origin (the portal). Used in OAuth metadata and Okta redirects. |
-| `MCP_BACKEND_URL` | `http://localhost:3001` | Where the portal proxies to. Read by `next dev`, and baked in at `next build` for `next start`. `npm run dev` and `npm start` also read it, `MCP_BACKEND_PORT` and `PORTAL_PORT` from `.env`; real environment variables take precedence. |
+| `MCP_BACKEND_URL` | `http://127.0.0.1:3001` | Where the portal proxies to. Read by `next dev`, and baked in at `next build` for `next start`. `npm run dev` and `npm start` also read it, `MCP_BACKEND_PORT` and `PORTAL_PORT` from `.env`; real environment variables take precedence. |
 | `APP_SECRET_KEY` | development key | 64 hex chars (`openssl rand -hex 32`). **Required in production**: the backend refuses to start if it is missing, malformed, or a publicly known sample. In development and test a deterministic insecure key is used, with a warning. |
+| `MCP_BACKEND_HOST` | `127.0.0.1` | Address the backend listens on. Keep loopback so only the portal proxy reaches it. Production refuses any other address unless `ALLOW_PUBLIC_BACKEND=true` (only behind a private network policy or mTLS). |
 | `ADMIN_BOOTSTRAP_USERNAME` / `ADMIN_BOOTSTRAP_PASSWORD` | `admin` / `admin123` | Break-glass portal login, seeded only into an empty database. Production refuses to start while any portal account uses a publicly known password, and rotates the bootstrap account to a strong `ADMIN_BOOTSTRAP_PASSWORD`. |
+| `ADMIN_BOOTSTRAP_TOTP_SECRET` | unset | Base32 authenticator secret enrolled on the bootstrap account at startup if it has none. Production asks every password sign-in for an authenticator code, so set this (or run `npm run portal:totp -- <username>`) before the first production sign-in. |
+| `BREAK_GLASS_ENABLED` | `false` | In production, password sign-in is closed while Okta SSO is enabled. Set `true` only during an Okta outage; each break-glass sign-in is logged and printed. |
 | `DB_PATH` | `./data/mcp-governance.sqlite` | SQLite database file. |
 | `SALESFORCE_ALLOWED_DOMAINS` | `.my.salesforce.com,.salesforce.com,.force.com` | SSRF allowlist for every Salesforce URL the server calls. |
 | `TRUST_PROXY` | `false` | Express `trust proxy`. Leave `false` unless a load balancer in front of the portal appends `X-Forwarded-For`; then set `loopback` so per-IP rate limits and audit logs see real client IPs. (The Next.js proxy forwards the header unchanged, so trusting it without such a balancer lets clients forge it.) |
@@ -77,9 +80,14 @@ Use single quotes: Salesforce session IDs contain `!`, which zsh and bash expand
 npm run build
 ```
 ```bash
-APP_SECRET_KEY=<64-hex> ADMIN_BOOTSTRAP_PASSWORD=<strong> npm start
+APP_SECRET_KEY=<64-hex> ADMIN_BOOTSTRAP_PASSWORD=<strong> ADMIN_BOOTSTRAP_TOTP_SECRET=<base32> npm start
 ```
-`npm start` runs the backend with `NODE_ENV=production` (unless you set it), so it refuses to start without a real `APP_SECRET_KEY` or while a portal account uses a publicly known password. `npm run build` compiles the backend to `dist/` (`tsconfig.server.json`) and builds the portal. `npm start` runs `node dist/index.js` and `next start` on `:3000`, using the backend port the portal was built to proxy to (`MCP_BACKEND_URL` at build time, default `:3001`).
+`npm start` runs the backend with `NODE_ENV=production` (unless you set it), so it refuses to start without a real `APP_SECRET_KEY` or while a portal account uses a publicly known password. Production also:
+
+* asks every password sign-in for an authenticator code. Add `ADMIN_BOOTSTRAP_TOTP_SECRET` to an authenticator app, or enroll an account from a shell on the server with `npm run portal:totp -- <username>` (`--replace` after a lost device, `--remove` to clear it). Administrators created in the portal get a setup key to hand over; each can replace theirs under **Portal Auth**.
+* closes password sign-in while Okta SSO is on, unless `BREAK_GLASS_ENABLED=true`.
+* refuses every `/mcp` token until **Salesforce Org Connection** has an expected Org ID (the Org ID lock is always on).
+* warns at startup until the **MCP client connected app** (Consumer Key and Secret) is set there, so `/mcp` accepts only tokens issued to that app. `npm run build` compiles the backend to `dist/` (`tsconfig.server.json`) and builds the portal. `npm start` runs `node dist/index.js` and `next start` on `:3000`, using the backend port the portal was built to proxy to (`MCP_BACKEND_URL` at build time, default `:3001`).
 
 ### 5. Verify
 | Command | What it runs |
