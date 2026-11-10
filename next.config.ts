@@ -23,7 +23,7 @@ const nextConfig: NextConfig = {
   },
   async rewrites() {
     // Read when the rewrites are built: at `next dev` startup, and at `next build` for `next start`.
-    const backendUrl = process.env.MCP_BACKEND_URL || 'http://localhost:3001';
+    const backendUrl = process.env.MCP_BACKEND_URL || 'http://127.0.0.1:3001';
     return [
       {
         source: '/mcp',

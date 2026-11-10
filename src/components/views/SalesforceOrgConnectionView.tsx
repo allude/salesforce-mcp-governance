@@ -82,6 +82,11 @@ export function SalesforceOrgConnectionView({
   const [mcpTokenHost, setMcpTokenHost] = useState(sfSettings.instanceUrl || '');
   const [mcpTokenHostError, setMcpTokenHostError] = useState('');
   const [savingMcpTokenHost, setSavingMcpTokenHost] = useState(false);
+  // The connected app MCP clients sign in through; its secret is write-only.
+  const [mcpClientId, setMcpClientId] = useState(sfSettings.mcpClientId || '');
+  const [mcpClientSecret, setMcpClientSecret] = useState('');
+  const [mcpClientError, setMcpClientError] = useState('');
+  const [savingMcpClient, setSavingMcpClient] = useState(false);
 
   // Private key & certificate state
   const [showCustomKeyInput, setShowCustomKeyInput] = useState(false);
@@ -115,6 +120,10 @@ export function SalesforceOrgConnectionView({
     setMcpTokenHost(sfSettings.instanceUrl || '');
     setMcpTokenHostError('');
   }, [sfSettings.instanceUrl]);
+
+  useEffect(() => {
+    setMcpClientId(sfSettings.mcpClientId || '');
+  }, [sfSettings.mcpClientId]);
 
   const handleGenerateCertClick = () => {
     const action = generateCertClick(sfSettings);
@@ -208,7 +217,8 @@ export function SalesforceOrgConnectionView({
     username: username.trim(),
     apiVersion: apiVersion.trim() || 'v62.0',
     expectedOrgId: expectedOrgId.trim(),
-    enforceOrgIdLock,
+    // Production always enforces the lock, and refuses a save that turns it off.
+    enforceOrgIdLock: enforceOrgIdLock || Boolean(sfSettings.orgIdLockRequired),
     ...(privateKeyInput.trim()
       ? { privateKeyPem: privateKeyInput.trim() }
       : {}),
@@ -260,6 +270,36 @@ export function SalesforceOrgConnectionView({
       setMcpTokenHostError(err.message);
     } finally {
       setSavingMcpTokenHost(false);
+    }
+  };
+
+  const handleSaveMcpClient = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setMcpClientError('');
+    setSavingMcpClient(true);
+    try {
+      const res = await apiFetch<{ sfSettings: SalesforceConnectionSettings }>(
+        '/api/admin/sf-settings',
+        {
+          method: 'PUT',
+          body: JSON.stringify({
+            mcpClientId: mcpClientId.trim(),
+            ...(mcpClientSecret.trim() ? { mcpClientSecret: mcpClientSecret.trim() } : {}),
+          }),
+        }
+      );
+      setMcpClientSecret('');
+      setMcpClientId(res.sfSettings.mcpClientId || '');
+      await onRefresh();
+      onShowToast(
+        res.sfSettings.mcpClientId
+          ? 'Saved. MCP now accepts only tokens issued to this connected app.'
+          : 'Saved. MCP accepts tokens from any connected app in the org.'
+      );
+    } catch (err: any) {
+      setMcpClientError(err.message);
+    } finally {
+      setSavingMcpClient(false);
     }
   };
 
@@ -788,19 +828,24 @@ export function SalesforceOrgConnectionView({
                   <div>
                     <div className="flex items-center gap-1.5 text-xs font-bold text-slate-800">
                       <Lock className="h-3.5 w-3.5 text-indigo-600" />
-                      <span>Enforce Salesforce Org ID Lock (Optional)</span>
+                      <span>
+                        Enforce Salesforce Org ID Lock{sfSettings.orgIdLockRequired ? ' (always on in production)' : ' (Optional)'}
+                      </span>
                     </div>
                     <p className="text-[11px] text-slate-500">
-                      If enabled, rejects connections unless the Salesforce `organization_id` matches the Expected Org ID below.
+                      {sfSettings.orgIdLockRequired
+                        ? 'MCP refuses every user token until the Expected Org ID below is set, and any token whose `organization_id` does not match it.'
+                        : 'If enabled, rejects connections unless the Salesforce `organization_id` matches the Expected Org ID below.'}
                     </p>
                   </div>
                   <Switch
-                    checked={enforceOrgIdLock}
+                    checked={enforceOrgIdLock || Boolean(sfSettings.orgIdLockRequired)}
                     onCheckedChange={setEnforceOrgIdLock}
+                    disabled={Boolean(sfSettings.orgIdLockRequired)}
                   />
                 </div>
 
-                {enforceOrgIdLock && (
+                {(enforceOrgIdLock || sfSettings.orgIdLockRequired) && (
                   <div className="mt-2.5">
                     <input
                       type="text"
@@ -882,6 +927,79 @@ export function SalesforceOrgConnectionView({
                   className="mt-1 text-[11px] font-semibold text-rose-700"
                 >
                   {mcpTokenHostError}
+                </p>
+              )}
+            </form>
+
+            {/* MCP client app: binds user tokens to the connected app MCP clients sign in through */}
+            <form
+              onSubmit={handleSaveMcpClient}
+              className="mt-4 border-t border-slate-100 pt-4"
+            >
+              <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-700">
+                <ShieldCheck className="h-3.5 w-3.5 text-indigo-600" />
+                <span>MCP client connected app</span>
+                <span
+                  className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${
+                    sfSettings.mcpClientId
+                      ? 'bg-emerald-100 text-emerald-800'
+                      : 'bg-amber-100 text-amber-800'
+                  }`}
+                >
+                  {sfSettings.mcpClientId ? 'Tokens bound to this app' : 'Any app in the org'}
+                </span>
+              </div>
+              <p className="text-[11px] text-slate-500">
+                The Consumer Key and Secret of the connected app Copilot or other MCP clients sign users in through. When set, MCP asks Salesforce (token introspection) which app each token was issued to and refuses tokens from any other app. Leave the key blank to accept any app&apos;s token.
+              </p>
+              <div className="mt-2 grid grid-cols-1 gap-2 md:grid-cols-2">
+                <div>
+                  <label htmlFor="mcp-client-id" className="block text-[11px] font-semibold text-slate-600">
+                    Consumer Key
+                  </label>
+                  <input
+                    id="mcp-client-id"
+                    type="text"
+                    autoComplete="off"
+                    value={mcpClientId}
+                    onChange={(e) => {
+                      setMcpClientId(e.target.value);
+                      setMcpClientError('');
+                    }}
+                    placeholder="3MVG9..."
+                    className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
+                  />
+                </div>
+                <div>
+                  <label htmlFor="mcp-client-secret" className="block text-[11px] font-semibold text-slate-600">
+                    Consumer Secret
+                  </label>
+                  <input
+                    id="mcp-client-secret"
+                    type="password"
+                    autoComplete="new-password"
+                    value={mcpClientSecret}
+                    onChange={(e) => {
+                      setMcpClientSecret(e.target.value);
+                      setMcpClientError('');
+                    }}
+                    placeholder={sfSettings.hasMcpClientSecret ? 'Stored (leave blank to keep)' : 'Consumer Secret'}
+                    className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:bg-white focus:outline-none"
+                  />
+                </div>
+              </div>
+              <div className="mt-2 flex justify-end">
+                <button
+                  type="submit"
+                  disabled={savingMcpClient}
+                  className="shrink-0 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                >
+                  {savingMcpClient ? 'Saving...' : 'Save Client App'}
+                </button>
+              </div>
+              {mcpClientError && (
+                <p role="alert" className="mt-1 text-[11px] font-semibold text-rose-700">
+                  {mcpClientError}
                 </p>
               )}
             </form>

@@ -1507,9 +1507,16 @@ test('evaluatePolicy: identity records how the Profile was matched', (t) => {
   assert.deepEqual(byId.identity, { callerProfileId: to18(id15), matchedProfileId: id15, matchMethod: 'id' });
 
   const strangerId = to18(randomSfId15('00e'));
-  const byName = decide(caller(strangerId, profile.name.toUpperCase()), 'list_enabled_objects', {});
+  // Registered under a Salesforce id, so never matched by name: every org has a Profile by that name.
+  const sameName = decide(caller(strangerId, profile.name.toUpperCase()), 'list_enabled_objects', {});
+  assertRefusal(sameName, { code: 'PROFILE_UNREGISTERED', stage: 'identity' }, 'name of a Profile registered by id');
+  assert.deepEqual(sameName.identity, { callerProfileId: strangerId, matchedProfileId: null, matchMethod: 'none' });
+
+  // Registered under an id that is not a Salesforce id: it has no id to match, so its name stands in.
+  const namedOnly = fx.profile('Named Only', [group], `NAMED_ONLY_${fx.tag}`);
+  const byName = decide(caller(strangerId, namedOnly.name.toUpperCase()), 'list_enabled_objects', {});
   assertAllowedDecision(byName, 'name fallback');
-  assert.deepEqual(byName.identity, { callerProfileId: strangerId, matchedProfileId: id15, matchMethod: 'name' });
+  assert.deepEqual(byName.identity, { callerProfileId: strangerId, matchedProfileId: namedOnly.id, matchMethod: 'name' });
 
   const none = decide(caller(strangerId, `Nobody ${fx.tag}`), 'list_enabled_objects', {});
   assertRefusal(none, { code: 'PROFILE_UNREGISTERED', stage: 'identity' }, 'no match');

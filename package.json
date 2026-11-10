@@ -13,6 +13,8 @@
     "start:web": "next start --port 3000",
     "start:mcp": "NODE_ENV=${NODE_ENV:-production} PORT=3001 node dist/index.js",
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "portal:totp": "node dist/cli/portalTotp.js",
+    "portal:totp:dev": "tsx src/cli/portalTotp.ts",
     "test": "npm run test:unit && npm run test:self",
     "test:unit": "NODE_ENV=test tsx --test --test-concurrency=1 'test/**/*.test.ts'",
     "test:self": "NODE_ENV=test tsx src/test-self.ts",

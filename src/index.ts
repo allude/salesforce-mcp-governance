@@ -19,6 +19,7 @@ import { hashToken } from './security/crypto.js';
 import { clientIpIsForwarded, rateLimitIpKey } from './security/clientIp.js';
 import { createFailureWindow } from './security/failureWindow.js';
 import { parseBearerToken } from './mcp/bearer.js';
+import { store } from './db/store.js';
 
 export const app = express();
 
@@ -88,11 +89,23 @@ app.use(
 app.use(express.json({ limit: '1mb' }));
 
 // 2. Rate Limiting for Auth & MCP Endpoints
-const authLimiter = rateLimit({
+//
+// Per-IP sign-in limits apply only where a trusted proxy named the client (clientIpIsForwarded).
+// Otherwise req.ip is the portal proxy that every caller shares, and a per-IP limit would be a single
+// global counter: 60 junk requests from anyone would lock every admin out of sign-in. Without a real
+// client address, brute force is held back per account instead (security/loginThrottle.ts, which
+// never locks the owner out) and PBKDF2 load by a concurrency gate (routes/adminRoutes.ts).
+const skipUnlessClientNamed = (req: Request) => !clientIpIsForwarded(req);
+
+// Okta callbacks: only failed ones count (an error redirect), per client.
+const oktaCallbackLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 60,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: skipUnlessClientNamed,
+  skipSuccessfulRequests: true,
+  requestWasSuccessful: (_req: Request, res: Response) => !String(res.getHeader('location') ?? '').includes('auth_error='),
   keyGenerator: (req: Request) => rateLimitIpKey(req.ip),
   message: { error: 'Too many authentication attempts, please try again later.' },
 });
@@ -103,23 +116,10 @@ const loginLimiter = rateLimit({
   max: 60,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: skipUnlessClientNamed,
   skipSuccessfulRequests: true,
   keyGenerator: (req: Request) => rateLimitIpKey(req.ip),
   message: { error: 'Too many authentication attempts, please try again later.' },
-});
-
-// Also per username, so changing IP (or X-Forwarded-For) cannot be used to brute-force one account.
-const loginPerUserLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  skipSuccessfulRequests: true,
-  keyGenerator: (req: Request) => {
-    const identifier = req.body?.username ?? req.body?.email;
-    return `user:${typeof identifier === 'string' ? identifier.trim().toLowerCase().slice(0, 200) : ''}`;
-  },
-  message: { error: 'Too many failed sign-in attempts for this account, please try again later.' },
 });
 
 // Behind the portal proxy every request can share one IP (TRUST_PROXY=false), so callers that
@@ -210,15 +210,16 @@ app.all('/mcp', mcpLimiter, mcpRejectedTokenLimiter, (req: Request, res: Respons
 });
 
 // 5. Okta OIDC SSO Routes for Admin Control Plane
-app.get('/auth/okta/login', authLimiter, (req: Request, res: Response, next: NextFunction) => {
+// Starting a login only redirects to Okta, so it is not limited: counting it let anyone lock SSO out.
+app.get('/auth/okta/login', (req: Request, res: Response, next: NextFunction) => {
   handleOktaLoginRedirect(req, res).catch(next);
 });
-app.get('/auth/okta/callback', authLimiter, (req: Request, res: Response, next: NextFunction) => {
+app.get('/auth/okta/callback', oktaCallbackLimiter, (req: Request, res: Response, next: NextFunction) => {
   handleOktaCallback(req, res).catch(next);
 });
 
 // 6. Admin Control Plane REST API
-app.post('/api/admin/login', loginLimiter, loginPerUserLimiter);
+app.post('/api/admin/login', loginLimiter);
 app.use('/api/admin', adminApiLimiter, adminRouter);
 
 // 7. Read-only documentation referenced by the OAuth resource metadata
@@ -255,6 +256,12 @@ app.use((err: any, req: Request, res: Response, _next: NextFunction) => {
   res.status(status).json({ error: status >= 500 ? 'Internal server error' : String(err?.message || 'Request error') });
 });
 
+/** Whether a listen address only accepts connections from this machine. */
+export function isLoopbackHost(host: string): boolean {
+  const h = host.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  return h === 'localhost' || h === '::1' || /^127(?:\.\d{1,3}){3}$/.test(h);
+}
+
 function isEntryModule(): boolean {
   const entry = process.argv[1];
   if (!entry) return false;
@@ -272,13 +279,34 @@ if (isEntryModule()) {
     console.error('[server] Unhandled promise rejection:', reason);
   });
 
-  const server = app.listen(config.port, () => {
+  if (config.isProd && !isLoopbackHost(config.host) && !config.allowPublicBackend) {
+    throw new Error(
+      `FATAL: MCP_BACKEND_HOST=${config.host} would expose the backend beyond this machine. Keep the default ` +
+        '(127.0.0.1) so only the portal proxy reaches it, or set ALLOW_PUBLIC_BACKEND=true when a private network ' +
+        'policy or mTLS already restricts who can connect.'
+    );
+  }
+  if (config.isProd && config.trustProxy === false) {
+    console.warn(
+      '[server] TRUST_PROXY is false, so every request appears to come from the portal proxy: per-IP sign-in ' +
+        'limits are skipped and audit-log IPs are the proxy\'s. Put a load balancer that appends the client ' +
+        'address in front of the portal and set TRUST_PROXY=loopback.'
+    );
+  }
+  if (config.isProd && !store.getSalesforceSettings().mcpClientId) {
+    console.warn(
+      '[server] No MCP client connected app is configured, so /mcp accepts a Salesforce token issued to any ' +
+        'connected app in the org. Set its Consumer Key and Secret under Salesforce Org Connection.'
+    );
+  }
+
+  const server = app.listen(config.port, config.host, () => {
     const address = server.address();
     const boundPort = typeof address === 'object' && address ? address.port : config.port;
     console.log(`\n========================================================================`);
     console.log(`🛡️  Salesforce Zero-Trust MCP Server & Admin API (Express backend)`);
     console.log(`========================================================================`);
-    console.log(`🔧 Backend listening on:         http://localhost:${boundPort}`);
+    console.log(`🔧 Backend listening on:         http://${config.host.includes(':') ? `[${config.host}]` : config.host}:${boundPort}`);
     console.log(`🌐 Admin Portal (Next.js):       ${config.baseUrl}`);
     console.log(`🔌 Streamable HTTP MCP Endpoint: ${config.baseUrl}/mcp`);
     console.log(`🔐 OAuth Resource Metadata:      ${config.baseUrl}/.well-known/oauth-protected-resource`);

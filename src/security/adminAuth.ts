@@ -16,26 +16,52 @@ export interface AdminSessionClaims {
   authMethod: 'okta_oidc' | 'local_bootstrap';
   groups?: string[];
   csrfToken: string;
+  /** The server-side session record's id (see store.createAdminSession). */
+  jti?: string;
+  /** When the holder last proved who they are (sign-in or step-up), epoch milliseconds. */
+  reauthenticatedAt?: number;
 }
 
 const SESSION_COOKIE_NAME = 'sf_mcp_admin_session';
 const OIDC_FLOW_COOKIE_NAME = 'sf_mcp_oidc_flow';
 const SECRET_KEY = new TextEncoder().encode(config.appSecretKey);
 
+/** A session ends this long after it started, however active. */
+export const SESSION_ABSOLUTE_TIMEOUT_MS = 8 * 60 * 60 * 1000;
+/** ... and this long after its last request. */
+export const SESSION_IDLE_TIMEOUT_MS = 60 * 60 * 1000;
+/** last_seen_at is written at most this often, so polling does not write on every request. */
+const SESSION_TOUCH_INTERVAL_MS = 60 * 1000;
+/** Security settings and account changes need a sign-in or step-up this recent. */
+export const STEP_UP_WINDOW_MS = 10 * 60 * 1000;
+
 /**
- * Signs an encrypted/verified JWT admin session cookie (`HttpOnly`, `SameSite=Lax`, `Secure` in prod)
+ * Starts an admin session: a server-side record (revocable, idle timeout) and a signed JWT cookie that
+ * names it (`HttpOnly`, `SameSite=Lax`, `Secure` in prod). The cookie alone is never enough: logout,
+ * a deleted account or an idle hour ends the record, and with it the cookie.
  */
 export async function issueAdminSessionCookie(
   res: Response,
-  claims: Omit<AdminSessionClaims, 'csrfToken'>
+  claims: Omit<AdminSessionClaims, 'csrfToken' | 'jti' | 'reauthenticatedAt'>
 ): Promise<{ csrfToken: string }> {
   const csrfToken = crypto.randomBytes(24).toString('base64url');
+  const jti = crypto.randomBytes(18).toString('base64url');
+  const nowMs = Date.now();
+  store.createAdminSession({
+    jti,
+    // Password sessions are tied to the portal account; Okta ones to the Okta subject.
+    subject: claims.authMethod === 'local_bootstrap' ? claims.email : claims.sub,
+    authMethod: claims.authMethod,
+    nowMs,
+    expiresAtMs: nowMs + SESSION_ABSOLUTE_TIMEOUT_MS,
+  });
   const token = await new jose.SignJWT({ ...claims, csrfToken })
     .setProtectedHeader({ alg: 'HS256' })
+    .setJti(jti)
     .setIssuedAt()
     .setIssuer('salesforce-mcp-admin')
     .setAudience('salesforce-mcp-admin-portal')
-    .setExpirationTime('8h')
+    .setExpirationTime(Math.floor((nowMs + SESSION_ABSOLUTE_TIMEOUT_MS) / 1000))
     .sign(SECRET_KEY);
 
   res.cookie(SESSION_COOKIE_NAME, token, {
@@ -43,7 +69,7 @@ export async function issueAdminSessionCookie(
     secure: config.isProd,
     sameSite: 'lax',
     path: '/',
-    maxAge: 8 * 60 * 60 * 1000, // 8 hours
+    maxAge: SESSION_ABSOLUTE_TIMEOUT_MS,
   });
 
   return { csrfToken };
@@ -51,6 +77,21 @@ export async function issueAdminSessionCookie(
 
 export function clearAdminSessionCookie(res: Response): void {
   res.clearCookie(SESSION_COOKIE_NAME, { path: '/' });
+}
+
+/** Ends the session the request's cookie names, if any, so the cookie stops working even if kept. */
+export async function revokeAdminSessionFromRequest(req: Request): Promise<void> {
+  const token = req.cookies?.[SESSION_COOKIE_NAME];
+  if (!token) return;
+  try {
+    const { payload } = await jose.jwtVerify(token, SECRET_KEY, {
+      issuer: 'salesforce-mcp-admin',
+      audience: 'salesforce-mcp-admin-portal',
+    });
+    if (typeof payload.jti === 'string') store.revokeAdminSession(payload.jti);
+  } catch {
+    // nothing to revoke
+  }
 }
 
 export async function verifyAdminSessionFromRequest(
@@ -65,6 +106,20 @@ export async function verifyAdminSessionFromRequest(
       audience: 'salesforce-mcp-admin-portal',
     });
 
+    // A cookie whose server-side record is missing (issued before sessions were recorded, or by
+    // another database), revoked, expired or idle too long is no session.
+    const jti = typeof payload.jti === 'string' ? payload.jti : '';
+    const record = jti ? store.getAdminSession(jti) : null;
+    const nowMs = Date.now();
+    if (
+      !record ||
+      record.revokedAt !== null ||
+      record.expiresAt <= nowMs ||
+      nowMs - record.lastSeenAt > SESSION_IDLE_TIMEOUT_MS
+    ) {
+      return null;
+    }
+
     const claims: AdminSessionClaims = {
       sub: String(payload.sub || ''),
       email: String(payload.email || ''),
@@ -72,15 +127,43 @@ export async function verifyAdminSessionFromRequest(
       authMethod: (payload.authMethod as 'okta_oidc' | 'local_bootstrap') || 'local_bootstrap',
       groups: Array.isArray(payload.groups) ? (payload.groups as string[]) : [],
       csrfToken: String(payload.csrfToken || ''),
+      jti,
+      reauthenticatedAt: record.reauthenticatedAt,
     };
+    // The record and the cookie must agree on whose session this is.
+    if (record.authMethod !== claims.authMethod) return null;
     // Password sessions end as soon as the portal user is deleted.
     if (claims.authMethod === 'local_bootstrap' && !store.portalUserExists(claims.email)) {
       return null;
     }
+    if (nowMs - record.lastSeenAt >= SESSION_TOUCH_INTERVAL_MS) store.touchAdminSession(jti, nowMs);
     return claims;
   } catch {
     return null;
   }
+}
+
+/**
+ * Guards the routes that change who can sign in or what MCP trusts (portal users, Okta, the Salesforce
+ * connection and its Org ID lock). A stolen or unattended session must prove its holder again first:
+ * a sign-in or step-up (POST /api/admin/reauth, or signing in with Okta again) within STEP_UP_WINDOW_MS.
+ * Runs after requireAdminAuth.
+ */
+export function requireRecentAuthentication(req: Request, res: Response, next: NextFunction): void {
+  const session = (req as any).adminSession as AdminSessionClaims | undefined;
+  const reauthenticatedAt = session?.reauthenticatedAt ?? 0;
+  if (!session || Date.now() - reauthenticatedAt > STEP_UP_WINDOW_MS) {
+    res.status(403).json({
+      error:
+        session?.authMethod === 'okta_oidc'
+          ? 'Sign in with Okta again to change security settings.'
+          : 'Confirm your password (and authenticator code) to change security settings.',
+      code: 'REAUTH_REQUIRED',
+      authMethod: session?.authMethod ?? null,
+    });
+    return;
+  }
+  next();
 }
 
 /**
@@ -166,7 +249,8 @@ export async function handleOktaLoginRedirect(req: Request, res: Response): Prom
   const nonce = generateStateToken();
 
   // Store PKCE verifier + state + nonce in a short-lived signed cookie (10 minutes)
-  const flowToken = await new jose.SignJWT({ codeVerifier, state, nonce })
+  const reauth = req.query.reauth === '1';
+  const flowToken = await new jose.SignJWT({ codeVerifier, state, nonce, reauth })
     .setProtectedHeader({ alg: 'HS256' })
     .setIssuedAt()
     .setExpirationTime('10m')
@@ -206,6 +290,11 @@ export async function handleOktaLoginRedirect(req: Request, res: Response): Prom
   authUrl.searchParams.set('nonce', nonce);
   authUrl.searchParams.set('code_challenge', codeChallenge);
   authUrl.searchParams.set('code_challenge_method', 'S256');
+  // Step-up (`?reauth=1`): Okta must authenticate the user now, not reuse its own session.
+  if (reauth) {
+    authUrl.searchParams.set('prompt', 'login');
+    authUrl.searchParams.set('max_age', '0');
+  }
 
   res.redirect(authUrl.toString());
 }
@@ -251,7 +340,7 @@ export async function handleOktaCallback(req: Request, res: Response): Promise<v
   const flowCookie = req.cookies?.[OIDC_FLOW_COOKIE_NAME];
   res.clearCookie(OIDC_FLOW_COOKIE_NAME, { path: '/' });
 
-  let flowClaims: { codeVerifier: string; state: string; nonce: string } | null = null;
+  let flowClaims: { codeVerifier: string; state: string; nonce: string; reauth?: boolean } | null = null;
   if (flowCookie) {
     try {
       const { payload } = await jose.jwtVerify(flowCookie, SECRET_KEY);
@@ -353,15 +442,27 @@ export async function handleOktaCallback(req: Request, res: Response): Promise<v
     if (typeof payload.nonce !== 'string' || !timingSafeStringEqual(payload.nonce, String(flowClaims.nonce))) {
       throw new Error('OIDC nonce mismatch');
     }
+    // A step-up asked Okta to authenticate the user again (max_age=0): the token must say it did.
+    if (flowClaims.reauth === true) {
+      const authTime = typeof payload.auth_time === 'number' ? payload.auth_time : 0;
+      if (Date.now() / 1000 - authTime > 5 * 60) {
+        throw new Error('Okta did not re-authenticate the user for the step-up sign-in');
+      }
+    }
 
     const groups = Array.isArray(payload.groups) ? (payload.groups as string[]) : [];
-    if (okta.adminGroup && !groups.includes(okta.adminGroup)) {
+    // Fail closed: with no required group configured, every user assigned to the Okta app would be
+    // an admin, so nobody is.
+    const requiredGroup = okta.adminGroup.trim();
+    if (!requiredGroup || !groups.includes(requiredGroup)) {
       store.recordPortalAdminLog({
         adminUsername: String(payload.email || payload.sub || 'okta_user'),
         authMethod: 'okta_sso',
         action: 'OKTA_LOGIN_DENIED',
         target: 'Portal Auth',
-        details: `Denied Okta login: missing required group '${okta.adminGroup}'`,
+        details: requiredGroup
+          ? `Denied Okta login: missing required group '${requiredGroup}'`
+          : 'Denied Okta login: no required admin group is configured in Okta SSO settings.',
         ipAddress: clientIp,
       });
       res.redirect('/?auth_error=group_denied');
@@ -371,6 +472,8 @@ export async function handleOktaCallback(req: Request, res: Response): Promise<v
     const email = String(payload.email || payload.preferred_username || payload.sub);
     const name = String(payload.name || email);
 
+    // Signing in again (also how an Okta admin steps up) replaces this browser's previous session.
+    await revokeAdminSessionFromRequest(req);
     await issueAdminSessionCookie(res, {
       sub: String(payload.sub),
       email,

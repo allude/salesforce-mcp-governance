@@ -418,7 +418,7 @@ describe('Portal users', () => {
     const user = store.getPortalUsers().find((u) => u.username === username)!;
     assert.equal(user.role, 'Super Admin');
     assert.equal(user.displayName, 'Ops Lead');
-    assert.ok(store.verifyPortalUserCredentials(username, 'second-pass-2'));
+    assert.ok(await store.verifyPortalUserCredentials(username, 'second-pass-2'));
     store.deletePortalUser(username);
   });
 });
@@ -683,21 +683,24 @@ describe('Salesforce API names', () => {
 });
 
 describe('Login throttling per username', () => {
-  test('failed logins for one account are limited even when each attempt claims a different client IP', async () => {
+  test('failed logins for one account back off even when each attempt claims a different client IP', async () => {
     const username = `target_${tag()}`;
     const statuses: number[] = [];
-    for (let i = 0; i < 22; i++) {
+    const retryAfter: number[] = [];
+    for (let i = 0; i < 12; i++) {
       const res = await fetch(`${server.baseUrl}/api/admin/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': `198.51.100.${i + 1}` },
         body: JSON.stringify({ username, password: `guess-${i}` }),
       });
       statuses.push(res.status);
+      retryAfter.push(Number(res.headers.get('retry-after') ?? 0));
       await res.text();
     }
-    assert.deepEqual(statuses.slice(0, 20), Array(20).fill(401));
-    assert.equal(statuses[20], 429);
-    assert.equal(statuses[21], 429);
+    // Five free failures and a sixth, then the account must wait (backoff, not a 15-minute lockout).
+    assert.deepEqual(statuses.slice(0, 6), Array(6).fill(401));
+    assert.deepEqual(statuses.slice(6), Array(6).fill(429));
+    assert.ok(retryAfter.slice(6).every((s) => s >= 1 && s <= 30), `Retry-After within the 30 s cap: ${retryAfter}`);
   });
 });
 

@@ -301,13 +301,14 @@ describe('decisionLogColumns', () => {
   });
 
   test('the caller\'s Profile id is kept only in the form of a Salesforce id, and the matched one only when the registry has it', () => {
+    // PROFILE_ID is a Salesforce id, so another id with its name is not matched: the caller's id is kept, no match.
     const byName = evaluatePolicy({ ...SUBJECT, profileId: '00e000000000ZZZ' }, 'soql_query', { objectName: 'Case' }, snapshot());
-    assert.equal(byName.identity.matchMethod, 'name');
+    assert.equal(byName.identity.matchMethod, 'none');
     assert.deepEqual(
       (({ callerProfileId, matchedProfileId, matchMethod }) => ({ callerProfileId, matchedProfileId, matchMethod }))(
         decisionLogColumns(byName, catalog())
       ),
-      { callerProfileId: '00e000000000ZZZ', matchedProfileId: PROFILE_ID, matchMethod: 'name' }
+      { callerProfileId: '00e000000000ZZZ', matchedProfileId: '', matchMethod: 'none' }
     );
 
     for (const [profileId, stored] of [

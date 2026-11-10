@@ -76,6 +76,15 @@ export interface AdminSession {
   role?: string;
   authMethod: string;
   groups?: string[];
+  /** A password account with an authenticator app enrolled. */
+  totpEnrolled?: boolean;
+}
+
+/** A new authenticator secret, shown once: its setup key and otpauth:// URI. */
+export interface TotpSetup {
+  username?: string;
+  secret: string;
+  otpauthUri: string;
 }
 
 export interface OrgObjectCatalogEntry {
@@ -362,6 +371,12 @@ export interface SalesforceConnectionSettings {
   syncInstanceUrl: string;
   apiVersion: string;
   enforceOrgIdLock: boolean;
+  /** Production enforces the Org ID lock whatever is stored, and refuses MCP tokens until expectedOrgId is set. */
+  orgIdLockRequired?: boolean;
+  /** Consumer Key of the connected app MCP clients use. When set, only tokens issued to it are accepted. */
+  mcpClientId?: string;
+  /** Its Consumer Secret is stored (never returned). */
+  hasMcpClientSecret?: boolean;
   sfdxObjectsFolderPath: string;
   updatedAt: string;
 }
@@ -442,6 +457,20 @@ export interface PortalUserSummary {
   role: string;
   createdAt: string;
   lastLoginAt: string | null;
+  /** An authenticator app is enrolled: password sign-in also needs its 6-digit code. */
+  totpEnrolled?: boolean;
+}
+
+/** The server-side record of an admin session cookie. Times are epoch milliseconds. */
+export interface AdminSessionRecord {
+  jti: string;
+  subject: string;
+  authMethod: string;
+  createdAt: number;
+  lastSeenAt: number;
+  reauthenticatedAt: number;
+  expiresAt: number;
+  revokedAt: number | null;
 }
 
 export interface PortalOverviewPayload {

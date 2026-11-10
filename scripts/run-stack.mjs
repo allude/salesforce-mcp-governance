@@ -51,7 +51,7 @@ if (mode === 'start') {
   if (process.env.MCP_BACKEND_PORT && process.env.MCP_BACKEND_PORT !== bakedPort) {
     console.error(
       `The portal was built to proxy to ${bakedBackendUrl}, but MCP_BACKEND_PORT=${process.env.MCP_BACKEND_PORT}. ` +
-        `Rebuild with MCP_BACKEND_URL=http://localhost:${process.env.MCP_BACKEND_PORT} npm run build.`
+        `Rebuild with MCP_BACKEND_URL=http://127.0.0.1:${process.env.MCP_BACKEND_PORT} npm run build.`
     );
     process.exit(1);
   }
@@ -73,7 +73,7 @@ const services = [
     command: bin('next'),
     args: [mode, '--port', portalPort],
     // Only read by `next dev`; `next start` uses the URL baked in at build time (checked above).
-    env: { MCP_BACKEND_URL: process.env.MCP_BACKEND_URL || `http://localhost:${backendPort}` },
+    env: { MCP_BACKEND_URL: process.env.MCP_BACKEND_URL || `http://127.0.0.1:${backendPort}` },
   },
 ];
 

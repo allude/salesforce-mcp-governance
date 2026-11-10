@@ -17,7 +17,12 @@ export interface FakeSalesforceUser {
   instanceUrl?: string;
   /** When set, the `SELECT ... FROM User` profile lookup answers with this HTTP status instead. */
   userQueryStatus?: number;
+  /** Consumer Key of the connected app the token was issued to (introspection's client_id). */
+  clientId?: string;
 }
+
+/** The connected app tokens are issued to unless a user names another. */
+export const DEFAULT_TOKEN_CLIENT_ID = 'MCP_CONNECTED_APP_KEY';
 
 export interface SalesforceMock {
   calls: RecordedSalesforceCall[];
@@ -25,6 +30,8 @@ export interface SalesforceMock {
   addUser(token: string, user: FakeSalesforceUser): void;
   /** Overrides the canned records returned for non-User SOQL queries. */
   setQueryRecords(records: Array<Record<string, unknown>>): void;
+  /** The client credentials /services/oauth2/introspect accepts; null (the default) refuses every caller. */
+  setIntrospectionClient(credentials: { clientId: string; clientSecret: string } | null): void;
   /** Calls whose host is not a Salesforce domain (should stay empty: SSRF guard). */
   nonSalesforceCalls: RecordedSalesforceCall[];
   reset(): void;
@@ -41,6 +48,7 @@ function json(status: number, body: unknown): Response {
 export function installSalesforceMock(): SalesforceMock {
   const realFetch = globalThis.fetch;
   const users = new Map<string, FakeSalesforceUser>();
+  let introspectionClient: { clientId: string; clientSecret: string } | null = null;
   let queryRecords: Array<Record<string, unknown>> = [
     { attributes: { type: 'Account' }, Id: '001000000000001AAA', Name: 'Private Customer Record' },
   ];
@@ -52,6 +60,9 @@ export function installSalesforceMock(): SalesforceMock {
     },
     setQueryRecords(records) {
       queryRecords = records;
+    },
+    setIntrospectionClient(credentials) {
+      introspectionClient = credentials;
     },
     reset() {
       mock.calls.length = 0;
@@ -85,6 +96,32 @@ export function installSalesforceMock(): SalesforceMock {
       return json(404, { error: 'not a salesforce host' });
     }
     mock.calls.push(call);
+
+    // RFC 7662 introspection: the caller authenticates as a connected app and sends the token in the form.
+    if (url.pathname === '/services/oauth2/introspect' && method === 'POST') {
+      const form = new URLSearchParams(typeof call.body === 'string' ? call.body : '');
+      if (
+        !introspectionClient ||
+        form.get('client_id') !== introspectionClient.clientId ||
+        form.get('client_secret') !== introspectionClient.clientSecret
+      ) {
+        return json(401, { error: 'invalid_client', error_description: 'invalid client credentials' });
+      }
+      const tokenUser = users.get(form.get('token') || '');
+      if (!tokenUser) return json(200, { active: false });
+      const now = Math.floor(Date.now() / 1000);
+      return json(200, {
+        active: true,
+        scope: 'api refresh_token',
+        client_id: tokenUser.clientId ?? DEFAULT_TOKEN_CLIENT_ID,
+        username: tokenUser.username,
+        sub: `https://login.salesforce.com/id/${tokenUser.organizationId}/${tokenUser.userId}`,
+        token_type: 'access_token',
+        iat: now,
+        nbf: now,
+        exp: now + 3600,
+      });
+    }
 
     const token = call.authorization.replace(/^Bearer\s+/i, '');
     const user = users.get(token);

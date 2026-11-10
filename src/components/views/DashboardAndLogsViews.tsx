@@ -12,6 +12,7 @@ import type {
   ProfileGroupMapping,
   OktaConfig,
   PortalUser,
+  TotpSetup,
   SalesforceConnectionSettings,
 } from '@/types/governance';
 import { MCP_TOOL_CATALOG, formatShortTime } from '@/components/ui/primitives';
@@ -1352,12 +1353,44 @@ interface PortalAuthSettingsViewProps {
   oktaSettings: OktaConfig;
   portalUsers: PortalUser[];
   onSaveOkta: (settings: Partial<OktaConfig> & { clientSecret?: string }) => Promise<OktaConfig>;
+  /** Answers the new account's authenticator secret when the server issued one (production). */
   onCreatePortalUser: (user: {
     username: string;
     displayName?: string;
     password: string;
-  }) => Promise<void>;
+  }) => Promise<TotpSetup | null | void>;
   onDeletePortalUser: (username: string) => Promise<void>;
+  /** The signed-in password account, or null for an Okta session (Okta enforces its own MFA). */
+  currentAccount?: { username: string; totpEnrolled: boolean } | null;
+  onStartTotpSetup?: () => Promise<TotpSetup>;
+  onConfirmTotp?: (code: string) => Promise<void>;
+}
+
+/** A secret shown once: its setup key in groups of four and the otpauth:// URI an app can import. */
+function TotpSecretPanel({ setup, title }: { setup: TotpSetup; title: string }) {
+  return (
+    <div
+      role="status"
+      style={{
+        border: '1px solid var(--bd)',
+        borderRadius: 6,
+        padding: '10px 12px',
+        margin: '10px 0',
+        fontSize: 12,
+      }}
+    >
+      <div style={{ fontWeight: 600, marginBottom: 4 }}>{title}</div>
+      <div style={{ color: 'var(--t3)', marginBottom: 6 }}>
+        Add it to an authenticator app now. It is not shown again.
+      </div>
+      <div className="mono" style={{ wordBreak: 'break-all' }}>
+        Setup key: {setup.secret.replace(/(.{4})/g, '$1 ').trim()}
+      </div>
+      <div className="mono" style={{ wordBreak: 'break-all', color: 'var(--t3)', marginTop: 4 }}>
+        {setup.otpauthUri}
+      </div>
+    </div>
+  );
 }
 
 export function PortalAuthSettingsView({
@@ -1366,7 +1399,17 @@ export function PortalAuthSettingsView({
   onSaveOkta,
   onCreatePortalUser,
   onDeletePortalUser,
+  currentAccount = null,
+  onStartTotpSetup,
+  onConfirmTotp,
 }: PortalAuthSettingsViewProps) {
+  // The new account's authenticator secret (production issues one), shown once to hand over.
+  const [createdTotp, setCreatedTotp] = useState<TotpSetup | null>(null);
+  // This account's enrollment: a pending secret waits for one code from the app before it takes effect.
+  const [pendingTotp, setPendingTotp] = useState<TotpSetup | null>(null);
+  const [totpCode, setTotpCode] = useState('');
+  const [totpError, setTotpError] = useState('');
+  const [totpBusy, setTotpBusy] = useState(false);
   const [oktaDraft, setOktaDraft] = useState<OktaConfig>(oktaSettings);
   const [oktaClientSecret, setOktaClientSecret] = useState('');
   // Only send the issuer when the admin edited it, so changing the domain re-derives a default issuer
@@ -1538,8 +1581,9 @@ export function PortalAuthSettingsView({
             <div>
               <div className="card-t">Portal Administrators</div>
               <div className="card-s">
-                Local password accounts (scrypt hashed). Every administrator
-                has full access.
+                Local password accounts (PBKDF2-SHA512 hashed). Every administrator
+                has full access. Production asks every password sign-in for an
+                authenticator code.
               </div>
             </div>
             <span className="tag mono">{portalUsers.length} users</span>
@@ -1557,7 +1601,10 @@ export function PortalAuthSettingsView({
                       </span>
                     </div>
                     <div className="mono" style={{ color: 'var(--t3)' }}>
-                      {u.username}
+                      {u.username}{' '}
+                      <span className={`tag ${u.totpEnrolled ? 'ok' : 'warn'}`} style={{ marginLeft: 4 }}>
+                        {u.totpEnrolled ? 'Authenticator' : 'No authenticator'}
+                      </span>
                     </div>
                   </div>
                   {u.username !== 'admin' ? (
@@ -1574,6 +1621,91 @@ export function PortalAuthSettingsView({
                 </div>
               ))}
             </div>
+
+            {currentAccount && onStartTotpSetup && onConfirmTotp && (
+              <div style={{ marginBottom: 14 }}>
+                <div className="sec-h">
+                  <span className="sec-t">Your authenticator app</span>
+                  <span className={`tag ${currentAccount.totpEnrolled ? 'ok' : 'warn'}`}>
+                    {currentAccount.totpEnrolled ? 'Enrolled' : 'Not set up'}
+                  </span>
+                </div>
+                {!pendingTotp ? (
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={totpBusy}
+                    onClick={async () => {
+                      setTotpBusy(true);
+                      setTotpError('');
+                      try {
+                        setPendingTotp(await onStartTotpSetup());
+                        setTotpCode('');
+                      } catch (err: any) {
+                        setTotpError(err?.message || 'Could not start the setup.');
+                      } finally {
+                        setTotpBusy(false);
+                      }
+                    }}
+                  >
+                    {currentAccount.totpEnrolled ? 'Replace authenticator app' : 'Set up authenticator app'}
+                  </button>
+                ) : (
+                  <form
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      setTotpBusy(true);
+                      setTotpError('');
+                      try {
+                        await onConfirmTotp(totpCode);
+                        setPendingTotp(null);
+                        setTotpCode('');
+                      } catch (err: any) {
+                        setTotpError(err?.message || 'That code did not match.');
+                      } finally {
+                        setTotpBusy(false);
+                      }
+                    }}
+                  >
+                    <TotpSecretPanel setup={pendingTotp} title={`New authenticator for ${currentAccount.username}`} />
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                      <input
+                        className="inp mono"
+                        aria-label="Code from the authenticator app"
+                        inputMode="numeric"
+                        autoComplete="one-time-code"
+                        maxLength={6}
+                        placeholder="Code from the app"
+                        value={totpCode}
+                        onChange={(e) => {
+                          setTotpCode(e.target.value.replace(/\D/g, ''));
+                          setTotpError('');
+                        }}
+                      />
+                      <button type="submit" className="btn pri" disabled={totpBusy || totpCode.length !== 6}>
+                        Confirm
+                      </button>
+                      <button
+                        type="button"
+                        className="btn gh"
+                        onClick={() => {
+                          setPendingTotp(null);
+                          setTotpCode('');
+                          setTotpError('');
+                        }}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </form>
+                )}
+                {totpError && (
+                  <div role="alert" style={{ marginTop: 6, fontSize: 11, color: 'var(--err)' }}>
+                    {totpError}
+                  </div>
+                )}
+              </div>
+            )}
 
             <div className="sec-h">
               <span className="sec-t">Add administrator</span>
@@ -1638,12 +1770,13 @@ export function PortalAuthSettingsView({
                   setBusy(true);
                   setCreateUserError('');
                   try {
-                    await onCreatePortalUser({
+                    const issued = await onCreatePortalUser({
                       username: newUsername.trim(),
                       // Omitted when blank so updating an existing user's password keeps their display name
                       displayName: newDisplayName.trim() || undefined,
                       password: newPassword,
                     });
+                    setCreatedTotp(issued ? { username: newUsername.trim(), ...issued } : null);
                     setNewUsername('');
                     setNewDisplayName('');
                     setNewPassword('');
@@ -1658,6 +1791,19 @@ export function PortalAuthSettingsView({
                 Create administrator
               </button>
             </div>
+            {createdTotp && (
+              <>
+                <TotpSecretPanel
+                  setup={createdTotp}
+                  title={`Authenticator for ${createdTotp.username}: hand this over securely`}
+                />
+                <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                  <button type="button" className="btn gh sm" onClick={() => setCreatedTotp(null)}>
+                    Done
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       </div>

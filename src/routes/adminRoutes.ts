@@ -1,6 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import crypto from 'node:crypto';
 import {
+  hashNewPassword,
   MembershipChangeError,
   runInTransaction,
   SIMULATE_MCP_CALL_ACTION,
@@ -10,15 +11,23 @@ import {
 import { parseProfilesCsv, parseSfdxFilesToObjects } from '../db/importers.js';
 import {
   requireAdminAuth,
+  requireRecentAuthentication,
   issueAdminSessionCookie,
   clearAdminSessionCookie,
+  revokeAdminSessionFromRequest,
   isHttpsUrl,
   effectiveOktaRedirectUri,
   verifyAdminSessionFromRequest,
+  type AdminSessionClaims,
 } from '../security/adminAuth.js';
 import { PORTAL_PASSWORD_MIN_LENGTH } from '../security/passwordPolicy.js';
+import { createLoginThrottle, loginThrottleKey } from '../security/loginThrottle.js';
+import { generateTotpSecret, totpProvisioningUri, verifyTotp } from '../security/totp.js';
+import { createVerificationGate, VerificationBusyError } from '../salesforce/verificationGate.js';
+import type { PortalUserSummary } from '../types/governance.js';
 import {
   createSimulatorToken,
+  forgetCachedIdentities,
   resolveSalesforceUserFromToken,
   validateSalesforceInstanceUrl,
 } from '../salesforce/client.js';
@@ -88,6 +97,9 @@ function parseSalesforceSettingsInput(body: Record<string, any>): SalesforceSett
   }
   if (body.enforceOrgIdLock !== undefined) {
     input.enforceOrgIdLock = Boolean(body.enforceOrgIdLock);
+    if (config.isProd && !input.enforceOrgIdLock) {
+      throw new Error('Production always enforces the Org ID lock; it cannot be turned off.');
+    }
   }
   if (body.sfdxObjectsFolderPath !== undefined) {
     input.sfdxObjectsFolderPath = String(body.sfdxObjectsFolderPath);
@@ -107,8 +119,49 @@ function parseSalesforceSettingsInput(body: Record<string, any>): SalesforceSett
   if (body.certificatePem !== undefined) input.certificatePem = String(body.certificatePem);
 
   const current = store.getSalesforceSettings();
-  if ((input.enforceOrgIdLock ?? current.enforceOrgIdLock) && !(input.expectedOrgId ?? current.expectedOrgId)) {
+  // Production's lock is always on, so other settings can be saved before the Org ID is known: MCP
+  // refuses every token until it is.
+  if (
+    !config.isProd &&
+    (input.enforceOrgIdLock ?? current.enforceOrgIdLock) &&
+    !(input.expectedOrgId ?? current.expectedOrgId)
+  ) {
     throw new Error('Set an expected Org ID before enforcing the Org ID lock.');
+  }
+  return input;
+}
+
+interface McpClientInput {
+  clientId?: string;
+  clientSecret?: string;
+}
+
+/**
+ * The MCP connected app's Consumer Key and Secret, for token introspection, or null when the request
+ * sends neither. A blank key turns introspection off; a blank secret keeps the stored one.
+ */
+function parseMcpClientInput(body: Record<string, any>): McpClientInput | null {
+  if (body.mcpClientId === undefined && body.mcpClientSecret === undefined) return null;
+  const input: McpClientInput = {};
+  if (body.mcpClientId !== undefined) {
+    const clientId = String(body.mcpClientId ?? '').trim();
+    if (clientId.length > 255 || /\s/.test(clientId)) {
+      throw new Error('MCP connected app Consumer Key must be a single token of at most 255 characters.');
+    }
+    input.clientId = clientId;
+  }
+  if (body.mcpClientSecret !== undefined) {
+    const clientSecret = String(body.mcpClientSecret ?? '').trim();
+    if (clientSecret.length > 255) throw new Error('MCP connected app Consumer Secret is too long.');
+    input.clientSecret = clientSecret;
+  }
+  const current = store.getSalesforceSettings();
+  const clientId = input.clientId ?? current.mcpClientId ?? '';
+  if (clientId && !input.clientSecret && !current.hasMcpClientSecret) {
+    throw new Error('Enter the MCP connected app Consumer Secret with its Consumer Key.');
+  }
+  if (!clientId && input.clientSecret) {
+    throw new Error('Enter the MCP connected app Consumer Key with its Consumer Secret.');
   }
   return input;
 }
@@ -143,6 +196,8 @@ function auditableSettings(settings: Omit<SalesforceConnectionSettings, 'updated
     username: settings.username,
     expectedOrgId: settings.expectedOrgId,
     enforceOrgIdLock: settings.enforceOrgIdLock,
+    mcpClientId: settings.mcpClientId,
+    hasMcpClientSecret: settings.hasMcpClientSecret,
     instanceUrl: settings.instanceUrl,
     syncInstanceUrl: settings.syncInstanceUrl,
     apiVersion: settings.apiVersion,
@@ -167,9 +222,12 @@ function auditDiff(before: Omit<SalesforceConnectionSettings, 'updatedAt'>, afte
 function auditChanges(
   before: Omit<SalesforceConnectionSettings, 'updatedAt'>,
   after: typeof before,
-  privateKeyReplaced: boolean
+  privateKeyReplaced: boolean,
+  mcpClientSecretReplaced = false
 ): string {
-  return `Changes: ${auditDiff(before, after)}. privateKeyReplaced: ${privateKeyReplaced}.`;
+  return `Changes: ${auditDiff(before, after)}. privateKeyReplaced: ${privateKeyReplaced}.${
+    mcpClientSecretReplaced ? ' mcpClientSecretReplaced: true.' : ''
+  }`;
 }
 
 /**
@@ -177,9 +235,10 @@ function auditChanges(
  * state, so nothing keeps reporting an org those settings were never tried against. A disconnected
  * org has no such state to end and stays disconnected.
  */
-function saveSalesforceSettings(input: SalesforceSettingsInput) {
+function saveSalesforceSettings(input: SalesforceSettingsInput, mcpClient: McpClientInput | null = null) {
   return runInTransaction(() => {
     const before = store.getSalesforceSettingsWithSecrets();
+    if (mcpClient) store.updateMcpClientCredentials(mcpClient);
     const saved = store.updateSalesforceSettings(input);
     const after = store.getSalesforceSettingsWithSecrets();
     const privateKeyReplaced = after.privateKeyPem !== before.privateKeyPem;
@@ -336,6 +395,10 @@ adminRouter.get('/session', asyncRoute(async (req: Request, res: Response) => {
   const session = await verifyAdminSessionFromRequest(req);
   const okta = store.getOktaConfig();
 
+  const passwordUser =
+    session?.authMethod === 'local_bootstrap'
+      ? store.getPortalUsers().find((u) => u.username.toLowerCase() === session.email.toLowerCase())
+      : undefined;
   res.json({
     authenticated: Boolean(session),
     user: session
@@ -344,6 +407,7 @@ adminRouter.get('/session', asyncRoute(async (req: Request, res: Response) => {
           name: session.name,
           authMethod: session.authMethod,
           groups: session.groups || [],
+          ...(passwordUser ? { totpEnrolled: Boolean(passwordUser.totpEnrolled) } : {}),
         }
       : null,
     csrfToken: session?.csrfToken || null,
@@ -351,21 +415,136 @@ adminRouter.get('/session', asyncRoute(async (req: Request, res: Response) => {
       enabled: okta.enabled,
       oktaDomain: okta.oktaDomain,
     },
+    // What the login screen offers: password sign-in may be closed (production with Okta on), and
+    // production asks every password sign-in for an authenticator code.
+    passwordLogin: {
+      enabled: passwordSignInClosedReason() === null,
+      totpRequired: config.isProd,
+    },
   });
 }));
 
+// Per-account backoff (see security/loginThrottle.ts): slows guessing without letting anyone lock the
+// break-glass account out. Shared by sign-in and step-up, so step-up cannot be used to guess either.
+const loginThrottle = createLoginThrottle();
+
+// PBKDF2 runs on the libuv thread pool, which fetch's DNS lookups share. Behind the portal proxy there
+// is no per-client limit to lean on, so at most two hashes run at once and a flood waits or gets 503.
+const passwordHashGate = createVerificationGate({ maxConcurrent: 2, maxQueued: 32, maxWaitMs: 5_000 });
+
+/** Why password sign-in is closed, or null. Production closes it while Okta SSO is on, unless BREAK_GLASS_ENABLED=true. */
+function passwordSignInClosedReason(): string | null {
+  if (!config.isProd || config.breakGlassEnabled) return null;
+  return store.getOktaConfig().enabled
+    ? 'Password sign-in is disabled while Okta SSO is enabled. Set BREAK_GLASS_ENABLED=true on the server for break-glass access.'
+    : null;
+}
+
+type SignInCheck =
+  | { ok: true; user: PortalUserSummary }
+  | { ok: false; throttled: true }
+  | { ok: false; throttled: false; reason: string };
+
+/**
+ * Both factors of a password sign-in. Production requires an authenticator code for every account;
+ * elsewhere only enrolled accounts need one. While the account is throttled only an attempt with a
+ * currently valid code is evaluated at all: it costs no PBKDF2, and since both factors must be right a
+ * guesser learns nothing, while the owner gets in at once.
+ */
+async function checkSignIn(identifier: string, password: string, code: unknown, throttled: boolean): Promise<SignInCheck> {
+  if (throttled) {
+    const storedName = store.findPortalUsername(identifier);
+    const totp = storedName === undefined ? null : store.getPortalUserTotp(storedName);
+    if (!totp || verifyTotp(totp.secret, code, totp.lastStep) === null) return { ok: false, throttled: true };
+  }
+  const user = await passwordHashGate.run(false, () => store.verifyPortalUserCredentials(identifier, password));
+  if (!user) return { ok: false, throttled: false, reason: 'wrong username or password' };
+  const totp = store.getPortalUserTotp(user.username);
+  if (!totp) {
+    return config.isProd
+      ? { ok: false, throttled: false, reason: 'no authenticator is enrolled, and production requires one (npm run portal:totp)' }
+      : { ok: true, user };
+  }
+  const step = verifyTotp(totp.secret, code, totp.lastStep);
+  if (step === null) {
+    return { ok: false, throttled: false, reason: code ? 'wrong or expired authenticator code' : 'authenticator code missing' };
+  }
+  // Compare-and-set, so a code cannot be used twice even by two requests racing.
+  if (!store.consumePortalUserTotpStep(user.username, step)) {
+    return { ok: false, throttled: false, reason: 'authenticator code already used' };
+  }
+  return { ok: true, user };
+}
+
+/** Runs checkSignIn and answers a refusal; returns the user on success, or null once it has answered. */
+async function signInOrRefuse(
+  req: Request,
+  res: Response,
+  identifier: string,
+  password: string,
+  code: unknown,
+  auditAction: 'LOGIN_FAILED' | 'REAUTH_FAILED'
+): Promise<PortalUserSummary | null> {
+  const throttleKey = loginThrottleKey(identifier);
+  const waitMs = loginThrottle.retryAfterMs(throttleKey);
+  let check: SignInCheck;
+  try {
+    check = await checkSignIn(identifier, password, code, waitMs > 0);
+  } catch (err) {
+    if (err instanceof VerificationBusyError) {
+      res.setHeader('Retry-After', '5');
+      res.status(503).json({ error: 'Sign-in is busy; try again in a few seconds.' });
+      return null;
+    }
+    throw err;
+  }
+  if (check.ok) {
+    loginThrottle.recordSuccess(throttleKey);
+    return check.user;
+  }
+  if (check.throttled) {
+    const seconds = Math.max(1, Math.ceil(waitMs / 1000));
+    res.setHeader('Retry-After', String(seconds));
+    res.status(429).json({ error: `Too many failed sign-in attempts for this account; try again in ${seconds} seconds.` });
+    return null;
+  }
+  loginThrottle.recordFailure(throttleKey);
+  const attemptedUsername = identifier.slice(0, 120);
+  store.recordPortalAdminLog({
+    adminUsername: attemptedUsername,
+    authMethod: 'password',
+    action: auditAction,
+    target: 'Portal Auth',
+    details:
+      auditAction === 'LOGIN_FAILED'
+        ? `Failed password login attempt for username "${attemptedUsername}" (${check.reason}).`
+        : `Failed step-up confirmation for "${attemptedUsername}" (${check.reason}).`,
+    ipAddress: req.ip || '127.0.0.1',
+    correlationId: correlationIdFor(res),
+  });
+  // One answer for every reason, so a guesser cannot tell a right password from a wrong code. A failed
+  // step-up is 403: the session itself is still valid, and 401 would tell the portal it had ended.
+  if (auditAction === 'REAUTH_FAILED') {
+    res.status(403).json({ error: 'Incorrect password or authenticator code.', code: 'REAUTH_FAILED' });
+    return null;
+  }
+  res.status(401).json({ error: 'Invalid username, password or authenticator code.' });
+  return null;
+}
+
 /**
  * POST /api/admin/login
- * Signs into the portal using Username + Password.
+ * Signs into the portal using Username + Password (+ authenticator code).
  */
 adminRouter.post('/login', asyncRoute(async (req: Request, res: Response) => {
-  const { username, email, password } = req.body || {};
+  const { username, email, password, totp } = req.body || {};
   const identifierInput = username ?? email;
   if (
     (identifierInput !== undefined && typeof identifierInput !== 'string') ||
-    (password !== undefined && typeof password !== 'string')
+    (password !== undefined && typeof password !== 'string') ||
+    (totp !== undefined && totp !== null && typeof totp !== 'string')
   ) {
-    res.status(400).json({ error: 'Username and password must be strings.' });
+    res.status(400).json({ error: 'Username, password and authenticator code must be strings.' });
     return;
   }
   const loginIdentifier = (identifierInput || '').trim();
@@ -376,25 +555,25 @@ adminRouter.post('/login', asyncRoute(async (req: Request, res: Response) => {
     return;
   }
 
-  const verifiedUser = store.verifyPortalUserCredentials(
-    loginIdentifier,
-    rawPassword
-  );
-  if (!verifiedUser) {
-    const attemptedUsername = loginIdentifier.slice(0, 120);
+  const closed = passwordSignInClosedReason();
+  if (closed) {
     store.recordPortalAdminLog({
-      adminUsername: attemptedUsername,
+      adminUsername: loginIdentifier.slice(0, 120),
       authMethod: 'password',
       action: 'LOGIN_FAILED',
       target: 'Portal Auth',
-      details: `Failed password login attempt for username "${attemptedUsername}".`,
+      details: 'Password sign-in refused: it is disabled while Okta SSO is enabled (BREAK_GLASS_ENABLED is not set).',
       ipAddress: req.ip || '127.0.0.1',
       correlationId: correlationIdFor(res),
     });
-    res.status(401).json({ error: 'Invalid username or password.' });
+    res.status(403).json({ error: closed });
     return;
   }
 
+  const verifiedUser = await signInOrRefuse(req, res, loginIdentifier, rawPassword, totp, 'LOGIN_FAILED');
+  if (!verifiedUser) return;
+
+  store.recordPortalUserLogin(verifiedUser.username);
   const { csrfToken } = await issueAdminSessionCookie(res, {
     sub: `portal_${verifiedUser.username}`,
     email: verifiedUser.username,
@@ -403,12 +582,19 @@ adminRouter.post('/login', asyncRoute(async (req: Request, res: Response) => {
     groups: [verifiedUser.role],
   });
 
+  // With Okta on, a password sign-in is a break-glass use: say so loudly, not just in the log.
+  const breakGlass = store.getOktaConfig().enabled;
+  if (breakGlass) {
+    console.warn(`[security] BREAK-GLASS password sign-in by "${verifiedUser.username}" from ${req.ip || 'unknown'} while Okta SSO is enabled.`);
+  }
   store.recordPortalAdminLog({
     adminUsername: verifiedUser.username,
     authMethod: 'password',
     action: 'LOGIN_SUCCESS',
     target: 'Portal Auth',
-    details: `User "${verifiedUser.username}" (${verifiedUser.role}) signed in with username and password.`,
+    details: `User "${verifiedUser.username}" (${verifiedUser.role}) signed in with username and password${
+      verifiedUser.totpEnrolled ? ' and authenticator code' : ''
+    }${breakGlass ? ' (break-glass: Okta SSO is enabled)' : ''}.`,
     ipAddress: req.ip || '127.0.0.1',
     correlationId: correlationIdFor(res),
   });
@@ -416,17 +602,20 @@ adminRouter.post('/login', asyncRoute(async (req: Request, res: Response) => {
   res.json({
     success: true,
     csrfToken,
+    // The same authMethod GET /session reports for this session, so the portal can compare the two.
     user: {
       username: verifiedUser.username,
       name: verifiedUser.displayName,
       role: verifiedUser.role,
-      authMethod: 'password',
+      authMethod: 'local_bootstrap',
+      totpEnrolled: Boolean(verifiedUser.totpEnrolled),
     },
   });
 }));
 
 /**
  * POST /api/admin/logout
+ * Revokes the session server-side, so the cookie stops working even if someone kept a copy.
  */
 adminRouter.post('/logout', asyncRoute(async (req: Request, res: Response) => {
   const session = await verifyAdminSessionFromRequest(req);
@@ -441,6 +630,7 @@ adminRouter.post('/logout', asyncRoute(async (req: Request, res: Response) => {
       correlationId: correlationIdFor(res),
     });
   }
+  await revokeAdminSessionFromRequest(req);
   clearAdminSessionCookie(res);
   res.json({ success: true });
 }));
@@ -450,6 +640,93 @@ adminRouter.post('/logout', asyncRoute(async (req: Request, res: Response) => {
 // ============================================================================
 adminRouter.use((req: Request, res: Response, next: NextFunction) => {
   requireAdminAuth(req, res, next).catch(next);
+});
+
+const sessionOf = (req: Request) => (req as any).adminSession as AdminSessionClaims;
+
+/**
+ * POST /api/admin/reauth
+ * Step-up for a password session: the password (and authenticator code) again, which opens the
+ * security settings for STEP_UP_WINDOW_MS. Okta sessions step up by signing in with Okta again.
+ */
+adminRouter.post('/reauth', asyncRoute(async (req: Request, res: Response) => {
+  const session = sessionOf(req);
+  if (session.authMethod !== 'local_bootstrap') {
+    res.status(400).json({
+      error: 'Okta sessions step up by signing in with Okta again.',
+      code: 'USE_OKTA',
+      loginUrl: '/auth/okta/login?reauth=1',
+    });
+    return;
+  }
+  const { password, totp } = req.body || {};
+  if (typeof password !== 'string' || !password || (totp !== undefined && totp !== null && typeof totp !== 'string')) {
+    res.status(400).json({ error: 'Your password (and authenticator code, as a string) is required.' });
+    return;
+  }
+  const user = await signInOrRefuse(req, res, session.email, password, totp, 'REAUTH_FAILED');
+  if (!user) return;
+  if (session.jti) store.markAdminSessionReauthenticated(session.jti, Date.now());
+  res.json({ success: true });
+}));
+
+/** Account-level TOTP setup only applies to password accounts; Okta enforces its own MFA. */
+function passwordAccountOf(req: Request, res: Response): string | null {
+  const session = sessionOf(req);
+  const username = session.authMethod === 'local_bootstrap' ? store.findPortalUsername(session.email) : undefined;
+  if (!username) {
+    res.status(400).json({ error: 'Authenticator apps are set up for password accounts only; Okta handles its own MFA.' });
+    return null;
+  }
+  return username;
+}
+
+/**
+ * POST /api/admin/account/totp/setup
+ * Starts enrolling (or replacing) the signed-in password account's authenticator: returns a new secret
+ * that takes effect once POST /account/totp/confirm proves the app produces its codes.
+ */
+adminRouter.post('/account/totp/setup', requireRecentAuthentication, (req: Request, res: Response) => {
+  const username = passwordAccountOf(req, res);
+  if (!username) return;
+  const secret = generateTotpSecret();
+  store.setPortalUserPendingTotp(username, secret);
+  res.json({ secret, otpauthUri: totpProvisioningUri(secret, username) });
+});
+
+/**
+ * POST /api/admin/account/totp/confirm
+ * Activates the pending authenticator with a code it produced.
+ */
+adminRouter.post('/account/totp/confirm', requireRecentAuthentication, (req: Request, res: Response) => {
+  const username = passwordAccountOf(req, res);
+  if (!username) return;
+  const pending = store.getPortalUserPendingTotp(username);
+  if (!pending) {
+    res.status(400).json({ error: 'Start the authenticator setup first.' });
+    return;
+  }
+  const step = verifyTotp(pending, req.body?.code, 0);
+  if (step === null) {
+    res.status(400).json({ error: 'That code does not match the new authenticator. Check the device clock and try again.' });
+    return;
+  }
+  const actor = getAdminInfo(req);
+  runInTransaction(() => {
+    store.activatePortalUserPendingTotp(username, step);
+    store.recordPortalAdminLog({
+      adminUsername: actor.username,
+      authMethod: actor.authMethod,
+      action: 'ENROLL_PORTAL_USER_TOTP',
+      target: `Portal User: ${username}`,
+      details: `Enrolled an authenticator app for "${username}".`,
+      ipAddress: actor.ip,
+      correlationId: actor.correlationId,
+      targetType: 'portal_user',
+      targetId: username,
+    });
+  });
+  res.json({ success: true, portalUsers: store.getPortalUsers() });
 });
 
 // Each list holds up to this many rows of ordinary traffic, plus its own smaller allowances of simulated
@@ -925,7 +1202,7 @@ adminRouter.post('/objects', (req: Request, res: Response) => {
     () => {
       const name = store.resolveObjectName(String(objectName));
       const wasEnabled = new Map(
-        (store.getObjects().find((o) => o.objectName === name)?.fields ?? []).map((f) => [f.fieldName.toLowerCase(), f.enabled])
+        (store.getObject(name)?.fields ?? []).map((f) => [f.fieldName.toLowerCase(), f.enabled])
       );
       const saved = store.upsertObjectWithFields({
         objectName: name,
@@ -989,7 +1266,7 @@ adminRouter.put('/objects/:objectName/toggle', (req: Request, res: Response) => 
   // The toggle, the notes it leaves in the history of the groups it affects and its audit entry share
   // one transaction: a toggled Object can never go unlogged.
   const updated = runInTransaction(() => {
-    const wasEnabled = store.getObjects().find((o) => o.objectName === objectName)?.enabled;
+    const wasEnabled = store.getObject(objectName)?.enabled;
     const toggled = store.toggleObject(objectName, Boolean(enabled));
     if (!toggled) return null;
     if (wasEnabled !== undefined && wasEnabled !== toggled.enabled) {
@@ -1094,7 +1371,7 @@ adminRouter.put(
     // One transaction with the notes it leaves in group history and its audit entry, so every field
     // changes or none does, as one policy revision, and the change can never go unlogged.
     const targetObj = runInTransaction(() => {
-      const found = store.getObjects().find((o) => o.objectName === objectName);
+      const found = store.getObject(objectName);
       if (!found) return undefined;
       const changedFields = found.fields.filter((f) => f.enabled !== Boolean(enabled)).map((f) => f.fieldName);
       for (const f of found.fields) {
@@ -1746,13 +2023,22 @@ adminRouter.post('/groups/:id/profiles', (req: Request, res: Response) => {
 // ============================================================================
 // 4. SETTINGS (Okta SSO, Salesforce Connection, Portal Users, Test MCP Call)
 // ============================================================================
-adminRouter.put('/okta', (req: Request, res: Response) => {
+adminRouter.put('/okta', requireRecentAuthentication, (req: Request, res: Response) => {
   if (config.isProd) {
     const insecure = insecureOktaUrlError(req.body || {});
     if (insecure) {
       res.status(400).json({ error: insecure });
       return;
     }
+  }
+  // The callback refuses everyone while no group is required, so enabling SSO without one locks Okta
+  // admins out; say so here instead.
+  const oktaBody = req.body || {};
+  const nextOkta = store.resolveOktaSave(oktaBody);
+  const nextAdminGroup = String(oktaBody.adminGroup ?? store.getOktaConfig().adminGroup ?? '').trim();
+  if (nextOkta.enabled && !nextAdminGroup) {
+    res.status(400).json({ error: 'Set the required Okta admin group before enabling Okta SSO: without one, nobody may sign in with Okta.' });
+    return;
   }
   const actor = getAdminInfo(req);
   // The save and its audit entry share one transaction: an Okta change can never go unlogged.
@@ -1774,10 +2060,12 @@ adminRouter.put('/okta', (req: Request, res: Response) => {
   res.json({ oktaSettings: updated });
 });
 
-adminRouter.put('/sf-settings', (req: Request, res: Response) => {
+adminRouter.put('/sf-settings', requireRecentAuthentication, (req: Request, res: Response) => {
   let input: SalesforceSettingsInput;
+  let mcpClient: McpClientInput | null;
   try {
     input = parseSalesforceSettingsInput(req.body || {});
+    mcpClient = parseMcpClientInput(req.body || {});
   } catch (err: any) {
     res.status(400).json({ error: err?.message || 'Invalid Salesforce settings.' });
     return;
@@ -1785,14 +2073,14 @@ adminRouter.put('/sf-settings', (req: Request, res: Response) => {
 
   const actor = getAdminInfo(req);
   const result = changeWithAuditEntry(
-    () => saveSalesforceSettings(input),
+    () => saveSalesforceSettings(input, mcpClient),
     ({ before, updated, privateKeyReplaced }) =>
       store.recordPortalAdminLog({
         adminUsername: actor.username,
         authMethod: actor.authMethod,
         action: 'UPDATE_SF_SETTINGS',
         target: 'Salesforce Org Connection',
-        details: `Updated Salesforce Org connection settings (Mode: ${updated.authMode}, Login URL: ${updated.loginUrl}, User: ${updated.username || 'Not set'}, OrgId: ${updated.expectedOrgId || 'Any'}, Instance: ${updated.instanceUrl}). ${auditChanges(before, updated, privateKeyReplaced)}`,
+        details: `Updated Salesforce Org connection settings (Mode: ${updated.authMode}, Login URL: ${updated.loginUrl}, User: ${updated.username || 'Not set'}, OrgId: ${updated.expectedOrgId || 'Any'}, Instance: ${updated.instanceUrl}). ${auditChanges(before, updated, privateKeyReplaced, Boolean(mcpClient?.clientSecret))}`,
         ipAddress: actor.ip,
         correlationId: actor.correlationId,
         targetType: 'settings',
@@ -1804,6 +2092,8 @@ adminRouter.put('/sf-settings', (req: Request, res: Response) => {
     res.status(400).json({ error: result.error?.message || 'Invalid Salesforce settings.' });
     return;
   }
+  // Identities verified under the old MCP app settings are not reused.
+  if (mcpClient) forgetCachedIdentities();
   res.json({ sfSettings: result.value.updated });
 });
 
@@ -1811,7 +2101,7 @@ adminRouter.put('/sf-settings', (req: Request, res: Response) => {
  * POST /api/admin/sf-settings/generate-cert
  * Generates a 2048-bit RSA Private Key + self-signed X.509 Certificate (.crt) for Salesforce Connected App JWT flow.
  */
-adminRouter.post('/sf-settings/generate-cert', (req: Request, res: Response) => {
+adminRouter.post('/sf-settings/generate-cert', requireRecentAuthentication, (req: Request, res: Response) => {
   const { commonName, confirmReplaceUndecryptableKey } = req.body || {};
   const actor = getAdminInfo(req);
   const current = store.getSalesforceSettings();
@@ -1886,6 +2176,7 @@ adminRouter.post('/sf-settings/generate-cert', (req: Request, res: Response) => 
  */
 adminRouter.post(
   '/sf-settings/connect',
+  requireRecentAuthentication,
   asyncRoute(async (req: Request, res: Response) => {
     const actor = getAdminInfo(req);
     const logFailure = (errMsg: string, changes: string) =>
@@ -2015,7 +2306,7 @@ adminRouter.post(
  * POST /api/admin/sf-settings/disconnect
  * Disconnects the active Salesforce Org metadata connection.
  */
-adminRouter.post('/sf-settings/disconnect', (req: Request, res: Response) => {
+adminRouter.post('/sf-settings/disconnect', requireRecentAuthentication, (req: Request, res: Response) => {
   const actor = getAdminInfo(req);
   // The disconnect and its audit entry share one transaction: it can never go unlogged.
   const updated = runInTransaction(() => {
@@ -2037,7 +2328,7 @@ adminRouter.post('/sf-settings/disconnect', (req: Request, res: Response) => {
   res.json({ sfSettings: updated });
 });
 
-adminRouter.post('/portal-users', (req: Request, res: Response) => {
+adminRouter.post('/portal-users', requireRecentAuthentication, asyncRoute(async (req: Request, res: Response) => {
   const { username, displayName, password, role } = req.body || {};
   if (!username || !password) {
     res.status(400).json({ error: 'Username and password are required.' });
@@ -2056,31 +2347,45 @@ adminRouter.post('/portal-users', (req: Request, res: Response) => {
   }
 
   const actor = getAdminInfo(req);
+  // Hashed off the event loop, before the (synchronous) transaction.
+  const passwordHash = await hashNewPassword(newPassword);
   // The save and its audit entry share one transaction: an account change can never go unlogged.
-  runInTransaction(() => {
+  const totpSetup = runInTransaction(() => {
+    const existed = store.portalUserExists(String(username));
     const saved = store.upsertPortalUser({
       username: String(username),
       displayName: displayName ? String(displayName) : undefined,
-      password: newPassword,
+      passwordHash,
       role: role ? String(role) : undefined,
     });
+    // A new password ends the account's other sessions: whoever knew the old one is signed out.
+    if (existed) store.revokeAdminSessionsFor('local_bootstrap', saved.username, Date.now(), sessionOf(req).jti ?? '');
+    // Production requires an authenticator for every password sign-in, and a new account cannot sign
+    // in to set one up, so it gets one now. The setup key is shown once, to pass on with the password.
+    let setup: { username: string; secret: string; otpauthUri: string } | undefined;
+    if (config.isProd && !saved.totpEnrolled) {
+      const secret = generateTotpSecret();
+      store.setPortalUserTotp(saved.username, secret);
+      setup = { username: saved.username, secret, otpauthUri: totpProvisioningUri(secret, saved.username) };
+    }
     store.recordPortalAdminLog({
       adminUsername: actor.username,
       authMethod: actor.authMethod,
       action: 'UPSERT_PORTAL_USER',
       target: `Portal User: ${saved.username}`,
-      details: `Created or updated portal administrator "${saved.username}" (${saved.role}).`,
+      details: `Created or updated portal administrator "${saved.username}" (${saved.role})${setup ? ' and issued an authenticator setup key' : ''}.`,
       ipAddress: actor.ip,
       correlationId: actor.correlationId,
       targetType: 'portal_user',
       targetId: saved.username,
     });
+    return setup;
   });
 
-  res.json({ portalUsers: store.getPortalUsers() });
-});
+  res.json({ portalUsers: store.getPortalUsers(), ...(totpSetup ? { totpSetup } : {}) });
+}));
 
-adminRouter.delete('/portal-users/:username', (req: Request, res: Response) => {
+adminRouter.delete('/portal-users/:username', requireRecentAuthentication, (req: Request, res: Response) => {
   const username = String(req.params.username);
   const actor = getAdminInfo(req);
   const result = changeWithAuditEntry(

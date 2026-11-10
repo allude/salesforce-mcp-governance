@@ -8,6 +8,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { generateTotpSecret, totpCode, totpStep } from '../src/security/totp.js';
 import { testTmpDir } from './helpers/env.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -35,7 +36,7 @@ function startBackend(
     const timer = setTimeout(() => reject(new Error(`backend did not start in time:\n${output}`)), 25_000);
     const onData = (chunk: Buffer) => {
       output += chunk.toString();
-      const match = output.match(/Backend listening on:\s+http:\/\/localhost:(\d+)/);
+      const match = output.match(/Backend listening on:\s+http:\/\/(?:localhost|127\.0\.0\.1):(\d+)/);
       if (match) {
         clearTimeout(timer);
         resolve({ port: Number(match[1]), child });
@@ -58,11 +59,11 @@ async function stopBackend(backend: Backend): Promise<void> {
   });
 }
 
-async function login(port: number, username: string, password: string): Promise<number> {
+async function login(port: number, username: string, password: string, totpSecret?: string): Promise<number> {
   const res = await fetch(`http://127.0.0.1:${port}/api/admin/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify({ username, password, ...(totpSecret ? { totp: totpCode(totpSecret, totpStep()) } : {}) }),
   });
   await res.text();
   return res.status;
@@ -84,15 +85,19 @@ describe('bootstrap portal admin (real backend processes)', () => {
 
   test('production with a configured ADMIN_BOOTSTRAP_PASSWORD: that password works and admin123 does not', { timeout: 60_000 }, async (t) => {
     const password = strongPassword();
+    const totpSecret = generateTotpSecret();
     const backend = await startBackend(t, {
       NODE_ENV: 'production',
       APP_SECRET_KEY: strongKey(),
       DB_PATH: freshDb(),
       ...UNSET_BOOTSTRAP,
       ADMIN_BOOTSTRAP_PASSWORD: password,
+      ADMIN_BOOTSTRAP_TOTP_SECRET: totpSecret,
     });
-    assert.equal(await login(backend.port, 'admin', password), 200);
-    assert.equal(await login(backend.port, 'admin', 'admin123'), 401);
+    // Production asks every password sign-in for an authenticator code.
+    assert.equal(await login(backend.port, 'admin', password), 401, 'the password alone is not enough');
+    assert.equal(await login(backend.port, 'admin', password, totpSecret), 200);
+    assert.equal(await login(backend.port, 'admin', 'admin123', totpSecret), 401);
     await stopBackend(backend);
   });
 
@@ -114,15 +119,17 @@ describe('bootstrap portal admin (real backend processes)', () => {
     );
 
     const password = strongPassword();
+    const totpSecret = generateTotpSecret();
     const prod = await startBackend(t, {
       NODE_ENV: 'production',
       APP_SECRET_KEY: key,
       DB_PATH: dbPath,
       ...UNSET_BOOTSTRAP,
       ADMIN_BOOTSTRAP_PASSWORD: password,
+      ADMIN_BOOTSTRAP_TOTP_SECRET: totpSecret,
     });
-    assert.equal(await login(prod.port, 'admin', password), 200);
-    assert.equal(await login(prod.port, 'admin', 'admin123'), 401);
+    assert.equal(await login(prod.port, 'admin', password, totpSecret), 200);
+    assert.equal(await login(prod.port, 'admin', 'admin123', totpSecret), 401);
     await stopBackend(prod);
   });
 });

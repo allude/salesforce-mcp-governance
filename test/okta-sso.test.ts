@@ -193,3 +193,69 @@ describe('Okta error callbacks', () => {
     });
   }
 });
+
+describe('admin group, step-up and the callback limiter', () => {
+  test('with no required admin group configured, nobody is signed in (fails closed)', async (t) => {
+    store.updateOktaConfig({ adminGroup: '' });
+    t.after(() => store.updateOktaConfig({ adminGroup: ADMIN_GROUP }));
+    const login = await startLogin();
+    nextIdToken = await signIdToken({ nonce: login.nonce, groups: [ADMIN_GROUP, 'Everyone'] });
+
+    let res!: Response;
+    const rows = await newLogRows(async () => {
+      res = await callback({ code: 'code-blank-group', state: login.state }, login.cookie);
+    });
+
+    assert.equal(res.status, 302);
+    assert.equal(res.headers.get('location'), '/?auth_error=group_denied');
+    assert.equal(sessionCookieOf(res), undefined);
+    assert.ok(rows.some((row) => row.action === 'OKTA_LOGIN_FAILED' || /Denied Okta login/.test(row.details)), JSON.stringify(rows));
+  });
+
+  test('a step-up sign-in asks Okta to authenticate again (prompt=login, max_age=0)', async () => {
+    const res = await fetch(`${server.baseUrl}/auth/okta/login?reauth=1`, { redirect: 'manual' });
+    assert.equal(res.status, 302);
+    const authorize = new URL(res.headers.get('location') || '');
+    assert.equal(authorize.searchParams.get('prompt'), 'login');
+    assert.equal(authorize.searchParams.get('max_age'), '0');
+
+    const ordinary = new URL((await fetch(`${server.baseUrl}/auth/okta/login`, { redirect: 'manual' })).headers.get('location') || '');
+    assert.equal(ordinary.searchParams.get('prompt'), null);
+  });
+
+  async function startStepUp() {
+    const res = await fetch(`${server.baseUrl}/auth/okta/login?reauth=1`, { redirect: 'manual' });
+    const authorize = new URL(res.headers.get('location') || '');
+    const cookie = res.headers.getSetCookie().find((c) => c.startsWith('sf_mcp_oidc_flow='))!.split(';')[0];
+    return { cookie, state: authorize.searchParams.get('state') || '', nonce: authorize.searchParams.get('nonce') || '' };
+  }
+
+  test('a step-up callback whose ID token shows an old authentication is refused; a fresh one signs in', async () => {
+    const stale = await startStepUp();
+    nextIdToken = await signIdToken({ nonce: stale.nonce, auth_time: Math.floor(Date.now() / 1000) - 3600 });
+    const refused = await callback({ code: 'code-stale', state: stale.state }, stale.cookie);
+    assert.equal(refused.headers.get('location'), '/?auth_error=sso_failed');
+    assert.equal(sessionCookieOf(refused), undefined);
+
+    const fresh = await startStepUp();
+    nextIdToken = await signIdToken({ nonce: fresh.nonce, auth_time: Math.floor(Date.now() / 1000) - 5 });
+    const accepted = await callback({ code: 'code-fresh', state: fresh.state }, fresh.cookie);
+    assert.equal(accepted.headers.get('location'), '/');
+    assert.ok(sessionCookieOf(accepted), 'a session cookie is issued');
+  });
+
+  test('only failed callbacks count toward the per-client limit, and starting a sign-in is never limited', async () => {
+    const clientIp = `198.51.100.${10 + crypto.randomInt(200)}`;
+    const failedCallback = () =>
+      fetch(`${server.baseUrl}/auth/okta/callback?state=x&code=y`, { redirect: 'manual', headers: { 'X-Forwarded-For': clientIp } });
+
+    for (let i = 0; i < 60; i++) {
+      const res = await failedCallback();
+      assert.equal(res.status, 302, `attempt ${i + 1}`);
+    }
+    assert.equal((await failedCallback()).status, 429, 'the 61st failure in the window is refused');
+
+    const start = await fetch(`${server.baseUrl}/auth/okta/login`, { redirect: 'manual', headers: { 'X-Forwarded-For': clientIp } });
+    assert.equal(start.status, 302, 'starting a sign-in is not limited');
+  });
+});
